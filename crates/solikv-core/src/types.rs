@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -73,7 +73,11 @@ impl ZSetValue {
 
     /// Increment a member's score. Returns the new score.
     pub fn incr(&mut self, member: Bytes, delta: f64) -> f64 {
-        let old = self.members.get(&member).copied().unwrap_or(OrderedFloat(0.0));
+        let old = self
+            .members
+            .get(&member)
+            .copied()
+            .unwrap_or(OrderedFloat(0.0));
         let new_score = old.into_inner() + delta;
         self.insert(new_score, member);
         new_score
@@ -95,7 +99,10 @@ pub struct StreamId {
 
 impl StreamId {
     pub const MIN: StreamId = StreamId { ms: 0, seq: 0 };
-    pub const MAX: StreamId = StreamId { ms: u64::MAX, seq: u64::MAX };
+    pub const MAX: StreamId = StreamId {
+        ms: u64::MAX,
+        seq: u64::MAX,
+    };
 
     pub fn new(ms: u64, seq: u64) -> Self {
         Self { ms, seq }
@@ -294,21 +301,22 @@ impl Default for HyperLogLogValue {
 /// Bloom Filter — double hashing, configurable capacity and error rate.
 #[derive(Debug, Clone)]
 pub struct BloomFilterValue {
-    pub bits: Vec<u8>,     // bit array (packed bytes)
-    pub num_bits: u64,     // total bits
-    pub num_hashes: u32,   // number of hash functions
-    pub num_items: u64,    // items inserted (for BF.INFO)
-    pub capacity: u64,     // original requested capacity
-    pub error_rate: f64,   // original requested error rate
+    pub bits: Vec<u8>,   // bit array (packed bytes)
+    pub num_bits: u64,   // total bits
+    pub num_hashes: u32, // number of hash functions
+    pub num_items: u64,  // items inserted (for BF.INFO)
+    pub capacity: u64,   // original requested capacity
+    pub error_rate: f64, // original requested error rate
 }
 
 impl BloomFilterValue {
     pub fn with_capacity(capacity: u64, error_rate: f64) -> Self {
-        let num_bits = (-((capacity as f64) * error_rate.ln()) / (2.0_f64.ln().powi(2))).ceil() as u64;
+        let num_bits =
+            (-((capacity as f64) * error_rate.ln()) / (2.0_f64.ln().powi(2))).ceil() as u64;
         let num_bits = num_bits.max(8); // minimum 8 bits
         let num_hashes = ((num_bits as f64 / capacity as f64) * 2.0_f64.ln()).ceil() as u32;
         let num_hashes = num_hashes.max(1);
-        let byte_len = ((num_bits + 7) / 8) as usize;
+        let byte_len = num_bits.div_ceil(8) as usize;
         Self {
             bits: vec![0u8; byte_len],
             num_bits,
@@ -460,11 +468,16 @@ impl CommandResponse {
     }
 
     pub fn wrong_type() -> Self {
-        CommandResponse::Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+        CommandResponse::Error(
+            "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+        )
     }
 
     pub fn wrong_arity(cmd: &str) -> Self {
-        CommandResponse::Error(format!("ERR wrong number of arguments for '{}' command", cmd))
+        CommandResponse::Error(format!(
+            "ERR wrong number of arguments for '{}' command",
+            cmd
+        ))
     }
 
     pub fn syntax_error() -> Self {
@@ -516,13 +529,40 @@ mod tests {
 
     #[test]
     fn test_type_names() {
-        assert_eq!(KeyEntry::new(RedisValue::String(Bytes::from(""))).type_name(), "string");
-        assert_eq!(KeyEntry::new(RedisValue::List(VecDeque::new())).type_name(), "list");
-        assert_eq!(KeyEntry::new(RedisValue::Hash(HashMap::new())).type_name(), "hash");
-        assert_eq!(KeyEntry::new(RedisValue::Set(HashSet::new())).type_name(), "set");
-        assert_eq!(KeyEntry::new(RedisValue::ZSet(ZSetValue::new())).type_name(), "zset");
-        assert_eq!(KeyEntry::new(RedisValue::Stream(StreamValue::new())).type_name(), "stream");
-        assert_eq!(KeyEntry::new(RedisValue::HyperLogLog(HyperLogLogValue::new())).type_name(), "string");
-        assert_eq!(KeyEntry::new(RedisValue::BloomFilter(BloomFilterValue::with_capacity(100, 0.01))).type_name(), "string");
+        assert_eq!(
+            KeyEntry::new(RedisValue::String(Bytes::from(""))).type_name(),
+            "string"
+        );
+        assert_eq!(
+            KeyEntry::new(RedisValue::List(VecDeque::new())).type_name(),
+            "list"
+        );
+        assert_eq!(
+            KeyEntry::new(RedisValue::Hash(HashMap::new())).type_name(),
+            "hash"
+        );
+        assert_eq!(
+            KeyEntry::new(RedisValue::Set(HashSet::new())).type_name(),
+            "set"
+        );
+        assert_eq!(
+            KeyEntry::new(RedisValue::ZSet(ZSetValue::new())).type_name(),
+            "zset"
+        );
+        assert_eq!(
+            KeyEntry::new(RedisValue::Stream(StreamValue::new())).type_name(),
+            "stream"
+        );
+        assert_eq!(
+            KeyEntry::new(RedisValue::HyperLogLog(HyperLogLogValue::new())).type_name(),
+            "string"
+        );
+        assert_eq!(
+            KeyEntry::new(RedisValue::BloomFilter(BloomFilterValue::with_capacity(
+                100, 0.01
+            )))
+            .type_name(),
+            "string"
+        );
     }
 }

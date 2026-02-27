@@ -11,7 +11,11 @@ pub struct LwwRegister {
 
 impl LwwRegister {
     pub fn new(value: Bytes, timestamp: u64, node_id: String) -> Self {
-        Self { value, timestamp, node_id }
+        Self {
+            value,
+            timestamp,
+            node_id,
+        }
     }
 
     /// Merge with another LWW register. Higher timestamp wins.

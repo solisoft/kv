@@ -74,7 +74,7 @@ impl RdbPersistence {
                     writer.write_all(&[TYPE_ZSET])?;
                     write_bytes(writer, key)?;
                     write_len(writer, zset.len())?;
-                    for ((score, member), _) in &zset.scores {
+                    for (score, member) in zset.scores.keys() {
                         write_bytes(writer, member)?;
                         writer.write_all(&score.into_inner().to_le_bytes())?;
                     }
@@ -109,13 +109,19 @@ impl RdbPersistence {
     pub fn load<R: Read>(reader: &mut R, store: &mut ShardStore) -> io::Result<()> {
         let mut magic = [0u8; 6];
         reader.read_exact(&mut magic)?;
-        if &magic != RDB_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid RDB magic"));
+        if magic != RDB_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid RDB magic",
+            ));
         }
         let mut version = [0u8; 1];
         reader.read_exact(&mut version)?;
         if version[0] != RDB_VERSION {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported RDB version"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported RDB version",
+            ));
         }
 
         let mut current_expiry: Option<u64> = None;
@@ -196,7 +202,9 @@ impl RdbPersistence {
                             "invalid HLL register size",
                         ));
                     }
-                    let hll = HyperLogLogValue { registers: registers_bytes.to_vec() };
+                    let hll = HyperLogLogValue {
+                        registers: registers_bytes.to_vec(),
+                    };
                     let entry = make_entry(RedisValue::HyperLogLog(hll), current_expiry.take());
                     store.insert_entry(key, entry);
                 }
@@ -294,7 +302,10 @@ where
             let mut writer = BufWriter::new(file);
             RdbPersistence::save(store, &mut writer)?;
             writer.flush()?;
-            writer.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+            writer
+                .into_inner()
+                .map_err(|e| e.into_error())?
+                .sync_all()?;
             Ok(())
         })?;
 
@@ -338,8 +349,16 @@ mod tests {
     #[test]
     fn test_rdb_roundtrip_string() {
         let mut store = ShardStore::new();
-        store.set(Bytes::from("key1"), RedisValue::String(Bytes::from("value1")), None);
-        store.set(Bytes::from("key2"), RedisValue::String(Bytes::from("value2")), Some(60000));
+        store.set(
+            Bytes::from("key1"),
+            RedisValue::String(Bytes::from("value1")),
+            None,
+        );
+        store.set(
+            Bytes::from("key2"),
+            RedisValue::String(Bytes::from("value2")),
+            Some(60000),
+        );
 
         let mut buf = Vec::new();
         RdbPersistence::save(&store, &mut buf).unwrap();
@@ -354,7 +373,10 @@ mod tests {
     #[test]
     fn test_rdb_roundtrip_list() {
         let mut store = ShardStore::new();
-        store.list_rpush(&Bytes::from("mylist"), vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]);
+        store.list_rpush(
+            &Bytes::from("mylist"),
+            vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")],
+        );
 
         let mut buf = Vec::new();
         RdbPersistence::save(&store, &mut buf).unwrap();
@@ -367,10 +389,13 @@ mod tests {
     #[test]
     fn test_rdb_roundtrip_hash() {
         let mut store = ShardStore::new();
-        store.hash_hset(&Bytes::from("myhash"), vec![
-            (Bytes::from("f1"), Bytes::from("v1")),
-            (Bytes::from("f2"), Bytes::from("v2")),
-        ]);
+        store.hash_hset(
+            &Bytes::from("myhash"),
+            vec![
+                (Bytes::from("f1"), Bytes::from("v1")),
+                (Bytes::from("f2"), Bytes::from("v2")),
+            ],
+        );
 
         let mut buf = Vec::new();
         RdbPersistence::save(&store, &mut buf).unwrap();
@@ -383,7 +408,10 @@ mod tests {
     #[test]
     fn test_rdb_roundtrip_set() {
         let mut store = ShardStore::new();
-        store.set_sadd(&Bytes::from("myset"), vec![Bytes::from("a"), Bytes::from("b")]);
+        store.set_sadd(
+            &Bytes::from("myset"),
+            vec![Bytes::from("a"), Bytes::from("b")],
+        );
 
         let mut buf = Vec::new();
         RdbPersistence::save(&store, &mut buf).unwrap();
@@ -396,10 +424,15 @@ mod tests {
     #[test]
     fn test_rdb_roundtrip_zset() {
         let mut store = ShardStore::new();
-        store.zset_zadd(&Bytes::from("myzset"), vec![
-            (1.0, Bytes::from("a")),
-            (2.5, Bytes::from("b")),
-        ], false, false, false, false, false);
+        store.zset_zadd(
+            &Bytes::from("myzset"),
+            vec![(1.0, Bytes::from("a")), (2.5, Bytes::from("b"))],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
 
         let mut buf = Vec::new();
         RdbPersistence::save(&store, &mut buf).unwrap();
@@ -412,7 +445,10 @@ mod tests {
     #[test]
     fn test_rdb_roundtrip_hll() {
         let mut store = ShardStore::new();
-        store.pfadd(&Bytes::from("myhll"), &[Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]);
+        store.pfadd(
+            &Bytes::from("myhll"),
+            &[Bytes::from("a"), Bytes::from("b"), Bytes::from("c")],
+        );
 
         let mut buf = Vec::new();
         RdbPersistence::save(&store, &mut buf).unwrap();
@@ -444,8 +480,17 @@ mod tests {
         assert_eq!(loaded.dbsize(), 1);
 
         // Verify membership is preserved
-        assert!(matches!(loaded.bf_exists(&Bytes::from("mybf"), &Bytes::from("hello")), CommandResponse::Integer(1)));
-        assert!(matches!(loaded.bf_exists(&Bytes::from("mybf"), &Bytes::from("world")), CommandResponse::Integer(1)));
-        assert!(matches!(loaded.bf_exists(&Bytes::from("mybf"), &Bytes::from("nothere")), CommandResponse::Integer(0)));
+        assert!(matches!(
+            loaded.bf_exists(&Bytes::from("mybf"), &Bytes::from("hello")),
+            CommandResponse::Integer(1)
+        ));
+        assert!(matches!(
+            loaded.bf_exists(&Bytes::from("mybf"), &Bytes::from("world")),
+            CommandResponse::Integer(1)
+        ));
+        assert!(matches!(
+            loaded.bf_exists(&Bytes::from("mybf"), &Bytes::from("nothere")),
+            CommandResponse::Integer(0)
+        ));
     }
 }

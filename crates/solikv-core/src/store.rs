@@ -62,7 +62,8 @@ impl ShardStore {
     /// Set a key-value pair with an absolute expiry timestamp in milliseconds.
     pub fn set_with_absolute_expiry(&mut self, key: Bytes, value: RedisValue, expires_at: u64) {
         self.expiry_heap.push(key.clone(), expires_at);
-        self.data.insert(key, KeyEntry::with_expiry(value, expires_at));
+        self.data
+            .insert(key, KeyEntry::with_expiry(value, expires_at));
     }
 
     /// Insert a KeyEntry directly.
@@ -154,7 +155,7 @@ impl ShardStore {
     pub fn ttl(&mut self, key: &Bytes) -> i64 {
         let pttl = self.pttl(key);
         if pttl > 0 {
-            ((pttl + 999) / 1000) as i64 // ceiling division
+            (pttl + 999) / 1000 // ceiling division
         } else {
             pttl
         }
@@ -186,7 +187,12 @@ impl ShardStore {
     }
 
     /// SCAN implementation: cursor-based iteration.
-    pub fn scan(&mut self, cursor: usize, pattern: Option<&str>, count: usize) -> (usize, Vec<Bytes>) {
+    pub fn scan(
+        &mut self,
+        cursor: usize,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> (usize, Vec<Bytes>) {
         let all_keys: Vec<Bytes> = self.data.keys().cloned().collect();
         let total = all_keys.len();
         if total == 0 {
@@ -323,7 +329,11 @@ mod tests {
     #[test]
     fn test_set_get() {
         let mut store = ShardStore::new();
-        store.set(Bytes::from("key1"), RedisValue::String(Bytes::from("val1")), None);
+        store.set(
+            Bytes::from("key1"),
+            RedisValue::String(Bytes::from("val1")),
+            None,
+        );
         let entry = store.get(&Bytes::from("key1")).unwrap();
         match &entry.value {
             RedisValue::String(v) => assert_eq!(v, &Bytes::from("val1")),
@@ -334,7 +344,11 @@ mod tests {
     #[test]
     fn test_del() {
         let mut store = ShardStore::new();
-        store.set(Bytes::from("key1"), RedisValue::String(Bytes::from("val1")), None);
+        store.set(
+            Bytes::from("key1"),
+            RedisValue::String(Bytes::from("val1")),
+            None,
+        );
         assert!(store.del(&Bytes::from("key1")));
         assert!(!store.del(&Bytes::from("key1")));
         assert!(store.get(&Bytes::from("key1")).is_none());
@@ -343,7 +357,11 @@ mod tests {
     #[test]
     fn test_exists() {
         let mut store = ShardStore::new();
-        store.set(Bytes::from("key1"), RedisValue::String(Bytes::from("val1")), None);
+        store.set(
+            Bytes::from("key1"),
+            RedisValue::String(Bytes::from("val1")),
+            None,
+        );
         assert!(store.exists(&Bytes::from("key1")));
         assert!(!store.exists(&Bytes::from("key2")));
     }
@@ -351,7 +369,11 @@ mod tests {
     #[test]
     fn test_expire_and_ttl() {
         let mut store = ShardStore::new();
-        store.set(Bytes::from("key1"), RedisValue::String(Bytes::from("val1")), Some(5000));
+        store.set(
+            Bytes::from("key1"),
+            RedisValue::String(Bytes::from("val1")),
+            Some(5000),
+        );
         let ttl = store.pttl(&Bytes::from("key1"));
         assert!(ttl > 0 && ttl <= 5000);
     }
@@ -360,7 +382,11 @@ mod tests {
     fn test_lazy_expiry() {
         let mut store = ShardStore::new();
         // Set with 0ms expiry (immediately expired)
-        store.set(Bytes::from("key1"), RedisValue::String(Bytes::from("val1")), None);
+        store.set(
+            Bytes::from("key1"),
+            RedisValue::String(Bytes::from("val1")),
+            None,
+        );
         store.data.get_mut(&Bytes::from("key1")).unwrap().expires_at = Some(1); // epoch + 1ms = past
         assert!(store.get(&Bytes::from("key1")).is_none());
     }
@@ -368,7 +394,11 @@ mod tests {
     #[test]
     fn test_persist() {
         let mut store = ShardStore::new();
-        store.set(Bytes::from("key1"), RedisValue::String(Bytes::from("val1")), Some(5000));
+        store.set(
+            Bytes::from("key1"),
+            RedisValue::String(Bytes::from("val1")),
+            Some(5000),
+        );
         assert!(store.persist(&Bytes::from("key1")));
         assert_eq!(store.pttl(&Bytes::from("key1")), -1);
     }
@@ -427,9 +457,21 @@ mod tests {
     #[test]
     fn test_keys_pattern() {
         let mut store = ShardStore::new();
-        store.set(Bytes::from("user:1"), RedisValue::String(Bytes::from("a")), None);
-        store.set(Bytes::from("user:2"), RedisValue::String(Bytes::from("b")), None);
-        store.set(Bytes::from("admin:1"), RedisValue::String(Bytes::from("c")), None);
+        store.set(
+            Bytes::from("user:1"),
+            RedisValue::String(Bytes::from("a")),
+            None,
+        );
+        store.set(
+            Bytes::from("user:2"),
+            RedisValue::String(Bytes::from("b")),
+            None,
+        );
+        store.set(
+            Bytes::from("admin:1"),
+            RedisValue::String(Bytes::from("c")),
+            None,
+        );
         let keys = store.keys("user:*");
         assert_eq!(keys.len(), 2);
     }

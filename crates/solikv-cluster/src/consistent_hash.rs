@@ -114,16 +114,32 @@ mod tests {
     #[test]
     fn test_distribute_evenly() {
         let mut ring = ConsistentHash::new();
-        ring.nodes = vec!["node1".to_string(), "node2".to_string(), "node3".to_string()];
+        ring.nodes = vec![
+            "node1".to_string(),
+            "node2".to_string(),
+            "node3".to_string(),
+        ];
         ring.distribute_evenly();
 
         // All slots should be assigned
         assert!(ring.slots.iter().all(|s| s.is_some()));
 
         // Each node should have roughly equal slots
-        let count1 = ring.slots.iter().filter(|s| s.as_deref() == Some("node1")).count();
-        let count2 = ring.slots.iter().filter(|s| s.as_deref() == Some("node2")).count();
-        let count3 = ring.slots.iter().filter(|s| s.as_deref() == Some("node3")).count();
+        let count1 = ring
+            .slots
+            .iter()
+            .filter(|s| s.as_deref() == Some("node1"))
+            .count();
+        let count2 = ring
+            .slots
+            .iter()
+            .filter(|s| s.as_deref() == Some("node2"))
+            .count();
+        let count3 = ring
+            .slots
+            .iter()
+            .filter(|s| s.as_deref() == Some("node3"))
+            .count();
         assert!(count1 > 5000);
         assert!(count2 > 5000);
         assert!(count3 > 5000);

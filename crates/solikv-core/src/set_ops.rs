@@ -17,7 +17,10 @@ impl ShardStore {
         }
 
         match self.get_mut(key).unwrap() {
-            KeyEntry { value: RedisValue::Set(ref mut s), .. } => Ok(s),
+            KeyEntry {
+                value: RedisValue::Set(ref mut s),
+                ..
+            } => Ok(s),
             _ => unreachable!(),
         }
     }
@@ -83,7 +86,10 @@ impl ShardStore {
             Err(e) => e,
             Ok(None) => CommandResponse::array(vec![]),
             Ok(Some(set)) => {
-                let items = set.iter().map(|m| CommandResponse::bulk(m.clone())).collect();
+                let items = set
+                    .iter()
+                    .map(|m| CommandResponse::bulk(m.clone()))
+                    .collect();
                 CommandResponse::array(items)
             }
         }
@@ -123,7 +129,7 @@ impl ShardStore {
             result = result.intersection(&other).cloned().collect();
         }
 
-        let items = result.into_iter().map(|m| CommandResponse::bulk(m)).collect();
+        let items = result.into_iter().map(CommandResponse::bulk).collect();
         CommandResponse::array(items)
     }
 
@@ -138,7 +144,7 @@ impl ShardStore {
                 Err(e) => return e,
             }
         }
-        let items = result.into_iter().map(|m| CommandResponse::bulk(m)).collect();
+        let items = result.into_iter().map(CommandResponse::bulk).collect();
         CommandResponse::array(items)
     }
 
@@ -157,13 +163,19 @@ impl ShardStore {
             };
             result = result.difference(&other).cloned().collect();
         }
-        let items = result.into_iter().map(|m| CommandResponse::bulk(m)).collect();
+        let items = result.into_iter().map(CommandResponse::bulk).collect();
         CommandResponse::array(items)
     }
 
     pub fn set_spop(&mut self, key: &Bytes, count: usize) -> CommandResponse {
         let entry = match self.get_mut(key) {
-            None => return if count == 1 { CommandResponse::nil() } else { CommandResponse::array(vec![]) },
+            None => {
+                return if count == 1 {
+                    CommandResponse::nil()
+                } else {
+                    CommandResponse::array(vec![])
+                }
+            }
             Some(e) => e,
         };
         match &mut entry.value {
@@ -205,14 +217,14 @@ impl ShardStore {
                 let abs_count = count.unsigned_abs() as usize;
                 let members: Vec<Bytes> = set.iter().take(abs_count).cloned().collect();
 
-                if count >= 0 && count <= 1 && members.len() == 1 {
+                if (0..=1).contains(&count) && members.len() == 1 {
                     if count == 0 {
                         return CommandResponse::array(vec![]);
                     }
                     // Single element case without explicit count
                     return CommandResponse::bulk(members[0].clone());
                 }
-                let items = members.into_iter().map(|m| CommandResponse::bulk(m)).collect();
+                let items = members.into_iter().map(CommandResponse::bulk).collect();
                 CommandResponse::array(items)
             }
         }
@@ -255,7 +267,10 @@ mod tests {
     fn test_sadd_scard() {
         let mut store = ShardStore::new();
         let key = Bytes::from("set");
-        let r = store.set_sadd(&key, vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("a")]);
+        let r = store.set_sadd(
+            &key,
+            vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("a")],
+        );
         assert!(matches!(r, CommandResponse::Integer(2)));
         assert!(matches!(store.set_scard(&key), CommandResponse::Integer(2)));
     }
@@ -275,8 +290,14 @@ mod tests {
         let mut store = ShardStore::new();
         let key = Bytes::from("set");
         store.set_sadd(&key, vec![Bytes::from("a")]);
-        assert!(matches!(store.set_sismember(&key, &Bytes::from("a")), CommandResponse::Integer(1)));
-        assert!(matches!(store.set_sismember(&key, &Bytes::from("b")), CommandResponse::Integer(0)));
+        assert!(matches!(
+            store.set_sismember(&key, &Bytes::from("a")),
+            CommandResponse::Integer(1)
+        ));
+        assert!(matches!(
+            store.set_sismember(&key, &Bytes::from("b")),
+            CommandResponse::Integer(0)
+        ));
     }
 
     #[test]
@@ -293,8 +314,14 @@ mod tests {
     #[test]
     fn test_sinter() {
         let mut store = ShardStore::new();
-        store.set_sadd(&Bytes::from("s1"), vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]);
-        store.set_sadd(&Bytes::from("s2"), vec![Bytes::from("b"), Bytes::from("c"), Bytes::from("d")]);
+        store.set_sadd(
+            &Bytes::from("s1"),
+            vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")],
+        );
+        store.set_sadd(
+            &Bytes::from("s2"),
+            vec![Bytes::from("b"), Bytes::from("c"), Bytes::from("d")],
+        );
         match store.set_sinter(&[Bytes::from("s1"), Bytes::from("s2")]) {
             CommandResponse::Array(items) => assert_eq!(items.len(), 2),
             _ => panic!("expected array"),
@@ -315,12 +342,17 @@ mod tests {
     #[test]
     fn test_sdiff() {
         let mut store = ShardStore::new();
-        store.set_sadd(&Bytes::from("s1"), vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]);
+        store.set_sadd(
+            &Bytes::from("s1"),
+            vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")],
+        );
         store.set_sadd(&Bytes::from("s2"), vec![Bytes::from("b"), Bytes::from("c")]);
         match store.set_sdiff(&[Bytes::from("s1"), Bytes::from("s2")]) {
             CommandResponse::Array(items) => {
                 assert_eq!(items.len(), 1);
-                assert!(matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("a")));
+                assert!(
+                    matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("a"))
+                );
             }
             _ => panic!("expected array"),
         }
@@ -343,8 +375,14 @@ mod tests {
         store.set_sadd(&Bytes::from("s2"), vec![Bytes::from("c")]);
         let r = store.set_smove(&Bytes::from("s1"), Bytes::from("s2"), Bytes::from("a"));
         assert!(matches!(r, CommandResponse::Integer(1)));
-        assert!(matches!(store.set_scard(&Bytes::from("s1")), CommandResponse::Integer(1)));
-        assert!(matches!(store.set_scard(&Bytes::from("s2")), CommandResponse::Integer(2)));
+        assert!(matches!(
+            store.set_scard(&Bytes::from("s1")),
+            CommandResponse::Integer(1)
+        ));
+        assert!(matches!(
+            store.set_scard(&Bytes::from("s2")),
+            CommandResponse::Integer(2)
+        ));
     }
 
     #[test]

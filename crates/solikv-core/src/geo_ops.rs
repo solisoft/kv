@@ -29,10 +29,14 @@ pub fn geo_encode(lon: f64, lat: f64) -> u64 {
 pub fn geo_decode(hash: u64) -> (f64, f64) {
     let (lon_bits, lat_bits) = deinterleave(hash);
 
-    let lon_min = GEO_LON_MIN + (lon_bits as f64 / (1u64 << GEO_STEP) as f64) * (GEO_LON_MAX - GEO_LON_MIN);
-    let lon_max = GEO_LON_MIN + ((lon_bits + 1) as f64 / (1u64 << GEO_STEP) as f64) * (GEO_LON_MAX - GEO_LON_MIN);
-    let lat_min = GEO_LAT_MIN + (lat_bits as f64 / (1u64 << GEO_STEP) as f64) * (GEO_LAT_MAX - GEO_LAT_MIN);
-    let lat_max = GEO_LAT_MIN + ((lat_bits + 1) as f64 / (1u64 << GEO_STEP) as f64) * (GEO_LAT_MAX - GEO_LAT_MIN);
+    let lon_min =
+        GEO_LON_MIN + (lon_bits as f64 / (1u64 << GEO_STEP) as f64) * (GEO_LON_MAX - GEO_LON_MIN);
+    let lon_max = GEO_LON_MIN
+        + ((lon_bits + 1) as f64 / (1u64 << GEO_STEP) as f64) * (GEO_LON_MAX - GEO_LON_MIN);
+    let lat_min =
+        GEO_LAT_MIN + (lat_bits as f64 / (1u64 << GEO_STEP) as f64) * (GEO_LAT_MAX - GEO_LAT_MIN);
+    let lat_max = GEO_LAT_MIN
+        + ((lat_bits + 1) as f64 / (1u64 << GEO_STEP) as f64) * (GEO_LAT_MAX - GEO_LAT_MIN);
 
     ((lon_min + lon_max) / 2.0, (lat_min + lat_max) / 2.0)
 }
@@ -151,8 +155,8 @@ pub enum GeoFrom {
 
 #[derive(Debug, Clone)]
 pub enum GeoBy {
-    Radius(f64, String),        // distance, unit
-    Box(f64, f64, String),      // width, height, unit
+    Radius(f64, String),   // distance, unit
+    Box(f64, f64, String), // width, height, unit
 }
 
 // ── ShardStore methods ──
@@ -169,7 +173,9 @@ impl ShardStore {
     ) -> CommandResponse {
         // Validate coordinates
         for &(lon, lat, _) in items {
-            if lon < GEO_LON_MIN || lon > GEO_LON_MAX || lat < GEO_LAT_MIN || lat > GEO_LAT_MAX {
+            if !(GEO_LON_MIN..=GEO_LON_MAX).contains(&lon)
+                || !(GEO_LAT_MIN..=GEO_LAT_MAX).contains(&lat)
+            {
                 return CommandResponse::error(format!(
                     "ERR invalid longitude,latitude pair {:.6},{:.6}",
                     lon, lat
@@ -193,7 +199,11 @@ impl ShardStore {
     /// GEOPOS key member [member ...]
     pub fn geo_pos(&mut self, key: &Bytes, members: &[Bytes]) -> CommandResponse {
         let zset = match self.get(key) {
-            None => return CommandResponse::array(members.iter().map(|_| CommandResponse::nil()).collect()),
+            None => {
+                return CommandResponse::array(
+                    members.iter().map(|_| CommandResponse::nil()).collect(),
+                )
+            }
             Some(entry) => match &entry.value {
                 RedisValue::ZSet(zs) => zs,
                 _ => return CommandResponse::wrong_type(),
@@ -202,16 +212,14 @@ impl ShardStore {
 
         let result: Vec<CommandResponse> = members
             .iter()
-            .map(|member| {
-                match zset.score(member) {
-                    None => CommandResponse::nil(),
-                    Some(score) => {
-                        let (lon, lat) = geo_decode(score as u64);
-                        CommandResponse::array(vec![
-                            CommandResponse::bulk(Bytes::from(format!("{:.17}", lon))),
-                            CommandResponse::bulk(Bytes::from(format!("{:.17}", lat))),
-                        ])
-                    }
+            .map(|member| match zset.score(member) {
+                None => CommandResponse::nil(),
+                Some(score) => {
+                    let (lon, lat) = geo_decode(score as u64);
+                    CommandResponse::array(vec![
+                        CommandResponse::bulk(Bytes::from(format!("{:.17}", lon))),
+                        CommandResponse::bulk(Bytes::from(format!("{:.17}", lat))),
+                    ])
                 }
             })
             .collect();
@@ -222,7 +230,11 @@ impl ShardStore {
     /// GEOHASH key member [member ...]
     pub fn geo_hash(&mut self, key: &Bytes, members: &[Bytes]) -> CommandResponse {
         let zset = match self.get(key) {
-            None => return CommandResponse::array(members.iter().map(|_| CommandResponse::nil()).collect()),
+            None => {
+                return CommandResponse::array(
+                    members.iter().map(|_| CommandResponse::nil()).collect(),
+                )
+            }
             Some(entry) => match &entry.value {
                 RedisValue::ZSet(zs) => zs,
                 _ => return CommandResponse::wrong_type(),
@@ -231,14 +243,12 @@ impl ShardStore {
 
         let result: Vec<CommandResponse> = members
             .iter()
-            .map(|member| {
-                match zset.score(member) {
-                    None => CommandResponse::nil(),
-                    Some(score) => {
-                        let (lon, lat) = geo_decode(score as u64);
-                        let hash_str = geo_hash_string(lon, lat);
-                        CommandResponse::bulk(Bytes::from(hash_str))
-                    }
+            .map(|member| match zset.score(member) {
+                None => CommandResponse::nil(),
+                Some(score) => {
+                    let (lon, lat) = geo_decode(score as u64);
+                    let hash_str = geo_hash_string(lon, lat);
+                    CommandResponse::bulk(Bytes::from(hash_str))
                 }
             })
             .collect();
@@ -282,6 +292,7 @@ impl ShardStore {
     /// GEOSEARCH key FROMMEMBER member | FROMLONLAT lon lat
     ///   BYRADIUS radius unit | BYBOX width height unit
     ///   [ASC|DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]
+    #[allow(clippy::too_many_arguments)]
     pub fn geo_search(
         &mut self,
         key: &Bytes,
@@ -304,12 +315,10 @@ impl ShardStore {
         // Resolve center
         let (center_lon, center_lat) = match from {
             GeoFrom::LonLat(lon, lat) => (*lon, *lat),
-            GeoFrom::Member(member) => {
-                match zset.score(member) {
-                    Some(score) => geo_decode(score as u64),
-                    None => return CommandResponse::array(vec![]),
-                }
-            }
+            GeoFrom::Member(member) => match zset.score(member) {
+                Some(score) => geo_decode(score as u64),
+                None => return CommandResponse::array(vec![]),
+            },
         };
 
         // Collect and filter candidates
@@ -343,8 +352,10 @@ impl ShardStore {
 
         // Sort
         match sort_asc {
-            Some(true) => candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)),
-            Some(false) => candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)),
+            Some(true) => candidates
+                .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)),
+            Some(false) => candidates
+                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)),
             None => {} // no sorting specified
         }
 
@@ -387,6 +398,7 @@ impl ShardStore {
     }
 
     /// GEOSEARCHSTORE dest src FROMMEMBER/FROMLONLAT ... BYRADIUS/BYBOX ... [STOREDIST]
+    #[allow(clippy::too_many_arguments)]
     pub fn geo_search_store(
         &mut self,
         dest: &Bytes,
@@ -413,15 +425,13 @@ impl ShardStore {
         // Resolve center
         let (center_lon, center_lat) = match from {
             GeoFrom::LonLat(lon, lat) => (*lon, *lat),
-            GeoFrom::Member(member) => {
-                match zset.score(member) {
-                    Some(score) => geo_decode(score as u64),
-                    None => {
-                        self.del(dest);
-                        return CommandResponse::integer(0);
-                    }
+            GeoFrom::Member(member) => match zset.score(member) {
+                Some(score) => geo_decode(score as u64),
+                None => {
+                    self.del(dest);
+                    return CommandResponse::integer(0);
                 }
-            }
+            },
         };
 
         let unit_str = match by {
@@ -459,8 +469,10 @@ impl ShardStore {
 
         // Sort
         match sort_asc {
-            Some(true) => candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)),
-            Some(false) => candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)),
+            Some(true) => candidates
+                .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)),
+            Some(false) => candidates
+                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)),
             None => {}
         }
 
@@ -714,18 +726,42 @@ mod tests {
         let key = Bytes::from("mygeo");
 
         // Add initial member
-        store.geo_add(&key, false, false, false, &[(13.361389, 38.115556, Bytes::from("Palermo"))]);
+        store.geo_add(
+            &key,
+            false,
+            false,
+            false,
+            &[(13.361389, 38.115556, Bytes::from("Palermo"))],
+        );
 
         // NX: should not update existing
-        let r = store.geo_add(&key, true, false, false, &[(15.0, 37.0, Bytes::from("Palermo"))]);
+        let r = store.geo_add(
+            &key,
+            true,
+            false,
+            false,
+            &[(15.0, 37.0, Bytes::from("Palermo"))],
+        );
         assert!(matches!(r, CommandResponse::Integer(0)));
 
         // XX: should not add new members
-        let r = store.geo_add(&key, false, true, false, &[(15.087269, 37.502669, Bytes::from("Catania"))]);
+        let r = store.geo_add(
+            &key,
+            false,
+            true,
+            false,
+            &[(15.087269, 37.502669, Bytes::from("Catania"))],
+        );
         assert!(matches!(r, CommandResponse::Integer(0)));
 
         // CH: report changed count
-        let r = store.geo_add(&key, false, false, true, &[(14.0, 38.0, Bytes::from("Palermo"))]);
+        let r = store.geo_add(
+            &key,
+            false,
+            false,
+            true,
+            &[(14.0, 38.0, Bytes::from("Palermo"))],
+        );
         assert!(matches!(r, CommandResponse::Integer(1)));
     }
 

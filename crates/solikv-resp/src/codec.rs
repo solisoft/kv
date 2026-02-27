@@ -144,12 +144,7 @@ pub fn decode_frame(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
 }
 
 fn find_crlf(src: &[u8]) -> Option<usize> {
-    for i in 0..src.len().saturating_sub(1) {
-        if src[i] == b'\r' && src[i + 1] == b'\n' {
-            return Some(i);
-        }
-    }
-    None
+    (0..src.len().saturating_sub(1)).find(|&i| src[i] == b'\r' && src[i + 1] == b'\n')
 }
 
 fn decode_simple_string(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
@@ -178,8 +173,7 @@ fn decode_integer(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
         Some(pos) => {
             let s = std::str::from_utf8(&src[1..1 + pos])
                 .map_err(|e| format!("invalid utf8 in integer: {}", e))?;
-            let n: i64 = s.parse()
-                .map_err(|e| format!("invalid integer: {}", e))?;
+            let n: i64 = s.parse().map_err(|e| format!("invalid integer: {}", e))?;
             Ok(Some((RespFrame::Integer(n), 1 + pos + 2)))
         }
     }
@@ -191,7 +185,8 @@ fn decode_bulk_string(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> 
         Some(pos) => {
             let len_str = std::str::from_utf8(&src[1..1 + pos])
                 .map_err(|e| format!("invalid utf8 in bulk length: {}", e))?;
-            let len: i64 = len_str.parse()
+            let len: i64 = len_str
+                .parse()
                 .map_err(|e| format!("invalid bulk length: {}", e))?;
 
             if len == -1 {
@@ -218,7 +213,8 @@ fn decode_array(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
         Some(pos) => {
             let count_str = std::str::from_utf8(&src[1..1 + pos])
                 .map_err(|e| format!("invalid utf8 in array count: {}", e))?;
-            let count: i64 = count_str.parse()
+            let count: i64 = count_str
+                .parse()
                 .map_err(|e| format!("invalid array count: {}", e))?;
 
             if count == -1 {
@@ -310,10 +306,7 @@ mod tests {
             ]),
             &mut buf,
         );
-        assert_eq!(
-            &buf[..],
-            b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n"
-        );
+        assert_eq!(&buf[..], b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n");
     }
 
     #[test]

@@ -72,7 +72,11 @@ impl std::fmt::Display for ImportStats {
         write!(
             f,
             "RDB v{}: {} keys imported, {} skipped (unsupported type), {} expired, {} database(s)",
-            self.rdb_version, self.keys_imported, self.keys_skipped, self.keys_expired, self.databases_seen
+            self.rdb_version,
+            self.keys_imported,
+            self.keys_skipped,
+            self.keys_expired,
+            self.databases_seen
         )
     }
 }
@@ -81,6 +85,7 @@ impl std::fmt::Display for ImportStats {
 ///
 /// Keys from all Redis databases are flattened into a single namespace.
 /// Already-expired keys are filtered out.
+#[allow(clippy::type_complexity)]
 pub fn import_redis_rdb(
     path: &Path,
     num_shards: usize,
@@ -198,7 +203,10 @@ pub fn import_redis_rdb(
 }
 
 /// Read a Redis value by type code. Returns `Ok(None)` for unsupported types (with a warning logged).
-fn read_value<R: io::Read>(reader: &mut RdbReader<R>, type_code: u8) -> io::Result<Option<RedisValue>> {
+fn read_value<R: io::Read>(
+    reader: &mut RdbReader<R>,
+    type_code: u8,
+) -> io::Result<Option<RedisValue>> {
     match type_code {
         TYPE_STRING => {
             let val = reader.read_string()?;
@@ -374,11 +382,17 @@ fn read_value<R: io::Read>(reader: &mut RdbReader<R>, type_code: u8) -> io::Resu
             Ok(Some(RedisValue::Set(set)))
         }
         // Unsupported types — skip and warn
-        TYPE_MODULE_OLD | TYPE_MODULE_2 | TYPE_HASH_ZIPMAP
-        | TYPE_STREAM_LISTPACKS | TYPE_STREAM_LISTPACKS_2
-        | TYPE_STREAM_LISTPACKS_3 | TYPE_STREAM_LISTPACKS_4
-        | TYPE_HASH_FIELD_EXPIRY_LISTPACK | TYPE_HASH_FIELD_EXPIRY_HT
-        | TYPE_HASH_FIELD_EXPIRY_LISTPACK_EX | TYPE_HASH_FIELD_EXPIRY_HT_EX => {
+        TYPE_MODULE_OLD
+        | TYPE_MODULE_2
+        | TYPE_HASH_ZIPMAP
+        | TYPE_STREAM_LISTPACKS
+        | TYPE_STREAM_LISTPACKS_2
+        | TYPE_STREAM_LISTPACKS_3
+        | TYPE_STREAM_LISTPACKS_4
+        | TYPE_HASH_FIELD_EXPIRY_LISTPACK
+        | TYPE_HASH_FIELD_EXPIRY_HT
+        | TYPE_HASH_FIELD_EXPIRY_LISTPACK_EX
+        | TYPE_HASH_FIELD_EXPIRY_HT_EX => {
             tracing::warn!(
                 "Skipping unsupported Redis type {} ({})",
                 type_code,
@@ -452,8 +466,10 @@ fn skip_value<R: io::Read>(reader: &mut RdbReader<R>, type_code: u8) -> io::Resu
             }
         }
         // Streams — skip the complex structure
-        TYPE_STREAM_LISTPACKS | TYPE_STREAM_LISTPACKS_2
-        | TYPE_STREAM_LISTPACKS_3 | TYPE_STREAM_LISTPACKS_4 => {
+        TYPE_STREAM_LISTPACKS
+        | TYPE_STREAM_LISTPACKS_2
+        | TYPE_STREAM_LISTPACKS_3
+        | TYPE_STREAM_LISTPACKS_4 => {
             skip_stream(reader, type_code)?;
         }
         // Module — cannot reliably skip MODULE_OLD, can skip MODULE_2 via opcode loop
@@ -811,7 +827,10 @@ mod tests {
         assert_eq!(stats.keys_expired, 0);
 
         // Collect all keys
-        let all_keys: Vec<&Bytes> = shards.iter().flat_map(|s| s.iter().map(|(k, _)| k)).collect();
+        let all_keys: Vec<&Bytes> = shards
+            .iter()
+            .flat_map(|s| s.iter().map(|(k, _)| k))
+            .collect();
         assert_eq!(all_keys.len(), 5);
     }
 
@@ -846,7 +865,10 @@ mod tests {
         assert_eq!(stats.keys_imported, 1);
         assert_eq!(stats.keys_expired, 1);
 
-        let all_keys: Vec<&Bytes> = shards.iter().flat_map(|s| s.iter().map(|(k, _)| k)).collect();
+        let all_keys: Vec<&Bytes> = shards
+            .iter()
+            .flat_map(|s| s.iter().map(|(k, _)| k))
+            .collect();
         assert_eq!(all_keys.len(), 1);
         assert_eq!(all_keys[0], &Bytes::from("alive"));
     }

@@ -5,7 +5,10 @@ use crate::store::ShardStore;
 use crate::types::*;
 
 impl ShardStore {
-    fn get_or_create_hash(&mut self, key: &Bytes) -> Result<&mut HashMap<Bytes, Bytes>, CommandResponse> {
+    fn get_or_create_hash(
+        &mut self,
+        key: &Bytes,
+    ) -> Result<&mut HashMap<Bytes, Bytes>, CommandResponse> {
         if let Some(entry) = self.get(key) {
             if !matches!(entry.value, RedisValue::Hash(_)) {
                 return Err(CommandResponse::wrong_type());
@@ -17,7 +20,10 @@ impl ShardStore {
         }
 
         match self.get_mut(key).unwrap() {
-            KeyEntry { value: RedisValue::Hash(ref mut h), .. } => Ok(h),
+            KeyEntry {
+                value: RedisValue::Hash(ref mut h),
+                ..
+            } => Ok(h),
             _ => unreachable!(),
         }
     }
@@ -171,7 +177,10 @@ impl ShardStore {
             Err(e) => e,
             Ok(None) => CommandResponse::array(vec![]),
             Ok(Some(h)) => {
-                let items = h.values().map(|v| CommandResponse::bulk(v.clone())).collect();
+                let items = h
+                    .values()
+                    .map(|v| CommandResponse::bulk(v.clone()))
+                    .collect();
                 CommandResponse::array(items)
             }
         }
@@ -198,15 +207,21 @@ impl ShardStore {
             Ok(h) => h,
             Err(e) => return e,
         };
-        if hash.contains_key(&field) {
-            CommandResponse::integer(0)
-        } else {
-            hash.insert(field, value);
+        if let std::collections::hash_map::Entry::Vacant(e) = hash.entry(field) {
+            e.insert(value);
             CommandResponse::integer(1)
+        } else {
+            CommandResponse::integer(0)
         }
     }
 
-    pub fn hash_hscan(&mut self, key: &Bytes, cursor: usize, pattern: Option<&str>, count: usize) -> CommandResponse {
+    pub fn hash_hscan(
+        &mut self,
+        key: &Bytes,
+        cursor: usize,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> CommandResponse {
         match self.get_hash(key) {
             Err(e) => e,
             Ok(None) => CommandResponse::array(vec![
@@ -214,7 +229,8 @@ impl ShardStore {
                 CommandResponse::array(vec![]),
             ]),
             Ok(Some(h)) => {
-                let pairs: Vec<(Bytes, Bytes)> = h.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let pairs: Vec<(Bytes, Bytes)> =
+                    h.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                 let total = pairs.len();
                 if total == 0 {
                     return CommandResponse::array(vec![
@@ -273,10 +289,13 @@ mod tests {
     fn test_hset_multiple() {
         let mut store = ShardStore::new();
         let key = Bytes::from("hash");
-        let r = store.hash_hset(&key, vec![
-            (Bytes::from("f1"), Bytes::from("v1")),
-            (Bytes::from("f2"), Bytes::from("v2")),
-        ]);
+        let r = store.hash_hset(
+            &key,
+            vec![
+                (Bytes::from("f1"), Bytes::from("v1")),
+                (Bytes::from("f2"), Bytes::from("v2")),
+            ],
+        );
         assert!(matches!(r, CommandResponse::Integer(2)));
     }
 
@@ -284,23 +303,32 @@ mod tests {
     fn test_hdel() {
         let mut store = ShardStore::new();
         let key = Bytes::from("hash");
-        store.hash_hset(&key, vec![
-            (Bytes::from("f1"), Bytes::from("v1")),
-            (Bytes::from("f2"), Bytes::from("v2")),
-        ]);
+        store.hash_hset(
+            &key,
+            vec![
+                (Bytes::from("f1"), Bytes::from("v1")),
+                (Bytes::from("f2"), Bytes::from("v2")),
+            ],
+        );
         let r = store.hash_hdel(&key, &[Bytes::from("f1")]);
         assert!(matches!(r, CommandResponse::Integer(1)));
-        assert!(matches!(store.hash_hget(&key, &Bytes::from("f1")), CommandResponse::Nil));
+        assert!(matches!(
+            store.hash_hget(&key, &Bytes::from("f1")),
+            CommandResponse::Nil
+        ));
     }
 
     #[test]
     fn test_hgetall() {
         let mut store = ShardStore::new();
         let key = Bytes::from("hash");
-        store.hash_hset(&key, vec![
-            (Bytes::from("f1"), Bytes::from("v1")),
-            (Bytes::from("f2"), Bytes::from("v2")),
-        ]);
+        store.hash_hset(
+            &key,
+            vec![
+                (Bytes::from("f1"), Bytes::from("v1")),
+                (Bytes::from("f2"), Bytes::from("v2")),
+            ],
+        );
         match store.hash_hgetall(&key) {
             CommandResponse::Array(items) => assert_eq!(items.len(), 4), // 2 pairs
             _ => panic!("expected array"),
@@ -315,7 +343,9 @@ mod tests {
         match store.hash_hmget(&key, &[Bytes::from("f1"), Bytes::from("f2")]) {
             CommandResponse::Array(items) => {
                 assert_eq!(items.len(), 2);
-                assert!(matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("v1")));
+                assert!(
+                    matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("v1"))
+                );
                 assert!(matches!(&items[1], CommandResponse::Nil));
             }
             _ => panic!("expected array"),
@@ -336,10 +366,13 @@ mod tests {
     fn test_hkeys_hvals_hlen() {
         let mut store = ShardStore::new();
         let key = Bytes::from("hash");
-        store.hash_hset(&key, vec![
-            (Bytes::from("f1"), Bytes::from("v1")),
-            (Bytes::from("f2"), Bytes::from("v2")),
-        ]);
+        store.hash_hset(
+            &key,
+            vec![
+                (Bytes::from("f1"), Bytes::from("v1")),
+                (Bytes::from("f2"), Bytes::from("v2")),
+            ],
+        );
         assert!(matches!(store.hash_hlen(&key), CommandResponse::Integer(2)));
         match store.hash_hkeys(&key) {
             CommandResponse::Array(items) => assert_eq!(items.len(), 2),
@@ -356,16 +389,28 @@ mod tests {
         let mut store = ShardStore::new();
         let key = Bytes::from("hash");
         store.hash_hset(&key, vec![(Bytes::from("f1"), Bytes::from("v1"))]);
-        assert!(matches!(store.hash_hexists(&key, &Bytes::from("f1")), CommandResponse::Integer(1)));
-        assert!(matches!(store.hash_hexists(&key, &Bytes::from("f2")), CommandResponse::Integer(0)));
+        assert!(matches!(
+            store.hash_hexists(&key, &Bytes::from("f1")),
+            CommandResponse::Integer(1)
+        ));
+        assert!(matches!(
+            store.hash_hexists(&key, &Bytes::from("f2")),
+            CommandResponse::Integer(0)
+        ));
     }
 
     #[test]
     fn test_hsetnx() {
         let mut store = ShardStore::new();
         let key = Bytes::from("hash");
-        assert!(matches!(store.hash_hsetnx(&key, Bytes::from("f1"), Bytes::from("v1")), CommandResponse::Integer(1)));
-        assert!(matches!(store.hash_hsetnx(&key, Bytes::from("f1"), Bytes::from("v2")), CommandResponse::Integer(0)));
+        assert!(matches!(
+            store.hash_hsetnx(&key, Bytes::from("f1"), Bytes::from("v1")),
+            CommandResponse::Integer(1)
+        ));
+        assert!(matches!(
+            store.hash_hsetnx(&key, Bytes::from("f1"), Bytes::from("v2")),
+            CommandResponse::Integer(0)
+        ));
         match store.hash_hget(&key, &Bytes::from("f1")) {
             CommandResponse::BulkString(v) => assert_eq!(v, Bytes::from("v1")),
             _ => panic!("expected bulk"),

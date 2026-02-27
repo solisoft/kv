@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, HashMap};
 use crate::store::ShardStore;
 use crate::types::*;
 
-fn generate_stream_id(stream: &StreamValue, input: StreamIdInput) -> Result<StreamId, CommandResponse> {
+fn generate_stream_id(
+    stream: &StreamValue,
+    input: StreamIdInput,
+) -> Result<StreamId, CommandResponse> {
     match input {
         StreamIdInput::Auto => {
             let ms = now_millis();
@@ -40,9 +43,9 @@ fn generate_stream_id(stream: &StreamValue, input: StreamIdInput) -> Result<Stre
             };
             Ok(StreamId::new(ms, seq))
         }
-        StreamIdInput::Min | StreamIdInput::Max => {
-            Err(CommandResponse::error("ERR Invalid stream ID specified as stream command argument"))
-        }
+        StreamIdInput::Min | StreamIdInput::Max => Err(CommandResponse::error(
+            "ERR Invalid stream ID specified as stream command argument",
+        )),
     }
 }
 
@@ -60,7 +63,8 @@ fn apply_trim(stream: &mut StreamValue, trim: &StreamTrim) -> i64 {
             }
         }
         StreamTrim::MinId { threshold, .. } => {
-            let to_remove: Vec<StreamId> = stream.entries
+            let to_remove: Vec<StreamId> = stream
+                .entries
                 .range(..(*threshold))
                 .map(|(&id, _)| id)
                 .collect();
@@ -84,7 +88,12 @@ fn format_stream_entries(entries: &[(&StreamId, &Vec<(Bytes, Bytes)>)]) -> Comma
 fn format_single_entry(id: &StreamId, fields: &[(Bytes, Bytes)]) -> CommandResponse {
     let field_items: Vec<CommandResponse> = fields
         .iter()
-        .flat_map(|(k, v)| vec![CommandResponse::bulk(k.clone()), CommandResponse::bulk(v.clone())])
+        .flat_map(|(k, v)| {
+            vec![
+                CommandResponse::bulk(k.clone()),
+                CommandResponse::bulk(v.clone()),
+            ]
+        })
         .collect();
     CommandResponse::array(vec![
         CommandResponse::bulk(Bytes::from(id.to_string())),
@@ -105,7 +114,10 @@ impl ShardStore {
         }
 
         match self.get_mut(key).unwrap() {
-            KeyEntry { value: RedisValue::Stream(ref mut sv), .. } => Ok(sv),
+            KeyEntry {
+                value: RedisValue::Stream(ref mut sv),
+                ..
+            } => Ok(sv),
             _ => unreachable!(),
         }
     }
@@ -129,7 +141,10 @@ impl ShardStore {
             return Ok(None);
         }
         match self.get_mut(key) {
-            Some(KeyEntry { value: RedisValue::Stream(ref mut sv), .. }) => Ok(Some(sv)),
+            Some(KeyEntry {
+                value: RedisValue::Stream(ref mut sv),
+                ..
+            }) => Ok(Some(sv)),
             _ => Ok(None),
         }
     }
@@ -296,7 +311,12 @@ impl ShardStore {
             Ok(None) => CommandResponse::error("ERR no such key"),
             Ok(Some(sv)) => {
                 let first_entry = sv.entries.keys().next().copied().unwrap_or(StreamId::MIN);
-                let last_entry = sv.entries.keys().next_back().copied().unwrap_or(StreamId::MIN);
+                let last_entry = sv
+                    .entries
+                    .keys()
+                    .next_back()
+                    .copied()
+                    .unwrap_or(StreamId::MIN);
                 CommandResponse::array(vec![
                     CommandResponse::bulk_string("length"),
                     CommandResponse::integer(sv.len() as i64),
@@ -345,7 +365,10 @@ impl ShardStore {
         }
 
         let stream = match self.get_mut(key) {
-            Some(KeyEntry { value: RedisValue::Stream(ref mut sv), .. }) => sv,
+            Some(KeyEntry {
+                value: RedisValue::Stream(ref mut sv),
+                ..
+            }) => sv,
             _ => unreachable!(),
         };
 
@@ -401,13 +424,15 @@ impl ShardStore {
             Ok(Some(sv)) => {
                 let grp = match sv.groups.get_mut(group) {
                     Some(g) => g,
-                    None => return CommandResponse::error("NOGROUP No such consumer group for key"),
+                    None => {
+                        return CommandResponse::error("NOGROUP No such consumer group for key")
+                    }
                 };
                 match grp.consumers.remove(consumer) {
                     Some(c) => {
                         let count = c.pending.len() as i64;
                         // Remove consumer's pending entries from group PEL
-                        for (id, _) in &c.pending {
+                        for id in c.pending.keys() {
                             grp.pending.remove(id);
                         }
                         CommandResponse::integer(count)
@@ -429,11 +454,15 @@ impl ShardStore {
     ) -> CommandResponse {
         match self.get_stream_mut(key) {
             Err(e) => e,
-            Ok(None) => CommandResponse::error("ERR The XREADGROUP subcommand requires the key to exist"),
+            Ok(None) => {
+                CommandResponse::error("ERR The XREADGROUP subcommand requires the key to exist")
+            }
             Ok(Some(sv)) => {
                 let grp = match sv.groups.get_mut(group) {
                     Some(g) => g,
-                    None => return CommandResponse::error("NOGROUP No such consumer group for key"),
+                    None => {
+                        return CommandResponse::error("NOGROUP No such consumer group for key")
+                    }
                 };
 
                 // Ensure consumer exists
@@ -452,10 +481,7 @@ impl ShardStore {
                     // ">" means: deliver new entries not yet delivered to this group
                     StreamIdInput::Max => {
                         let start = if grp.last_delivered_id.seq < u64::MAX {
-                            StreamId::new(
-                                grp.last_delivered_id.ms,
-                                grp.last_delivered_id.seq + 1,
-                            )
+                            StreamId::new(grp.last_delivered_id.ms, grp.last_delivered_id.seq + 1)
                         } else {
                             StreamId::new(grp.last_delivered_id.ms.saturating_add(1), 0)
                         };
@@ -463,7 +489,9 @@ impl ShardStore {
                         let entries_data: Vec<(StreamId, Vec<(Bytes, Bytes)>)> = {
                             let iter = sv.entries.range(start..);
                             if let Some(c) = count {
-                                iter.take(c).map(|(&id, fields)| (id, fields.clone())).collect()
+                                iter.take(c)
+                                    .map(|(&id, fields)| (id, fields.clone()))
+                                    .collect()
                             } else {
                                 iter.map(|(&id, fields)| (id, fields.clone())).collect()
                             }
@@ -478,20 +506,24 @@ impl ShardStore {
                         grp.last_delivered_id = last_delivered;
 
                         for (id, _) in &entries_data {
-                            grp.pending.insert(*id, PendingEntry {
-                                id: *id,
-                                consumer: consumer_name.clone(),
-                                delivery_time: now,
-                                delivery_count: 1,
-                            });
+                            grp.pending.insert(
+                                *id,
+                                PendingEntry {
+                                    id: *id,
+                                    consumer: consumer_name.clone(),
+                                    delivery_time: now,
+                                    delivery_count: 1,
+                                },
+                            );
                             let consumer = grp.consumers.get_mut(consumer_name).unwrap();
                             consumer.pending.insert(*id, ());
                             consumer.seen_time = now;
                         }
 
-                        let result: Vec<CommandResponse> = entries_data.iter().map(|(id, fields)| {
-                            format_single_entry(id, fields)
-                        }).collect();
+                        let result: Vec<CommandResponse> = entries_data
+                            .iter()
+                            .map(|(id, fields)| format_single_entry(id, fields))
+                            .collect();
 
                         CommandResponse::array(result)
                     }
@@ -509,7 +541,8 @@ impl ShardStore {
                             None => return CommandResponse::array(vec![]),
                         };
 
-                        let pending_ids: Vec<StreamId> = consumer.pending
+                        let pending_ids: Vec<StreamId> = consumer
+                            .pending
                             .range(start_id..)
                             .map(|(&id, _)| id)
                             .collect();
@@ -543,12 +576,7 @@ impl ShardStore {
     }
 
     /// XACK key group id [id ...]
-    pub fn stream_xack(
-        &mut self,
-        key: &Bytes,
-        group: &Bytes,
-        ids: &[StreamId],
-    ) -> CommandResponse {
+    pub fn stream_xack(&mut self, key: &Bytes, group: &Bytes, ids: &[StreamId]) -> CommandResponse {
         match self.get_stream_mut(key) {
             Err(e) => e,
             Ok(None) => CommandResponse::integer(0),
@@ -589,7 +617,9 @@ impl ShardStore {
             Ok(Some(sv)) => {
                 let grp = match sv.groups.get(group) {
                     Some(g) => g,
-                    None => return CommandResponse::error("NOGROUP No such consumer group for key"),
+                    None => {
+                        return CommandResponse::error("NOGROUP No such consumer group for key")
+                    }
                 };
 
                 // Summary form: no start/end/count
@@ -604,7 +634,9 @@ impl ShardStore {
                         if !consumer.pending.is_empty() {
                             consumer_counts.push(CommandResponse::array(vec![
                                 CommandResponse::bulk(name.clone()),
-                                CommandResponse::bulk(Bytes::from(consumer.pending.len().to_string())),
+                                CommandResponse::bulk(Bytes::from(
+                                    consumer.pending.len().to_string(),
+                                )),
                             ]));
                         }
                     }
@@ -633,7 +665,7 @@ impl ShardStore {
 
                 for (_, pe) in iter.take(count) {
                     if let Some(filter) = consumer_filter {
-                        if &pe.consumer != filter {
+                        if pe.consumer != filter {
                             continue;
                         }
                     }
@@ -641,7 +673,7 @@ impl ShardStore {
                         CommandResponse::bulk(Bytes::from(pe.id.to_string())),
                         CommandResponse::bulk(pe.consumer.clone()),
                         CommandResponse::integer(
-                            now_millis().saturating_sub(pe.delivery_time) as i64,
+                            now_millis().saturating_sub(pe.delivery_time) as i64
                         ),
                         CommandResponse::integer(pe.delivery_count as i64),
                     ]));
@@ -681,7 +713,10 @@ mod tests {
         assert_eq!(StreamId::parse("*"), Some(StreamIdInput::Auto));
         assert_eq!(StreamId::parse("-"), Some(StreamIdInput::Min));
         assert_eq!(StreamId::parse("+"), Some(StreamIdInput::Max));
-        assert_eq!(StreamId::parse("100-5"), Some(StreamIdInput::Explicit(StreamId::new(100, 5))));
+        assert_eq!(
+            StreamId::parse("100-5"),
+            Some(StreamIdInput::Explicit(StreamId::new(100, 5)))
+        );
         assert_eq!(StreamId::parse("100"), Some(StreamIdInput::Partial(100)));
         assert_eq!(StreamId::parse("abc"), None);
         assert_eq!(StreamId::parse("100-abc"), None);
@@ -707,7 +742,10 @@ mod tests {
             }
             _ => panic!("expected bulk string, got {:?}", r),
         }
-        assert!(matches!(store.stream_xlen(&key), CommandResponse::Integer(1)));
+        assert!(matches!(
+            store.stream_xlen(&key),
+            CommandResponse::Integer(1)
+        ));
     }
 
     #[test]
@@ -738,7 +776,10 @@ mod tests {
             _ => panic!("expected bulk string"),
         }
 
-        assert!(matches!(store.stream_xlen(&key), CommandResponse::Integer(2)));
+        assert!(matches!(
+            store.stream_xlen(&key),
+            CommandResponse::Integer(2)
+        ));
     }
 
     #[test]
@@ -826,12 +867,10 @@ mod tests {
             CommandResponse::Array(items) => {
                 assert_eq!(items.len(), 2);
                 match &items[0] {
-                    CommandResponse::Array(inner) => {
-                        match &inner[0] {
-                            CommandResponse::BulkString(id) => assert_eq!(id, &Bytes::from("5000-0")),
-                            _ => panic!("expected id"),
-                        }
-                    }
+                    CommandResponse::Array(inner) => match &inner[0] {
+                        CommandResponse::BulkString(id) => assert_eq!(id, &Bytes::from("5000-0")),
+                        _ => panic!("expected id"),
+                    },
                     _ => panic!("expected array"),
                 }
             }
@@ -862,7 +901,10 @@ mod tests {
 
         let r = store.stream_xdel(&key, &[StreamId::new(1000, 0)]);
         assert!(matches!(r, CommandResponse::Integer(1)));
-        assert!(matches!(store.stream_xlen(&key), CommandResponse::Integer(1)));
+        assert!(matches!(
+            store.stream_xlen(&key),
+            CommandResponse::Integer(1)
+        ));
 
         let r = store.stream_xdel(&key, &[StreamId::new(9999, 0)]);
         assert!(matches!(r, CommandResponse::Integer(0)));
@@ -884,9 +926,18 @@ mod tests {
             );
         }
 
-        let r = store.stream_xtrim(&key, StreamTrim::MaxLen { exact: true, threshold: 5 });
+        let r = store.stream_xtrim(
+            &key,
+            StreamTrim::MaxLen {
+                exact: true,
+                threshold: 5,
+            },
+        );
         assert!(matches!(r, CommandResponse::Integer(5)));
-        assert!(matches!(store.stream_xlen(&key), CommandResponse::Integer(5)));
+        assert!(matches!(
+            store.stream_xlen(&key),
+            CommandResponse::Integer(5)
+        ));
     }
 
     #[test]
@@ -905,10 +956,16 @@ mod tests {
 
         let r = store.stream_xtrim(
             &key,
-            StreamTrim::MinId { exact: true, threshold: StreamId::new(6000, 0) },
+            StreamTrim::MinId {
+                exact: true,
+                threshold: StreamId::new(6000, 0),
+            },
         );
         assert!(matches!(r, CommandResponse::Integer(5)));
-        assert!(matches!(store.stream_xlen(&key), CommandResponse::Integer(5)));
+        assert!(matches!(
+            store.stream_xlen(&key),
+            CommandResponse::Integer(5)
+        ));
     }
 
     #[test]
@@ -921,10 +978,16 @@ mod tests {
                 StreamIdInput::Explicit(StreamId::new(i * 1000, 0)),
                 vec![(Bytes::from("n"), Bytes::from(i.to_string()))],
                 false,
-                Some(StreamTrim::MaxLen { exact: true, threshold: 5 }),
+                Some(StreamTrim::MaxLen {
+                    exact: true,
+                    threshold: 5,
+                }),
             );
         }
-        assert!(matches!(store.stream_xlen(&key), CommandResponse::Integer(5)));
+        assert!(matches!(
+            store.stream_xlen(&key),
+            CommandResponse::Integer(5)
+        ));
     }
 
     // ---- XREAD single ----
@@ -996,7 +1059,10 @@ mod tests {
 
         let r = store.stream_xgroup_create(&key, Bytes::from("grp"), StreamIdInput::Min, true);
         assert!(matches!(r, CommandResponse::Ok));
-        assert!(matches!(store.stream_xlen(&key), CommandResponse::Integer(0)));
+        assert!(matches!(
+            store.stream_xlen(&key),
+            CommandResponse::Integer(0)
+        ));
     }
 
     #[test]
@@ -1283,7 +1349,10 @@ mod tests {
     #[test]
     fn test_xlen_nonexistent() {
         let mut store = ShardStore::new();
-        assert!(matches!(store.stream_xlen(&Bytes::from("nope")), CommandResponse::Integer(0)));
+        assert!(matches!(
+            store.stream_xlen(&Bytes::from("nope")),
+            CommandResponse::Integer(0)
+        ));
     }
 
     #[test]

@@ -101,7 +101,12 @@ impl ShardStore {
     }
 
     // ---- GETEX ----
-    pub fn string_getex(&mut self, key: &Bytes, expire_ms: Option<u64>, persist: bool) -> CommandResponse {
+    pub fn string_getex(
+        &mut self,
+        key: &Bytes,
+        expire_ms: Option<u64>,
+        persist: bool,
+    ) -> CommandResponse {
         match self.get(key) {
             None => CommandResponse::nil(),
             Some(entry) => match &entry.value {
@@ -121,10 +126,7 @@ impl ShardStore {
 
     // ---- MGET ----
     pub fn string_mget(&mut self, keys: &[Bytes]) -> CommandResponse {
-        let results: Vec<CommandResponse> = keys
-            .iter()
-            .map(|k| self.string_get(k))
-            .collect();
+        let results: Vec<CommandResponse> = keys.iter().map(|k| self.string_get(k)).collect();
         CommandResponse::array(results)
     }
 
@@ -165,15 +167,21 @@ impl ShardStore {
         let current = match self.get(key) {
             None => 0i64,
             Some(entry) => match &entry.value {
-                RedisValue::String(v) => {
-                    match std::str::from_utf8(v) {
-                        Ok(s) => match s.parse::<i64>() {
-                            Ok(n) => n,
-                            Err(_) => return CommandResponse::error("ERR value is not an integer or out of range"),
-                        },
-                        Err(_) => return CommandResponse::error("ERR value is not an integer or out of range"),
+                RedisValue::String(v) => match std::str::from_utf8(v) {
+                    Ok(s) => match s.parse::<i64>() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            return CommandResponse::error(
+                                "ERR value is not an integer or out of range",
+                            )
+                        }
+                    },
+                    Err(_) => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
                     }
-                }
+                },
                 _ => return CommandResponse::wrong_type(),
             },
         };
@@ -201,15 +209,13 @@ impl ShardStore {
         let current = match self.get(key) {
             None => 0.0f64,
             Some(entry) => match &entry.value {
-                RedisValue::String(v) => {
-                    match std::str::from_utf8(v) {
-                        Ok(s) => match s.parse::<f64>() {
-                            Ok(n) => n,
-                            Err(_) => return CommandResponse::error("ERR value is not a valid float"),
-                        },
+                RedisValue::String(v) => match std::str::from_utf8(v) {
+                    Ok(s) => match s.parse::<f64>() {
+                        Ok(n) => n,
                         Err(_) => return CommandResponse::error("ERR value is not a valid float"),
-                    }
-                }
+                    },
+                    Err(_) => return CommandResponse::error("ERR value is not a valid float"),
+                },
                 _ => return CommandResponse::wrong_type(),
             },
         };
@@ -271,8 +277,16 @@ impl ShardStore {
                     if len == 0 {
                         return CommandResponse::bulk(Bytes::new());
                     }
-                    let s = if start < 0 { (len + start).max(0) } else { start.min(len) };
-                    let e = if end < 0 { (len + end).max(0) } else { end.min(len - 1) };
+                    let s = if start < 0 {
+                        (len + start).max(0)
+                    } else {
+                        start.min(len)
+                    };
+                    let e = if end < 0 {
+                        (len + end).max(0)
+                    } else {
+                        end.min(len - 1)
+                    };
                     if s > e {
                         CommandResponse::bulk(Bytes::new())
                     } else {
@@ -285,7 +299,12 @@ impl ShardStore {
     }
 
     // ---- SETRANGE ----
-    pub fn string_setrange(&mut self, key: &Bytes, offset: usize, value: &Bytes) -> CommandResponse {
+    pub fn string_setrange(
+        &mut self,
+        key: &Bytes,
+        offset: usize,
+        value: &Bytes,
+    ) -> CommandResponse {
         let current = match self.get(key) {
             None => Bytes::new(),
             Some(entry) => match &entry.value {
@@ -364,7 +383,12 @@ impl ShardStore {
     }
 
     // ---- BITCOUNT ----
-    pub fn string_bitcount(&mut self, key: &Bytes, start: Option<i64>, end: Option<i64>) -> CommandResponse {
+    pub fn string_bitcount(
+        &mut self,
+        key: &Bytes,
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> CommandResponse {
         match self.get(key) {
             None => CommandResponse::integer(0),
             Some(entry) => match &entry.value {
@@ -376,7 +400,11 @@ impl ShardStore {
                     let (s, e) = match (start, end) {
                         (Some(s), Some(e)) => {
                             let s = if s < 0 { (len + s).max(0) } else { s.min(len) };
-                            let e = if e < 0 { (len + e).max(0) } else { e.min(len - 1) };
+                            let e = if e < 0 {
+                                (len + e).max(0)
+                            } else {
+                                e.min(len - 1)
+                            };
                             (s as usize, e as usize)
                         }
                         _ => (0, (len - 1) as usize),
@@ -409,23 +437,21 @@ impl ShardStore {
                     .map(|i| !src.get(i).copied().unwrap_or(0))
                     .collect()
             }
-            _ => {
-                (0..max_len)
-                    .map(|i| {
-                        let mut val = sources[0].get(i).copied().unwrap_or(0);
-                        for src in &sources[1..] {
-                            let b = src.get(i).copied().unwrap_or(0);
-                            match op {
-                                "AND" => val &= b,
-                                "OR" => val |= b,
-                                "XOR" => val ^= b,
-                                _ => {}
-                            }
+            _ => (0..max_len)
+                .map(|i| {
+                    let mut val = sources[0].get(i).copied().unwrap_or(0);
+                    for src in &sources[1..] {
+                        let b = src.get(i).copied().unwrap_or(0);
+                        match op {
+                            "AND" => val &= b,
+                            "OR" => val |= b,
+                            "XOR" => val ^= b,
+                            _ => {}
                         }
-                        val
-                    })
-                    .collect()
-            }
+                    }
+                    val
+                })
+                .collect(),
         };
 
         let len = result.len() as i64;
@@ -452,13 +478,23 @@ mod tests {
     #[test]
     fn test_get_nonexistent() {
         let mut store = ShardStore::new();
-        assert!(matches!(store.string_get(&Bytes::from("x")), CommandResponse::Nil));
+        assert!(matches!(
+            store.string_get(&Bytes::from("x")),
+            CommandResponse::Nil
+        ));
     }
 
     #[test]
     fn test_set_and_get() {
         let mut store = ShardStore::new();
-        store.string_set(Bytes::from("k"), Bytes::from("v"), None, false, false, false);
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("v"),
+            None,
+            false,
+            false,
+            false,
+        );
         match store.string_get(&Bytes::from("k")) {
             CommandResponse::BulkString(v) => assert_eq!(v, Bytes::from("v")),
             other => panic!("Expected BulkString, got {:?}", other),
@@ -468,9 +504,23 @@ mod tests {
     #[test]
     fn test_set_nx() {
         let mut store = ShardStore::new();
-        store.string_set(Bytes::from("k"), Bytes::from("v1"), None, true, false, false);
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("v1"),
+            None,
+            true,
+            false,
+            false,
+        );
         // NX: should not overwrite
-        store.string_set(Bytes::from("k"), Bytes::from("v2"), None, true, false, false);
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("v2"),
+            None,
+            true,
+            false,
+            false,
+        );
         match store.string_get(&Bytes::from("k")) {
             CommandResponse::BulkString(v) => assert_eq!(v, Bytes::from("v1")),
             other => panic!("Expected BulkString, got {:?}", other),
@@ -482,11 +532,28 @@ mod tests {
         let mut store = ShardStore::new();
         // XX on nonexistent: should not set
         store.string_set(Bytes::from("k"), Bytes::from("v"), None, false, true, false);
-        assert!(matches!(store.string_get(&Bytes::from("k")), CommandResponse::Nil));
+        assert!(matches!(
+            store.string_get(&Bytes::from("k")),
+            CommandResponse::Nil
+        ));
 
         // Set first, then XX should update
-        store.string_set(Bytes::from("k"), Bytes::from("v1"), None, false, false, false);
-        store.string_set(Bytes::from("k"), Bytes::from("v2"), None, false, true, false);
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("v1"),
+            None,
+            false,
+            false,
+            false,
+        );
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("v2"),
+            None,
+            false,
+            true,
+            false,
+        );
         match store.string_get(&Bytes::from("k")) {
             CommandResponse::BulkString(v) => assert_eq!(v, Bytes::from("v2")),
             other => panic!("Expected BulkString, got {:?}", other),
@@ -496,8 +563,22 @@ mod tests {
     #[test]
     fn test_set_get_flag() {
         let mut store = ShardStore::new();
-        store.string_set(Bytes::from("k"), Bytes::from("old"), None, false, false, false);
-        let resp = store.string_set(Bytes::from("k"), Bytes::from("new"), None, false, false, true);
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("old"),
+            None,
+            false,
+            false,
+            false,
+        );
+        let resp = store.string_set(
+            Bytes::from("k"),
+            Bytes::from("new"),
+            None,
+            false,
+            false,
+            true,
+        );
         match resp {
             CommandResponse::BulkString(v) => assert_eq!(v, Bytes::from("old")),
             other => panic!("Expected BulkString, got {:?}", other),
@@ -507,7 +588,14 @@ mod tests {
     #[test]
     fn test_set_with_expiry() {
         let mut store = ShardStore::new();
-        store.string_set(Bytes::from("k"), Bytes::from("v"), Some(5000), false, false, false);
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("v"),
+            Some(5000),
+            false,
+            false,
+            false,
+        );
         let ttl = store.pttl(&Bytes::from("k"));
         assert!(ttl > 0 && ttl <= 5000);
     }
@@ -515,8 +603,14 @@ mod tests {
     #[test]
     fn test_setnx() {
         let mut store = ShardStore::new();
-        assert!(matches!(store.string_setnx(Bytes::from("k"), Bytes::from("v1")), CommandResponse::Integer(1)));
-        assert!(matches!(store.string_setnx(Bytes::from("k"), Bytes::from("v2")), CommandResponse::Integer(0)));
+        assert!(matches!(
+            store.string_setnx(Bytes::from("k"), Bytes::from("v1")),
+            CommandResponse::Integer(1)
+        ));
+        assert!(matches!(
+            store.string_setnx(Bytes::from("k"), Bytes::from("v2")),
+            CommandResponse::Integer(0)
+        ));
     }
 
     #[test]
@@ -542,13 +636,23 @@ mod tests {
     #[test]
     fn test_getdel() {
         let mut store = ShardStore::new();
-        store.string_set(Bytes::from("k"), Bytes::from("v"), None, false, false, false);
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("v"),
+            None,
+            false,
+            false,
+            false,
+        );
         let r = store.string_getdel(&Bytes::from("k"));
         match r {
             CommandResponse::BulkString(v) => assert_eq!(v, Bytes::from("v")),
             _ => panic!("expected bulk"),
         }
-        assert!(matches!(store.string_get(&Bytes::from("k")), CommandResponse::Nil));
+        assert!(matches!(
+            store.string_get(&Bytes::from("k")),
+            CommandResponse::Nil
+        ));
     }
 
     #[test]
@@ -562,8 +666,12 @@ mod tests {
         match r {
             CommandResponse::Array(items) => {
                 assert_eq!(items.len(), 3);
-                assert!(matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("1")));
-                assert!(matches!(&items[1], CommandResponse::BulkString(v) if v == &Bytes::from("2")));
+                assert!(
+                    matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("1"))
+                );
+                assert!(
+                    matches!(&items[1], CommandResponse::BulkString(v) if v == &Bytes::from("2"))
+                );
                 assert!(matches!(&items[2], CommandResponse::Nil));
             }
             _ => panic!("expected array"),
@@ -586,7 +694,10 @@ mod tests {
         ]);
         assert!(matches!(r, CommandResponse::Integer(0)));
         // 'c' should not exist
-        assert!(matches!(store.string_get(&Bytes::from("c")), CommandResponse::Nil));
+        assert!(matches!(
+            store.string_get(&Bytes::from("c")),
+            CommandResponse::Nil
+        ));
     }
 
     #[test]
@@ -603,7 +714,14 @@ mod tests {
     #[test]
     fn test_incrby() {
         let mut store = ShardStore::new();
-        store.string_set(Bytes::from("k"), Bytes::from("10"), None, false, false, false);
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("10"),
+            None,
+            false,
+            false,
+            false,
+        );
         let r = store.string_incrby(&Bytes::from("k"), 5);
         assert!(matches!(r, CommandResponse::Integer(15)));
     }
@@ -611,7 +729,14 @@ mod tests {
     #[test]
     fn test_decrby() {
         let mut store = ShardStore::new();
-        store.string_set(Bytes::from("k"), Bytes::from("10"), None, false, false, false);
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("10"),
+            None,
+            false,
+            false,
+            false,
+        );
         let r = store.string_decrby(&Bytes::from("k"), 3);
         assert!(matches!(r, CommandResponse::Integer(7)));
     }
@@ -619,7 +744,14 @@ mod tests {
     #[test]
     fn test_incr_non_integer() {
         let mut store = ShardStore::new();
-        store.string_set(Bytes::from("k"), Bytes::from("abc"), None, false, false, false);
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("abc"),
+            None,
+            false,
+            false,
+            false,
+        );
         let r = store.string_incr(&Bytes::from("k"));
         assert!(matches!(r, CommandResponse::Error(_)));
     }
@@ -627,7 +759,14 @@ mod tests {
     #[test]
     fn test_incrbyfloat() {
         let mut store = ShardStore::new();
-        store.string_set(Bytes::from("k"), Bytes::from("10.5"), None, false, false, false);
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("10.5"),
+            None,
+            false,
+            false,
+            false,
+        );
         let r = store.string_incrbyfloat(&Bytes::from("k"), 0.5);
         match r {
             CommandResponse::BulkString(v) => assert_eq!(v, Bytes::from("11")),
@@ -638,7 +777,14 @@ mod tests {
     #[test]
     fn test_append() {
         let mut store = ShardStore::new();
-        store.string_set(Bytes::from("k"), Bytes::from("hello"), None, false, false, false);
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("hello"),
+            None,
+            false,
+            false,
+            false,
+        );
         let r = store.string_append(&Bytes::from("k"), &Bytes::from(" world"));
         assert!(matches!(r, CommandResponse::Integer(11)));
         match store.string_get(&Bytes::from("k")) {
@@ -657,15 +803,35 @@ mod tests {
     #[test]
     fn test_strlen() {
         let mut store = ShardStore::new();
-        store.string_set(Bytes::from("k"), Bytes::from("hello"), None, false, false, false);
-        assert!(matches!(store.string_strlen(&Bytes::from("k")), CommandResponse::Integer(5)));
-        assert!(matches!(store.string_strlen(&Bytes::from("x")), CommandResponse::Integer(0)));
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("hello"),
+            None,
+            false,
+            false,
+            false,
+        );
+        assert!(matches!(
+            store.string_strlen(&Bytes::from("k")),
+            CommandResponse::Integer(5)
+        ));
+        assert!(matches!(
+            store.string_strlen(&Bytes::from("x")),
+            CommandResponse::Integer(0)
+        ));
     }
 
     #[test]
     fn test_getrange() {
         let mut store = ShardStore::new();
-        store.string_set(Bytes::from("k"), Bytes::from("hello world"), None, false, false, false);
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("hello world"),
+            None,
+            false,
+            false,
+            false,
+        );
         match store.string_getrange(&Bytes::from("k"), 0, 4) {
             CommandResponse::BulkString(v) => assert_eq!(v, Bytes::from("hello")),
             _ => panic!("expected bulk"),
@@ -680,7 +846,14 @@ mod tests {
     #[test]
     fn test_setrange() {
         let mut store = ShardStore::new();
-        store.string_set(Bytes::from("k"), Bytes::from("hello world"), None, false, false, false);
+        store.string_set(
+            Bytes::from("k"),
+            Bytes::from("hello world"),
+            None,
+            false,
+            false,
+            false,
+        );
         let r = store.string_setrange(&Bytes::from("k"), 6, &Bytes::from("Redis"));
         assert!(matches!(r, CommandResponse::Integer(11)));
         match store.string_get(&Bytes::from("k")) {
@@ -742,7 +915,14 @@ mod tests {
     fn test_bitcount() {
         let mut store = ShardStore::new();
         // 0xFF = 8 bits set
-        store.string_set(Bytes::from("bm"), Bytes::from(vec![0xFF]), None, false, false, false);
+        store.string_set(
+            Bytes::from("bm"),
+            Bytes::from(vec![0xFF]),
+            None,
+            false,
+            false,
+            false,
+        );
         let count = store.string_bitcount(&Bytes::from("bm"), None, None);
         assert!(matches!(count, CommandResponse::Integer(8)));
     }
@@ -751,7 +931,14 @@ mod tests {
     fn test_bitcount_range() {
         let mut store = ShardStore::new();
         // Two bytes: 0xFF (8 bits), 0x0F (4 bits)
-        store.string_set(Bytes::from("bm"), Bytes::from(vec![0xFF, 0x0F]), None, false, false, false);
+        store.string_set(
+            Bytes::from("bm"),
+            Bytes::from(vec![0xFF, 0x0F]),
+            None,
+            false,
+            false,
+            false,
+        );
         // Only count byte 1
         let count = store.string_bitcount(&Bytes::from("bm"), Some(1), Some(1));
         assert!(matches!(count, CommandResponse::Integer(4)));
@@ -778,11 +965,7 @@ mod tests {
     #[test]
     fn test_bitop_or() {
         let mut store = ShardStore::new();
-        let result = store.string_bitop(
-            Bytes::from("dest"),
-            "OR",
-            &[vec![0xF0], vec![0x0F]],
-        );
+        let result = store.string_bitop(Bytes::from("dest"), "OR", &[vec![0xF0], vec![0x0F]]);
         assert!(matches!(result, CommandResponse::Integer(1)));
         match store.string_get(&Bytes::from("dest")) {
             CommandResponse::BulkString(v) => assert_eq!(v.as_ref(), &[0xFF]),
@@ -793,11 +976,7 @@ mod tests {
     #[test]
     fn test_bitop_xor() {
         let mut store = ShardStore::new();
-        let result = store.string_bitop(
-            Bytes::from("dest"),
-            "XOR",
-            &[vec![0xFF], vec![0xFF]],
-        );
+        let result = store.string_bitop(Bytes::from("dest"), "XOR", &[vec![0xFF], vec![0xFF]]);
         assert!(matches!(result, CommandResponse::Integer(1)));
         match store.string_get(&Bytes::from("dest")) {
             CommandResponse::BulkString(v) => assert_eq!(v.as_ref(), &[0x00]),
@@ -808,11 +987,7 @@ mod tests {
     #[test]
     fn test_bitop_not() {
         let mut store = ShardStore::new();
-        let result = store.string_bitop(
-            Bytes::from("dest"),
-            "NOT",
-            &[vec![0xF0]],
-        );
+        let result = store.string_bitop(Bytes::from("dest"), "NOT", &[vec![0xF0]]);
         assert!(matches!(result, CommandResponse::Integer(1)));
         match store.string_get(&Bytes::from("dest")) {
             CommandResponse::BulkString(v) => assert_eq!(v.as_ref(), &[0x0F]),

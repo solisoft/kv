@@ -11,7 +11,9 @@ pub struct ExpiryEntry {
 impl Ord for ExpiryEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Min-heap: earliest expiry first
-        other.expires_at.cmp(&self.expires_at)
+        other
+            .expires_at
+            .cmp(&self.expires_at)
             .then_with(|| other.key.cmp(&self.key))
     }
 }

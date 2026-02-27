@@ -232,10 +232,7 @@ mod tests {
     async fn test_psubscribe_keyevent_pattern() {
         let broker = PubSubBroker::new();
         let mut rx = broker.psubscribe("__keyevent@0__:*".to_string());
-        let count = broker.publish(
-            Bytes::from("__keyevent@0__:set"),
-            Bytes::from("mykey"),
-        );
+        let count = broker.publish(Bytes::from("__keyevent@0__:set"), Bytes::from("mykey"));
         assert_eq!(count, 1);
 
         let msg = rx.recv().await.unwrap();

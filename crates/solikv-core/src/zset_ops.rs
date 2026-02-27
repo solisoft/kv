@@ -17,7 +17,10 @@ impl ShardStore {
         }
 
         match self.get_mut(key).unwrap() {
-            KeyEntry { value: RedisValue::ZSet(ref mut zs), .. } => Ok(zs),
+            KeyEntry {
+                value: RedisValue::ZSet(ref mut zs),
+                ..
+            } => Ok(zs),
             _ => unreachable!(),
         }
     }
@@ -33,7 +36,17 @@ impl ShardStore {
     }
 
     /// ZADD key [NX|XX] [GT|LT] [CH] score member [score member ...]
-    pub fn zset_zadd(&mut self, key: &Bytes, pairs: Vec<(f64, Bytes)>, nx: bool, xx: bool, gt: bool, lt: bool, ch: bool) -> CommandResponse {
+    #[allow(clippy::too_many_arguments)]
+    pub fn zset_zadd(
+        &mut self,
+        key: &Bytes,
+        pairs: Vec<(f64, Bytes)>,
+        nx: bool,
+        xx: bool,
+        gt: bool,
+        lt: bool,
+        ch: bool,
+    ) -> CommandResponse {
         let zset = match self.get_or_create_zset(key) {
             Ok(z) => z,
             Err(e) => return e,
@@ -161,7 +174,8 @@ impl ShardStore {
             Err(e) => e,
             Ok(None) => CommandResponse::integer(0),
             Ok(Some(zset)) => {
-                let count = zset.scores
+                let count = zset
+                    .scores
                     .range((OrderedFloat(min), Bytes::new())..)
                     .take_while(|((s, _), _)| s.into_inner() <= max)
                     .count();
@@ -171,7 +185,13 @@ impl ShardStore {
     }
 
     /// ZRANGE key start stop [WITHSCORES]
-    pub fn zset_zrange(&mut self, key: &Bytes, start: i64, stop: i64, withscores: bool) -> CommandResponse {
+    pub fn zset_zrange(
+        &mut self,
+        key: &Bytes,
+        start: i64,
+        stop: i64,
+        withscores: bool,
+    ) -> CommandResponse {
         match self.get_zset(key) {
             Err(e) => e,
             Ok(None) => CommandResponse::array(vec![]),
@@ -184,7 +204,8 @@ impl ShardStore {
                 }
                 let e = e.min(len as usize - 1);
 
-                let items: Vec<(f64, Bytes)> = zset.scores
+                let items: Vec<(f64, Bytes)> = zset
+                    .scores
                     .iter()
                     .skip(s)
                     .take(e - s + 1)
@@ -197,7 +218,13 @@ impl ShardStore {
     }
 
     /// ZREVRANGE key start stop [WITHSCORES]
-    pub fn zset_zrevrange(&mut self, key: &Bytes, start: i64, stop: i64, withscores: bool) -> CommandResponse {
+    pub fn zset_zrevrange(
+        &mut self,
+        key: &Bytes,
+        start: i64,
+        stop: i64,
+        withscores: bool,
+    ) -> CommandResponse {
         match self.get_zset(key) {
             Err(e) => e,
             Ok(None) => CommandResponse::array(vec![]),
@@ -210,7 +237,8 @@ impl ShardStore {
                 }
                 let e = e.min(len as usize - 1);
 
-                let items: Vec<(f64, Bytes)> = zset.scores
+                let items: Vec<(f64, Bytes)> = zset
+                    .scores
                     .iter()
                     .rev()
                     .skip(s)
@@ -237,7 +265,8 @@ impl ShardStore {
             Err(e) => e,
             Ok(None) => CommandResponse::array(vec![]),
             Ok(Some(zset)) => {
-                let iter = zset.scores
+                let iter = zset
+                    .scores
                     .range((OrderedFloat(min), Bytes::new())..)
                     .take_while(|((s, _), _)| s.into_inner() <= max)
                     .skip(offset);
@@ -247,7 +276,8 @@ impl ShardStore {
                         .map(|((s, m), _)| (s.into_inner(), m.clone()))
                         .collect()
                 } else {
-                    iter.map(|((s, m), _)| (s.into_inner(), m.clone())).collect()
+                    iter.map(|((s, m), _)| (s.into_inner(), m.clone()))
+                        .collect()
                 };
 
                 format_zrange_result(items, withscores)
@@ -271,7 +301,9 @@ impl ShardStore {
                             zset.scores.remove(&(score, member.clone()));
                             zset.members.remove(&member);
                             items.push(CommandResponse::bulk(member));
-                            items.push(CommandResponse::bulk(Bytes::from(format_score(score.into_inner()))));
+                            items.push(CommandResponse::bulk(Bytes::from(format_score(
+                                score.into_inner(),
+                            ))));
                         }
                         None => break,
                     }
@@ -301,7 +333,9 @@ impl ShardStore {
                             zset.scores.remove(&(score, member.clone()));
                             zset.members.remove(&member);
                             items.push(CommandResponse::bulk(member));
-                            items.push(CommandResponse::bulk(Bytes::from(format_score(score.into_inner()))));
+                            items.push(CommandResponse::bulk(Bytes::from(format_score(
+                                score.into_inner(),
+                            ))));
                         }
                         None => break,
                     }
@@ -316,7 +350,13 @@ impl ShardStore {
     }
 
     /// ZSCAN key cursor [MATCH pattern] [COUNT count]
-    pub fn zset_zscan(&mut self, key: &Bytes, cursor: usize, _pattern: Option<&str>, count: usize) -> CommandResponse {
+    pub fn zset_zscan(
+        &mut self,
+        key: &Bytes,
+        cursor: usize,
+        _pattern: Option<&str>,
+        count: usize,
+    ) -> CommandResponse {
         match self.get_zset(key) {
             Err(e) => e,
             Ok(None) => CommandResponse::array(vec![
@@ -324,7 +364,8 @@ impl ShardStore {
                 CommandResponse::array(vec![]),
             ]),
             Ok(Some(zset)) => {
-                let pairs: Vec<(Bytes, f64)> = zset.scores
+                let pairs: Vec<(Bytes, f64)> = zset
+                    .scores
                     .iter()
                     .map(|((score, member), _)| (member.clone(), score.into_inner()))
                     .collect();
@@ -352,7 +393,13 @@ impl ShardStore {
     }
 
     /// ZUNIONSTORE dest numkeys key [key ...] [WEIGHTS weight ...] [AGGREGATE SUM|MIN|MAX]
-    pub fn zset_zunionstore(&mut self, dest: &Bytes, keys: &[Bytes], weights: &[f64], aggregate: Aggregate) -> CommandResponse {
+    pub fn zset_zunionstore(
+        &mut self,
+        dest: &Bytes,
+        keys: &[Bytes],
+        weights: &[f64],
+        aggregate: Aggregate,
+    ) -> CommandResponse {
         let mut result = ZSetValue::new();
 
         for (i, key) in keys.iter().enumerate() {
@@ -385,7 +432,13 @@ impl ShardStore {
     }
 
     /// ZINTERSTORE dest numkeys key [key ...] [WEIGHTS weight ...] [AGGREGATE SUM|MIN|MAX]
-    pub fn zset_zinterstore(&mut self, dest: &Bytes, keys: &[Bytes], weights: &[f64], aggregate: Aggregate) -> CommandResponse {
+    pub fn zset_zinterstore(
+        &mut self,
+        dest: &Bytes,
+        keys: &[Bytes],
+        weights: &[f64],
+        aggregate: Aggregate,
+    ) -> CommandResponse {
         if keys.is_empty() {
             self.set(dest.clone(), RedisValue::ZSet(ZSetValue::new()), None);
             return CommandResponse::integer(0);
@@ -490,17 +543,44 @@ mod tests {
     fn test_zadd_zcard() {
         let mut store = ShardStore::new();
         let key = Bytes::from("zset");
-        let r = store.zset_zadd(&key, vec![(1.0, Bytes::from("a")), (2.0, Bytes::from("b"))], false, false, false, false, false);
+        let r = store.zset_zadd(
+            &key,
+            vec![(1.0, Bytes::from("a")), (2.0, Bytes::from("b"))],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(matches!(r, CommandResponse::Integer(2)));
-        assert!(matches!(store.zset_zcard(&key), CommandResponse::Integer(2)));
+        assert!(matches!(
+            store.zset_zcard(&key),
+            CommandResponse::Integer(2)
+        ));
     }
 
     #[test]
     fn test_zadd_nx() {
         let mut store = ShardStore::new();
         let key = Bytes::from("zset");
-        store.zset_zadd(&key, vec![(1.0, Bytes::from("a"))], false, false, false, false, false);
-        store.zset_zadd(&key, vec![(2.0, Bytes::from("a"))], true, false, false, false, false);
+        store.zset_zadd(
+            &key,
+            vec![(1.0, Bytes::from("a"))],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        store.zset_zadd(
+            &key,
+            vec![(2.0, Bytes::from("a"))],
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
         match store.zset_zscore(&key, &Bytes::from("a")) {
             CommandResponse::BulkString(v) => assert_eq!(v, Bytes::from("1")),
             _ => panic!("expected bulk"),
@@ -511,17 +591,36 @@ mod tests {
     fn test_zrem() {
         let mut store = ShardStore::new();
         let key = Bytes::from("zset");
-        store.zset_zadd(&key, vec![(1.0, Bytes::from("a")), (2.0, Bytes::from("b"))], false, false, false, false, false);
+        store.zset_zadd(
+            &key,
+            vec![(1.0, Bytes::from("a")), (2.0, Bytes::from("b"))],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         let r = store.zset_zrem(&key, &[Bytes::from("a")]);
         assert!(matches!(r, CommandResponse::Integer(1)));
-        assert!(matches!(store.zset_zcard(&key), CommandResponse::Integer(1)));
+        assert!(matches!(
+            store.zset_zcard(&key),
+            CommandResponse::Integer(1)
+        ));
     }
 
     #[test]
     fn test_zscore() {
         let mut store = ShardStore::new();
         let key = Bytes::from("zset");
-        store.zset_zadd(&key, vec![(1.5, Bytes::from("a"))], false, false, false, false, false);
+        store.zset_zadd(
+            &key,
+            vec![(1.5, Bytes::from("a"))],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         match store.zset_zscore(&key, &Bytes::from("a")) {
             CommandResponse::BulkString(v) => assert_eq!(v, Bytes::from("1.5")),
             _ => panic!("expected bulk"),
@@ -532,20 +631,42 @@ mod tests {
     fn test_zrank() {
         let mut store = ShardStore::new();
         let key = Bytes::from("zset");
-        store.zset_zadd(&key, vec![
-            (1.0, Bytes::from("a")),
-            (2.0, Bytes::from("b")),
-            (3.0, Bytes::from("c")),
-        ], false, false, false, false, false);
-        assert!(matches!(store.zset_zrank(&key, &Bytes::from("a")), CommandResponse::Integer(0)));
-        assert!(matches!(store.zset_zrank(&key, &Bytes::from("c")), CommandResponse::Integer(2)));
+        store.zset_zadd(
+            &key,
+            vec![
+                (1.0, Bytes::from("a")),
+                (2.0, Bytes::from("b")),
+                (3.0, Bytes::from("c")),
+            ],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(matches!(
+            store.zset_zrank(&key, &Bytes::from("a")),
+            CommandResponse::Integer(0)
+        ));
+        assert!(matches!(
+            store.zset_zrank(&key, &Bytes::from("c")),
+            CommandResponse::Integer(2)
+        ));
     }
 
     #[test]
     fn test_zincrby() {
         let mut store = ShardStore::new();
         let key = Bytes::from("zset");
-        store.zset_zadd(&key, vec![(1.0, Bytes::from("a"))], false, false, false, false, false);
+        store.zset_zadd(
+            &key,
+            vec![(1.0, Bytes::from("a"))],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         let r = store.zset_zincrby(&key, 2.5, Bytes::from("a"));
         match r {
             CommandResponse::BulkString(v) => assert_eq!(v, Bytes::from("3.5")),
@@ -557,27 +678,48 @@ mod tests {
     fn test_zcount() {
         let mut store = ShardStore::new();
         let key = Bytes::from("zset");
-        store.zset_zadd(&key, vec![
-            (1.0, Bytes::from("a")),
-            (2.0, Bytes::from("b")),
-            (3.0, Bytes::from("c")),
-        ], false, false, false, false, false);
-        assert!(matches!(store.zset_zcount(&key, 1.0, 2.0), CommandResponse::Integer(2)));
+        store.zset_zadd(
+            &key,
+            vec![
+                (1.0, Bytes::from("a")),
+                (2.0, Bytes::from("b")),
+                (3.0, Bytes::from("c")),
+            ],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(matches!(
+            store.zset_zcount(&key, 1.0, 2.0),
+            CommandResponse::Integer(2)
+        ));
     }
 
     #[test]
     fn test_zrange() {
         let mut store = ShardStore::new();
         let key = Bytes::from("zset");
-        store.zset_zadd(&key, vec![
-            (1.0, Bytes::from("a")),
-            (2.0, Bytes::from("b")),
-            (3.0, Bytes::from("c")),
-        ], false, false, false, false, false);
+        store.zset_zadd(
+            &key,
+            vec![
+                (1.0, Bytes::from("a")),
+                (2.0, Bytes::from("b")),
+                (3.0, Bytes::from("c")),
+            ],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         match store.zset_zrange(&key, 0, -1, false) {
             CommandResponse::Array(items) => {
                 assert_eq!(items.len(), 3);
-                assert!(matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("a")));
+                assert!(
+                    matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("a"))
+                );
             }
             _ => panic!("expected array"),
         }
@@ -587,7 +729,15 @@ mod tests {
     fn test_zrange_withscores() {
         let mut store = ShardStore::new();
         let key = Bytes::from("zset");
-        store.zset_zadd(&key, vec![(1.0, Bytes::from("a")), (2.0, Bytes::from("b"))], false, false, false, false, false);
+        store.zset_zadd(
+            &key,
+            vec![(1.0, Bytes::from("a")), (2.0, Bytes::from("b"))],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         match store.zset_zrange(&key, 0, -1, true) {
             CommandResponse::Array(items) => assert_eq!(items.len(), 4), // 2 pairs
             _ => panic!("expected array"),
@@ -598,15 +748,25 @@ mod tests {
     fn test_zrevrange() {
         let mut store = ShardStore::new();
         let key = Bytes::from("zset");
-        store.zset_zadd(&key, vec![
-            (1.0, Bytes::from("a")),
-            (2.0, Bytes::from("b")),
-            (3.0, Bytes::from("c")),
-        ], false, false, false, false, false);
+        store.zset_zadd(
+            &key,
+            vec![
+                (1.0, Bytes::from("a")),
+                (2.0, Bytes::from("b")),
+                (3.0, Bytes::from("c")),
+            ],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         match store.zset_zrevrange(&key, 0, 0, false) {
             CommandResponse::Array(items) => {
                 assert_eq!(items.len(), 1);
-                assert!(matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("c")));
+                assert!(
+                    matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("c"))
+                );
             }
             _ => panic!("expected array"),
         }
@@ -616,16 +776,26 @@ mod tests {
     fn test_zpopmin_zpopmax() {
         let mut store = ShardStore::new();
         let key = Bytes::from("zset");
-        store.zset_zadd(&key, vec![
-            (1.0, Bytes::from("a")),
-            (2.0, Bytes::from("b")),
-            (3.0, Bytes::from("c")),
-        ], false, false, false, false, false);
+        store.zset_zadd(
+            &key,
+            vec![
+                (1.0, Bytes::from("a")),
+                (2.0, Bytes::from("b")),
+                (3.0, Bytes::from("c")),
+            ],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
 
         match store.zset_zpopmin(&key, 1) {
             CommandResponse::Array(items) => {
                 assert_eq!(items.len(), 2);
-                assert!(matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("a")));
+                assert!(
+                    matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("a"))
+                );
             }
             _ => panic!("expected array"),
         }
@@ -633,7 +803,9 @@ mod tests {
         match store.zset_zpopmax(&key, 1) {
             CommandResponse::Array(items) => {
                 assert_eq!(items.len(), 2);
-                assert!(matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("c")));
+                assert!(
+                    matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("c"))
+                );
             }
             _ => panic!("expected array"),
         }
@@ -642,14 +814,24 @@ mod tests {
     #[test]
     fn test_zunionstore() {
         let mut store = ShardStore::new();
-        store.zset_zadd(&Bytes::from("z1"), vec![
-            (1.0, Bytes::from("a")),
-            (2.0, Bytes::from("b")),
-        ], false, false, false, false, false);
-        store.zset_zadd(&Bytes::from("z2"), vec![
-            (3.0, Bytes::from("b")),
-            (4.0, Bytes::from("c")),
-        ], false, false, false, false, false);
+        store.zset_zadd(
+            &Bytes::from("z1"),
+            vec![(1.0, Bytes::from("a")), (2.0, Bytes::from("b"))],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        store.zset_zadd(
+            &Bytes::from("z2"),
+            vec![(3.0, Bytes::from("b")), (4.0, Bytes::from("c"))],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
 
         let r = store.zset_zunionstore(
             &Bytes::from("out"),
@@ -663,14 +845,24 @@ mod tests {
     #[test]
     fn test_zinterstore() {
         let mut store = ShardStore::new();
-        store.zset_zadd(&Bytes::from("z1"), vec![
-            (1.0, Bytes::from("a")),
-            (2.0, Bytes::from("b")),
-        ], false, false, false, false, false);
-        store.zset_zadd(&Bytes::from("z2"), vec![
-            (3.0, Bytes::from("b")),
-            (4.0, Bytes::from("c")),
-        ], false, false, false, false, false);
+        store.zset_zadd(
+            &Bytes::from("z1"),
+            vec![(1.0, Bytes::from("a")), (2.0, Bytes::from("b"))],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        store.zset_zadd(
+            &Bytes::from("z2"),
+            vec![(3.0, Bytes::from("b")), (4.0, Bytes::from("c"))],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
 
         let r = store.zset_zinterstore(
             &Bytes::from("out"),

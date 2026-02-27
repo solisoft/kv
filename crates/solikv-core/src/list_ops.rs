@@ -18,7 +18,10 @@ impl ShardStore {
         }
 
         match self.get_mut(key).unwrap() {
-            KeyEntry { value: RedisValue::List(ref mut list), .. } => Ok(list),
+            KeyEntry {
+                value: RedisValue::List(ref mut list),
+                ..
+            } => Ok(list),
             _ => unreachable!(),
         }
     }
@@ -185,20 +188,37 @@ impl ShardStore {
             Ok(None) => CommandResponse::array(vec![]),
             Ok(Some(list)) => {
                 let len = list.len() as i64;
-                let s = if start < 0 { (len + start).max(0) } else { start };
-                let e = if stop < 0 { len + stop } else { stop.min(len - 1) };
+                let s = if start < 0 {
+                    (len + start).max(0)
+                } else {
+                    start
+                };
+                let e = if stop < 0 {
+                    len + stop
+                } else {
+                    stop.min(len - 1)
+                };
                 if s > e || s >= len {
                     return CommandResponse::array(vec![]);
                 }
                 let items: Vec<CommandResponse> = (s..=e)
-                    .filter_map(|i| list.get(i as usize).map(|v| CommandResponse::bulk(v.clone())))
+                    .filter_map(|i| {
+                        list.get(i as usize)
+                            .map(|v| CommandResponse::bulk(v.clone()))
+                    })
                     .collect();
                 CommandResponse::array(items)
             }
         }
     }
 
-    pub fn list_linsert(&mut self, key: &Bytes, before: bool, pivot: &Bytes, value: Bytes) -> CommandResponse {
+    pub fn list_linsert(
+        &mut self,
+        key: &Bytes,
+        before: bool,
+        pivot: &Bytes,
+        value: Bytes,
+    ) -> CommandResponse {
         let entry = match self.get_mut(key) {
             None => return CommandResponse::integer(0),
             Some(e) => e,
@@ -228,7 +248,7 @@ impl ShardStore {
                 if count > 0 {
                     let mut i = 0;
                     while i < list.len() && removed < count {
-                        if &list[i] == value {
+                        if list[i] == value {
                             list.remove(i);
                             removed += 1;
                         } else {
@@ -240,7 +260,7 @@ impl ShardStore {
                     let mut i = list.len();
                     while i > 0 && removed < limit {
                         i -= 1;
-                        if &list[i] == value {
+                        if list[i] == value {
                             list.remove(i);
                             removed += 1;
                         }
@@ -272,8 +292,16 @@ impl ShardStore {
         match &mut entry.value {
             RedisValue::List(list) => {
                 let len = list.len() as i64;
-                let s = if start < 0 { (len + start).max(0) } else { start };
-                let e = if stop < 0 { len + stop } else { stop.min(len - 1) };
+                let s = if start < 0 {
+                    (len + start).max(0)
+                } else {
+                    start
+                };
+                let e = if stop < 0 {
+                    len + stop
+                } else {
+                    stop.min(len - 1)
+                };
                 if s > e || s >= len {
                     list.clear();
                 } else {
@@ -318,7 +346,10 @@ mod tests {
     fn test_lpop_rpop() {
         let mut store = ShardStore::new();
         let key = Bytes::from("list");
-        store.list_rpush(&key, vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]);
+        store.list_rpush(
+            &key,
+            vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")],
+        );
 
         match store.list_lpop(&key, 1) {
             CommandResponse::BulkString(v) => assert_eq!(v, Bytes::from("a")),
@@ -343,7 +374,10 @@ mod tests {
     fn test_lindex() {
         let mut store = ShardStore::new();
         let key = Bytes::from("list");
-        store.list_rpush(&key, vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]);
+        store.list_rpush(
+            &key,
+            vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")],
+        );
         match store.list_lindex(&key, 0) {
             CommandResponse::BulkString(v) => assert_eq!(v, Bytes::from("a")),
             _ => panic!("expected bulk"),
@@ -370,12 +404,24 @@ mod tests {
     fn test_lrange() {
         let mut store = ShardStore::new();
         let key = Bytes::from("list");
-        store.list_rpush(&key, vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c"), Bytes::from("d")]);
+        store.list_rpush(
+            &key,
+            vec![
+                Bytes::from("a"),
+                Bytes::from("b"),
+                Bytes::from("c"),
+                Bytes::from("d"),
+            ],
+        );
         match store.list_lrange(&key, 1, 2) {
             CommandResponse::Array(items) => {
                 assert_eq!(items.len(), 2);
-                assert!(matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("b")));
-                assert!(matches!(&items[1], CommandResponse::BulkString(v) if v == &Bytes::from("c")));
+                assert!(
+                    matches!(&items[0], CommandResponse::BulkString(v) if v == &Bytes::from("b"))
+                );
+                assert!(
+                    matches!(&items[1], CommandResponse::BulkString(v) if v == &Bytes::from("c"))
+                );
             }
             _ => panic!("expected array"),
         }
@@ -390,7 +436,9 @@ mod tests {
         match store.list_lrange(&key, 0, -1) {
             CommandResponse::Array(items) => {
                 assert_eq!(items.len(), 3);
-                assert!(matches!(&items[1], CommandResponse::BulkString(v) if v == &Bytes::from("b")));
+                assert!(
+                    matches!(&items[1], CommandResponse::BulkString(v) if v == &Bytes::from("b"))
+                );
             }
             _ => panic!("expected array"),
         }
@@ -400,7 +448,16 @@ mod tests {
     fn test_lrem() {
         let mut store = ShardStore::new();
         let key = Bytes::from("list");
-        store.list_rpush(&key, vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("a"), Bytes::from("c"), Bytes::from("a")]);
+        store.list_rpush(
+            &key,
+            vec![
+                Bytes::from("a"),
+                Bytes::from("b"),
+                Bytes::from("a"),
+                Bytes::from("c"),
+                Bytes::from("a"),
+            ],
+        );
         let r = store.list_lrem(&key, 2, &Bytes::from("a"));
         assert!(matches!(r, CommandResponse::Integer(2)));
         assert!(matches!(store.list_llen(&key), CommandResponse::Integer(3)));
@@ -410,7 +467,15 @@ mod tests {
     fn test_ltrim() {
         let mut store = ShardStore::new();
         let key = Bytes::from("list");
-        store.list_rpush(&key, vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c"), Bytes::from("d")]);
+        store.list_rpush(
+            &key,
+            vec![
+                Bytes::from("a"),
+                Bytes::from("b"),
+                Bytes::from("c"),
+                Bytes::from("d"),
+            ],
+        );
         store.list_ltrim(&key, 1, 2);
         assert!(matches!(store.list_llen(&key), CommandResponse::Integer(2)));
     }

@@ -277,11 +277,14 @@ async fn list_range(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let start = range.start.unwrap_or(0);
     let stop = range.stop.unwrap_or(-1);
-    let resp = state.engine.execute("LRANGE", &[
-        Bytes::from(key),
-        Bytes::from(start.to_string()),
-        Bytes::from(stop.to_string()),
-    ]);
+    let resp = state.engine.execute(
+        "LRANGE",
+        &[
+            Bytes::from(key),
+            Bytes::from(start.to_string()),
+            Bytes::from(stop.to_string()),
+        ],
+    );
     to_json_response(resp)
 }
 
@@ -335,7 +338,9 @@ async fn hash_get_field(
     State(state): State<AppState>,
     Path((key, field)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("HGET", &[Bytes::from(key), Bytes::from(field)]);
+    let resp = state
+        .engine
+        .execute("HGET", &[Bytes::from(key), Bytes::from(field)]);
     to_json_response(resp)
 }
 
@@ -357,7 +362,9 @@ async fn hash_del_field(
     State(state): State<AppState>,
     Path((key, field)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("HDEL", &[Bytes::from(key), Bytes::from(field)]);
+    let resp = state
+        .engine
+        .execute("HDEL", &[Bytes::from(key), Bytes::from(field)]);
     to_json_response(resp)
 }
 
@@ -384,7 +391,9 @@ async fn set_rem_member(
     State(state): State<AppState>,
     Path((key, member)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("SREM", &[Bytes::from(key), Bytes::from(member)]);
+    let resp = state
+        .engine
+        .execute("SREM", &[Bytes::from(key), Bytes::from(member)]);
     to_json_response(resp)
 }
 
@@ -395,12 +404,15 @@ async fn zset_range(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let start = range.start.unwrap_or(0);
     let stop = range.stop.unwrap_or(-1);
-    let resp = state.engine.execute("ZRANGE", &[
-        Bytes::from(key),
-        Bytes::from(start.to_string()),
-        Bytes::from(stop.to_string()),
-        Bytes::from("WITHSCORES"),
-    ]);
+    let resp = state.engine.execute(
+        "ZRANGE",
+        &[
+            Bytes::from(key),
+            Bytes::from(start.to_string()),
+            Bytes::from(stop.to_string()),
+            Bytes::from("WITHSCORES"),
+        ],
+    );
     to_json_response(resp)
 }
 
@@ -427,16 +439,12 @@ async fn execute_command(
     to_json_response(resp)
 }
 
-async fn server_info(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn server_info(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let resp = state.engine.execute("INFO", &[]);
     to_json_response(resp)
 }
 
-async fn dbsize(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn dbsize(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let resp = state.engine.execute("DBSIZE", &[]);
     to_json_response(resp)
 }
@@ -480,11 +488,14 @@ async fn bf_reserve(
     Path(key): Path<String>,
     Json(body): Json<BfReserveBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("BF.RESERVE", &[
-        Bytes::from(key),
-        Bytes::from(body.error_rate.to_string()),
-        Bytes::from(body.capacity.to_string()),
-    ]);
+    let resp = state.engine.execute(
+        "BF.RESERVE",
+        &[
+            Bytes::from(key),
+            Bytes::from(body.error_rate.to_string()),
+            Bytes::from(body.capacity.to_string()),
+        ],
+    );
     to_json_response(resp)
 }
 
@@ -493,7 +504,9 @@ async fn bf_add(
     Path(key): Path<String>,
     Json(body): Json<BfAddBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("BF.ADD", &[Bytes::from(key), Bytes::from(body.item)]);
+    let resp = state
+        .engine
+        .execute("BF.ADD", &[Bytes::from(key), Bytes::from(body.item)]);
     to_json_response(resp)
 }
 
@@ -501,7 +514,9 @@ async fn bf_exists(
     State(state): State<AppState>,
     Path((key, item)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("BF.EXISTS", &[Bytes::from(key), Bytes::from(item)]);
+    let resp = state
+        .engine
+        .execute("BF.EXISTS", &[Bytes::from(key), Bytes::from(item)]);
     to_json_response(resp)
 }
 
@@ -520,11 +535,14 @@ async fn bitmap_setbit(
     Path(key): Path<String>,
     Json(body): Json<SetBitBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("SETBIT", &[
-        Bytes::from(key),
-        Bytes::from(body.offset.to_string()),
-        Bytes::from(body.value.to_string()),
-    ]);
+    let resp = state.engine.execute(
+        "SETBIT",
+        &[
+            Bytes::from(key),
+            Bytes::from(body.offset.to_string()),
+            Bytes::from(body.value.to_string()),
+        ],
+    );
     to_json_response(resp)
 }
 
@@ -532,7 +550,9 @@ async fn bitmap_getbit(
     State(state): State<AppState>,
     Path((key, offset)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("GETBIT", &[Bytes::from(key), Bytes::from(offset)]);
+    let resp = state
+        .engine
+        .execute("GETBIT", &[Bytes::from(key), Bytes::from(offset)]);
     to_json_response(resp)
 }
 
@@ -571,7 +591,9 @@ async fn geo_pos(
     State(state): State<AppState>,
     Path((key, member)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("GEOPOS", &[Bytes::from(key), Bytes::from(member)]);
+    let resp = state
+        .engine
+        .execute("GEOPOS", &[Bytes::from(key), Bytes::from(member)]);
     to_json_response(resp)
 }
 

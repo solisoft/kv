@@ -5,8 +5,8 @@ use crate::codec::RespFrame;
 /// A parsed Redis command with name and arguments.
 #[derive(Debug, Clone)]
 pub struct ParsedCommand {
-    pub name: String,      // uppercase command name
-    pub args: Vec<Bytes>,  // arguments (raw bytes)
+    pub name: String,     // uppercase command name
+    pub args: Vec<Bytes>, // arguments (raw bytes)
 }
 
 impl ParsedCommand {
@@ -92,9 +92,7 @@ mod tests {
 
     #[test]
     fn test_parse_ping() {
-        let frame = RespFrame::Array(vec![
-            RespFrame::BulkString(Bytes::from("PING")),
-        ]);
+        let frame = RespFrame::Array(vec![RespFrame::BulkString(Bytes::from("PING"))]);
         let cmd = ParsedCommand::from_frame(frame).unwrap();
         assert_eq!(cmd.name, "PING");
         assert!(cmd.args.is_empty());

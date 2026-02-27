@@ -20,7 +20,10 @@ use std::io;
 ///   11110100 + 8 bytes      -> i64 LE
 pub fn decode_listpack(data: &[u8]) -> io::Result<Vec<Bytes>> {
     if data.len() < 7 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "listpack too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "listpack too short",
+        ));
     }
 
     let _tot_bytes = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -31,7 +34,10 @@ pub fn decode_listpack(data: &[u8]) -> io::Result<Vec<Bytes>> {
 
     loop {
         if pos >= data.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "listpack: unexpected end"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "listpack: unexpected end",
+            ));
         }
 
         // End marker
@@ -51,14 +57,20 @@ pub fn decode_listpack(data: &[u8]) -> io::Result<Vec<Bytes>> {
             let len = (enc & 0x3F) as usize;
             pos += 1;
             if pos + len > data.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "listpack: string overflows"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "listpack: string overflows",
+                ));
             }
             entries.push(Bytes::copy_from_slice(&data[pos..pos + len]));
             pos += len;
         } else if enc & 0xE0 == 0xC0 {
             // 110xxxxx + 1 byte: 13-bit signed int
             if pos + 1 >= data.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "listpack: truncated 13-bit int"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "listpack: truncated 13-bit int",
+                ));
             }
             let raw = ((enc as u16 & 0x1F) << 8) | (data[pos + 1] as u16);
             // Sign-extend from 13 bits
@@ -72,12 +84,18 @@ pub fn decode_listpack(data: &[u8]) -> io::Result<Vec<Bytes>> {
         } else if enc & 0xF0 == 0xE0 {
             // 1110xxxx + 1 byte: string with 12-bit length
             if pos + 1 >= data.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "listpack: truncated 12-bit len"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "listpack: truncated 12-bit len",
+                ));
             }
             let len = (((enc & 0x0F) as usize) << 8) | (data[pos + 1] as usize);
             pos += 2;
             if pos + len > data.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "listpack: string overflows"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "listpack: string overflows",
+                ));
             }
             entries.push(Bytes::copy_from_slice(&data[pos..pos + len]));
             pos += len;
@@ -86,12 +104,23 @@ pub fn decode_listpack(data: &[u8]) -> io::Result<Vec<Bytes>> {
                 0xF0 => {
                     // 32-bit length string
                     if pos + 5 > data.len() {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "listpack: truncated 32-bit len"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "listpack: truncated 32-bit len",
+                        ));
                     }
-                    let len = u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]) as usize;
+                    let len = u32::from_le_bytes([
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                        data[pos + 4],
+                    ]) as usize;
                     pos += 5;
                     if pos + len > data.len() {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "listpack: string overflows"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "listpack: string overflows",
+                        ));
                     }
                     entries.push(Bytes::copy_from_slice(&data[pos..pos + len]));
                     pos += len;
@@ -99,7 +128,10 @@ pub fn decode_listpack(data: &[u8]) -> io::Result<Vec<Bytes>> {
                 0xF1 => {
                     // i16 LE
                     if pos + 3 > data.len() {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "listpack: truncated i16"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "listpack: truncated i16",
+                        ));
                     }
                     let val = i16::from_le_bytes([data[pos + 1], data[pos + 2]]);
                     entries.push(Bytes::from(val.to_string()));
@@ -108,7 +140,10 @@ pub fn decode_listpack(data: &[u8]) -> io::Result<Vec<Bytes>> {
                 0xF2 => {
                     // i24 LE (3 bytes, sign-extended)
                     if pos + 4 > data.len() {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "listpack: truncated i24"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "listpack: truncated i24",
+                        ));
                     }
                     let raw = (data[pos + 1] as i32)
                         | ((data[pos + 2] as i32) << 8)
@@ -124,20 +159,37 @@ pub fn decode_listpack(data: &[u8]) -> io::Result<Vec<Bytes>> {
                 0xF3 => {
                     // i32 LE
                     if pos + 5 > data.len() {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "listpack: truncated i32"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "listpack: truncated i32",
+                        ));
                     }
-                    let val = i32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]);
+                    let val = i32::from_le_bytes([
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                        data[pos + 4],
+                    ]);
                     entries.push(Bytes::from(val.to_string()));
                     pos += 5;
                 }
                 0xF4 => {
                     // i64 LE
                     if pos + 9 > data.len() {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "listpack: truncated i64"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "listpack: truncated i64",
+                        ));
                     }
                     let val = i64::from_le_bytes([
-                        data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4],
-                        data[pos + 5], data[pos + 6], data[pos + 7], data[pos + 8],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                        data[pos + 4],
+                        data[pos + 5],
+                        data[pos + 6],
+                        data[pos + 7],
+                        data[pos + 8],
                     ]);
                     entries.push(Bytes::from(val.to_string()));
                     pos += 9;
@@ -154,7 +206,10 @@ pub fn decode_listpack(data: &[u8]) -> io::Result<Vec<Bytes>> {
         // Skip back-length varint: read bytes until high bit is 0
         loop {
             if pos >= data.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "listpack: truncated back-length"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "listpack: truncated back-length",
+                ));
             }
             let b = data[pos];
             pos += 1;
@@ -230,9 +285,16 @@ mod tests {
 
     #[test]
     fn test_listpack_uints() {
-        let lp = build_listpack(&[ListpackItem::Uint(0), ListpackItem::Uint(42), ListpackItem::Uint(127)]);
+        let lp = build_listpack(&[
+            ListpackItem::Uint(0),
+            ListpackItem::Uint(42),
+            ListpackItem::Uint(127),
+        ]);
         let result = decode_listpack(&lp).unwrap();
-        assert_eq!(result, vec![Bytes::from("0"), Bytes::from("42"), Bytes::from("127")]);
+        assert_eq!(
+            result,
+            vec![Bytes::from("0"), Bytes::from("42"), Bytes::from("127")]
+        );
     }
 
     #[test]

@@ -14,7 +14,10 @@ use solikv_server::resp_server;
 use solikv_server::rest_server;
 
 #[derive(Parser, Debug)]
-#[command(name = "solikv", about = "SoliKV - High-Performance In-Memory Database")]
+#[command(
+    name = "solikv",
+    about = "SoliKV - High-Performance In-Memory Database"
+)]
 struct Args {
     /// Redis protocol port
     #[arg(long, default_value = "6379")]
@@ -71,8 +74,7 @@ async fn main() {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
         )
         .init();
 
@@ -92,7 +94,9 @@ async fn main() {
 
     tracing::info!(
         "SoliKV starting with {} shards, RESP on port {}, REST on port {}",
-        num_shards, args.port, args.rest_port
+        num_shards,
+        args.port,
+        args.rest_port
     );
     if password.is_some() {
         tracing::info!("Authentication enabled");
@@ -141,7 +145,11 @@ async fn main() {
                 tracing::info!("Redis RDB import complete: {stats} ({total} keys loaded into {num_shards} shards)");
             }
             Err(e) => {
-                tracing::error!("Failed to import Redis RDB from {:?}: {}", redis_rdb_path, e);
+                tracing::error!(
+                    "Failed to import Redis RDB from {:?}: {}",
+                    redis_rdb_path,
+                    e
+                );
                 std::process::exit(1);
             }
         }
@@ -157,7 +165,9 @@ async fn main() {
         });
         Ok(())
     }) {
-        Ok(n) if n > 0 => tracing::info!("Loaded RDB snapshots for {} shards from {:?}", n, args.dir),
+        Ok(n) if n > 0 => {
+            tracing::info!("Loaded RDB snapshots for {} shards from {:?}", n, args.dir)
+        }
         Ok(_) => tracing::info!("No RDB snapshots found in {:?}, starting fresh", args.dir),
         Err(e) => tracing::warn!("RDB load error: {}", e),
     }
@@ -169,7 +179,8 @@ async fn main() {
             match AofPersistence::replay(&aof_path) {
                 Ok(commands) => {
                     let count = commands.len();
-                    let replay_engine = solikv_engine::CommandEngine::new(shards.clone(), pubsub.clone());
+                    let replay_engine =
+                        solikv_engine::CommandEngine::new(shards.clone(), pubsub.clone());
                     for cmd_args in commands {
                         if cmd_args.is_empty() {
                             continue;

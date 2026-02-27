@@ -40,7 +40,7 @@ impl ShardHandle {
 
         // Periodic active expiry every 100 ops
         let tick = self.tick.fetch_add(1, Ordering::Relaxed);
-        if tick % 100 == 0 {
+        if tick.is_multiple_of(100) {
             let active_expired = self.store.lock().run_active_expiry();
             self.emit_expired_notifications(&active_expired);
         }

@@ -9,7 +9,10 @@ const DEFAULT_CAPACITY: u64 = 100;
 const DEFAULT_ERROR_RATE: f64 = 0.01;
 
 impl ShardStore {
-    fn get_or_create_bloom(&mut self, key: &Bytes) -> Result<&mut BloomFilterValue, CommandResponse> {
+    fn get_or_create_bloom(
+        &mut self,
+        key: &Bytes,
+    ) -> Result<&mut BloomFilterValue, CommandResponse> {
         if let Some(entry) = self.get(key) {
             if !matches!(entry.value, RedisValue::BloomFilter(_)) {
                 return Err(CommandResponse::wrong_type());
@@ -19,13 +22,19 @@ impl ShardStore {
         if self.get(key).is_none() {
             self.set(
                 key.clone(),
-                RedisValue::BloomFilter(BloomFilterValue::with_capacity(DEFAULT_CAPACITY, DEFAULT_ERROR_RATE)),
+                RedisValue::BloomFilter(BloomFilterValue::with_capacity(
+                    DEFAULT_CAPACITY,
+                    DEFAULT_ERROR_RATE,
+                )),
                 None,
             );
         }
 
         match self.get_mut(key).unwrap() {
-            KeyEntry { value: RedisValue::BloomFilter(ref mut bf), .. } => Ok(bf),
+            KeyEntry {
+                value: RedisValue::BloomFilter(ref mut bf),
+                ..
+            } => Ok(bf),
             _ => unreachable!(),
         }
     }

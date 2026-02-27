@@ -12,11 +12,18 @@ impl ShardStore {
         }
 
         if self.get(key).is_none() {
-            self.set(key.clone(), RedisValue::HyperLogLog(HyperLogLogValue::new()), None);
+            self.set(
+                key.clone(),
+                RedisValue::HyperLogLog(HyperLogLogValue::new()),
+                None,
+            );
         }
 
         match self.get_mut(key).unwrap() {
-            KeyEntry { value: RedisValue::HyperLogLog(ref mut hll), .. } => Ok(hll),
+            KeyEntry {
+                value: RedisValue::HyperLogLog(ref mut hll),
+                ..
+            } => Ok(hll),
             _ => unreachable!(),
         }
     }
@@ -121,7 +128,10 @@ mod tests {
     fn test_pfadd_new_key() {
         let mut store = ShardStore::new();
         let key = Bytes::from("hll");
-        let r = store.pfadd(&key, &[Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]);
+        let r = store.pfadd(
+            &key,
+            &[Bytes::from("a"), Bytes::from("b"), Bytes::from("c")],
+        );
         assert!(matches!(r, CommandResponse::Integer(1)));
     }
 
@@ -162,7 +172,13 @@ mod tests {
         };
         // HLL with p=14 should be within ~2% of actual
         let error = ((count as f64 - n as f64) / n as f64).abs();
-        assert!(error < 0.03, "HLL error too high: {} (count={}, expected={})", error, count, n);
+        assert!(
+            error < 0.03,
+            "HLL error too high: {} (count={}, expected={})",
+            error,
+            count,
+            n
+        );
     }
 
     #[test]

@@ -23,7 +23,10 @@ use std::io;
 ///   0xF1..=0xFD -> inline integer 0..12 (value = (byte - 0xF1))
 pub fn decode_ziplist(data: &[u8]) -> io::Result<Vec<Bytes>> {
     if data.len() < 11 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "ziplist too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ziplist too short",
+        ));
     }
 
     // Header
@@ -36,7 +39,10 @@ pub fn decode_ziplist(data: &[u8]) -> io::Result<Vec<Bytes>> {
 
     loop {
         if pos >= data.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "ziplist: unexpected end"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ziplist: unexpected end",
+            ));
         }
 
         // End marker
@@ -52,7 +58,10 @@ pub fn decode_ziplist(data: &[u8]) -> io::Result<Vec<Bytes>> {
         }
 
         if pos >= data.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "ziplist: truncated entry"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ziplist: truncated entry",
+            ));
         }
 
         let enc = data[pos];
@@ -64,7 +73,10 @@ pub fn decode_ziplist(data: &[u8]) -> io::Result<Vec<Bytes>> {
                 let len = (enc & 0x3F) as usize;
                 pos += 1;
                 if pos + len > data.len() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "ziplist: string overflows"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ziplist: string overflows",
+                    ));
                 }
                 entries.push(Bytes::copy_from_slice(&data[pos..pos + len]));
                 pos += len;
@@ -72,12 +84,18 @@ pub fn decode_ziplist(data: &[u8]) -> io::Result<Vec<Bytes>> {
             0b01 => {
                 // 14-bit length
                 if pos + 1 >= data.len() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "ziplist: truncated 14-bit len"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ziplist: truncated 14-bit len",
+                    ));
                 }
                 let len = (((enc & 0x3F) as usize) << 8) | (data[pos + 1] as usize);
                 pos += 2;
                 if pos + len > data.len() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "ziplist: string overflows"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ziplist: string overflows",
+                    ));
                 }
                 entries.push(Bytes::copy_from_slice(&data[pos..pos + len]));
                 pos += len;
@@ -85,12 +103,23 @@ pub fn decode_ziplist(data: &[u8]) -> io::Result<Vec<Bytes>> {
             0b10 => {
                 // 32-bit BE length
                 if pos + 5 > data.len() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "ziplist: truncated 32-bit len"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ziplist: truncated 32-bit len",
+                    ));
                 }
-                let len = u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]) as usize;
+                let len = u32::from_be_bytes([
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
+                ]) as usize;
                 pos += 5;
                 if pos + len > data.len() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "ziplist: string overflows"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ziplist: string overflows",
+                    ));
                 }
                 entries.push(Bytes::copy_from_slice(&data[pos..pos + len]));
                 pos += len;
@@ -102,7 +131,10 @@ pub fn decode_ziplist(data: &[u8]) -> io::Result<Vec<Bytes>> {
                         // i16 LE
                         pos += 1;
                         if pos + 2 > data.len() {
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, "ziplist: truncated i16"));
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "ziplist: truncated i16",
+                            ));
                         }
                         let val = i16::from_le_bytes([data[pos], data[pos + 1]]);
                         entries.push(Bytes::from(val.to_string()));
@@ -112,9 +144,17 @@ pub fn decode_ziplist(data: &[u8]) -> io::Result<Vec<Bytes>> {
                         // i32 LE
                         pos += 1;
                         if pos + 4 > data.len() {
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, "ziplist: truncated i32"));
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "ziplist: truncated i32",
+                            ));
                         }
-                        let val = i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                        let val = i32::from_le_bytes([
+                            data[pos],
+                            data[pos + 1],
+                            data[pos + 2],
+                            data[pos + 3],
+                        ]);
                         entries.push(Bytes::from(val.to_string()));
                         pos += 4;
                     }
@@ -122,11 +162,20 @@ pub fn decode_ziplist(data: &[u8]) -> io::Result<Vec<Bytes>> {
                         // i64 LE
                         pos += 1;
                         if pos + 8 > data.len() {
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, "ziplist: truncated i64"));
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "ziplist: truncated i64",
+                            ));
                         }
                         let val = i64::from_le_bytes([
-                            data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                            data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+                            data[pos],
+                            data[pos + 1],
+                            data[pos + 2],
+                            data[pos + 3],
+                            data[pos + 4],
+                            data[pos + 5],
+                            data[pos + 6],
+                            data[pos + 7],
                         ]);
                         entries.push(Bytes::from(val.to_string()));
                         pos += 8;
@@ -135,7 +184,10 @@ pub fn decode_ziplist(data: &[u8]) -> io::Result<Vec<Bytes>> {
                         // i24 LE (3 bytes, sign-extended)
                         pos += 1;
                         if pos + 3 > data.len() {
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, "ziplist: truncated i24"));
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "ziplist: truncated i24",
+                            ));
                         }
                         let val = (data[pos] as i32)
                             | ((data[pos + 1] as i32) << 8)
@@ -153,7 +205,10 @@ pub fn decode_ziplist(data: &[u8]) -> io::Result<Vec<Bytes>> {
                         // i8
                         pos += 1;
                         if pos >= data.len() {
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, "ziplist: truncated i8"));
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "ziplist: truncated i8",
+                            ));
                         }
                         let val = data[pos] as i8;
                         entries.push(Bytes::from(val.to_string()));
@@ -211,7 +266,11 @@ mod tests {
         body.push(0xFF); // end marker
 
         let total_len = 10 + body.len(); // header + body
-        let tail_offset = if entries.is_empty() { 10 } else { total_len - 1 }; // points to last entry or end
+        let tail_offset = if entries.is_empty() {
+            10
+        } else {
+            total_len - 1
+        }; // points to last entry or end
 
         let mut data = Vec::new();
         data.extend_from_slice(&(total_len as u32).to_le_bytes()); // zlbytes

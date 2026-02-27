@@ -133,7 +133,9 @@ async fn handle_connection(
                         Some(pass) => {
                             if cmd.args.len() != 1 {
                                 encode_frame(
-                                    &RespFrame::error("ERR wrong number of arguments for 'auth' command"),
+                                    &RespFrame::error(
+                                        "ERR wrong number of arguments for 'auth' command",
+                                    ),
                                     &mut write_buf,
                                 );
                             } else if cmd.args[0] == pass.as_bytes() {
@@ -164,8 +166,7 @@ async fn handle_connection(
                         // Enter pubsub mode — send confirmations, then enter delivery loop
                         for channel in &cmd.args {
                             conn.subscriptions.push(channel.clone());
-                            let count =
-                                conn.subscriptions.len() + conn.psubscriptions.len();
+                            let count = conn.subscriptions.len() + conn.psubscriptions.len();
                             encode_frame(
                                 &RespFrame::Array(vec![
                                     RespFrame::BulkString(Bytes::from("subscribe")),
@@ -197,8 +198,7 @@ async fn handle_connection(
                             let pattern =
                                 std::str::from_utf8(pattern_bytes).unwrap_or("").to_string();
                             conn.psubscriptions.push(pattern.clone());
-                            let count =
-                                conn.subscriptions.len() + conn.psubscriptions.len();
+                            let count = conn.subscriptions.len() + conn.psubscriptions.len();
                             encode_frame(
                                 &RespFrame::Array(vec![
                                     RespFrame::BulkString(Bytes::from("psubscribe")),
@@ -249,8 +249,7 @@ async fn handle_connection(
                             conn.psubscriptions.clear();
                         } else {
                             for pat_bytes in &cmd.args {
-                                let pat =
-                                    std::str::from_utf8(pat_bytes).unwrap_or("").to_string();
+                                let pat = std::str::from_utf8(pat_bytes).unwrap_or("").to_string();
                                 conn.psubscriptions.retain(|s| s != &pat);
                             }
                         }
@@ -285,8 +284,7 @@ async fn handle_connection(
 
                         let mut results = Vec::new();
                         for args in queue {
-                            let name =
-                                std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
+                            let name = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
                             let cmd_args: Vec<Bytes> = args[1..].to_vec();
                             let resp = engine.execute(&name, &cmd_args);
                             results.push(command_response_to_frame(resp));
@@ -631,8 +629,12 @@ async fn handle_pubsub_mode(
     }
 
     // Clean up
-    for (_, h) in channel_tasks { h.abort(); }
-    for (_, h) in pattern_tasks { h.abort(); }
+    for (_, h) in channel_tasks {
+        h.abort();
+    }
+    for (_, h) in pattern_tasks {
+        h.abort();
+    }
     Ok(())
 }
 

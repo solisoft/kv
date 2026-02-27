@@ -21,6 +21,12 @@ pub struct ScriptCache {
     scripts: DashMap<String, String>,
 }
 
+impl Default for ScriptCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScriptCache {
     pub fn new() -> Self {
         Self {
@@ -66,9 +72,18 @@ pub fn sha1_hex(input: &str) -> String {
 // ---------------------------------------------------------------------------
 
 const BLOCKED_COMMANDS: &[&str] = &[
-    "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",
-    "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE",
-    "EVAL", "EVALSHA", "SCRIPT",
+    "MULTI",
+    "EXEC",
+    "DISCARD",
+    "WATCH",
+    "UNWATCH",
+    "SUBSCRIBE",
+    "UNSUBSCRIBE",
+    "PSUBSCRIBE",
+    "PUNSUBSCRIBE",
+    "EVAL",
+    "EVALSHA",
+    "SCRIPT",
 ];
 
 fn is_blocked_in_script(cmd: &str) -> bool {
@@ -94,11 +109,9 @@ fn take_lua(engine: &Arc<CommandEngine>) -> Lua {
     let engine_id = Arc::as_ptr(engine) as usize;
     let cached = LUA_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
-        if let Some(idx) = pool.iter().rposition(|p| p.engine_id == engine_id) {
-            Some(pool.swap_remove(idx).lua)
-        } else {
-            None
-        }
+        pool.iter()
+            .rposition(|p| p.engine_id == engine_id)
+            .map(|idx| pool.swap_remove(idx).lua)
     });
 
     if let Some(lua) = cached {
@@ -156,7 +169,9 @@ pub fn execute_script(
 
 fn sandbox_lua(lua: &Lua) {
     let globals = lua.globals();
-    let remove = ["os", "io", "debug", "loadfile", "dofile", "package", "require"];
+    let remove = [
+        "os", "io", "debug", "loadfile", "dofile", "package", "require",
+    ];
     for name in &remove {
         let _ = globals.set(*name, LuaValue::Nil);
     }
@@ -171,7 +186,8 @@ fn setup_keys_argv(lua: &Lua, keys: &[Bytes], argv: &[Bytes]) {
         let t = lua.create_table().expect("create table");
         for (i, item) in items.iter().enumerate() {
             let s = String::from_utf8_lossy(item);
-            t.set(i + 1, s.as_ref().to_owned()).expect("set table entry");
+            t.set(i + 1, s.as_ref().to_owned())
+                .expect("set table entry");
         }
         t
     }
@@ -290,9 +306,7 @@ fn setup_redis_module(lua: &Lua, engine: &Arc<CommandEngine>) {
     redis.set("LOG_NOTICE", 2i64).expect("set LOG_NOTICE");
     redis.set("LOG_WARNING", 3i64).expect("set LOG_WARNING");
 
-    lua.globals()
-        .set("redis", redis)
-        .expect("set redis global");
+    lua.globals().set("redis", redis).expect("set redis global");
 }
 
 // ---------------------------------------------------------------------------
@@ -464,7 +478,10 @@ mod tests {
 
     #[test]
     fn test_lua_to_response_primitives() {
-        assert!(matches!(lua_to_response(LuaValue::Nil), CommandResponse::Nil));
+        assert!(matches!(
+            lua_to_response(LuaValue::Nil),
+            CommandResponse::Nil
+        ));
         assert!(matches!(
             lua_to_response(LuaValue::Boolean(true)),
             CommandResponse::Integer(1)
@@ -673,12 +690,7 @@ mod tests {
         }
 
         // Return status table
-        let resp = execute_script(
-            &engine,
-            "return redis.status_reply('PONG')",
-            vec![],
-            vec![],
-        );
+        let resp = execute_script(&engine, "return redis.status_reply('PONG')", vec![], vec![]);
         match resp {
             CommandResponse::SimpleString(s) => assert_eq!(s.as_ref(), b"PONG"),
             other => panic!("expected SimpleString, got {:?}", other),

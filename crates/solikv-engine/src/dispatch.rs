@@ -101,7 +101,10 @@ fn parse_stream_id(arg: &Bytes) -> Option<StreamIdInput> {
     StreamId::parse(s)
 }
 
-fn parse_stream_trim(args: &[Bytes], start: &mut usize) -> Result<Option<StreamTrim>, CommandResponse> {
+fn parse_stream_trim(
+    args: &[Bytes],
+    start: &mut usize,
+) -> Result<Option<StreamTrim>, CommandResponse> {
     let i = *start;
     if i >= args.len() {
         return Ok(None);
@@ -129,8 +132,8 @@ fn parse_stream_trim(args: &[Bytes], start: &mut usize) -> Result<Option<StreamT
                 *start += 1;
                 Ok(Some(StreamTrim::MaxLen { exact, threshold }))
             } else {
-                let id_input = parse_stream_id(&args[*start])
-                    .ok_or_else(CommandResponse::syntax_error)?;
+                let id_input =
+                    parse_stream_id(&args[*start]).ok_or_else(CommandResponse::syntax_error)?;
                 let threshold = match id_input {
                     StreamIdInput::Explicit(id) => id,
                     StreamIdInput::Partial(ms) => StreamId::new(ms, 0),
@@ -603,7 +606,10 @@ impl CommandEngine {
                         CommandResponse::ok()
                     }
                     "RESETSTAT" => CommandResponse::ok(),
-                    _ => CommandResponse::error(format!("ERR Unknown subcommand or wrong number of arguments for 'config|{}'", sub.to_lowercase())),
+                    _ => CommandResponse::error(format!(
+                        "ERR Unknown subcommand or wrong number of arguments for 'config|{}'",
+                        sub.to_lowercase()
+                    )),
                 }
             }
             "INFO" => {
@@ -621,9 +627,8 @@ impl CommandEngine {
                 let mut total = 0i64;
                 for i in 0..num {
                     let shard = shards.shard(i).clone();
-                    let resp = shard.execute(|store| {
-                        CommandResponse::integer(store.dbsize() as i64)
-                    });
+                    let resp =
+                        shard.execute(|store| CommandResponse::integer(store.dbsize() as i64));
                     if let CommandResponse::Integer(n) = resp {
                         total += n;
                     }
@@ -669,9 +674,9 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("get");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_get(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_get(&key))
             }
             "SET" => {
                 if args.len() < 2 {
@@ -690,7 +695,10 @@ impl CommandEngine {
                     match opt.as_str() {
                         "EX" => {
                             i += 1;
-                            if let Some(secs) = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok()) {
+                            if let Some(secs) = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok())
+                            {
                                 expire_ms = Some(secs * 1000);
                             } else {
                                 return CommandResponse::syntax_error();
@@ -698,7 +706,10 @@ impl CommandEngine {
                         }
                         "PX" => {
                             i += 1;
-                            if let Some(ms) = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok()) {
+                            if let Some(ms) = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok())
+                            {
                                 expire_ms = Some(ms);
                             } else {
                                 return CommandResponse::syntax_error();
@@ -706,7 +717,10 @@ impl CommandEngine {
                         }
                         "EXAT" => {
                             i += 1;
-                            if let Some(ts) = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok()) {
+                            if let Some(ts) = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok())
+                            {
                                 let now = now_millis();
                                 let target = ts * 1000;
                                 expire_ms = Some(target.saturating_sub(now));
@@ -716,7 +730,10 @@ impl CommandEngine {
                         }
                         "PXAT" => {
                             i += 1;
-                            if let Some(ts) = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok()) {
+                            if let Some(ts) = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok())
+                            {
                                 let now = now_millis();
                                 expire_ms = Some(ts.saturating_sub(now));
                             } else {
@@ -732,9 +749,9 @@ impl CommandEngine {
                     i += 1;
                 }
 
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_set(key, value, expire_ms, nx, xx, get)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_set(key, value, expire_ms, nx, xx, get))
             }
             "SETNX" => {
                 if args.len() != 2 {
@@ -742,37 +759,51 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let value = args[1].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_setnx(key, value)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_setnx(key, value))
             }
             "SETEX" => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("setex");
                 }
                 let key = args[0].clone();
-                let seconds = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                let seconds = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     Some(s) => s,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
                 let value = args[2].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_setex(key, seconds, value)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_setex(key, seconds, value))
             }
             "PSETEX" => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("psetex");
                 }
                 let key = args[0].clone();
-                let millis = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                let millis = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     Some(m) => m,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
                 let value = args[2].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_psetex(key, millis, value)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_psetex(key, millis, value))
             }
             "GETSET" => {
                 if args.len() != 2 {
@@ -780,18 +811,18 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let value = args[1].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_getset(key, value)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_getset(key, value))
             }
             "GETDEL" => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("getdel");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_getdel(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_getdel(&key))
             }
             "GETEX" => {
                 if args.is_empty() {
@@ -806,20 +837,25 @@ impl CommandEngine {
                     match opt.as_str() {
                         "EX" => {
                             i += 1;
-                            expire_ms = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok()).map(|s| s * 1000);
+                            expire_ms = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok())
+                                .map(|s| s * 1000);
                         }
                         "PX" => {
                             i += 1;
-                            expire_ms = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok());
+                            expire_ms = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok());
                         }
                         "PERSIST" => persist = true,
                         _ => return CommandResponse::syntax_error(),
                     }
                     i += 1;
                 }
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_getex(&key, expire_ms, persist)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_getex(&key, expire_ms, persist))
             }
             "MGET" => {
                 if args.is_empty() {
@@ -829,91 +865,104 @@ impl CommandEngine {
                 // TODO: proper multi-shard gather
                 let keys: Vec<Bytes> = args.to_vec();
                 let shard = self.shards.shard_for_key(&keys[0]).clone();
-                shard.execute(move |store| {
-                    store.string_mget(&keys)
-                })
+                shard.execute(move |store| store.string_mget(&keys))
             }
             "MSET" => {
-                if args.len() < 2 || args.len() % 2 != 0 {
+                if args.len() < 2 || !args.len().is_multiple_of(2) {
                     return CommandResponse::wrong_arity("mset");
                 }
-                let pairs: Vec<(Bytes, Bytes)> = args.chunks(2)
+                let pairs: Vec<(Bytes, Bytes)> = args
+                    .chunks(2)
                     .map(|c| (c[0].clone(), c[1].clone()))
                     .collect();
                 // Route to first key's shard for simplicity
                 let shard = self.shards.shard_for_key(&pairs[0].0).clone();
-                shard.execute(move |store| {
-                    store.string_mset(pairs)
-                })
+                shard.execute(move |store| store.string_mset(pairs))
             }
             "MSETNX" => {
-                if args.len() < 2 || args.len() % 2 != 0 {
+                if args.len() < 2 || !args.len().is_multiple_of(2) {
                     return CommandResponse::wrong_arity("msetnx");
                 }
-                let pairs: Vec<(Bytes, Bytes)> = args.chunks(2)
+                let pairs: Vec<(Bytes, Bytes)> = args
+                    .chunks(2)
                     .map(|c| (c[0].clone(), c[1].clone()))
                     .collect();
                 let shard = self.shards.shard_for_key(&pairs[0].0).clone();
-                shard.execute(move |store| {
-                    store.string_msetnx(pairs)
-                })
+                shard.execute(move |store| store.string_msetnx(pairs))
             }
             "INCR" => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("incr");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_incr(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_incr(&key))
             }
             "DECR" => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("decr");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_decr(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_decr(&key))
             }
             "INCRBY" => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("incrby");
                 }
                 let key = args[0].clone();
-                let delta = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let delta = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(d) => d,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_incrby(&key, delta)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_incrby(&key, delta))
             }
             "DECRBY" => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("decrby");
                 }
                 let key = args[0].clone();
-                let delta = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let delta = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(d) => d,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_decrby(&key, delta)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_decrby(&key, delta))
             }
             "INCRBYFLOAT" => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("incrbyfloat");
                 }
                 let key = args[0].clone();
-                let delta = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                let delta = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                {
                     Some(d) => d,
                     None => return CommandResponse::error("ERR value is not a valid float"),
                 };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_incrbyfloat(&key, delta)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_incrbyfloat(&key, delta))
             }
             "APPEND" => {
                 if args.len() != 2 {
@@ -921,49 +970,70 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let value = args[1].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_append(&key, &value)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_append(&key, &value))
             }
             "STRLEN" => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("strlen");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_strlen(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_strlen(&key))
             }
             "GETRANGE" | "SUBSTR" => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("getrange");
                 }
                 let key = args[0].clone();
-                let start = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let start = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(s) => s,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
-                let end = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let end = match std::str::from_utf8(&args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(e) => e,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_getrange(&key, start, end)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_getrange(&key, start, end))
             }
             "SETRANGE" => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("setrange");
                 }
                 let key = args[0].clone();
-                let offset = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<usize>().ok()) {
+                let offset = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
                     Some(o) => o,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
                 let value = args[2].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_setrange(&key, offset, &value)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_setrange(&key, offset, &value))
             }
 
             // ---- Generic key commands ----
@@ -1021,12 +1091,23 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("expire");
                 }
                 let key = args[0].clone();
-                let seconds = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                let seconds = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     Some(s) => s,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
                 self.shards.shard_for_key(&key).execute(move |store| {
-                    CommandResponse::integer(if store.expire(&key, seconds * 1000) { 1 } else { 0 })
+                    CommandResponse::integer(if store.expire(&key, seconds * 1000) {
+                        1
+                    } else {
+                        0
+                    })
                 })
             }
             "PEXPIRE" => {
@@ -1034,9 +1115,16 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("pexpire");
                 }
                 let key = args[0].clone();
-                let millis = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                let millis = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     Some(m) => m,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
                 self.shards.shard_for_key(&key).execute(move |store| {
                     CommandResponse::integer(if store.expire(&key, millis) { 1 } else { 0 })
@@ -1047,12 +1135,23 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("expireat");
                 }
                 let key = args[0].clone();
-                let ts = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                let ts = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     Some(t) => t,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
                 self.shards.shard_for_key(&key).execute(move |store| {
-                    CommandResponse::integer(if store.expire_at(&key, ts * 1000) { 1 } else { 0 })
+                    CommandResponse::integer(if store.expire_at(&key, ts * 1000) {
+                        1
+                    } else {
+                        0
+                    })
                 })
             }
             "PEXPIREAT" => {
@@ -1060,9 +1159,16 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("pexpireat");
                 }
                 let key = args[0].clone();
-                let ts = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                let ts = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     Some(t) => t,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
                 self.shards.shard_for_key(&key).execute(move |store| {
                     CommandResponse::integer(if store.expire_at(&key, ts) { 1 } else { 0 })
@@ -1073,18 +1179,18 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("ttl");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    CommandResponse::integer(store.ttl(&key))
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| CommandResponse::integer(store.ttl(&key)))
             }
             "PTTL" => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("pttl");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    CommandResponse::integer(store.pttl(&key))
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| CommandResponse::integer(store.pttl(&key)))
             }
             "PERSIST" => {
                 if args.len() != 1 {
@@ -1100,9 +1206,9 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("type");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    CommandResponse::simple(store.key_type(&key))
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| CommandResponse::simple(store.key_type(&key)))
             }
             "RENAME" => {
                 if args.len() != 2 {
@@ -1148,7 +1254,9 @@ impl CommandEngine {
                     let p = pattern.clone();
                     let resp = shard.execute(move |store| {
                         let keys = store.keys(&p);
-                        CommandResponse::array(keys.into_iter().map(CommandResponse::bulk).collect())
+                        CommandResponse::array(
+                            keys.into_iter().map(CommandResponse::bulk).collect(),
+                        )
                     });
                     if let CommandResponse::Array(items) = resp {
                         all_keys.extend(items);
@@ -1160,7 +1268,10 @@ impl CommandEngine {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("scan");
                 }
-                let cursor = std::str::from_utf8(&args[0]).ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let cursor = std::str::from_utf8(&args[0])
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
                 let mut pattern = None;
                 let mut count = 10usize;
                 let mut i = 1;
@@ -1169,11 +1280,17 @@ impl CommandEngine {
                     match opt.as_str() {
                         "MATCH" => {
                             i += 1;
-                            pattern = args.get(i).and_then(|b| std::str::from_utf8(b).ok()).map(|s| s.to_string());
+                            pattern = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok())
+                                .map(|s| s.to_string());
                         }
                         "COUNT" => {
                             i += 1;
-                            count = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse().ok()).unwrap_or(10);
+                            count = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok())
+                                .unwrap_or(10);
                         }
                         _ => {}
                     }
@@ -1186,17 +1303,17 @@ impl CommandEngine {
                     let (next, keys) = store.scan(cursor, pat.as_deref(), count);
                     CommandResponse::array(vec![
                         CommandResponse::bulk(Bytes::from(next.to_string())),
-                        CommandResponse::array(keys.into_iter().map(CommandResponse::bulk).collect()),
+                        CommandResponse::array(
+                            keys.into_iter().map(CommandResponse::bulk).collect(),
+                        ),
                     ])
                 })
             }
             "RANDOMKEY" => {
                 let shard = self.shards.shard(0).clone();
-                shard.execute(|store| {
-                    match store.random_key() {
-                        Some(k) => CommandResponse::bulk(k),
-                        None => CommandResponse::nil(),
-                    }
+                shard.execute(|store| match store.random_key() {
+                    Some(k) => CommandResponse::bulk(k),
+                    None => CommandResponse::nil(),
                 })
             }
             "OBJECT" => {
@@ -1236,9 +1353,9 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let values: Vec<Bytes> = args[1..].to_vec();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.list_lpush(&key, values)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.list_lpush(&key, values))
             }
             "RPUSH" => {
                 if args.len() < 2 {
@@ -1246,82 +1363,116 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let values: Vec<Bytes> = args[1..].to_vec();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.list_rpush(&key, values)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.list_rpush(&key, values))
             }
             "LPOP" => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("lpop");
                 }
                 let key = args[0].clone();
-                let count = args.get(1).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(1);
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.list_lpop(&key, count)
-                })
+                let count = args
+                    .get(1)
+                    .and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok())
+                    .unwrap_or(1);
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.list_lpop(&key, count))
             }
             "RPOP" => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("rpop");
                 }
                 let key = args[0].clone();
-                let count = args.get(1).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(1);
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.list_rpop(&key, count)
-                })
+                let count = args
+                    .get(1)
+                    .and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok())
+                    .unwrap_or(1);
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.list_rpop(&key, count))
             }
             "LLEN" => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("llen");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.list_llen(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.list_llen(&key))
             }
             "LINDEX" => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("lindex");
                 }
                 let key = args[0].clone();
-                let index = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let index = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(i) => i,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.list_lindex(&key, index)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.list_lindex(&key, index))
             }
             "LSET" => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("lset");
                 }
                 let key = args[0].clone();
-                let index = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let index = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(i) => i,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
                 let value = args[2].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.list_lset(&key, index, value)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.list_lset(&key, index, value))
             }
             "LRANGE" => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("lrange");
                 }
                 let key = args[0].clone();
-                let start = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let start = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(s) => s,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
-                let stop = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let stop = match std::str::from_utf8(&args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(s) => s,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.list_lrange(&key, start, stop)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.list_lrange(&key, start, stop))
             }
             "LINSERT" => {
                 if args.len() != 4 {
@@ -1336,62 +1487,85 @@ impl CommandEngine {
                 };
                 let pivot = args[2].clone();
                 let value = args[3].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.list_linsert(&key, before, &pivot, value)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.list_linsert(&key, before, &pivot, value))
             }
             "LREM" => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("lrem");
                 }
                 let key = args[0].clone();
-                let count = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let count = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(c) => c,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
                 let value = args[2].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.list_lrem(&key, count, &value)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.list_lrem(&key, count, &value))
             }
             "LTRIM" => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("ltrim");
                 }
                 let key = args[0].clone();
-                let start = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let start = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(s) => s,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
-                let stop = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let stop = match std::str::from_utf8(&args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(s) => s,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.list_ltrim(&key, start, stop)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.list_ltrim(&key, start, stop))
             }
 
             // ---- Hash commands ----
             "HSET" => {
-                if args.len() < 3 || (args.len() - 1) % 2 != 0 {
+                if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
                     return CommandResponse::wrong_arity("hset");
                 }
                 let key = args[0].clone();
-                let pairs: Vec<(Bytes, Bytes)> = args[1..].chunks(2)
+                let pairs: Vec<(Bytes, Bytes)> = args[1..]
+                    .chunks(2)
                     .map(|c| (c[0].clone(), c[1].clone()))
                     .collect();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.hash_hset(&key, pairs)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.hash_hset(&key, pairs))
             }
             "HMSET" => {
                 // HMSET is deprecated but still supported, same logic as HSET
-                if args.len() < 3 || (args.len() - 1) % 2 != 0 {
+                if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
                     return CommandResponse::wrong_arity("hmset");
                 }
                 let key = args[0].clone();
-                let pairs: Vec<(Bytes, Bytes)> = args[1..].chunks(2)
+                let pairs: Vec<(Bytes, Bytes)> = args[1..]
+                    .chunks(2)
                     .map(|c| (c[0].clone(), c[1].clone()))
                     .collect();
                 self.shards.shard_for_key(&key).execute(move |store| {
@@ -1405,9 +1579,9 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let field = args[1].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.hash_hget(&key, &field)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.hash_hget(&key, &field))
             }
             "HDEL" => {
                 if args.len() < 2 {
@@ -1415,18 +1589,18 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let fields: Vec<Bytes> = args[1..].to_vec();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.hash_hdel(&key, &fields)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.hash_hdel(&key, &fields))
             }
             "HGETALL" => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("hgetall");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.hash_hgetall(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.hash_hgetall(&key))
             }
             "HMGET" => {
                 if args.len() < 2 {
@@ -1434,9 +1608,9 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let fields: Vec<Bytes> = args[1..].to_vec();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.hash_hmget(&key, &fields)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.hash_hmget(&key, &fields))
             }
             "HINCRBY" => {
                 if args.len() != 3 {
@@ -1444,13 +1618,20 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let field = args[1].clone();
-                let delta = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let delta = match std::str::from_utf8(&args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(d) => d,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.hash_hincrby(&key, field, delta)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.hash_hincrby(&key, field, delta))
             }
             "HINCRBYFLOAT" => {
                 if args.len() != 3 {
@@ -1458,40 +1639,43 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let field = args[1].clone();
-                let delta = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                let delta = match std::str::from_utf8(&args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                {
                     Some(d) => d,
                     None => return CommandResponse::error("ERR value is not a valid float"),
                 };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.hash_hincrbyfloat(&key, field, delta)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.hash_hincrbyfloat(&key, field, delta))
             }
             "HKEYS" => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("hkeys");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.hash_hkeys(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.hash_hkeys(&key))
             }
             "HVALS" => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("hvals");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.hash_hvals(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.hash_hvals(&key))
             }
             "HLEN" => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("hlen");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.hash_hlen(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.hash_hlen(&key))
             }
             "HEXISTS" => {
                 if args.len() != 2 {
@@ -1499,9 +1683,9 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let field = args[1].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.hash_hexists(&key, &field)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.hash_hexists(&key, &field))
             }
             "HSETNX" => {
                 if args.len() != 3 {
@@ -1510,32 +1694,47 @@ impl CommandEngine {
                 let key = args[0].clone();
                 let field = args[1].clone();
                 let value = args[2].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.hash_hsetnx(&key, field, value)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.hash_hsetnx(&key, field, value))
             }
             "HSCAN" => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("hscan");
                 }
                 let key = args[0].clone();
-                let cursor = std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let cursor = std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
                 let mut pattern = None;
                 let mut count = 10usize;
                 let mut i = 2;
                 while i < args.len() {
                     let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
                     match opt.as_str() {
-                        "MATCH" => { i += 1; pattern = args.get(i).and_then(|b| std::str::from_utf8(b).ok()).map(|s| s.to_string()); }
-                        "COUNT" => { i += 1; count = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse().ok()).unwrap_or(10); }
+                        "MATCH" => {
+                            i += 1;
+                            pattern = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok())
+                                .map(|s| s.to_string());
+                        }
+                        "COUNT" => {
+                            i += 1;
+                            count = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok())
+                                .unwrap_or(10);
+                        }
                         _ => {}
                     }
                     i += 1;
                 }
                 let pat = pattern.clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.hash_hscan(&key, cursor, pat.as_deref(), count)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.hash_hscan(&key, cursor, pat.as_deref(), count))
             }
 
             // ---- Set commands ----
@@ -1545,9 +1744,9 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let members: Vec<Bytes> = args[1..].to_vec();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.set_sadd(&key, members)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.set_sadd(&key, members))
             }
             "SREM" => {
                 if args.len() < 2 {
@@ -1555,18 +1754,18 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let members: Vec<Bytes> = args[1..].to_vec();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.set_srem(&key, &members)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.set_srem(&key, &members))
             }
             "SMEMBERS" => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("smembers");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.set_smembers(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.set_smembers(&key))
             }
             "SISMEMBER" => {
                 if args.len() != 2 {
@@ -1574,18 +1773,18 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let member = args[1].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.set_sismember(&key, &member)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.set_sismember(&key, &member))
             }
             "SCARD" => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("scard");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.set_scard(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.set_scard(&key))
             }
             "SINTER" => {
                 if args.is_empty() {
@@ -1616,20 +1815,25 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("spop");
                 }
                 let key = args[0].clone();
-                let count = args.get(1).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(1);
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.set_spop(&key, count)
-                })
+                let count = args
+                    .get(1)
+                    .and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok())
+                    .unwrap_or(1);
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.set_spop(&key, count))
             }
             "SRANDMEMBER" => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("srandmember");
                 }
                 let key = args[0].clone();
-                let count = args.get(1).and_then(|b| std::str::from_utf8(b).ok()?.parse::<i64>().ok());
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.set_srandmember(&key, count)
-                })
+                let count = args
+                    .get(1)
+                    .and_then(|b| std::str::from_utf8(b).ok()?.parse::<i64>().ok());
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.set_srandmember(&key, count))
             }
             "SMOVE" => {
                 if args.len() != 3 {
@@ -1638,9 +1842,9 @@ impl CommandEngine {
                 let src = args[0].clone();
                 let dst = args[1].clone();
                 let member = args[2].clone();
-                self.shards.shard_for_key(&src).execute(move |store| {
-                    store.set_smove(&src, dst, member)
-                })
+                self.shards
+                    .shard_for_key(&src)
+                    .execute(move |store| store.set_smove(&src, dst, member))
             }
 
             // ---- Sorted Set commands ----
@@ -1660,21 +1864,37 @@ impl CommandEngine {
                 while i < args.len() {
                     let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
                     match opt.as_str() {
-                        "NX" => { nx = true; i += 1; }
-                        "XX" => { xx = true; i += 1; }
-                        "GT" => { gt = true; i += 1; }
-                        "LT" => { lt = true; i += 1; }
-                        "CH" => { ch = true; i += 1; }
+                        "NX" => {
+                            nx = true;
+                            i += 1;
+                        }
+                        "XX" => {
+                            xx = true;
+                            i += 1;
+                        }
+                        "GT" => {
+                            gt = true;
+                            i += 1;
+                        }
+                        "LT" => {
+                            lt = true;
+                            i += 1;
+                        }
+                        "CH" => {
+                            ch = true;
+                            i += 1;
+                        }
                         _ => break, // Start of score-member pairs
                     }
                 }
 
                 let remaining = &args[i..];
-                if remaining.len() < 2 || remaining.len() % 2 != 0 {
+                if remaining.len() < 2 || !remaining.len().is_multiple_of(2) {
                     return CommandResponse::wrong_arity("zadd");
                 }
 
-                let pairs: Vec<(f64, Bytes)> = remaining.chunks(2)
+                let pairs: Vec<(f64, Bytes)> = remaining
+                    .chunks(2)
                     .filter_map(|c| {
                         let score = std::str::from_utf8(&c[0]).ok()?.parse::<f64>().ok()?;
                         Some((score, c[1].clone()))
@@ -1685,9 +1905,9 @@ impl CommandEngine {
                     return CommandResponse::error("ERR value is not a valid float");
                 }
 
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.zset_zadd(&key, pairs, nx, xx, gt, lt, ch)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.zset_zadd(&key, pairs, nx, xx, gt, lt, ch))
             }
             "ZREM" => {
                 if args.len() < 2 {
@@ -1695,9 +1915,9 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let members: Vec<Bytes> = args[1..].to_vec();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.zset_zrem(&key, &members)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.zset_zrem(&key, &members))
             }
             "ZSCORE" => {
                 if args.len() != 2 {
@@ -1705,18 +1925,18 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let member = args[1].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.zset_zscore(&key, &member)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.zset_zscore(&key, &member))
             }
             "ZCARD" => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("zcard");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.zset_zcard(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.zset_zcard(&key))
             }
             "ZRANK" => {
                 if args.len() != 2 {
@@ -1724,9 +1944,9 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let member = args[1].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.zset_zrank(&key, &member)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.zset_zrank(&key, &member))
             }
             "ZREVRANK" => {
                 if args.len() != 2 {
@@ -1734,23 +1954,26 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let member = args[1].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.zset_zrevrank(&key, &member)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.zset_zrevrank(&key, &member))
             }
             "ZINCRBY" => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("zincrby");
                 }
                 let key = args[0].clone();
-                let delta = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                let delta = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                {
                     Some(d) => d,
                     None => return CommandResponse::error("ERR value is not a valid float"),
                 };
                 let member = args[2].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.zset_zincrby(&key, delta, member)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.zset_zincrby(&key, delta, member))
             }
             "ZCOUNT" => {
                 if args.len() != 3 {
@@ -1759,45 +1982,79 @@ impl CommandEngine {
                 let key = args[0].clone();
                 let min = parse_score_bound(&args[1], f64::NEG_INFINITY);
                 let max = parse_score_bound(&args[2], f64::INFINITY);
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.zset_zcount(&key, min, max)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.zset_zcount(&key, min, max))
             }
             "ZRANGE" => {
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity("zrange");
                 }
                 let key = args[0].clone();
-                let start = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let start = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(s) => s,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
-                let stop = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let stop = match std::str::from_utf8(&args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(s) => s,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
-                let withscores = args.get(3).map(|b| std::str::from_utf8(b).unwrap_or("").to_uppercase() == "WITHSCORES").unwrap_or(false);
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.zset_zrange(&key, start, stop, withscores)
-                })
+                let withscores = args
+                    .get(3)
+                    .map(|b| std::str::from_utf8(b).unwrap_or("").to_uppercase() == "WITHSCORES")
+                    .unwrap_or(false);
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.zset_zrange(&key, start, stop, withscores))
             }
             "ZREVRANGE" => {
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity("zrevrange");
                 }
                 let key = args[0].clone();
-                let start = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let start = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(s) => s,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
-                let stop = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                let stop = match std::str::from_utf8(&args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
                     Some(s) => s,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
-                let withscores = args.get(3).map(|b| std::str::from_utf8(b).unwrap_or("").to_uppercase() == "WITHSCORES").unwrap_or(false);
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.zset_zrevrange(&key, start, stop, withscores)
-                })
+                let withscores = args
+                    .get(3)
+                    .map(|b| std::str::from_utf8(b).unwrap_or("").to_uppercase() == "WITHSCORES")
+                    .unwrap_or(false);
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.zset_zrevrange(&key, start, stop, withscores))
             }
             "ZRANGEBYSCORE" => {
                 if args.len() < 3 {
@@ -1816,9 +2073,14 @@ impl CommandEngine {
                         "WITHSCORES" => withscores = true,
                         "LIMIT" => {
                             i += 1;
-                            offset = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse().ok()).unwrap_or(0);
+                            offset = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok())
+                                .unwrap_or(0);
                             i += 1;
-                            count = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse().ok());
+                            count = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok());
                         }
                         _ => {}
                     }
@@ -1833,29 +2095,42 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("zpopmin");
                 }
                 let key = args[0].clone();
-                let count = args.get(1).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(1);
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.zset_zpopmin(&key, count)
-                })
+                let count = args
+                    .get(1)
+                    .and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok())
+                    .unwrap_or(1);
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.zset_zpopmin(&key, count))
             }
             "ZPOPMAX" => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("zpopmax");
                 }
                 let key = args[0].clone();
-                let count = args.get(1).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(1);
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.zset_zpopmax(&key, count)
-                })
+                let count = args
+                    .get(1)
+                    .and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok())
+                    .unwrap_or(1);
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.zset_zpopmax(&key, count))
             }
             "ZUNIONSTORE" => {
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity("zunionstore");
                 }
                 let dest = args[0].clone();
-                let numkeys = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<usize>().ok()) {
+                let numkeys = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
                     Some(n) => n,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
                 if args.len() < 2 + numkeys {
                     return CommandResponse::wrong_arity("zunionstore");
@@ -1870,7 +2145,10 @@ impl CommandEngine {
                         "WEIGHTS" => {
                             i += 1;
                             while i < args.len() {
-                                if let Some(w) = std::str::from_utf8(&args[i]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                                if let Some(w) = std::str::from_utf8(&args[i])
+                                    .ok()
+                                    .and_then(|s| s.parse::<f64>().ok())
+                                {
                                     weights.push(w);
                                     i += 1;
                                 } else {
@@ -1881,7 +2159,8 @@ impl CommandEngine {
                         }
                         "AGGREGATE" => {
                             i += 1;
-                            if let Some(agg) = args.get(i).and_then(|b| std::str::from_utf8(b).ok()) {
+                            if let Some(agg) = args.get(i).and_then(|b| std::str::from_utf8(b).ok())
+                            {
                                 aggregate = match agg.to_uppercase().as_str() {
                                     "MIN" => Aggregate::Min,
                                     "MAX" => Aggregate::Max,
@@ -1894,18 +2173,24 @@ impl CommandEngine {
                     i += 1;
                 }
                 let shard = self.shards.shard_for_key(&dest).clone();
-                shard.execute(move |store| {
-                    store.zset_zunionstore(&dest, &keys, &weights, aggregate)
-                })
+                shard
+                    .execute(move |store| store.zset_zunionstore(&dest, &keys, &weights, aggregate))
             }
             "ZINTERSTORE" => {
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity("zinterstore");
                 }
                 let dest = args[0].clone();
-                let numkeys = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<usize>().ok()) {
+                let numkeys = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
                     Some(n) => n,
-                    None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
                 };
                 if args.len() < 2 + numkeys {
                     return CommandResponse::wrong_arity("zinterstore");
@@ -1920,7 +2205,10 @@ impl CommandEngine {
                         "WEIGHTS" => {
                             i += 1;
                             while i < args.len() {
-                                if let Some(w) = std::str::from_utf8(&args[i]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                                if let Some(w) = std::str::from_utf8(&args[i])
+                                    .ok()
+                                    .and_then(|s| s.parse::<f64>().ok())
+                                {
                                     weights.push(w);
                                     i += 1;
                                 } else {
@@ -1931,7 +2219,8 @@ impl CommandEngine {
                         }
                         "AGGREGATE" => {
                             i += 1;
-                            if let Some(agg) = args.get(i).and_then(|b| std::str::from_utf8(b).ok()) {
+                            if let Some(agg) = args.get(i).and_then(|b| std::str::from_utf8(b).ok())
+                            {
                                 aggregate = match agg.to_uppercase().as_str() {
                                     "MIN" => Aggregate::Min,
                                     "MAX" => Aggregate::Max,
@@ -1944,20 +2233,22 @@ impl CommandEngine {
                     i += 1;
                 }
                 let shard = self.shards.shard_for_key(&dest).clone();
-                shard.execute(move |store| {
-                    store.zset_zinterstore(&dest, &keys, &weights, aggregate)
-                })
+                shard
+                    .execute(move |store| store.zset_zinterstore(&dest, &keys, &weights, aggregate))
             }
             "ZSCAN" => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("zscan");
                 }
                 let key = args[0].clone();
-                let cursor = std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let cursor = std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
                 let count = 10;
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.zset_zscan(&key, cursor, None, count)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.zset_zscan(&key, cursor, None, count))
             }
 
             // ---- Geospatial commands ----
@@ -1976,25 +2267,40 @@ impl CommandEngine {
                 while i < args.len() {
                     let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
                     match opt.as_str() {
-                        "NX" => { nx = true; i += 1; }
-                        "XX" => { xx = true; i += 1; }
-                        "CH" => { ch = true; i += 1; }
+                        "NX" => {
+                            nx = true;
+                            i += 1;
+                        }
+                        "XX" => {
+                            xx = true;
+                            i += 1;
+                        }
+                        "CH" => {
+                            ch = true;
+                            i += 1;
+                        }
                         _ => break,
                     }
                 }
 
                 // Remaining args must be triplets: longitude latitude member
-                if (args.len() - i) < 3 || (args.len() - i) % 3 != 0 {
+                if (args.len() - i) < 3 || !(args.len() - i).is_multiple_of(3) {
                     return CommandResponse::wrong_arity("geoadd");
                 }
 
                 let mut items = Vec::new();
                 while i + 2 < args.len() {
-                    let lon = match std::str::from_utf8(&args[i]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                    let lon = match std::str::from_utf8(&args[i])
+                        .ok()
+                        .and_then(|s| s.parse::<f64>().ok())
+                    {
                         Some(v) => v,
                         None => return CommandResponse::error("ERR value is not a valid float"),
                     };
-                    let lat = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                    let lat = match std::str::from_utf8(&args[i + 1])
+                        .ok()
+                        .and_then(|s| s.parse::<f64>().ok())
+                    {
                         Some(v) => v,
                         None => return CommandResponse::error("ERR value is not a valid float"),
                     };
@@ -2003,9 +2309,9 @@ impl CommandEngine {
                     i += 3;
                 }
 
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.geo_add(&key, nx, xx, ch, &items)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.geo_add(&key, nx, xx, ch, &items))
             }
             "GEOPOS" => {
                 if args.len() < 2 {
@@ -2013,9 +2319,9 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let members: Vec<Bytes> = args[1..].to_vec();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.geo_pos(&key, &members)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.geo_pos(&key, &members))
             }
             "GEOHASH" => {
                 if args.len() < 2 {
@@ -2023,9 +2329,9 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let members: Vec<Bytes> = args[1..].to_vec();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.geo_hash(&key, &members)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.geo_hash(&key, &members))
             }
             "GEODIST" => {
                 if args.len() < 3 {
@@ -2034,17 +2340,22 @@ impl CommandEngine {
                 let key = args[0].clone();
                 let member1 = args[1].clone();
                 let member2 = args[2].clone();
-                let unit = args.get(3)
+                let unit = args
+                    .get(3)
                     .and_then(|b| std::str::from_utf8(b).ok())
                     .unwrap_or("m")
                     .to_lowercase();
                 match unit.as_str() {
                     "m" | "km" | "ft" | "mi" => {}
-                    _ => return CommandResponse::error("ERR unsupported unit provided. please use M, KM, FT, MI"),
+                    _ => {
+                        return CommandResponse::error(
+                            "ERR unsupported unit provided. please use M, KM, FT, MI",
+                        )
+                    }
                 }
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.geo_dist(&key, &member1, &member2, &unit)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.geo_dist(&key, &member1, &member2, &unit))
             }
             "GEOSEARCH" => {
                 // GEOSEARCH key FROMMEMBER member | FROMLONLAT lon lat
@@ -2068,43 +2379,80 @@ impl CommandEngine {
                     match opt.as_str() {
                         "FROMMEMBER" => {
                             i += 1;
-                            if i >= args.len() { return CommandResponse::syntax_error(); }
+                            if i >= args.len() {
+                                return CommandResponse::syntax_error();
+                            }
                             from = Some(solikv_core::geo_ops::GeoFrom::Member(args[i].clone()));
                         }
                         "FROMLONLAT" => {
-                            if i + 2 >= args.len() { return CommandResponse::syntax_error(); }
-                            let lon = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                            if i + 2 >= args.len() {
+                                return CommandResponse::syntax_error();
+                            }
+                            let lon = match std::str::from_utf8(&args[i + 1])
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
                                 Some(v) => v,
-                                None => return CommandResponse::error("ERR value is not a valid float"),
+                                None => {
+                                    return CommandResponse::error("ERR value is not a valid float")
+                                }
                             };
-                            let lat = match std::str::from_utf8(&args[i + 2]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                            let lat = match std::str::from_utf8(&args[i + 2])
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
                                 Some(v) => v,
-                                None => return CommandResponse::error("ERR value is not a valid float"),
+                                None => {
+                                    return CommandResponse::error("ERR value is not a valid float")
+                                }
                             };
                             from = Some(solikv_core::geo_ops::GeoFrom::LonLat(lon, lat));
                             i += 2;
                         }
                         "BYRADIUS" => {
-                            if i + 2 >= args.len() { return CommandResponse::syntax_error(); }
-                            let radius = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                            if i + 2 >= args.len() {
+                                return CommandResponse::syntax_error();
+                            }
+                            let radius = match std::str::from_utf8(&args[i + 1])
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
                                 Some(v) => v,
-                                None => return CommandResponse::error("ERR value is not a valid float"),
+                                None => {
+                                    return CommandResponse::error("ERR value is not a valid float")
+                                }
                             };
-                            let unit = std::str::from_utf8(&args[i + 2]).unwrap_or("m").to_lowercase();
+                            let unit = std::str::from_utf8(&args[i + 2])
+                                .unwrap_or("m")
+                                .to_lowercase();
                             by = Some(solikv_core::geo_ops::GeoBy::Radius(radius, unit));
                             i += 2;
                         }
                         "BYBOX" => {
-                            if i + 3 >= args.len() { return CommandResponse::syntax_error(); }
-                            let width = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                            if i + 3 >= args.len() {
+                                return CommandResponse::syntax_error();
+                            }
+                            let width = match std::str::from_utf8(&args[i + 1])
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
                                 Some(v) => v,
-                                None => return CommandResponse::error("ERR value is not a valid float"),
+                                None => {
+                                    return CommandResponse::error("ERR value is not a valid float")
+                                }
                             };
-                            let height = match std::str::from_utf8(&args[i + 2]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                            let height = match std::str::from_utf8(&args[i + 2])
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
                                 Some(v) => v,
-                                None => return CommandResponse::error("ERR value is not a valid float"),
+                                None => {
+                                    return CommandResponse::error("ERR value is not a valid float")
+                                }
                             };
-                            let unit = std::str::from_utf8(&args[i + 3]).unwrap_or("m").to_lowercase();
+                            let unit = std::str::from_utf8(&args[i + 3])
+                                .unwrap_or("m")
+                                .to_lowercase();
                             by = Some(solikv_core::geo_ops::GeoBy::Box(width, height, unit));
                             i += 3;
                         }
@@ -2112,11 +2460,17 @@ impl CommandEngine {
                         "DESC" => sort_asc = Some(false),
                         "COUNT" => {
                             i += 1;
-                            count = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse().ok());
+                            count = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok());
                             // Skip optional ANY
                             if i + 1 < args.len() {
-                                let next = std::str::from_utf8(&args[i + 1]).unwrap_or("").to_uppercase();
-                                if next == "ANY" { i += 1; }
+                                let next = std::str::from_utf8(&args[i + 1])
+                                    .unwrap_or("")
+                                    .to_uppercase();
+                                if next == "ANY" {
+                                    i += 1;
+                                }
                             }
                         }
                         "WITHCOORD" => withcoord = true,
@@ -2137,7 +2491,9 @@ impl CommandEngine {
                 };
 
                 self.shards.shard_for_key(&key).execute(move |store| {
-                    store.geo_search(&key, &from, &by, sort_asc, count, withcoord, withdist, withhash)
+                    store.geo_search(
+                        &key, &from, &by, sort_asc, count, withcoord, withdist, withhash,
+                    )
                 })
             }
             "GEOSEARCHSTORE" => {
@@ -2161,43 +2517,80 @@ impl CommandEngine {
                     match opt.as_str() {
                         "FROMMEMBER" => {
                             i += 1;
-                            if i >= args.len() { return CommandResponse::syntax_error(); }
+                            if i >= args.len() {
+                                return CommandResponse::syntax_error();
+                            }
                             from = Some(solikv_core::geo_ops::GeoFrom::Member(args[i].clone()));
                         }
                         "FROMLONLAT" => {
-                            if i + 2 >= args.len() { return CommandResponse::syntax_error(); }
-                            let lon = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                            if i + 2 >= args.len() {
+                                return CommandResponse::syntax_error();
+                            }
+                            let lon = match std::str::from_utf8(&args[i + 1])
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
                                 Some(v) => v,
-                                None => return CommandResponse::error("ERR value is not a valid float"),
+                                None => {
+                                    return CommandResponse::error("ERR value is not a valid float")
+                                }
                             };
-                            let lat = match std::str::from_utf8(&args[i + 2]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                            let lat = match std::str::from_utf8(&args[i + 2])
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
                                 Some(v) => v,
-                                None => return CommandResponse::error("ERR value is not a valid float"),
+                                None => {
+                                    return CommandResponse::error("ERR value is not a valid float")
+                                }
                             };
                             from = Some(solikv_core::geo_ops::GeoFrom::LonLat(lon, lat));
                             i += 2;
                         }
                         "BYRADIUS" => {
-                            if i + 2 >= args.len() { return CommandResponse::syntax_error(); }
-                            let radius = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                            if i + 2 >= args.len() {
+                                return CommandResponse::syntax_error();
+                            }
+                            let radius = match std::str::from_utf8(&args[i + 1])
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
                                 Some(v) => v,
-                                None => return CommandResponse::error("ERR value is not a valid float"),
+                                None => {
+                                    return CommandResponse::error("ERR value is not a valid float")
+                                }
                             };
-                            let unit = std::str::from_utf8(&args[i + 2]).unwrap_or("m").to_lowercase();
+                            let unit = std::str::from_utf8(&args[i + 2])
+                                .unwrap_or("m")
+                                .to_lowercase();
                             by = Some(solikv_core::geo_ops::GeoBy::Radius(radius, unit));
                             i += 2;
                         }
                         "BYBOX" => {
-                            if i + 3 >= args.len() { return CommandResponse::syntax_error(); }
-                            let width = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                            if i + 3 >= args.len() {
+                                return CommandResponse::syntax_error();
+                            }
+                            let width = match std::str::from_utf8(&args[i + 1])
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
                                 Some(v) => v,
-                                None => return CommandResponse::error("ERR value is not a valid float"),
+                                None => {
+                                    return CommandResponse::error("ERR value is not a valid float")
+                                }
                             };
-                            let height = match std::str::from_utf8(&args[i + 2]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                            let height = match std::str::from_utf8(&args[i + 2])
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
                                 Some(v) => v,
-                                None => return CommandResponse::error("ERR value is not a valid float"),
+                                None => {
+                                    return CommandResponse::error("ERR value is not a valid float")
+                                }
                             };
-                            let unit = std::str::from_utf8(&args[i + 3]).unwrap_or("m").to_lowercase();
+                            let unit = std::str::from_utf8(&args[i + 3])
+                                .unwrap_or("m")
+                                .to_lowercase();
                             by = Some(solikv_core::geo_ops::GeoBy::Box(width, height, unit));
                             i += 3;
                         }
@@ -2205,10 +2598,16 @@ impl CommandEngine {
                         "DESC" => sort_asc = Some(false),
                         "COUNT" => {
                             i += 1;
-                            count = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse().ok());
+                            count = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok());
                             if i + 1 < args.len() {
-                                let next = std::str::from_utf8(&args[i + 1]).unwrap_or("").to_uppercase();
-                                if next == "ANY" { i += 1; }
+                                let next = std::str::from_utf8(&args[i + 1])
+                                    .unwrap_or("")
+                                    .to_uppercase();
+                                if next == "ANY" {
+                                    i += 1;
+                                }
                             }
                         }
                         "STOREDIST" => store_dist = true,
@@ -2264,12 +2663,16 @@ impl CommandEngine {
                 }
                 let id_input = match parse_stream_id(&args[i]) {
                     Some(id) => id,
-                    None => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR Invalid stream ID specified as stream command argument",
+                        )
+                    }
                 };
                 i += 1;
 
                 // Parse field-value pairs
-                if (args.len() - i) < 2 || (args.len() - i) % 2 != 0 {
+                if (args.len() - i) < 2 || !(args.len() - i).is_multiple_of(2) {
                     return CommandResponse::wrong_arity("xadd");
                 }
                 let fields: Vec<(Bytes, Bytes)> = args[i..]
@@ -2286,9 +2689,9 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("xlen");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.stream_xlen(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.stream_xlen(&key))
             }
             "XRANGE" => {
                 // XRANGE key start end [COUNT n]
@@ -2300,24 +2703,34 @@ impl CommandEngine {
                     Some(StreamIdInput::Min) => StreamId::MIN,
                     Some(StreamIdInput::Explicit(id)) => id,
                     Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, 0),
-                    _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                    _ => {
+                        return CommandResponse::error(
+                            "ERR Invalid stream ID specified as stream command argument",
+                        )
+                    }
                 };
                 let end = match parse_stream_id(&args[2]) {
                     Some(StreamIdInput::Max) => StreamId::MAX,
                     Some(StreamIdInput::Explicit(id)) => id,
                     Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, u64::MAX),
-                    _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                    _ => {
+                        return CommandResponse::error(
+                            "ERR Invalid stream ID specified as stream command argument",
+                        )
+                    }
                 };
                 let mut count = None;
                 if args.len() >= 5 {
                     let opt = std::str::from_utf8(&args[3]).unwrap_or("").to_uppercase();
                     if opt == "COUNT" {
-                        count = args.get(4).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok());
+                        count = args
+                            .get(4)
+                            .and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok());
                     }
                 }
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.stream_xrange(&key, start, end, count)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.stream_xrange(&key, start, end, count))
             }
             "XREVRANGE" => {
                 // XREVRANGE key end start [COUNT n]
@@ -2329,24 +2742,34 @@ impl CommandEngine {
                     Some(StreamIdInput::Max) => StreamId::MAX,
                     Some(StreamIdInput::Explicit(id)) => id,
                     Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, u64::MAX),
-                    _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                    _ => {
+                        return CommandResponse::error(
+                            "ERR Invalid stream ID specified as stream command argument",
+                        )
+                    }
                 };
                 let start = match parse_stream_id(&args[2]) {
                     Some(StreamIdInput::Min) => StreamId::MIN,
                     Some(StreamIdInput::Explicit(id)) => id,
                     Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, 0),
-                    _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                    _ => {
+                        return CommandResponse::error(
+                            "ERR Invalid stream ID specified as stream command argument",
+                        )
+                    }
                 };
                 let mut count = None;
                 if args.len() >= 5 {
                     let opt = std::str::from_utf8(&args[3]).unwrap_or("").to_uppercase();
                     if opt == "COUNT" {
-                        count = args.get(4).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok());
+                        count = args
+                            .get(4)
+                            .and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok());
                     }
                 }
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.stream_xrevrange(&key, end, start, count)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.stream_xrevrange(&key, end, start, count))
             }
             "XREAD" => {
                 // XREAD [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]
@@ -2362,7 +2785,9 @@ impl CommandEngine {
                     match opt.as_str() {
                         "COUNT" => {
                             i += 1;
-                            count = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok());
+                            count = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok());
                             i += 1;
                         }
                         "BLOCK" => {
@@ -2381,7 +2806,7 @@ impl CommandEngine {
 
                 // Remaining args: keys... ids... (equal count)
                 let remaining = &args[i..];
-                if remaining.is_empty() || remaining.len() % 2 != 0 {
+                if remaining.is_empty() || !remaining.len().is_multiple_of(2) {
                     return CommandResponse::syntax_error();
                 }
                 let half = remaining.len() / 2;
@@ -2392,22 +2817,26 @@ impl CommandEngine {
                 let mut results = Vec::new();
                 for (idx, key) in keys.iter().enumerate() {
                     let id_arg = &ids[idx];
-                    let last_id = if std::str::from_utf8(id_arg).unwrap_or("") == "$" {
-                        // "$" means: only new entries from now; since we don't block, return nil
-                        continue;
-                    } else {
-                        match parse_stream_id(id_arg) {
-                            Some(StreamIdInput::Explicit(id)) => id,
-                            Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, 0),
-                            Some(StreamIdInput::Min) => StreamId::MIN,
-                            _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
-                        }
-                    };
+                    let last_id =
+                        if std::str::from_utf8(id_arg).unwrap_or("") == "$" {
+                            // "$" means: only new entries from now; since we don't block, return nil
+                            continue;
+                        } else {
+                            match parse_stream_id(id_arg) {
+                                Some(StreamIdInput::Explicit(id)) => id,
+                                Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, 0),
+                                Some(StreamIdInput::Min) => StreamId::MIN,
+                                _ => return CommandResponse::error(
+                                    "ERR Invalid stream ID specified as stream command argument",
+                                ),
+                            }
+                        };
 
                     let k = key.clone();
-                    let resp = self.shards.shard_for_key(&k).execute(move |store| {
-                        store.stream_xread_single(&k, last_id, count)
-                    });
+                    let resp = self
+                        .shards
+                        .shard_for_key(&k)
+                        .execute(move |store| store.stream_xread_single(&k, last_id, count));
 
                     if !matches!(resp, CommandResponse::Nil) {
                         results.push(CommandResponse::array(vec![
@@ -2434,12 +2863,16 @@ impl CommandEngine {
                     match parse_stream_id(arg) {
                         Some(StreamIdInput::Explicit(id)) => ids.push(id),
                         Some(StreamIdInput::Partial(ms)) => ids.push(StreamId::new(ms, 0)),
-                        _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                        _ => {
+                            return CommandResponse::error(
+                                "ERR Invalid stream ID specified as stream command argument",
+                            )
+                        }
                     }
                 }
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.stream_xdel(&key, &ids)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.stream_xdel(&key, &ids))
             }
             "XTRIM" => {
                 // XTRIM key MAXLEN|MINID [=|~] N
@@ -2453,9 +2886,9 @@ impl CommandEngine {
                     Ok(None) => return CommandResponse::syntax_error(),
                     Err(e) => return e,
                 };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.stream_xtrim(&key, trim)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.stream_xtrim(&key, trim))
             }
             "XINFO" => {
                 // XINFO STREAM key
@@ -2466,9 +2899,9 @@ impl CommandEngine {
                 match sub.as_str() {
                     "STREAM" => {
                         let key = args[1].clone();
-                        self.shards.shard_for_key(&key).execute(move |store| {
-                            store.stream_xinfo(&key)
-                        })
+                        self.shards
+                            .shard_for_key(&key)
+                            .execute(move |store| store.stream_xinfo(&key))
                     }
                     _ => CommandResponse::error(format!("ERR Unknown XINFO subcommand '{}'", sub)),
                 }
@@ -2492,11 +2925,16 @@ impl CommandEngine {
                         } else {
                             match StreamId::parse(id_str) {
                                 Some(id) => id,
-                                None => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                                None => return CommandResponse::error(
+                                    "ERR Invalid stream ID specified as stream command argument",
+                                ),
                             }
                         };
-                        let mkstream = args.get(4)
-                            .map(|a| std::str::from_utf8(a).unwrap_or("").to_uppercase() == "MKSTREAM")
+                        let mkstream = args
+                            .get(4)
+                            .map(|a| {
+                                std::str::from_utf8(a).unwrap_or("").to_uppercase() == "MKSTREAM"
+                            })
                             .unwrap_or(false);
                         self.shards.shard_for_key(&key).execute(move |store| {
                             store.stream_xgroup_create(&key, group, id, mkstream)
@@ -2508,9 +2946,9 @@ impl CommandEngine {
                         }
                         let key = args[1].clone();
                         let group = args[2].clone();
-                        self.shards.shard_for_key(&key).execute(move |store| {
-                            store.stream_xgroup_destroy(&key, &group)
-                        })
+                        self.shards
+                            .shard_for_key(&key)
+                            .execute(move |store| store.stream_xgroup_destroy(&key, &group))
                     }
                     "DELCONSUMER" => {
                         if args.len() < 4 {
@@ -2550,7 +2988,9 @@ impl CommandEngine {
                     match opt.as_str() {
                         "COUNT" => {
                             i += 1;
-                            count = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok());
+                            count = args
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok());
                             i += 1;
                         }
                         "BLOCK" => {
@@ -2565,7 +3005,7 @@ impl CommandEngine {
                 }
 
                 let remaining = &args[i..];
-                if remaining.is_empty() || remaining.len() % 2 != 0 {
+                if remaining.is_empty() || !remaining.len().is_multiple_of(2) {
                     return CommandResponse::syntax_error();
                 }
                 let half = remaining.len() / 2;
@@ -2576,14 +3016,17 @@ impl CommandEngine {
                 for (idx, key) in keys.iter().enumerate() {
                     let id_arg = &ids[idx];
                     let id_str = std::str::from_utf8(id_arg).unwrap_or(">");
-                    let id_input = if id_str == ">" {
-                        StreamIdInput::Max
-                    } else {
-                        match parse_stream_id(id_arg) {
-                            Some(id) => id,
-                            None => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
-                        }
-                    };
+                    let id_input =
+                        if id_str == ">" {
+                            StreamIdInput::Max
+                        } else {
+                            match parse_stream_id(id_arg) {
+                                Some(id) => id,
+                                None => return CommandResponse::error(
+                                    "ERR Invalid stream ID specified as stream command argument",
+                                ),
+                            }
+                        };
 
                     let k = key.clone();
                     let g = group.clone();
@@ -2618,12 +3061,16 @@ impl CommandEngine {
                     match parse_stream_id(arg) {
                         Some(StreamIdInput::Explicit(id)) => ids.push(id),
                         Some(StreamIdInput::Partial(ms)) => ids.push(StreamId::new(ms, 0)),
-                        _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                        _ => {
+                            return CommandResponse::error(
+                                "ERR Invalid stream ID specified as stream command argument",
+                            )
+                        }
                     }
                 }
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.stream_xack(&key, &group, &ids)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.stream_xack(&key, &group, &ids))
             }
             "XPENDING" => {
                 // XPENDING key group [start end count [consumer]]
@@ -2644,18 +3091,36 @@ impl CommandEngine {
                         Some(StreamIdInput::Min) => StreamId::MIN,
                         Some(StreamIdInput::Explicit(id)) => id,
                         Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, 0),
-                        _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                        _ => {
+                            return CommandResponse::error(
+                                "ERR Invalid stream ID specified as stream command argument",
+                            )
+                        }
                     };
                     let end = match parse_stream_id(&args[3]) {
                         Some(StreamIdInput::Max) => StreamId::MAX,
                         Some(StreamIdInput::Explicit(id)) => id,
                         Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, u64::MAX),
-                        _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                        _ => {
+                            return CommandResponse::error(
+                                "ERR Invalid stream ID specified as stream command argument",
+                            )
+                        }
                     };
-                    let count = std::str::from_utf8(&args[4]).ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
+                    let count = std::str::from_utf8(&args[4])
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(10);
                     let consumer_filter = args.get(5).cloned();
                     self.shards.shard_for_key(&key).execute(move |store| {
-                        store.stream_xpending(&key, &group, Some(start), Some(end), Some(count), consumer_filter.as_ref())
+                        store.stream_xpending(
+                            &key,
+                            &group,
+                            Some(start),
+                            Some(end),
+                            Some(count),
+                            consumer_filter.as_ref(),
+                        )
                     })
                 } else {
                     CommandResponse::syntax_error()
@@ -2680,7 +3145,9 @@ impl CommandEngine {
                 match sub.as_str() {
                     "CHANNELS" => {
                         let channels = self.pubsub.channels();
-                        CommandResponse::array(channels.into_iter().map(CommandResponse::bulk).collect())
+                        CommandResponse::array(
+                            channels.into_iter().map(CommandResponse::bulk).collect(),
+                        )
                     }
                     "NUMSUB" => {
                         let subs = self.pubsub.numsub();
@@ -2747,7 +3214,9 @@ impl CommandEngine {
 
                 match self.get_self_arc() {
                     Some(arc) => crate::lua::execute_script(&arc, script, keys, argv),
-                    None => CommandResponse::error("ERR scripting not initialized (call init_self_ref)"),
+                    None => {
+                        CommandResponse::error("ERR scripting not initialized (call init_self_ref)")
+                    }
                 }
             }
             "EVALSHA" => {
@@ -2762,9 +3231,7 @@ impl CommandEngine {
                 let script = match self.script_cache.get(&sha) {
                     Some(s) => s,
                     None => {
-                        return CommandResponse::error(
-                            "NOSCRIPT No matching script. Use EVAL.",
-                        )
+                        return CommandResponse::error("NOSCRIPT No matching script. Use EVAL.")
                     }
                 };
                 let numkeys: usize = match std::str::from_utf8(&args[1])
@@ -2788,16 +3255,16 @@ impl CommandEngine {
 
                 match self.get_self_arc() {
                     Some(arc) => crate::lua::execute_script(&arc, &script, keys, argv),
-                    None => CommandResponse::error("ERR scripting not initialized (call init_self_ref)"),
+                    None => {
+                        CommandResponse::error("ERR scripting not initialized (call init_self_ref)")
+                    }
                 }
             }
             "SCRIPT" => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("script");
                 }
-                let sub = std::str::from_utf8(&args[0])
-                    .unwrap_or("")
-                    .to_uppercase();
+                let sub = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
                 match sub.as_str() {
                     "LOAD" => {
                         if args.len() != 2 {
@@ -2831,10 +3298,7 @@ impl CommandEngine {
                         self.script_cache.flush();
                         CommandResponse::ok()
                     }
-                    _ => CommandResponse::error(format!(
-                        "ERR Unknown SCRIPT subcommand '{}'",
-                        sub
-                    )),
+                    _ => CommandResponse::error(format!("ERR Unknown SCRIPT subcommand '{}'", sub)),
                 }
             }
 
@@ -2851,9 +3315,9 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let elements: Vec<Bytes> = args[1..].to_vec();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.pfadd(&key, &elements)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.pfadd(&key, &elements))
             }
             "PFCOUNT" => {
                 if args.is_empty() {
@@ -2861,17 +3325,18 @@ impl CommandEngine {
                 }
                 if args.len() == 1 {
                     let key = args[0].clone();
-                    self.shards.shard_for_key(&key).execute(move |store| {
-                        store.pfcount(&[key])
-                    })
+                    self.shards
+                        .shard_for_key(&key)
+                        .execute(move |store| store.pfcount(&[key]))
                 } else {
                     // Multi-key: collect registers from each shard, merge, count
                     let mut merged_registers = vec![0u8; 16384];
                     for key in args {
                         let k = key.clone();
-                        let resp = self.shards.shard_for_key(key).execute(move |store| {
-                            store.pfget_registers(&k)
-                        });
+                        let resp = self
+                            .shards
+                            .shard_for_key(key)
+                            .execute(move |store| store.pfget_registers(&k));
                         match resp {
                             CommandResponse::BulkString(data) => {
                                 for (i, &r) in data.iter().enumerate() {
@@ -2883,7 +3348,9 @@ impl CommandEngine {
                             _ => {}
                         }
                     }
-                    let hll = solikv_core::types::HyperLogLogValue { registers: merged_registers };
+                    let hll = solikv_core::types::HyperLogLogValue {
+                        registers: merged_registers,
+                    };
                     CommandResponse::integer(hll.count() as i64)
                 }
             }
@@ -2914,9 +3381,10 @@ impl CommandEngine {
                 // Merge all source HLLs
                 for src in &args[1..] {
                     let src_key = src.clone();
-                    let resp = self.shards.shard_for_key(src).execute(move |store| {
-                        store.pfget_registers(&src_key)
-                    });
+                    let resp = self
+                        .shards
+                        .shard_for_key(src)
+                        .execute(move |store| store.pfget_registers(&src_key));
                     match resp {
                         CommandResponse::BulkString(data) => {
                             for (i, &r) in data.iter().enumerate() {
@@ -2930,9 +3398,9 @@ impl CommandEngine {
                 }
 
                 // Store merged result in dest's shard
-                self.shards.shard_for_key(&dest).execute(move |store| {
-                    store.pfset_registers(&dest, merged_registers)
-                })
+                self.shards
+                    .shard_for_key(&dest)
+                    .execute(move |store| store.pfset_registers(&dest, merged_registers))
             }
 
             // ---- Bloom Filter commands ----
@@ -2941,17 +3409,23 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("bf.reserve");
                 }
                 let key = args[0].clone();
-                let error_rate = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                let error_rate = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                {
                     Some(r) if r > 0.0 && r < 1.0 => r,
                     _ => return CommandResponse::error("ERR bad error rate value"),
                 };
-                let capacity = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                let capacity = match std::str::from_utf8(&args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     Some(c) if c > 0 => c,
                     _ => return CommandResponse::error("ERR bad capacity value"),
                 };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.bf_reserve(&key, error_rate, capacity)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.bf_reserve(&key, error_rate, capacity))
             }
             "BF.ADD" => {
                 if args.len() != 2 {
@@ -2959,9 +3433,9 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let item = args[1].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.bf_add(&key, &item)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.bf_add(&key, &item))
             }
             "BF.MADD" => {
                 if args.len() < 2 {
@@ -2969,9 +3443,9 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let items: Vec<Bytes> = args[1..].to_vec();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.bf_madd(&key, &items)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.bf_madd(&key, &items))
             }
             "BF.EXISTS" => {
                 if args.len() != 2 {
@@ -2979,9 +3453,9 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let item = args[1].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.bf_exists(&key, &item)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.bf_exists(&key, &item))
             }
             "BF.MEXISTS" => {
                 if args.len() < 2 {
@@ -2989,18 +3463,18 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let items: Vec<Bytes> = args[1..].to_vec();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.bf_mexists(&key, &items)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.bf_mexists(&key, &items))
             }
             "BF.INFO" => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("bf.info");
                 }
                 let key = args[0].clone();
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.bf_info(&key)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.bf_info(&key))
             }
 
             // ---- Bitmap commands ----
@@ -3009,30 +3483,49 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("setbit");
                 }
                 let key = args[0].clone();
-                let offset = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                let offset = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     Some(o) => o,
-                    None => return CommandResponse::error("ERR bit offset is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR bit offset is not an integer or out of range",
+                        )
+                    }
                 };
-                let value = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<u8>().ok()) {
+                let value = match std::str::from_utf8(&args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<u8>().ok())
+                {
                     Some(v) if v <= 1 => v,
-                    _ => return CommandResponse::error("ERR bit is not an integer or out of range"),
+                    _ => {
+                        return CommandResponse::error("ERR bit is not an integer or out of range")
+                    }
                 };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_setbit(&key, offset, value)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_setbit(&key, offset, value))
             }
             "GETBIT" => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("getbit");
                 }
                 let key = args[0].clone();
-                let offset = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                let offset = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     Some(o) => o,
-                    None => return CommandResponse::error("ERR bit offset is not an integer or out of range"),
+                    None => {
+                        return CommandResponse::error(
+                            "ERR bit offset is not an integer or out of range",
+                        )
+                    }
                 };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_getbit(&key, offset)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_getbit(&key, offset))
             }
             "BITCOUNT" => {
                 if args.is_empty() || args.len() == 2 || args.len() > 3 {
@@ -3040,21 +3533,35 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let (start, end) = if args.len() == 3 {
-                    let s = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                    let s = match std::str::from_utf8(&args[1])
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                    {
                         Some(v) => v,
-                        None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                        None => {
+                            return CommandResponse::error(
+                                "ERR value is not an integer or out of range",
+                            )
+                        }
                     };
-                    let e = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                    let e = match std::str::from_utf8(&args[2])
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                    {
                         Some(v) => v,
-                        None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                        None => {
+                            return CommandResponse::error(
+                                "ERR value is not an integer or out of range",
+                            )
+                        }
                     };
                     (Some(s), Some(e))
                 } else {
                     (None, None)
                 };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    store.string_bitcount(&key, start, end)
-                })
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.string_bitcount(&key, start, end))
             }
             "BITOP" => {
                 if args.len() < 3 {
@@ -3067,7 +3574,9 @@ impl CommandEngine {
                 match op.as_str() {
                     "NOT" => {
                         if src_keys.len() != 1 {
-                            return CommandResponse::error("ERR BITOP NOT requires one and only one key");
+                            return CommandResponse::error(
+                                "ERR BITOP NOT requires one and only one key",
+                            );
                         }
                     }
                     "AND" | "OR" | "XOR" => {}
@@ -3078,9 +3587,10 @@ impl CommandEngine {
                 let mut sources: Vec<Vec<u8>> = Vec::with_capacity(src_keys.len());
                 for src_key in src_keys {
                     let k = src_key.clone();
-                    let resp = self.shards.shard_for_key(src_key).execute(move |store| {
-                        store.string_get_raw(&k)
-                    });
+                    let resp = self
+                        .shards
+                        .shard_for_key(src_key)
+                        .execute(move |store| store.string_get_raw(&k));
                     match resp {
                         CommandResponse::BulkString(data) => sources.push(data.to_vec()),
                         CommandResponse::Nil => sources.push(Vec::new()),
@@ -3090,9 +3600,9 @@ impl CommandEngine {
                 }
 
                 // Store result in dest shard
-                self.shards.shard_for_key(&dest).execute(move |store| {
-                    store.string_bitop(dest, &op, &sources)
-                })
+                self.shards
+                    .shard_for_key(&dest)
+                    .execute(move |store| store.string_bitop(dest, &op, &sources))
             }
 
             // ---- Catch-all ----

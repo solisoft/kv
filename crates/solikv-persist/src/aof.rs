@@ -157,11 +157,7 @@ impl AofPersistence {
         let mut reader = BufReader::new(file);
         let mut commands = Vec::new();
 
-        loop {
-            let line = match read_line_crlf(&mut reader) {
-                Ok(l) => l,
-                Err(_) => break,
-            };
+        while let Ok(line) = read_line_crlf(&mut reader) {
             if line.is_empty() {
                 break;
             }

@@ -66,7 +66,9 @@ impl PartialEq for VectorClock {
         if self.clocks.len() != other.clocks.len() {
             return false;
         }
-        self.clocks.iter().all(|(k, v)| other.clocks.get(k) == Some(v))
+        self.clocks
+            .iter()
+            .all(|(k, v)| other.clocks.get(k) == Some(v))
     }
 }
 
