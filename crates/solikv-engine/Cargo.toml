@@ -1,0 +1,19 @@
+[package]
+name = "solikv-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+solikv-core = { workspace = true }
+solikv-pubsub = { workspace = true }
+solikv-persist = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+ordered-float = { workspace = true }
+parking_lot = { workspace = true }
+serde_json = { workspace = true }
+fnv = "1.0"
+glob-match = "0.2"
+
+[dev-dependencies]

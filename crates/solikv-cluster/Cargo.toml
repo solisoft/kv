@@ -1,0 +1,15 @@
+[package]
+name = "solikv-cluster"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+solikv-core = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+crc16 = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]

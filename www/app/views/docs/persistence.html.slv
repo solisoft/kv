@@ -1,0 +1,169 @@
+<div class="space-y-12">
+    <div>
+        <h1 class="text-4xl font-bold mb-4">Persistence</h1>
+        <p class="text-lg text-slate-400">RDB snapshots + AOF append-only file &mdash; Redis-compatible persistence with near-zero overhead</p>
+    </div>
+
+    <!-- Overview -->
+    <div class="p-6 rounded-xl bg-indigo-500/10 border border-indigo-500/30">
+        <p class="text-slate-400">SoliKV supports two complementary persistence mechanisms, matching Redis defaults. AOF is enabled by default with <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">appendfsync everysec</code>, losing at most ~1 second of data on crash. RDB snapshots are saved every 5 minutes as a safety net.</p>
+    </div>
+
+    <!-- How It Works -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-6">How It Works</h2>
+        <div class="grid grid-cols-2 gap-6">
+            <div class="p-6 rounded-xl bg-white/5 border border-white/10">
+                <h3 class="text-lg font-semibold text-emerald-400 mb-3">AOF (Append-Only File)</h3>
+                <ul class="space-y-2 text-sm text-slate-400">
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">1.</span> Every write command is RESP-serialized on the caller thread</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">2.</span> Serialized bytes are sent through a 256K bounded channel (lock-free)</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">3.</span> Background task batch-drains the channel into a 64KB BufWriter</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">4.</span> fsync is called per the configured policy (always/everysec/no)</li>
+                </ul>
+                <div class="mt-4 p-3 rounded-lg bg-slate-900 text-xs font-mono text-slate-500">
+                    File: data/appendonly.aof (RESP format)
+                </div>
+            </div>
+            <div class="p-6 rounded-xl bg-white/5 border border-white/10">
+                <h3 class="text-lg font-semibold text-purple-400 mb-3">RDB (Snapshots)</h3>
+                <ul class="space-y-2 text-sm text-slate-400">
+                    <li class="flex items-start gap-2"><span class="text-purple-400">1.</span> Full point-in-time snapshot of all data per shard</li>
+                    <li class="flex items-start gap-2"><span class="text-purple-400">2.</span> Background task saves every 300 seconds</li>
+                    <li class="flex items-start gap-2"><span class="text-purple-400">3.</span> Atomic write via temp file + rename (crash-safe)</li>
+                    <li class="flex items-start gap-2"><span class="text-purple-400">4.</span> Final snapshot saved on graceful shutdown (CTRL-C)</li>
+                </ul>
+                <div class="mt-4 p-3 rounded-lg bg-slate-900 text-xs font-mono text-slate-500">
+                    Files: data/dump-0.rdb, data/dump-1.rdb, ...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Startup Sequence -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Startup Sequence</h2>
+        <div class="p-6 rounded-xl bg-white/5 border border-white/10">
+            <ol class="space-y-3 text-slate-300">
+                <li class="flex items-start gap-3">
+                    <span class="shrink-0 w-7 h-7 rounded-lg bg-indigo-500/20 flex items-center justify-center text-sm font-bold text-indigo-400">1</span>
+                    <div><strong class="text-white">Load RDB snapshots</strong> &mdash; Each shard's RDB file is loaded to restore the base state</div>
+                </li>
+                <li class="flex items-start gap-3">
+                    <span class="shrink-0 w-7 h-7 rounded-lg bg-indigo-500/20 flex items-center justify-center text-sm font-bold text-indigo-400">2</span>
+                    <div><strong class="text-white">Replay AOF</strong> &mdash; Commands from the AOF are replayed on top of the RDB state to bring data up to date</div>
+                </li>
+                <li class="flex items-start gap-3">
+                    <span class="shrink-0 w-7 h-7 rounded-lg bg-indigo-500/20 flex items-center justify-center text-sm font-bold text-indigo-400">3</span>
+                    <div><strong class="text-white">Open AOF writer</strong> &mdash; New write commands start being logged to the AOF</div>
+                </li>
+                <li class="flex items-start gap-3">
+                    <span class="shrink-0 w-7 h-7 rounded-lg bg-indigo-500/20 flex items-center justify-center text-sm font-bold text-indigo-400">4</span>
+                    <div><strong class="text-white">Start serving</strong> &mdash; RESP and REST servers begin accepting connections</div>
+                </li>
+            </ol>
+        </div>
+    </div>
+
+    <!-- Fsync Policies -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Fsync Policies</h2>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Policy</th><th class="py-3 pr-4 text-slate-400 font-medium">Durability</th><th class="py-3 pr-4 text-slate-400 font-medium">Performance</th><th class="py-3 text-slate-400 font-medium">Use case</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">always</td>
+                        <td class="py-3 pr-4">Every write fsynced</td>
+                        <td class="py-3 pr-4 text-slate-500">Slowest</td>
+                        <td class="py-3 text-slate-500">Maximum durability</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-emerald-400">everysec</td>
+                        <td class="py-3 pr-4">Fsync every 1 second</td>
+                        <td class="py-3 pr-4 text-emerald-400">Near-zero overhead</td>
+                        <td class="py-3 text-slate-500">Default. Lose at most ~1s on crash</td>
+                    </tr>
+                    <tr>
+                        <td class="py-3 pr-4 font-mono text-indigo-400">no</td>
+                        <td class="py-3 pr-4">OS decides when to flush</td>
+                        <td class="py-3 pr-4 text-slate-500">Fastest</td>
+                        <td class="py-3 text-slate-500">Maximum performance, data at risk</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Configuration -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Configuration</h2>
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
+            <div class="flex items-center gap-2 px-4 py-2 bg-white/5 border-b border-white/5">
+                <div class="w-3 h-3 rounded-full bg-red-500/60"></div>
+                <div class="w-3 h-3 rounded-full bg-yellow-500/60"></div>
+                <div class="w-3 h-3 rounded-full bg-green-500/60"></div>
+                <span class="ml-2 text-xs text-slate-500 font-mono">Terminal</span>
+            </div>
+            <div class="p-4 font-mono text-sm">
+                <div class="text-slate-500"># Default: AOF enabled with everysec fsync</div>
+                <div class="text-emerald-400">./solikv</div>
+                <div class="text-slate-500 mt-3"># Custom data directory and fsync policy</div>
+                <div class="text-emerald-400">./solikv --dir /var/data/solikv --appendfsync always</div>
+                <div class="text-slate-500 mt-3"># Disable AOF (RDB snapshots only)</div>
+                <div class="text-emerald-400">./solikv --appendonly false</div>
+                <div class="text-slate-500 mt-3"># Custom RDB filename prefix</div>
+                <div class="text-emerald-400">./solikv --dbfilename mydb</div>
+                <div class="text-slate-500 mt-1"># Creates: data/mydb-0.rdb, data/mydb-1.rdb, ...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Redis Commands -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Persistence Commands</h2>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Syntax</th><th class="py-3 text-slate-400 font-medium">Description</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">SAVE</td><td class="py-3 pr-4 font-mono text-sm">SAVE</td><td class="py-3">Synchronous RDB save (blocks until complete)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">BGSAVE</td><td class="py-3 pr-4 font-mono text-sm">BGSAVE</td><td class="py-3">Background RDB save</td></tr>
+                    <tr><td class="py-3 pr-4 font-mono text-indigo-400">BGREWRITEAOF</td><td class="py-3 pr-4 font-mono text-sm">BGREWRITEAOF</td><td class="py-3">Rewrite AOF from current state (compaction)</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- AOF Performance -->
+    <div class="p-6 rounded-xl bg-emerald-500/10 border border-emerald-500/30">
+        <h2 class="text-xl font-semibold mb-3 text-emerald-400">Lock-Free AOF Performance</h2>
+        <p class="text-slate-400 mb-4">SoliKV's AOF uses a channel-based architecture that eliminates mutex contention on the hot path. Write commands are RESP-serialized on the caller thread and sent through a bounded channel to a dedicated I/O task.</p>
+        <div class="grid grid-cols-3 gap-4">
+            <div class="p-4 rounded-xl bg-slate-900 text-center">
+                <div class="text-lg font-bold text-emerald-400 font-mono">~2-3%</div>
+                <div class="text-xs text-slate-500 mt-1">AOF overhead on writes</div>
+            </div>
+            <div class="p-4 rounded-xl bg-slate-900 text-center">
+                <div class="text-lg font-bold text-emerald-400 font-mono">256K</div>
+                <div class="text-xs text-slate-500 mt-1">channel buffer capacity</div>
+            </div>
+            <div class="p-4 rounded-xl bg-slate-900 text-center">
+                <div class="text-lg font-bold text-emerald-400 font-mono">64KB</div>
+                <div class="text-xs text-slate-500 mt-1">BufWriter buffer size</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- File Layout -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">File Layout</h2>
+        <div class="rounded-xl bg-slate-900 border border-white/10 p-4 font-mono text-sm">
+            <div class="text-slate-500">data/</div>
+            <div class="text-white pl-4">appendonly.aof    <span class="text-slate-600"># AOF log (RESP format)</span></div>
+            <div class="text-white pl-4">dump-0.rdb        <span class="text-slate-600"># RDB snapshot for shard 0</span></div>
+            <div class="text-white pl-4">dump-1.rdb        <span class="text-slate-600"># RDB snapshot for shard 1</span></div>
+            <div class="text-white pl-4">dump-2.rdb        <span class="text-slate-600"># RDB snapshot for shard 2</span></div>
+            <div class="text-white pl-4">...               <span class="text-slate-600"># One per shard (auto-detected from --shards)</span></div>
+        </div>
+    </div>
+</div>

@@ -1,0 +1,559 @@
+<div class="space-y-16">
+    <div>
+        <h1 class="text-4xl font-bold mb-4">Command Reference</h1>
+        <p class="text-lg text-slate-400">Complete reference for all 92 Redis-compatible commands</p>
+    </div>
+
+    <!-- Quick Navigation -->
+    <div class="p-6 rounded-xl bg-slate-900 border border-white/10">
+        <div class="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">Jump to</div>
+        <div class="flex flex-wrap gap-2">
+            <a href="#strings" class="px-3 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 text-sm hover:bg-emerald-500/20 transition-colors">Strings (16)</a>
+            <a href="#lists" class="px-3 py-1.5 rounded-lg bg-cyan-500/10 text-cyan-400 text-sm hover:bg-cyan-500/20 transition-colors">Lists (13)</a>
+            <a href="#hashes" class="px-3 py-1.5 rounded-lg bg-purple-500/10 text-purple-400 text-sm hover:bg-purple-500/20 transition-colors">Hashes (11)</a>
+            <a href="#sets" class="px-3 py-1.5 rounded-lg bg-pink-500/10 text-pink-400 text-sm hover:bg-pink-500/20 transition-colors">Sets (10)</a>
+            <a href="#sorted-sets" class="px-3 py-1.5 rounded-lg bg-orange-500/10 text-orange-400 text-sm hover:bg-orange-500/20 transition-colors">Sorted Sets (12)</a>
+            <a href="#keys" class="px-3 py-1.5 rounded-lg bg-yellow-500/10 text-yellow-400 text-sm hover:bg-yellow-500/20 transition-colors">Keys (11)</a>
+            <a href="#transactions" class="px-3 py-1.5 rounded-lg bg-red-500/10 text-red-400 text-sm hover:bg-red-500/20 transition-colors">Transactions (3)</a>
+            <a href="#pubsub" class="px-3 py-1.5 rounded-lg bg-teal-500/10 text-teal-400 text-sm hover:bg-teal-500/20 transition-colors">Pub/Sub (5)</a>
+            <a href="#server" class="px-3 py-1.5 rounded-lg bg-slate-500/10 text-slate-400 text-sm hover:bg-slate-500/20 transition-colors">Server (11)</a>
+        </div>
+    </div>
+
+    <!-- ==================== STRINGS ==================== -->
+    <div id="strings">
+        <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-emerald-500/20 flex items-center justify-center text-lg font-bold text-emerald-400">S</span>
+            Strings
+        </h2>
+
+        <!-- SET -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-emerald-400">SET</h3>
+            <div class="text-sm text-slate-400 mb-3">Set a key to a string value with optional flags and expiry.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SET key value [NX|XX] [GET] [EX seconds | PX milliseconds]</div>
+            <div class="text-xs text-slate-500 mb-3">
+                <span class="text-slate-400">NX</span> &mdash; only set if key does not exist.
+                <span class="text-slate-400">XX</span> &mdash; only set if key exists.
+                <span class="text-slate-400">GET</span> &mdash; return the old value.
+                <span class="text-slate-400">EX/PX</span> &mdash; set TTL in seconds/milliseconds.
+            </div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET mykey hello</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET mykey world NX</span></div>
+                <div class="text-white">(nil)</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET session token123 EX 3600</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET mykey newval GET</span></div>
+                <div class="text-white">"hello"</div>
+            </div>
+        </div>
+
+        <!-- GET -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-emerald-400">GET</h3>
+            <div class="text-sm text-slate-400 mb-3">Get the value of a key. Returns nil if the key does not exist.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">GET key</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET greeting "hello world"</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GET greeting</span></div>
+                <div class="text-white">"hello world"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GET nonexistent</span></div>
+                <div class="text-white">(nil)</div>
+            </div>
+        </div>
+
+        <!-- SETNX -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-emerald-400">SETNX</h3>
+            <div class="text-sm text-slate-400 mb-3">Set key only if it does not exist. Returns 1 if set, 0 if key already existed.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SETNX key value</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SETNX lock owner1</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SETNX lock owner2</span></div>
+                <div class="text-white">(integer) 0</div>
+            </div>
+        </div>
+
+        <!-- SETEX / PSETEX -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-emerald-400">SETEX / PSETEX</h3>
+            <div class="text-sm text-slate-400 mb-3">Set key with an expiry. SETEX uses seconds, PSETEX uses milliseconds.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SETEX key seconds value<br>PSETEX key milliseconds value</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SETEX cache:page 60 "&lt;html&gt;..."</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">TTL cache:page</span></div>
+                <div class="text-white">(integer) 60</div>
+            </div>
+        </div>
+
+        <!-- GETSET -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-emerald-400">GETSET</h3>
+            <div class="text-sm text-slate-400 mb-3">Atomically set a new value and return the old value.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">GETSET key value</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET counter 10</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GETSET counter 0</span></div>
+                <div class="text-white">"10"</div>
+            </div>
+        </div>
+
+        <!-- MSET / MSETNX / MGET -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-emerald-400">MSET / MSETNX / MGET</h3>
+            <div class="text-sm text-slate-400 mb-3">Multi-key operations. MSET sets multiple keys atomically. MSETNX only if none exist. MGET returns multiple values.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">MSET key value [key value ...]<br>MSETNX key value [key value ...]<br>MGET key [key ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">MSET a 1 b 2 c 3</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">MGET a b c</span></div>
+                <div class="text-white">1) "1"</div>
+                <div class="text-white">2) "2"</div>
+                <div class="text-white">3) "3"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">MSETNX x 10 y 20 a 99</span></div>
+                <div class="text-white">(integer) 0</div>
+                <div class="text-slate-600 text-xs mt-1"># Failed because 'a' already exists</div>
+            </div>
+        </div>
+
+        <!-- APPEND / STRLEN -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-emerald-400">APPEND / STRLEN</h3>
+            <div class="text-sm text-slate-400 mb-3">APPEND adds to the end of a string. STRLEN returns the length.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">APPEND key value<br>STRLEN key</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET msg "hello"</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">APPEND msg " world"</span></div>
+                <div class="text-white">(integer) 11</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">STRLEN msg</span></div>
+                <div class="text-white">(integer) 11</div>
+            </div>
+        </div>
+
+        <!-- INCR / DECR / INCRBY / DECRBY / INCRBYFLOAT -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-emerald-400">INCR / DECR / INCRBY / DECRBY / INCRBYFLOAT</h3>
+            <div class="text-sm text-slate-400 mb-3">Atomic numeric operations. Auto-creates key with value 0 if it doesn't exist.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">INCR key<br>DECR key<br>INCRBY key amount<br>DECRBY key amount<br>INCRBYFLOAT key amount</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">INCR views</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">INCRBY views 100</span></div>
+                <div class="text-white">(integer) 101</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">DECRBY views 50</span></div>
+                <div class="text-white">(integer) 51</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET price 10.50</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">INCRBYFLOAT price 2.75</span></div>
+                <div class="text-white">"13.25"</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== LISTS ==================== -->
+    <div id="lists">
+        <h2 class="text-3xl font-bold mb-2 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-cyan-500/20 flex items-center justify-center text-lg font-bold text-cyan-400">L</span>
+            Lists
+        </h2>
+        <p class="text-sm text-slate-500 mb-8">Backed by a VecDeque &mdash; O(1) push/pop at both ends, O(1) random access.</p>
+
+        <!-- LPUSH / RPUSH -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-cyan-400">LPUSH / RPUSH</h3>
+            <div class="text-sm text-slate-400 mb-3">Push elements to the head (LPUSH) or tail (RPUSH) of a list. Creates the list if it doesn't exist. Returns the new length.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">LPUSH key value [value ...]<br>RPUSH key value [value ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPUSH queue job1 job2 job3</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LPUSH queue urgent</span></div>
+                <div class="text-white">(integer) 4</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LRANGE queue 0 -1</span></div>
+                <div class="text-white">1) "urgent"</div>
+                <div class="text-white">2) "job1"</div>
+                <div class="text-white">3) "job2"</div>
+                <div class="text-white">4) "job3"</div>
+            </div>
+        </div>
+
+        <!-- LPOP / RPOP -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-cyan-400">LPOP / RPOP</h3>
+            <div class="text-sm text-slate-400 mb-3">Remove and return an element from the head (LPOP) or tail (RPOP). Returns nil if empty.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">LPOP key<br>RPOP key</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPUSH tasks a b c</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LPOP tasks</span></div>
+                <div class="text-white">"a"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPOP tasks</span></div>
+                <div class="text-white">"c"</div>
+            </div>
+        </div>
+
+        <!-- LLEN / LRANGE / LINDEX / LSET -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-cyan-400">LLEN / LRANGE / LINDEX / LSET</h3>
+            <div class="text-sm text-slate-400 mb-3">Query and modify list elements. Negative indices count from the tail (-1 is last).</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">LLEN key<br>LRANGE key start stop<br>LINDEX key index<br>LSET key index value</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPUSH colors red green blue</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LLEN colors</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LINDEX colors -1</span></div>
+                <div class="text-white">"blue"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LSET colors 1 yellow</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LRANGE colors 0 -1</span></div>
+                <div class="text-white">1) "red"</div>
+                <div class="text-white">2) "yellow"</div>
+                <div class="text-white">3) "blue"</div>
+            </div>
+        </div>
+
+        <!-- LREM / LTRIM / LINSERT / LPOS / RPOPLPUSH -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-cyan-400">LREM / LTRIM / LINSERT / LPOS / RPOPLPUSH</h3>
+            <div class="text-sm text-slate-400 mb-3">Advanced list manipulation.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">LREM key count value<br>LTRIM key start stop<br>LINSERT key BEFORE|AFTER pivot value<br>LPOS key value<br>RPOPLPUSH source destination</div>
+            <div class="text-xs text-slate-500 mb-3">
+                <span class="text-slate-400">LREM count&gt;0</span> &mdash; remove first N from head.
+                <span class="text-slate-400">count&lt;0</span> &mdash; remove first N from tail.
+                <span class="text-slate-400">count=0</span> &mdash; remove all.
+            </div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPUSH mylist a b c b d</span></div>
+                <div class="text-white">(integer) 5</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LREM mylist 1 b</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LPOS mylist d</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LINSERT mylist BEFORE c X</span></div>
+                <div class="text-white">(integer) 5</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPOPLPUSH mylist other</span></div>
+                <div class="text-white">"d"</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== HASHES ==================== -->
+    <div id="hashes">
+        <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-purple-500/20 flex items-center justify-center text-lg font-bold text-purple-400">H</span>
+            Hashes
+        </h2>
+
+        <!-- HSET / HGET / HDEL / HEXISTS -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-purple-400">HSET / HGET / HDEL / HEXISTS</h3>
+            <div class="text-sm text-slate-400 mb-3">Basic hash field operations. HSET can set multiple fields at once.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">HSET key field value [field value ...]<br>HGET key field<br>HDEL key field [field ...]<br>HEXISTS key field</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HSET user:1 name Alice age 30 city NYC</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HGET user:1 name</span></div>
+                <div class="text-white">"Alice"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HEXISTS user:1 age</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HDEL user:1 city</span></div>
+                <div class="text-white">(integer) 1</div>
+            </div>
+        </div>
+
+        <!-- HGETALL / HKEYS / HVALS / HLEN / HMSET / HMGET / HINCRBY -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-purple-400">HGETALL / HKEYS / HVALS / HLEN / HMSET / HMGET / HINCRBY</h3>
+            <div class="text-sm text-slate-400 mb-3">Bulk hash operations and introspection.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">HGETALL key<br>HKEYS key<br>HVALS key<br>HLEN key<br>HMSET key field val [field val ...]<br>HMGET key field [field ...]<br>HINCRBY key field amount</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HGETALL user:1</span></div>
+                <div class="text-white">1) "name"</div>
+                <div class="text-white">2) "Alice"</div>
+                <div class="text-white">3) "age"</div>
+                <div class="text-white">4) "30"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HKEYS user:1</span></div>
+                <div class="text-white">1) "name"</div>
+                <div class="text-white">2) "age"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HINCRBY user:1 age 1</span></div>
+                <div class="text-white">(integer) 31</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HMGET user:1 name age email</span></div>
+                <div class="text-white">1) "Alice"</div>
+                <div class="text-white">2) "31"</div>
+                <div class="text-white">3) (nil)</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== SETS ==================== -->
+    <div id="sets">
+        <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-pink-500/20 flex items-center justify-center text-lg font-bold text-pink-400">S</span>
+            Sets
+        </h2>
+
+        <!-- SADD / SREM / SMEMBERS / SISMEMBER / SCARD -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-pink-400">SADD / SREM / SMEMBERS / SISMEMBER / SCARD</h3>
+            <div class="text-sm text-slate-400 mb-3">Basic set operations.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SADD key member [member ...]<br>SREM key member [member ...]<br>SMEMBERS key<br>SISMEMBER key member<br>SCARD key</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SADD tags redis nosql fast</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SISMEMBER tags redis</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SCARD tags</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SMEMBERS tags</span></div>
+                <div class="text-white">1) "fast"</div>
+                <div class="text-white">2) "nosql"</div>
+                <div class="text-white">3) "redis"</div>
+            </div>
+        </div>
+
+        <!-- SPOP / SRANDMEMBER / SUNION / SINTER / SDIFF -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-pink-400">SPOP / SRANDMEMBER / SUNION / SINTER / SDIFF</h3>
+            <div class="text-sm text-slate-400 mb-3">Random access and set algebra.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SPOP key [count]<br>SRANDMEMBER key [count]<br>SUNION key [key ...]<br>SINTER key [key ...]<br>SDIFF key [key ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SADD s1 a b c d</span></div>
+                <div class="text-white">(integer) 4</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SADD s2 c d e f</span></div>
+                <div class="text-white">(integer) 4</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SINTER s1 s2</span></div>
+                <div class="text-white">1) "c"</div>
+                <div class="text-white">2) "d"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SDIFF s1 s2</span></div>
+                <div class="text-white">1) "a"</div>
+                <div class="text-white">2) "b"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SPOP s1</span></div>
+                <div class="text-white">"b"</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== SORTED SETS ==================== -->
+    <div id="sorted-sets">
+        <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-orange-500/20 flex items-center justify-center text-lg font-bold text-orange-400">Z</span>
+            Sorted Sets
+        </h2>
+
+        <!-- ZADD / ZREM / ZSCORE / ZRANK / ZREVRANK -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-orange-400">ZADD / ZREM / ZSCORE / ZRANK / ZREVRANK</h3>
+            <div class="text-sm text-slate-400 mb-3">Add scored members and query individual scores/ranks.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">ZADD key [NX|XX] [GT|LT] score member [score member ...]<br>ZREM key member [member ...]<br>ZSCORE key member<br>ZRANK key member<br>ZREVRANK key member</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZADD leaderboard 100 alice 200 bob 150 charlie</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZSCORE leaderboard bob</span></div>
+                <div class="text-white">"200"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZRANK leaderboard alice</span></div>
+                <div class="text-white">(integer) 0</div>
+                <div class="text-slate-600 text-xs mt-1"># alice has the lowest score, so rank 0</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZREVRANK leaderboard alice</span></div>
+                <div class="text-white">(integer) 2</div>
+                <div class="text-slate-600 text-xs"># alice is last when sorted high-to-low</div>
+            </div>
+        </div>
+
+        <!-- ZRANGE / ZREVRANGE / ZRANGEBYSCORE -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-orange-400">ZRANGE / ZREVRANGE / ZRANGEBYSCORE</h3>
+            <div class="text-sm text-slate-400 mb-3">Range queries by rank or score. Use WITHSCORES to include scores. Use -inf/+inf for open ranges.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">ZRANGE key start stop [WITHSCORES]<br>ZREVRANGE key start stop [WITHSCORES]<br>ZRANGEBYSCORE key min max [LIMIT offset count]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZRANGE leaderboard 0 -1 WITHSCORES</span></div>
+                <div class="text-white">1) "alice"</div>
+                <div class="text-white">2) "100"</div>
+                <div class="text-white">3) "charlie"</div>
+                <div class="text-white">4) "150"</div>
+                <div class="text-white">5) "bob"</div>
+                <div class="text-white">6) "200"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZRANGEBYSCORE leaderboard 100 160</span></div>
+                <div class="text-white">1) "alice"</div>
+                <div class="text-white">2) "charlie"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZREVRANGE leaderboard 0 0 WITHSCORES</span></div>
+                <div class="text-white">1) "bob"</div>
+                <div class="text-white">2) "200"</div>
+                <div class="text-slate-600 text-xs mt-1"># Top scorer</div>
+            </div>
+        </div>
+
+        <!-- ZCARD / ZCOUNT / ZINCRBY / ZREMRANGEBYSCORE -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-orange-400">ZCARD / ZCOUNT / ZINCRBY / ZREMRANGEBYSCORE</h3>
+            <div class="text-sm text-slate-400 mb-3">Counting, incrementing, and bulk removal.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">ZCARD key<br>ZCOUNT key min max<br>ZINCRBY key increment member<br>ZREMRANGEBYSCORE key min max</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZCARD leaderboard</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZCOUNT leaderboard 100 200</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZINCRBY leaderboard 50 alice</span></div>
+                <div class="text-white">"150"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZREMRANGEBYSCORE leaderboard -inf 100</span></div>
+                <div class="text-white">(integer) 0</div>
+                <div class="text-slate-600 text-xs"># No members with score &lt;= 100 after ZINCRBY</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== KEYS ==================== -->
+    <div id="keys">
+        <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-yellow-500/20 flex items-center justify-center text-lg font-bold text-yellow-400">K</span>
+            Keys
+        </h2>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-yellow-400">DEL / EXISTS / TYPE / RENAME / RENAMENX</h3>
+            <div class="text-sm text-slate-400 mb-3">Key management. These work across all data types.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">DEL key [key ...]<br>EXISTS key [key ...]<br>TYPE key<br>RENAME key newkey<br>RENAMENX key newkey</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET foo bar</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">TYPE foo</span></div>
+                <div class="text-white">string</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">EXISTS foo</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RENAME foo baz</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">DEL baz</span></div>
+                <div class="text-white">(integer) 1</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-yellow-400">EXPIRE / PEXPIRE / TTL / PTTL / PERSIST / KEYS</h3>
+            <div class="text-sm text-slate-400 mb-3">TTL management and key search. EXPIRE sets TTL in seconds, PEXPIRE in milliseconds. PERSIST removes TTL.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">EXPIRE key seconds<br>PEXPIRE key milliseconds<br>TTL key<br>PTTL key<br>PERSIST key<br>KEYS pattern</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET temp hello</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">EXPIRE temp 30</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">TTL temp</span></div>
+                <div class="text-white">(integer) 30</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">PERSIST temp</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">KEYS user:*</span></div>
+                <div class="text-white">1) "user:1"</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== TRANSACTIONS ==================== -->
+    <div id="transactions">
+        <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-red-500/20 flex items-center justify-center text-lg font-bold text-red-400">T</span>
+            Transactions
+        </h2>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-red-400">MULTI / EXEC / DISCARD</h3>
+            <div class="text-sm text-slate-400 mb-3">Queue commands with MULTI, then execute atomically with EXEC. All commands between MULTI and EXEC run under a single write lock. DISCARD aborts the transaction.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">MULTI<br>EXEC<br>DISCARD</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">MULTI</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET account:1:balance 500</span></div>
+                <div class="text-white">QUEUED</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET account:2:balance 1500</span></div>
+                <div class="text-white">QUEUED</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">EXEC</span></div>
+                <div class="text-white">1) OK</div>
+                <div class="text-white">2) OK</div>
+                <div class="mt-2"><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">MULTI</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET x 1</span></div>
+                <div class="text-white">QUEUED</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">DISCARD</span></div>
+                <div class="text-white">OK</div>
+                <div class="text-slate-600 text-xs mt-1"># Transaction aborted, x was not set</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== PUB/SUB ==================== -->
+    <div id="pubsub">
+        <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-teal-500/20 flex items-center justify-center text-lg font-bold text-teal-400">P</span>
+            Pub/Sub
+        </h2>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-teal-400">SUBSCRIBE / UNSUBSCRIBE / PUBLISH / PSUBSCRIBE / PUNSUBSCRIBE</h3>
+            <div class="text-sm text-slate-400 mb-3">Publish-subscribe messaging. Subscribers receive messages in real-time. PSUBSCRIBE supports glob patterns. Uses a separate mutex &mdash; does not contend with data operations.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SUBSCRIBE channel [channel ...]<br>UNSUBSCRIBE [channel ...]<br>PUBLISH channel message<br>PSUBSCRIBE pattern [pattern ...]<br>PUNSUBSCRIBE [pattern ...]</div>
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <div class="text-xs text-slate-500 uppercase mb-2">Terminal 1 (subscriber)</div>
+                    <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                        <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SUBSCRIBE news</span></div>
+                        <div class="text-white">1) "subscribe"</div>
+                        <div class="text-white">2) "news"</div>
+                        <div class="text-white">3) (integer) 1</div>
+                        <div class="text-slate-600 text-xs mt-1"># Waiting for messages...</div>
+                        <div class="text-white mt-2">1) "message"</div>
+                        <div class="text-white">2) "news"</div>
+                        <div class="text-white">3) "breaking: SoliKV released"</div>
+                    </div>
+                </div>
+                <div>
+                    <div class="text-xs text-slate-500 uppercase mb-2">Terminal 2 (publisher)</div>
+                    <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                        <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">PUBLISH news "breaking: SoliKV released"</span></div>
+                        <div class="text-white">(integer) 1</div>
+                        <div class="text-slate-600 text-xs mt-1"># 1 subscriber received it</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== SERVER ==================== -->
+    <div id="server">
+        <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-slate-500/20 flex items-center justify-center text-lg font-bold text-slate-400">*</span>
+            Server
+        </h2>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-slate-400">PING / ECHO / QUIT / SELECT / DBSIZE / FLUSHDB / FLUSHALL / INFO / COMMAND / CONFIG / TIME</h3>
+            <div class="text-sm text-slate-400 mb-3">Server management and diagnostics.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">PING [message]<br>ECHO message<br>QUIT<br>SELECT db (0-15)<br>DBSIZE<br>FLUSHDB<br>FLUSHALL<br>INFO [section]<br>COMMAND [DOCS|COUNT]<br>CONFIG GET pattern<br>TIME</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">PING</span></div>
+                <div class="text-white">PONG</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">PING "hello"</span></div>
+                <div class="text-white">"hello"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ECHO "test"</span></div>
+                <div class="text-white">"test"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SELECT 1</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">DBSIZE</span></div>
+                <div class="text-white">(integer) 0</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">TIME</span></div>
+                <div class="text-white">1) "1708790400"</div>
+                <div class="text-white">2) "123456"</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- WRONGTYPE note -->
+    <div class="p-6 rounded-xl bg-red-500/10 border border-red-500/30">
+        <h2 class="text-xl font-semibold mb-2 text-red-400">Type Safety</h2>
+        <p class="text-slate-400">All typed commands check the key type first. Using a list command on a string key (or vice versa) returns:</p>
+        <div class="font-mono text-sm text-red-400 bg-slate-900 rounded-lg px-4 py-2 mt-3">-WRONGTYPE Operation against a key holding the wrong kind of value</div>
+    </div>
+</div>

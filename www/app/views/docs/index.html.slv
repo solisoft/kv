@@ -1,0 +1,119 @@
+<div class="space-y-12">
+    <!-- Hero -->
+    <div>
+        <h1 class="text-4xl font-bold tracking-tight mb-4">SoliKV Documentation</h1>
+        <p class="text-lg text-zinc-400 max-w-2xl leading-relaxed">
+            High-performance key-value store with full Redis compatibility &mdash;
+            92 commands, 5 data types, transactions, pub/sub, persistence, clustering, and sub-millisecond latency. Written in Rust.
+        </p>
+    </div>
+
+    <!-- Stats -->
+    <div class="grid grid-cols-4 gap-3">
+        <div class="p-5 rounded-lg bg-zinc-900 border border-zinc-800">
+            <div class="text-2xl font-bold font-mono text-teal-400">1.81M</div>
+            <div class="text-xs text-zinc-500 mt-1">pipelined SET/s</div>
+        </div>
+        <div class="p-5 rounded-lg bg-zinc-900 border border-zinc-800">
+            <div class="text-2xl font-bold font-mono text-teal-400">125K</div>
+            <div class="text-xs text-zinc-500 mt-1">req/s (standard)</div>
+        </div>
+        <div class="p-5 rounded-lg bg-zinc-900 border border-zinc-800">
+            <div class="text-2xl font-bold font-mono text-amber-400">92</div>
+            <div class="text-xs text-zinc-500 mt-1">Redis commands</div>
+        </div>
+        <div class="p-5 rounded-lg bg-zinc-900 border border-zinc-800">
+            <div class="text-2xl font-bold font-mono text-amber-400">AOF+RDB</div>
+            <div class="text-xs text-zinc-500 mt-1">persistence</div>
+        </div>
+    </div>
+
+    <!-- Features -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-6 tracking-tight">Features</h2>
+        <div class="grid grid-cols-2 gap-px bg-zinc-800/50 rounded-xl overflow-hidden border border-zinc-800/50">
+            <div class="bg-zinc-950 p-5 hover:bg-zinc-900/50 transition-colors">
+                <div class="flex items-center gap-3 mb-2">
+                    <div class="w-8 h-8 rounded-lg bg-teal-500/10 border border-teal-500/20 flex items-center justify-center">
+                        <svg class="w-4 h-4 text-teal-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+                    </div>
+                    <h3 class="font-semibold">5 Data Types</h3>
+                </div>
+                <p class="text-sm text-zinc-500">Strings, Lists, Hashes, Sets, Sorted Sets &mdash; full Redis data model with RESP2 protocol</p>
+            </div>
+            <div class="bg-zinc-950 p-5 hover:bg-zinc-900/50 transition-colors">
+                <div class="flex items-center gap-3 mb-2">
+                    <div class="w-8 h-8 rounded-lg bg-teal-500/10 border border-teal-500/20 flex items-center justify-center">
+                        <svg class="w-4 h-4 text-teal-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                    </div>
+                    <h3 class="font-semibold">Faster than Redis</h3>
+                </div>
+                <p class="text-sm text-zinc-500">Beats Redis 7.0 on every benchmark. 9% faster on pipelined SET even with AOF persistence.</p>
+            </div>
+            <div class="bg-zinc-950 p-5 hover:bg-zinc-900/50 transition-colors">
+                <div class="flex items-center gap-3 mb-2">
+                    <div class="w-8 h-8 rounded-lg bg-teal-500/10 border border-teal-500/20 flex items-center justify-center">
+                        <svg class="w-4 h-4 text-teal-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" /></svg>
+                    </div>
+                    <h3 class="font-semibold">Persistence</h3>
+                </div>
+                <p class="text-sm text-zinc-500">RDB snapshots + AOF with lock-free channel-based writer. Near-zero overhead.</p>
+            </div>
+            <div class="bg-zinc-950 p-5 hover:bg-zinc-900/50 transition-colors">
+                <div class="flex items-center gap-3 mb-2">
+                    <div class="w-8 h-8 rounded-lg bg-amber-500/10 border border-amber-500/20 flex items-center justify-center">
+                        <svg class="w-4 h-4 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+                    </div>
+                    <h3 class="font-semibold">Clustering</h3>
+                </div>
+                <p class="text-sm text-zinc-500">Peer-to-peer distributed architecture with CRC16 sharding across 16384 hash slots</p>
+            </div>
+            <div class="bg-zinc-950 p-5 hover:bg-zinc-900/50 transition-colors">
+                <div class="flex items-center gap-3 mb-2">
+                    <div class="w-8 h-8 rounded-lg bg-amber-500/10 border border-amber-500/20 flex items-center justify-center">
+                        <svg class="w-4 h-4 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
+                    </div>
+                    <h3 class="font-semibold">Pub/Sub &amp; Transactions</h3>
+                </div>
+                <p class="text-sm text-zinc-500">SUBSCRIBE/PUBLISH messaging and MULTI/EXEC atomic transactions</p>
+            </div>
+            <div class="bg-zinc-950 p-5 hover:bg-zinc-900/50 transition-colors">
+                <div class="flex items-center gap-3 mb-2">
+                    <div class="w-8 h-8 rounded-lg bg-amber-500/10 border border-amber-500/20 flex items-center justify-center">
+                        <svg class="w-4 h-4 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" /></svg>
+                    </div>
+                    <h3 class="font-semibold">REST API</h3>
+                </div>
+                <p class="text-sm text-zinc-500">Full HTTP API via Axum for all data types. 500K+ req/s with AOF persistence.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Explore -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-6 tracking-tight">Explore</h2>
+        <div class="grid grid-cols-3 gap-4">
+            <a href="/docs/getting-started" class="group p-6 rounded-xl bg-zinc-900 border border-zinc-800 hover:border-teal-500/40 transition-all">
+                <div class="w-10 h-10 rounded-lg bg-teal-500/10 border border-teal-500/20 flex items-center justify-center mb-4 group-hover:scale-110 transition-transform">
+                    <svg class="w-5 h-5 text-teal-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                </div>
+                <h3 class="font-semibold mb-1">Getting Started</h3>
+                <p class="text-sm text-zinc-500">Build from source and connect in minutes</p>
+            </a>
+            <a href="/docs/tcp-protocol" class="group p-6 rounded-xl bg-zinc-900 border border-zinc-800 hover:border-teal-500/40 transition-all">
+                <div class="w-10 h-10 rounded-lg bg-teal-500/10 border border-teal-500/20 flex items-center justify-center mb-4 group-hover:scale-110 transition-transform">
+                    <svg class="w-5 h-5 text-teal-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+                </div>
+                <h3 class="font-semibold mb-1">Redis Protocol</h3>
+                <p class="text-sm text-zinc-500">92 commands across 5 data types</p>
+            </a>
+            <a href="/docs/benchmarks" class="group p-6 rounded-xl bg-zinc-900 border border-zinc-800 hover:border-amber-500/40 transition-all">
+                <div class="w-10 h-10 rounded-lg bg-amber-500/10 border border-amber-500/20 flex items-center justify-center mb-4 group-hover:scale-110 transition-transform">
+                    <svg class="w-5 h-5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
+                </div>
+                <h3 class="font-semibold mb-1">Benchmarks</h3>
+                <p class="text-sm text-zinc-500">SoliKV vs Redis 7.0 &mdash; 1.81M pipelined SET/s</p>
+            </a>
+        </div>
+    </div>
+</div>

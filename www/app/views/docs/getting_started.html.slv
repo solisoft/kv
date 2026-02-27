@@ -1,0 +1,185 @@
+<div class="space-y-12">
+    <div>
+        <h1 class="text-4xl font-bold mb-4">Getting Started</h1>
+        <p class="text-lg text-slate-400">Get SoliKV up and running in minutes</p>
+    </div>
+
+    <!-- Prerequisites -->
+    <div class="p-6 rounded-xl bg-slate-900/50 border border-white/10">
+        <h2 class="text-xl font-semibold mb-4 flex items-center gap-2">
+            <svg class="w-5 h-5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+            Prerequisites
+        </h2>
+        <ul class="space-y-2 text-slate-300">
+            <li class="flex items-center gap-2"><span class="text-indigo-400">01.</span> Rust 1.75+ (with cargo)</li>
+            <li class="flex items-center gap-2"><span class="text-indigo-400">02.</span> Linux/macOS</li>
+            <li class="flex items-center gap-2"><span class="text-indigo-400">03.</span> redis-cli (optional, for testing)</li>
+        </ul>
+    </div>
+
+    <!-- Build -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Build</h2>
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
+            <div class="flex items-center gap-2 px-4 py-2 bg-white/5 border-b border-white/5">
+                <div class="w-3 h-3 rounded-full bg-red-500/60"></div>
+                <div class="w-3 h-3 rounded-full bg-yellow-500/60"></div>
+                <div class="w-3 h-3 rounded-full bg-green-500/60"></div>
+                <span class="ml-2 text-xs text-slate-500 font-mono">Terminal</span>
+            </div>
+            <div class="p-4 font-mono text-sm">
+                <div class="text-slate-500"># Clone the repository</div>
+                <div class="text-emerald-400">git clone https://github.com/solisoft/solikv.git</div>
+                <div class="text-slate-500 mt-3"># Build in release mode</div>
+                <div class="text-emerald-400">cd solikv && cargo build --release</div>
+                <div class="text-slate-500 mt-3"># Binary is at target/release/solikv</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Run -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Run</h2>
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
+            <div class="p-4 font-mono text-sm">
+                <div class="text-slate-500"># Start the server (RESP on port 6379, REST on port 5020)</div>
+                <div class="text-emerald-400">./target/release/solikv</div>
+                <div class="text-white mt-1">SoliKV starting with 8 shards, RESP on port 6379, REST on port 5020</div>
+                <div class="text-white">AOF enabled (Everysec fsync) at "data/appendonly.aof"</div>
+                <div class="text-slate-500 mt-3"># Verify it's running</div>
+                <div class="text-emerald-400">redis-cli PING</div>
+                <div class="text-white mt-1">PONG</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Quick Test -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Quick Test</h2>
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
+            <div class="flex items-center gap-2 px-4 py-2 bg-white/5 border-b border-white/5">
+                <div class="w-3 h-3 rounded-full bg-red-500/60"></div>
+                <div class="w-3 h-3 rounded-full bg-yellow-500/60"></div>
+                <div class="w-3 h-3 rounded-full bg-green-500/60"></div>
+                <span class="ml-2 text-xs text-slate-500 font-mono">redis-cli</span>
+            </div>
+            <div class="p-4 font-mono text-sm">
+                <div class="text-slate-500"># Set and get a key</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">SET greeting "hello world"</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">GET greeting</span></div>
+                <div class="text-white">"hello world"</div>
+                <div class="text-slate-500 mt-3"># Set with TTL (expires in 60 seconds)</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">SET session:abc token123 EX 60</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">TTL session:abc</span></div>
+                <div class="text-white">(integer) 60</div>
+                <div class="text-slate-500 mt-3"># Atomic counter</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">INCR page:views</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div class="text-slate-500 mt-3"># Multi-key operations</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">MSET a 1 b 2 c 3</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">KEYS *</span></div>
+                <div class="text-white">1) "greeting"</div>
+                <div class="text-white">2) "a"</div>
+                <div class="text-white">3) "b"</div>
+                <div class="text-white">4) "c"</div>
+                <div class="text-white">5) "page:views"</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- REST API Quick Test -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">REST API Quick Test</h2>
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
+            <div class="p-4 font-mono text-sm">
+                <div class="text-slate-500"># Set a key via REST</div>
+                <div class="text-emerald-400">curl -X PUT http://localhost:5020/kv/mykey \</div>
+                <div class="text-emerald-400 ml-4">-H "Content-Type: application/json" \</div>
+                <div class="text-emerald-400 ml-4">-d '{"value":"hello"}'</div>
+                <div class="text-white mt-1">{"result":"OK"}</div>
+                <div class="text-slate-500 mt-3"># Get a key via REST</div>
+                <div class="text-emerald-400">curl http://localhost:5020/kv/mykey</div>
+                <div class="text-white mt-1">{"result":"hello"}</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- CLI Options -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">CLI Options</h2>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left">
+                <thead>
+                    <tr class="border-b border-white/10">
+                        <th class="py-3 pr-4 text-slate-400 font-medium">Flag</th>
+                        <th class="py-3 pr-4 text-slate-400 font-medium">Default</th>
+                        <th class="py-3 text-slate-400 font-medium">Description</th>
+                    </tr>
+                </thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--port</td>
+                        <td class="py-3 pr-4">6379</td>
+                        <td class="py-3">RESP2 TCP server port</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--rest-port</td>
+                        <td class="py-3 pr-4">5020</td>
+                        <td class="py-3">REST API port</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--bind</td>
+                        <td class="py-3 pr-4">0.0.0.0</td>
+                        <td class="py-3">Bind address</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--shards</td>
+                        <td class="py-3 pr-4">0 (auto)</td>
+                        <td class="py-3">Number of shards (0 = number of CPU cores)</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--dir</td>
+                        <td class="py-3 pr-4">data</td>
+                        <td class="py-3">Data directory for persistence files</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--dbfilename</td>
+                        <td class="py-3 pr-4">dump</td>
+                        <td class="py-3">RDB snapshot base filename</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--appendonly</td>
+                        <td class="py-3 pr-4">true</td>
+                        <td class="py-3">Enable append-only file persistence</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--appendfsync</td>
+                        <td class="py-3 pr-4">everysec</td>
+                        <td class="py-3">AOF fsync policy: always, everysec, no</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--log-level</td>
+                        <td class="py-3 pr-4">info</td>
+                        <td class="py-3">Log level (trace, debug, info, warn, error)</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- What's Next -->
+    <div class="p-6 rounded-xl bg-indigo-500/10 border border-indigo-500/30">
+        <h2 class="text-xl font-semibold mb-3">What's Next?</h2>
+        <div class="grid grid-cols-3 gap-4 text-sm">
+            <a href="/docs/tcp-protocol" class="text-indigo-400 hover:text-indigo-300 transition-colors">Redis Protocol &rarr;</a>
+            <a href="/docs/commands" class="text-indigo-400 hover:text-indigo-300 transition-colors">Command Reference &rarr;</a>
+            <a href="/docs/api" class="text-indigo-400 hover:text-indigo-300 transition-colors">REST API Reference &rarr;</a>
+            <a href="/docs/persistence" class="text-indigo-400 hover:text-indigo-300 transition-colors">Persistence &rarr;</a>
+            <a href="/docs/benchmarks" class="text-indigo-400 hover:text-indigo-300 transition-colors">Benchmarks &rarr;</a>
+            <a href="/docs/clustering" class="text-indigo-400 hover:text-indigo-300 transition-colors">Clustering &rarr;</a>
+        </div>
+    </div>
+</div>

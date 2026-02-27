@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/solikv-core",
+    "crates/solikv-resp",
+    "crates/solikv-engine",
+    "crates/solikv-server",
+    "crates/solikv-persist",
+    "crates/solikv-cluster",
+    "crates/solikv-replication",
+    "crates/solikv-pubsub",
+]
+
+[workspace.dependencies]
+tokio = { version = "1.43", features = ["full"] }
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+ordered-float = "4"
+crossbeam-skiplist = "0.1"
+dashmap = "6.1"
+crc16 = "0.4"
+parking_lot = "0.12"
+
+# Workspace crates
+solikv-core = { path = "crates/solikv-core" }
+solikv-resp = { path = "crates/solikv-resp" }
+solikv-engine = { path = "crates/solikv-engine" }
+solikv-server = { path = "crates/solikv-server" }
+solikv-persist = { path = "crates/solikv-persist" }
+solikv-cluster = { path = "crates/solikv-cluster" }
+solikv-replication = { path = "crates/solikv-replication" }
+solikv-pubsub = { path = "crates/solikv-pubsub" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

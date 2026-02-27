@@ -1,0 +1,285 @@
+<div class="space-y-12">
+    <div>
+        <h1 class="text-4xl font-bold mb-4">REST API Reference</h1>
+        <p class="text-lg text-slate-400">HTTP API on port 5020 powered by Axum &mdash; RESTful endpoints for all 5 data types</p>
+    </div>
+
+    <!-- Info -->
+    <div class="p-6 rounded-xl bg-indigo-500/10 border border-indigo-500/30">
+        <p class="text-slate-400">SoliKV exposes two interfaces: the <a href="/docs/tcp-protocol" class="text-indigo-400 hover:text-indigo-300 transition-colors">Redis protocol</a> on port 6379 for RESP2 operations, and this REST API on port 5020 for HTTP access to all data types. Both share the same engine &mdash; AOF persistence covers both interfaces automatically.</p>
+    </div>
+
+    <!-- Key-Value (Strings) -->
+    <div class="space-y-4">
+        <h2 class="text-2xl font-semibold flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-emerald-500/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" /></svg>
+            </span>
+            Key-Value (Strings)
+        </h2>
+        <div class="space-y-3">
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/kv/:key</code>
+                    <p class="text-sm text-slate-400 mt-1">Get the value of a key. Returns 404 if key does not exist.</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-orange-500/20 text-orange-400 text-xs font-mono">PUT</span>
+                <div class="flex-1">
+                    <code class="text-white">/kv/:key</code>
+                    <p class="text-sm text-slate-400 mt-1">Set a key to a string value with optional TTL.</p>
+                    <div class="mt-2 text-sm text-slate-500 font-mono">{"value": "hello", "ex": 3600}</div>
+                    <div class="text-xs text-slate-600 mt-1"><code>ex</code> = TTL in seconds, <code>px</code> = TTL in milliseconds (optional)</div>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-red-500/20 text-red-400 text-xs font-mono">DELETE</span>
+                <div class="flex-1">
+                    <code class="text-white">/kv/:key</code>
+                    <p class="text-sm text-slate-400 mt-1">Delete a key. Returns the count of keys deleted.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Lists -->
+    <div class="space-y-4">
+        <h2 class="text-2xl font-semibold flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-cyan-500/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16" /></svg>
+            </span>
+            Lists
+        </h2>
+        <div class="space-y-3">
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/list/:key?start=0&amp;stop=-1</code>
+                    <p class="text-sm text-slate-400 mt-1">Get a range of elements from the list (LRANGE). Defaults to all elements.</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs font-mono">POST</span>
+                <div class="flex-1">
+                    <code class="text-white">/list/:key/lpush</code>
+                    <p class="text-sm text-slate-400 mt-1">Push values to the head of the list. Returns new list length.</p>
+                    <div class="mt-2 text-sm text-slate-500 font-mono">{"values": ["a", "b", "c"]}</div>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs font-mono">POST</span>
+                <div class="flex-1">
+                    <code class="text-white">/list/:key/rpush</code>
+                    <p class="text-sm text-slate-400 mt-1">Push values to the tail of the list. Returns new list length.</p>
+                    <div class="mt-2 text-sm text-slate-500 font-mono">{"values": ["x", "y"]}</div>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs font-mono">POST</span>
+                <div class="flex-1">
+                    <code class="text-white">/list/:key/lpop</code>
+                    <p class="text-sm text-slate-400 mt-1">Remove and return the first element.</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs font-mono">POST</span>
+                <div class="flex-1">
+                    <code class="text-white">/list/:key/rpop</code>
+                    <p class="text-sm text-slate-400 mt-1">Remove and return the last element.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Hashes -->
+    <div class="space-y-4">
+        <h2 class="text-2xl font-semibold flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-purple-500/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+            </span>
+            Hashes
+        </h2>
+        <div class="space-y-3">
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/hash/:key</code>
+                    <p class="text-sm text-slate-400 mt-1">Get all fields and values (HGETALL).</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/hash/:key/:field</code>
+                    <p class="text-sm text-slate-400 mt-1">Get a single field value (HGET).</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-orange-500/20 text-orange-400 text-xs font-mono">PUT</span>
+                <div class="flex-1">
+                    <code class="text-white">/hash/:key</code>
+                    <p class="text-sm text-slate-400 mt-1">Set one or more hash fields (HSET).</p>
+                    <div class="mt-2 text-sm text-slate-500 font-mono">{"fields": {"name": "Alice", "age": "30"}}</div>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-red-500/20 text-red-400 text-xs font-mono">DELETE</span>
+                <div class="flex-1">
+                    <code class="text-white">/hash/:key/:field</code>
+                    <p class="text-sm text-slate-400 mt-1">Delete a hash field (HDEL).</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sets -->
+    <div class="space-y-4">
+        <h2 class="text-2xl font-semibold flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-pink-500/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-pink-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" /></svg>
+            </span>
+            Sets
+        </h2>
+        <div class="space-y-3">
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/set/:key</code>
+                    <p class="text-sm text-slate-400 mt-1">Get all members (SMEMBERS).</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-orange-500/20 text-orange-400 text-xs font-mono">PUT</span>
+                <div class="flex-1">
+                    <code class="text-white">/set/:key</code>
+                    <p class="text-sm text-slate-400 mt-1">Add members (SADD). Returns count of new members added.</p>
+                    <div class="mt-2 text-sm text-slate-500 font-mono">{"members": ["redis", "nosql", "fast"]}</div>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-red-500/20 text-red-400 text-xs font-mono">DELETE</span>
+                <div class="flex-1">
+                    <code class="text-white">/set/:key/:member</code>
+                    <p class="text-sm text-slate-400 mt-1">Remove a member (SREM).</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sorted Sets -->
+    <div class="space-y-4">
+        <h2 class="text-2xl font-semibold flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-orange-500/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-orange-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 4h13M3 8h9m-9 4h6m4 0l4-4m0 0l4 4m-4-4v12" /></svg>
+            </span>
+            Sorted Sets
+        </h2>
+        <div class="space-y-3">
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/zset/:key?start=0&amp;stop=-1</code>
+                    <p class="text-sm text-slate-400 mt-1">Get members with scores in rank order (ZRANGE WITHSCORES).</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-orange-500/20 text-orange-400 text-xs font-mono">PUT</span>
+                <div class="flex-1">
+                    <code class="text-white">/zset/:key</code>
+                    <p class="text-sm text-slate-400 mt-1">Add members with scores (ZADD).</p>
+                    <div class="mt-2 text-sm text-slate-500 font-mono">{"members": [{"score": 100, "member": "alice"}, {"score": 200, "member": "bob"}]}</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Generic Command -->
+    <div class="space-y-4">
+        <h2 class="text-2xl font-semibold flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-indigo-500/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+            </span>
+            Generic Command Endpoint
+        </h2>
+        <p class="text-slate-400">Execute any Redis command via HTTP. This gives you access to all 92 commands without needing dedicated REST endpoints.</p>
+        <div class="space-y-3">
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs font-mono">POST</span>
+                <div class="flex-1">
+                    <code class="text-white">/cmd</code>
+                    <p class="text-sm text-slate-400 mt-1">Execute any command by name with arguments.</p>
+                    <div class="mt-2 text-sm text-slate-500 font-mono">{"command": "HSET", "args": ["user:1", "name", "Alice", "age", "30"]}</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Server -->
+    <div class="space-y-4">
+        <h2 class="text-2xl font-semibold flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-cyan-500/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
+            </span>
+            Server
+        </h2>
+        <div class="space-y-3">
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/info</code>
+                    <p class="text-sm text-slate-400 mt-1">Server information (equivalent to INFO command)</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/dbsize</code>
+                    <p class="text-sm text-slate-400 mt-1">Returns the number of keys in the database</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Example Session -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Example Session</h2>
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
+            <div class="flex items-center gap-2 px-4 py-2 bg-white/5 border-b border-white/5">
+                <div class="w-3 h-3 rounded-full bg-red-500/60"></div>
+                <div class="w-3 h-3 rounded-full bg-yellow-500/60"></div>
+                <div class="w-3 h-3 rounded-full bg-green-500/60"></div>
+                <span class="ml-2 text-xs text-slate-500 font-mono">Terminal</span>
+            </div>
+            <div class="p-4 font-mono text-sm">
+                <div class="text-slate-500"># Set a key with 1-hour TTL</div>
+                <div class="text-emerald-400">curl -X PUT http://localhost:5020/kv/session:abc \</div>
+                <div class="text-emerald-400 ml-4">-H "Content-Type: application/json" \</div>
+                <div class="text-emerald-400 ml-4">-d '{"value":"token123","ex":3600}'</div>
+                <div class="text-white mt-1">{"result":"OK"}</div>
+                <div class="text-slate-500 mt-3"># Get a key</div>
+                <div class="text-emerald-400">curl http://localhost:5020/kv/session:abc</div>
+                <div class="text-white mt-1">{"result":"token123"}</div>
+                <div class="text-slate-500 mt-3"># Push to a list</div>
+                <div class="text-emerald-400">curl -X POST http://localhost:5020/list/queue/rpush \</div>
+                <div class="text-emerald-400 ml-4">-H "Content-Type: application/json" \</div>
+                <div class="text-emerald-400 ml-4">-d '{"values":["job1","job2","job3"]}'</div>
+                <div class="text-white mt-1">{"result":3}</div>
+                <div class="text-slate-500 mt-3"># Set hash fields</div>
+                <div class="text-emerald-400">curl -X PUT http://localhost:5020/hash/user:1 \</div>
+                <div class="text-emerald-400 ml-4">-H "Content-Type: application/json" \</div>
+                <div class="text-emerald-400 ml-4">-d '{"fields":{"name":"Alice","age":"30"}}'</div>
+                <div class="text-white mt-1">{"result":2}</div>
+                <div class="text-slate-500 mt-3"># Get all hash fields</div>
+                <div class="text-emerald-400">curl http://localhost:5020/hash/user:1</div>
+                <div class="text-white mt-1">{"result":["name","Alice","age","30"]}</div>
+                <div class="text-slate-500 mt-3"># Execute any command via /cmd</div>
+                <div class="text-emerald-400">curl -X POST http://localhost:5020/cmd \</div>
+                <div class="text-emerald-400 ml-4">-H "Content-Type: application/json" \</div>
+                <div class="text-emerald-400 ml-4">-d '{"command":"ZADD","args":["leaderboard","100","alice","200","bob"]}'</div>
+                <div class="text-white mt-1">{"result":2}</div>
+            </div>
+        </div>
+    </div>
+</div>

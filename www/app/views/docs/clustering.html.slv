@@ -1,0 +1,149 @@
+<div class="space-y-12">
+    <div>
+        <h1 class="text-4xl font-bold mb-4">Clustering</h1>
+        <p class="text-lg text-slate-400">Peer-to-peer distributed architecture with no single point of failure</p>
+    </div>
+
+    <!-- Architecture -->
+    <div class="p-6 rounded-xl bg-gradient-to-br from-indigo-500/10 via-purple-500/5 to-transparent border border-white/10">
+        <h2 class="text-2xl font-semibold mb-6">Architecture</h2>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div class="text-center p-4">
+                <div class="w-12 h-12 mx-auto mb-3 rounded-xl bg-indigo-500/20 flex items-center justify-center">
+                    <svg class="w-6 h-6 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                </div>
+                <h3 class="font-semibold text-white">No Leader</h3>
+                <p class="text-sm text-slate-400">All nodes are equal peers</p>
+            </div>
+            <div class="text-center p-4">
+                <div class="w-12 h-12 mx-auto mb-3 rounded-xl bg-emerald-500/20 flex items-center justify-center">
+                    <svg class="w-6 h-6 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7" /></svg>
+                </div>
+                <h3 class="font-semibold text-white">CRC16 Sharding</h3>
+                <p class="text-sm text-slate-400">16384 hash slots (XMODEM)</p>
+            </div>
+            <div class="text-center p-4">
+                <div class="w-12 h-12 mx-auto mb-3 rounded-xl bg-purple-500/20 flex items-center justify-center">
+                    <svg class="w-6 h-6 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                </div>
+                <h3 class="font-semibold text-white">Replication</h3>
+                <p class="text-sm text-slate-400">CRDT-based sync</p>
+            </div>
+            <div class="text-center p-4">
+                <div class="w-12 h-12 mx-auto mb-3 rounded-xl bg-cyan-500/20 flex items-center justify-center">
+                    <svg class="w-6 h-6 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
+                </div>
+                <h3 class="font-semibold text-white">Auto-failover</h3>
+                <p class="text-sm text-slate-400">Health checks + rerouting</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sharding -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Hash Slot Sharding</h2>
+        <p class="text-slate-400 mb-6">Keys are distributed across 16384 hash slots using CRC16 XMODEM, matching the Redis Cluster slot assignment scheme. Each slot is assigned to a node. The slot for a key is <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded">crc16(key) % 16384</code>.</p>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+            <div class="p-5 rounded-xl bg-white/5 border border-white/10">
+                <h3 class="font-semibold text-white mb-3">How it works</h3>
+                <ol class="space-y-2 text-sm text-slate-400">
+                    <li class="flex items-start gap-2"><span class="text-indigo-400 font-mono font-bold">1.</span> Key bytes are hashed with CRC16 XMODEM</li>
+                    <li class="flex items-start gap-2"><span class="text-indigo-400 font-mono font-bold">2.</span> Hash modulo 16384 gives the slot number</li>
+                    <li class="flex items-start gap-2"><span class="text-indigo-400 font-mono font-bold">3.</span> ConsistentHash maps slot to its owning node</li>
+                    <li class="flex items-start gap-2"><span class="text-indigo-400 font-mono font-bold">4.</span> If the local node owns the slot, write locally; otherwise forward</li>
+                </ol>
+            </div>
+
+            <div class="p-5 rounded-xl bg-white/5 border border-white/10">
+                <h3 class="font-semibold text-white mb-3">Local sharding</h3>
+                <ul class="space-y-2 text-sm text-slate-400">
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Within a node, keys are partitioned across N shards (default: CPU count)</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Each shard has its own ShardStore with parking_lot Mutex</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Commands routed to the correct shard via mpsc channels</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Zero-lock hot path for non-overlapping keys</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Shard distribution diagram -->
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
+            <div class="px-4 py-2 border-b border-white/5 text-xs text-slate-500">Slot distribution (3 nodes, 16384 slots)</div>
+            <div class="p-4 font-mono text-sm">
+                <div class="text-slate-500"># Slots distributed evenly across nodes</div>
+                <div class="mt-2 text-white">Slots 0-5460     -> <span class="text-emerald-400">Node 1</span></div>
+                <div class="text-white">Slots 5461-10922  -> <span class="text-indigo-400">Node 2</span></div>
+                <div class="text-white">Slots 10923-16383 -> <span class="text-purple-400">Node 3</span></div>
+                <div class="mt-3 text-slate-500"># Key routing example</div>
+                <div class="text-white">SET "user:42" -> crc16("user:42") % 16384 = <span class="text-yellow-400">9832</span> -> <span class="text-indigo-400">Node 2</span></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Replication -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Replication</h2>
+        <p class="text-slate-400 mb-6">SoliKV uses CRDT-based replication for conflict-free convergence across nodes.</p>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+            <div class="p-5 rounded-xl bg-white/5 border border-white/10">
+                <h3 class="font-semibold text-white mb-3">CRDT Types</h3>
+                <ul class="space-y-2 text-sm text-slate-400">
+                    <li class="flex items-start gap-2"><span class="text-indigo-400 font-mono font-bold">LWW</span> Last-Writer-Wins Register for string values</li>
+                    <li class="flex items-start gap-2"><span class="text-indigo-400 font-mono font-bold">OR-Set</span> Observed-Remove Set for set operations</li>
+                    <li class="flex items-start gap-2"><span class="text-indigo-400 font-mono font-bold">PN-Counter</span> Positive-Negative Counter for INCR/DECR</li>
+                </ul>
+            </div>
+
+            <div class="p-5 rounded-xl bg-white/5 border border-white/10">
+                <h3 class="font-semibold text-white mb-3">Vector Clocks</h3>
+                <ul class="space-y-2 text-sm text-slate-400">
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Each node maintains a vector clock for causal ordering</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Concurrent writes detected and merged deterministically</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> No coordination needed &mdash; all nodes can accept writes</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- Conflict Resolution -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Conflict Resolution</h2>
+        <p class="text-slate-400 mb-4">CRDTs provide automatic conflict-free resolution without coordination between nodes.</p>
+        <div class="overflow-x-auto mb-6">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">CRDT</th><th class="py-3 pr-4 text-slate-400 font-medium">Merge Strategy</th><th class="py-3 text-slate-400 font-medium">Use case</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">LWW-Register</td><td class="py-3 pr-4">Most recent write by timestamp wins</td><td class="py-3 text-slate-500">Strings, hashes, general key-value</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">OR-Set</td><td class="py-3 pr-4">Add wins over concurrent remove</td><td class="py-3 text-slate-500">Sets, membership tracking</td></tr>
+                    <tr><td class="py-3 pr-4 font-mono text-indigo-400">PN-Counter</td><td class="py-3 pr-4">Increments and decrements are additive</td><td class="py-3 text-slate-500">Counters, INCR/DECR operations</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Failover -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Failover &amp; Health Checks</h2>
+        <p class="text-slate-400 mb-4">Each node periodically checks peers. Unhealthy nodes are marked and traffic is rerouted to healthy peers.</p>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div class="p-5 rounded-xl bg-white/5 border border-white/10">
+                <h3 class="font-semibold text-white mb-3">Detection</h3>
+                <ul class="space-y-2 text-sm text-slate-400">
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Periodic health checks on all peers</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Peers marked <code class="text-red-400 bg-red-500/10 px-1 rounded">unhealthy</code> on failed response</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Slot routing skips unhealthy nodes</li>
+                </ul>
+            </div>
+            <div class="p-5 rounded-xl bg-white/5 border border-white/10">
+                <h3 class="font-semibold text-white mb-3">Recovery</h3>
+                <ul class="space-y-2 text-sm text-slate-400">
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Recovered nodes rejoin automatically</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> CRDT merge catches up missed writes</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Slot map rebalanced, broadcast to cluster</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>

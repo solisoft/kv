@@ -1,0 +1,389 @@
+<div class="space-y-12">
+    <div>
+        <h1 class="text-4xl font-bold mb-4">Redis Protocol (RESP2)</h1>
+        <p class="text-lg text-slate-400">Redis-compatible TCP server on port 6379 &mdash; 92 commands across 5 data types, transactions, pub/sub, and persistence</p>
+    </div>
+
+    <!-- Connection -->
+    <div class="p-6 rounded-xl bg-gradient-to-br from-emerald-500/10 to-transparent border border-white/10">
+        <h2 class="text-2xl font-semibold mb-4">Connection</h2>
+        <div class="font-mono text-sm">
+            <div class="text-slate-500"># Connect with redis-cli (default port 6379)</div>
+            <div class="text-emerald-400">redis-cli</div>
+            <div class="text-slate-500 mt-3"># Or any Redis client library (ioredis, go-redis, jedis, etc.)</div>
+            <div class="text-emerald-400">redis = Redis.new(host: "localhost", port: 6379)</div>
+        </div>
+    </div>
+
+    <!-- Protocol Format -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Protocol Format</h2>
+        <p class="text-slate-400 mb-4">SoliKV speaks RESP2 (REdis Serialization Protocol), the same wire format used by Redis. Both array format and inline commands are supported.</p>
+        <div class="rounded-xl bg-slate-900 border border-white/10 p-6">
+            <pre class="text-sm font-mono text-slate-300 overflow-x-auto">
+Array format:    *3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
+Inline format:   SET foo bar\r\n
+
+Responses:
+  Simple string:  +OK\r\n
+  Error:          -ERR message\r\n
+  Integer:        :42\r\n
+  Bulk string:    $3\r\nbar\r\n
+  Null:           $-1\r\n
+  Array:          *2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n</pre>
+        </div>
+    </div>
+
+    <!-- Command Summary -->
+    <div class="p-6 rounded-xl bg-indigo-500/10 border border-indigo-500/30">
+        <div class="grid grid-cols-5 gap-4 text-center">
+            <div>
+                <div class="text-2xl font-bold text-indigo-400">92</div>
+                <div class="text-xs text-slate-400 mt-1">commands</div>
+            </div>
+            <div>
+                <div class="text-2xl font-bold text-emerald-400">5</div>
+                <div class="text-xs text-slate-400 mt-1">data types</div>
+            </div>
+            <div>
+                <div class="text-2xl font-bold text-purple-400">16</div>
+                <div class="text-xs text-slate-400 mt-1">databases</div>
+            </div>
+            <div>
+                <div class="text-2xl font-bold text-cyan-400">MULTI</div>
+                <div class="text-xs text-slate-400 mt-1">transactions</div>
+            </div>
+            <div>
+                <div class="text-2xl font-bold text-pink-400">PUB/SUB</div>
+                <div class="text-xs text-slate-400 mt-1">messaging</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Strings -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
+            <span class="w-8 h-8 rounded-lg bg-emerald-500/20 flex items-center justify-center text-sm font-bold text-emerald-400">S</span>
+            Strings <span class="text-sm font-normal text-slate-500">(16 commands)</span>
+        </h2>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Syntax</th><th class="py-3 text-slate-400 font-medium">Description</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">SET</td><td class="py-2 pr-4 font-mono text-sm">SET key value [NX|XX] [GET] [EX s|PX ms]</td><td class="py-2">Set key with optional flags and TTL</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">GET</td><td class="py-2 pr-4 font-mono text-sm">GET key</td><td class="py-2">Get value by key</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">SETNX</td><td class="py-2 pr-4 font-mono text-sm">SETNX key value</td><td class="py-2">Set only if key does not exist</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">SETEX</td><td class="py-2 pr-4 font-mono text-sm">SETEX key seconds value</td><td class="py-2">Set with expiry in seconds</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">PSETEX</td><td class="py-2 pr-4 font-mono text-sm">PSETEX key ms value</td><td class="py-2">Set with expiry in milliseconds</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">GETSET</td><td class="py-2 pr-4 font-mono text-sm">GETSET key value</td><td class="py-2">Set and return old value</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">MSET</td><td class="py-2 pr-4 font-mono text-sm">MSET key val [key val ...]</td><td class="py-2">Set multiple keys atomically</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">MSETNX</td><td class="py-2 pr-4 font-mono text-sm">MSETNX key val [key val ...]</td><td class="py-2">Set multiple keys only if none exist</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">MGET</td><td class="py-2 pr-4 font-mono text-sm">MGET key [key ...]</td><td class="py-2">Get multiple keys</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">APPEND</td><td class="py-2 pr-4 font-mono text-sm">APPEND key value</td><td class="py-2">Append to string, returns new length</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">STRLEN</td><td class="py-2 pr-4 font-mono text-sm">STRLEN key</td><td class="py-2">Returns string length</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">INCR</td><td class="py-2 pr-4 font-mono text-sm">INCR key</td><td class="py-2">Increment by 1, returns new value</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">DECR</td><td class="py-2 pr-4 font-mono text-sm">DECR key</td><td class="py-2">Decrement by 1</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">INCRBY</td><td class="py-2 pr-4 font-mono text-sm">INCRBY key amount</td><td class="py-2">Increment by integer amount</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">DECRBY</td><td class="py-2 pr-4 font-mono text-sm">DECRBY key amount</td><td class="py-2">Decrement by integer amount</td></tr>
+                    <tr><td class="py-2 pr-4 font-mono text-indigo-400">INCRBYFLOAT</td><td class="py-2 pr-4 font-mono text-sm">INCRBYFLOAT key amount</td><td class="py-2">Increment by float amount</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Lists -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
+            <span class="w-8 h-8 rounded-lg bg-cyan-500/20 flex items-center justify-center text-sm font-bold text-cyan-400">L</span>
+            Lists <span class="text-sm font-normal text-slate-500">(13 commands)</span>
+        </h2>
+        <p class="text-sm text-slate-500 mb-4">Backed by a VecDeque &mdash; O(1) LPUSH/RPUSH/LPOP/RPOP at both ends.</p>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Syntax</th><th class="py-3 text-slate-400 font-medium">Description</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">LPUSH</td><td class="py-2 pr-4 font-mono text-sm">LPUSH key val [val ...]</td><td class="py-2">Push to head, returns length</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">RPUSH</td><td class="py-2 pr-4 font-mono text-sm">RPUSH key val [val ...]</td><td class="py-2">Push to tail, returns length</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">LPOP</td><td class="py-2 pr-4 font-mono text-sm">LPOP key</td><td class="py-2">Pop from head</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">RPOP</td><td class="py-2 pr-4 font-mono text-sm">RPOP key</td><td class="py-2">Pop from tail</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">LLEN</td><td class="py-2 pr-4 font-mono text-sm">LLEN key</td><td class="py-2">Returns list length</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">LRANGE</td><td class="py-2 pr-4 font-mono text-sm">LRANGE key start stop</td><td class="py-2">Get range of elements</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">LINDEX</td><td class="py-2 pr-4 font-mono text-sm">LINDEX key index</td><td class="py-2">Get element by index</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">LSET</td><td class="py-2 pr-4 font-mono text-sm">LSET key index value</td><td class="py-2">Set element at index</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">LREM</td><td class="py-2 pr-4 font-mono text-sm">LREM key count value</td><td class="py-2">Remove elements by value</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">LTRIM</td><td class="py-2 pr-4 font-mono text-sm">LTRIM key start stop</td><td class="py-2">Trim list to range</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">RPOPLPUSH</td><td class="py-2 pr-4 font-mono text-sm">RPOPLPUSH src dst</td><td class="py-2">Pop tail of src, push to head of dst</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">LINSERT</td><td class="py-2 pr-4 font-mono text-sm">LINSERT key BEFORE|AFTER pivot val</td><td class="py-2">Insert before or after pivot</td></tr>
+                    <tr><td class="py-2 pr-4 font-mono text-indigo-400">LPOS</td><td class="py-2 pr-4 font-mono text-sm">LPOS key value</td><td class="py-2">Find index of value</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Hashes -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
+            <span class="w-8 h-8 rounded-lg bg-purple-500/20 flex items-center justify-center text-sm font-bold text-purple-400">H</span>
+            Hashes <span class="text-sm font-normal text-slate-500">(11 commands)</span>
+        </h2>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Syntax</th><th class="py-3 text-slate-400 font-medium">Description</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">HSET</td><td class="py-2 pr-4 font-mono text-sm">HSET key field val [field val ...]</td><td class="py-2">Set field(s), returns count of new fields</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">HGET</td><td class="py-2 pr-4 font-mono text-sm">HGET key field</td><td class="py-2">Get field value</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">HDEL</td><td class="py-2 pr-4 font-mono text-sm">HDEL key field [field ...]</td><td class="py-2">Delete field(s)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">HEXISTS</td><td class="py-2 pr-4 font-mono text-sm">HEXISTS key field</td><td class="py-2">Check if field exists</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">HGETALL</td><td class="py-2 pr-4 font-mono text-sm">HGETALL key</td><td class="py-2">Get all fields and values</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">HKEYS</td><td class="py-2 pr-4 font-mono text-sm">HKEYS key</td><td class="py-2">Get all field names</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">HVALS</td><td class="py-2 pr-4 font-mono text-sm">HVALS key</td><td class="py-2">Get all values</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">HLEN</td><td class="py-2 pr-4 font-mono text-sm">HLEN key</td><td class="py-2">Returns number of fields</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">HMSET</td><td class="py-2 pr-4 font-mono text-sm">HMSET key field val [field val ...]</td><td class="py-2">Set multiple fields</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">HMGET</td><td class="py-2 pr-4 font-mono text-sm">HMGET key field [field ...]</td><td class="py-2">Get multiple fields</td></tr>
+                    <tr><td class="py-2 pr-4 font-mono text-indigo-400">HINCRBY</td><td class="py-2 pr-4 font-mono text-sm">HINCRBY key field amount</td><td class="py-2">Increment field by integer</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Sets -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
+            <span class="w-8 h-8 rounded-lg bg-pink-500/20 flex items-center justify-center text-sm font-bold text-pink-400">S</span>
+            Sets <span class="text-sm font-normal text-slate-500">(10 commands)</span>
+        </h2>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Syntax</th><th class="py-3 text-slate-400 font-medium">Description</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">SADD</td><td class="py-2 pr-4 font-mono text-sm">SADD key member [member ...]</td><td class="py-2">Add member(s), returns count added</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">SREM</td><td class="py-2 pr-4 font-mono text-sm">SREM key member [member ...]</td><td class="py-2">Remove member(s)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">SMEMBERS</td><td class="py-2 pr-4 font-mono text-sm">SMEMBERS key</td><td class="py-2">Get all members</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">SISMEMBER</td><td class="py-2 pr-4 font-mono text-sm">SISMEMBER key member</td><td class="py-2">Check membership</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">SCARD</td><td class="py-2 pr-4 font-mono text-sm">SCARD key</td><td class="py-2">Returns set size</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">SPOP</td><td class="py-2 pr-4 font-mono text-sm">SPOP key [count]</td><td class="py-2">Remove and return random member(s)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">SRANDMEMBER</td><td class="py-2 pr-4 font-mono text-sm">SRANDMEMBER key [count]</td><td class="py-2">Get random member(s) without removing</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">SUNION</td><td class="py-2 pr-4 font-mono text-sm">SUNION key [key ...]</td><td class="py-2">Union of sets</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">SINTER</td><td class="py-2 pr-4 font-mono text-sm">SINTER key [key ...]</td><td class="py-2">Intersection of sets</td></tr>
+                    <tr><td class="py-2 pr-4 font-mono text-indigo-400">SDIFF</td><td class="py-2 pr-4 font-mono text-sm">SDIFF key [key ...]</td><td class="py-2">Difference of sets</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Sorted Sets -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
+            <span class="w-8 h-8 rounded-lg bg-orange-500/20 flex items-center justify-center text-sm font-bold text-orange-400">Z</span>
+            Sorted Sets <span class="text-sm font-normal text-slate-500">(12 commands)</span>
+        </h2>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Syntax</th><th class="py-3 text-slate-400 font-medium">Description</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">ZADD</td><td class="py-2 pr-4 font-mono text-sm">ZADD key [NX|XX] [GT|LT] score member [...]</td><td class="py-2">Add members with scores</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">ZREM</td><td class="py-2 pr-4 font-mono text-sm">ZREM key member [member ...]</td><td class="py-2">Remove member(s)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">ZSCORE</td><td class="py-2 pr-4 font-mono text-sm">ZSCORE key member</td><td class="py-2">Get member score</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">ZRANK</td><td class="py-2 pr-4 font-mono text-sm">ZRANK key member</td><td class="py-2">Get rank (0-based, low to high)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">ZREVRANK</td><td class="py-2 pr-4 font-mono text-sm">ZREVRANK key member</td><td class="py-2">Get rank (0-based, high to low)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">ZRANGE</td><td class="py-2 pr-4 font-mono text-sm">ZRANGE key start stop [WITHSCORES]</td><td class="py-2">Get range by rank</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">ZREVRANGE</td><td class="py-2 pr-4 font-mono text-sm">ZREVRANGE key start stop [WITHSCORES]</td><td class="py-2">Get range by rank (reversed)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">ZRANGEBYSCORE</td><td class="py-2 pr-4 font-mono text-sm">ZRANGEBYSCORE key min max [LIMIT off cnt]</td><td class="py-2">Get range by score</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">ZCARD</td><td class="py-2 pr-4 font-mono text-sm">ZCARD key</td><td class="py-2">Returns sorted set size</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">ZCOUNT</td><td class="py-2 pr-4 font-mono text-sm">ZCOUNT key min max</td><td class="py-2">Count members in score range</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">ZINCRBY</td><td class="py-2 pr-4 font-mono text-sm">ZINCRBY key increment member</td><td class="py-2">Increment member score</td></tr>
+                    <tr><td class="py-2 pr-4 font-mono text-indigo-400">ZREMRANGEBYSCORE</td><td class="py-2 pr-4 font-mono text-sm">ZREMRANGEBYSCORE key min max</td><td class="py-2">Remove members by score range</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Keys -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
+            <span class="w-8 h-8 rounded-lg bg-yellow-500/20 flex items-center justify-center text-sm font-bold text-yellow-400">K</span>
+            Keys <span class="text-sm font-normal text-slate-500">(11 commands)</span>
+        </h2>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Syntax</th><th class="py-3 text-slate-400 font-medium">Description</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">DEL</td><td class="py-2 pr-4 font-mono text-sm">DEL key [key ...]</td><td class="py-2">Delete key(s), returns count deleted</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">EXISTS</td><td class="py-2 pr-4 font-mono text-sm">EXISTS key [key ...]</td><td class="py-2">Check existence, returns count</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">TYPE</td><td class="py-2 pr-4 font-mono text-sm">TYPE key</td><td class="py-2">Returns key type (string, list, hash, set, zset)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">RENAME</td><td class="py-2 pr-4 font-mono text-sm">RENAME key newkey</td><td class="py-2">Rename key</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">RENAMENX</td><td class="py-2 pr-4 font-mono text-sm">RENAMENX key newkey</td><td class="py-2">Rename only if newkey does not exist</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">EXPIRE</td><td class="py-2 pr-4 font-mono text-sm">EXPIRE key seconds</td><td class="py-2">Set TTL in seconds</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">PEXPIRE</td><td class="py-2 pr-4 font-mono text-sm">PEXPIRE key ms</td><td class="py-2">Set TTL in milliseconds</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">TTL</td><td class="py-2 pr-4 font-mono text-sm">TTL key</td><td class="py-2">Remaining TTL in seconds</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">PTTL</td><td class="py-2 pr-4 font-mono text-sm">PTTL key</td><td class="py-2">Remaining TTL in milliseconds</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">PERSIST</td><td class="py-2 pr-4 font-mono text-sm">PERSIST key</td><td class="py-2">Remove TTL</td></tr>
+                    <tr><td class="py-2 pr-4 font-mono text-indigo-400">KEYS</td><td class="py-2 pr-4 font-mono text-sm">KEYS pattern</td><td class="py-2">Find keys matching pattern (*, prefix*, *suffix)</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Transactions -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
+            <span class="w-8 h-8 rounded-lg bg-red-500/20 flex items-center justify-center text-sm font-bold text-red-400">T</span>
+            Transactions <span class="text-sm font-normal text-slate-500">(3 commands)</span>
+        </h2>
+        <p class="text-sm text-slate-500 mb-4">Queued commands execute atomically under a single write lock.</p>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Syntax</th><th class="py-3 text-slate-400 font-medium">Description</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">MULTI</td><td class="py-2 pr-4 font-mono text-sm">MULTI</td><td class="py-2">Start transaction</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">EXEC</td><td class="py-2 pr-4 font-mono text-sm">EXEC</td><td class="py-2">Execute queued commands</td></tr>
+                    <tr><td class="py-2 pr-4 font-mono text-indigo-400">DISCARD</td><td class="py-2 pr-4 font-mono text-sm">DISCARD</td><td class="py-2">Discard queued commands</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Pub/Sub -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
+            <span class="w-8 h-8 rounded-lg bg-teal-500/20 flex items-center justify-center text-sm font-bold text-teal-400">P</span>
+            Pub/Sub <span class="text-sm font-normal text-slate-500">(5 commands)</span>
+        </h2>
+        <p class="text-sm text-slate-500 mb-4">Uses DashMap + tokio::broadcast channels &mdash; pub/sub does not contend with data operations.</p>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Syntax</th><th class="py-3 text-slate-400 font-medium">Description</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">SUBSCRIBE</td><td class="py-2 pr-4 font-mono text-sm">SUBSCRIBE channel [channel ...]</td><td class="py-2">Subscribe to channel(s)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">UNSUBSCRIBE</td><td class="py-2 pr-4 font-mono text-sm">UNSUBSCRIBE [channel ...]</td><td class="py-2">Unsubscribe from channel(s)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">PSUBSCRIBE</td><td class="py-2 pr-4 font-mono text-sm">PSUBSCRIBE pattern [pattern ...]</td><td class="py-2">Subscribe to pattern(s)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">PUNSUBSCRIBE</td><td class="py-2 pr-4 font-mono text-sm">PUNSUBSCRIBE [pattern ...]</td><td class="py-2">Unsubscribe from pattern(s)</td></tr>
+                    <tr><td class="py-2 pr-4 font-mono text-indigo-400">PUBLISH</td><td class="py-2 pr-4 font-mono text-sm">PUBLISH channel message</td><td class="py-2">Publish message, returns receiver count</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Server -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
+            <span class="w-8 h-8 rounded-lg bg-slate-500/20 flex items-center justify-center text-sm font-bold text-slate-400">*</span>
+            Server <span class="text-sm font-normal text-slate-500">(11 commands)</span>
+        </h2>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Syntax</th><th class="py-3 text-slate-400 font-medium">Description</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">PING</td><td class="py-2 pr-4 font-mono text-sm">PING [msg]</td><td class="py-2">Returns PONG or echoes argument</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">ECHO</td><td class="py-2 pr-4 font-mono text-sm">ECHO message</td><td class="py-2">Echoes message back</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">QUIT</td><td class="py-2 pr-4 font-mono text-sm">QUIT</td><td class="py-2">Close connection</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">SELECT</td><td class="py-2 pr-4 font-mono text-sm">SELECT db</td><td class="py-2">Select database (0-15)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">DBSIZE</td><td class="py-2 pr-4 font-mono text-sm">DBSIZE</td><td class="py-2">Returns number of keys</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">FLUSHDB</td><td class="py-2 pr-4 font-mono text-sm">FLUSHDB</td><td class="py-2">Delete all keys in current db</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">FLUSHALL</td><td class="py-2 pr-4 font-mono text-sm">FLUSHALL</td><td class="py-2">Delete all keys in all databases</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">INFO</td><td class="py-2 pr-4 font-mono text-sm">INFO [section]</td><td class="py-2">Server information</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">COMMAND</td><td class="py-2 pr-4 font-mono text-sm">COMMAND [DOCS|COUNT]</td><td class="py-2">Command metadata</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">CONFIG</td><td class="py-2 pr-4 font-mono text-sm">CONFIG GET pattern</td><td class="py-2">Get configuration</td></tr>
+                    <tr><td class="py-2 pr-4 font-mono text-indigo-400">TIME</td><td class="py-2 pr-4 font-mono text-sm">TIME</td><td class="py-2">Server time [seconds, microseconds]</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Examples -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Examples</h2>
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
+            <div class="flex items-center gap-2 px-4 py-2 bg-white/5 border-b border-white/5">
+                <div class="w-3 h-3 rounded-full bg-red-500/60"></div>
+                <div class="w-3 h-3 rounded-full bg-yellow-500/60"></div>
+                <div class="w-3 h-3 rounded-full bg-green-500/60"></div>
+                <span class="ml-2 text-xs text-slate-500 font-mono">redis-cli -p 6379</span>
+            </div>
+            <div class="p-4 font-mono text-sm">
+                <div class="text-slate-500"># Strings</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">SET user:1 Alice EX 3600</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">INCR page:views</span></div>
+                <div class="text-white">(integer) 1</div>
+
+                <div class="text-slate-500 mt-3"># Lists</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">RPUSH queue job1 job2 job3</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">LPOP queue</span></div>
+                <div class="text-white">"job1"</div>
+
+                <div class="text-slate-500 mt-3"># Hashes</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">HSET user:1 name Alice age 30</span></div>
+                <div class="text-white">(integer) 2</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">HGETALL user:1</span></div>
+                <div class="text-white">1) "name"</div>
+                <div class="text-white">2) "Alice"</div>
+                <div class="text-white">3) "age"</div>
+                <div class="text-white">4) "30"</div>
+
+                <div class="text-slate-500 mt-3"># Sorted sets (leaderboard)</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">ZADD leaderboard 100 alice 200 bob 150 charlie</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">ZRANGE leaderboard 0 -1 WITHSCORES</span></div>
+                <div class="text-white">1) "alice"</div>
+                <div class="text-white">2) "100"</div>
+                <div class="text-white">3) "charlie"</div>
+                <div class="text-white">4) "150"</div>
+                <div class="text-white">5) "bob"</div>
+                <div class="text-white">6) "200"</div>
+
+                <div class="text-slate-500 mt-3"># Transactions</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">MULTI</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">SET x 1</span></div>
+                <div class="text-white">QUEUED</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">SET y 2</span></div>
+                <div class="text-white">QUEUED</div>
+                <div><span class="text-slate-500">127.0.0.1:6379&gt;</span> <span class="text-emerald-400">EXEC</span></div>
+                <div class="text-white">1) OK</div>
+                <div class="text-white">2) OK</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Pipeline Support -->
+    <div class="p-6 rounded-xl bg-indigo-500/10 border border-indigo-500/30">
+        <h2 class="text-xl font-semibold mb-2 flex items-center gap-2">
+            <svg class="w-5 h-5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+            Pipeline Support
+        </h2>
+        <p class="text-slate-400">Full pipeline support with batch locking and write coalescing. Clients can send multiple commands without waiting for individual responses, achieving 1.6M+ SET/sec and 1.5M+ GET/sec with P=16.</p>
+    </div>
+
+    <!-- Compatibility -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Client Compatibility</h2>
+        <div class="grid grid-cols-3 gap-3">
+            <div class="flex items-center gap-3 p-3 rounded-lg bg-white/5">
+                <svg class="w-5 h-5 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>
+                <span class="text-slate-300">redis-cli</span>
+            </div>
+            <div class="flex items-center gap-3 p-3 rounded-lg bg-white/5">
+                <svg class="w-5 h-5 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>
+                <span class="text-slate-300">ioredis (Node.js)</span>
+            </div>
+            <div class="flex items-center gap-3 p-3 rounded-lg bg-white/5">
+                <svg class="w-5 h-5 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>
+                <span class="text-slate-300">go-redis (Go)</span>
+            </div>
+            <div class="flex items-center gap-3 p-3 rounded-lg bg-white/5">
+                <svg class="w-5 h-5 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>
+                <span class="text-slate-300">redis-py (Python)</span>
+            </div>
+            <div class="flex items-center gap-3 p-3 rounded-lg bg-white/5">
+                <svg class="w-5 h-5 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>
+                <span class="text-slate-300">Jedis (Java)</span>
+            </div>
+            <div class="flex items-center gap-3 p-3 rounded-lg bg-white/5">
+                <svg class="w-5 h-5 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>
+                <span class="text-slate-300">redis-benchmark</span>
+            </div>
+        </div>
+    </div>
+</div>

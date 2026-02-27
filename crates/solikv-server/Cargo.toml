@@ -1,0 +1,32 @@
+[package]
+name = "solikv-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "solikv"
+path = "src/main.rs"
+
+[dependencies]
+solikv-core = { workspace = true }
+solikv-resp = { workspace = true }
+solikv-engine = { workspace = true }
+solikv-pubsub = { workspace = true }
+solikv-persist = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+mimalloc = { version = "0.1", default-features = false }
+futures = "0.3"
+
+[dev-dependencies]
+redis = { version = "0.27", features = ["tokio-comp"] }
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { workspace = true, features = ["test-util"] }
