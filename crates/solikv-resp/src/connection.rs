@@ -15,11 +15,11 @@ pub struct ClientConnection {
 }
 
 impl ClientConnection {
-    pub fn new(addr: SocketAddr) -> Self {
+    pub fn new(addr: SocketAddr, requires_auth: bool) -> Self {
         Self {
             addr,
             db: 0,
-            authenticated: true, // no auth by default
+            authenticated: !requires_auth,
             in_transaction: false,
             tx_queue: Vec::new(),
             watch_keys: Vec::new(),

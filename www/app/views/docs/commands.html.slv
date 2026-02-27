@@ -1,22 +1,28 @@
 <div class="space-y-16">
     <div>
         <h1 class="text-4xl font-bold mb-4">Command Reference</h1>
-        <p class="text-lg text-slate-400">Complete reference for all 92 Redis-compatible commands</p>
+        <p class="text-lg text-slate-400">Complete reference for all 100+ Redis-compatible commands</p>
     </div>
 
     <!-- Quick Navigation -->
     <div class="p-6 rounded-xl bg-slate-900 border border-white/10">
         <div class="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">Jump to</div>
         <div class="flex flex-wrap gap-2">
-            <a href="#strings" class="px-3 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 text-sm hover:bg-emerald-500/20 transition-colors">Strings (16)</a>
-            <a href="#lists" class="px-3 py-1.5 rounded-lg bg-cyan-500/10 text-cyan-400 text-sm hover:bg-cyan-500/20 transition-colors">Lists (13)</a>
-            <a href="#hashes" class="px-3 py-1.5 rounded-lg bg-purple-500/10 text-purple-400 text-sm hover:bg-purple-500/20 transition-colors">Hashes (11)</a>
-            <a href="#sets" class="px-3 py-1.5 rounded-lg bg-pink-500/10 text-pink-400 text-sm hover:bg-pink-500/20 transition-colors">Sets (10)</a>
-            <a href="#sorted-sets" class="px-3 py-1.5 rounded-lg bg-orange-500/10 text-orange-400 text-sm hover:bg-orange-500/20 transition-colors">Sorted Sets (12)</a>
-            <a href="#keys" class="px-3 py-1.5 rounded-lg bg-yellow-500/10 text-yellow-400 text-sm hover:bg-yellow-500/20 transition-colors">Keys (11)</a>
+            <a href="#strings" class="px-3 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 text-sm hover:bg-emerald-500/20 transition-colors">Strings (21)</a>
+            <a href="#lists" class="px-3 py-1.5 rounded-lg bg-cyan-500/10 text-cyan-400 text-sm hover:bg-cyan-500/20 transition-colors">Lists (14)</a>
+            <a href="#hashes" class="px-3 py-1.5 rounded-lg bg-purple-500/10 text-purple-400 text-sm hover:bg-purple-500/20 transition-colors">Hashes (14)</a>
+            <a href="#sets" class="px-3 py-1.5 rounded-lg bg-pink-500/10 text-pink-400 text-sm hover:bg-pink-500/20 transition-colors">Sets (11)</a>
+            <a href="#sorted-sets" class="px-3 py-1.5 rounded-lg bg-orange-500/10 text-orange-400 text-sm hover:bg-orange-500/20 transition-colors">Sorted Sets (17)</a>
+            <a href="#streams" class="px-3 py-1.5 rounded-lg bg-sky-500/10 text-sky-400 text-sm hover:bg-sky-500/20 transition-colors">Streams (14)</a>
+            <a href="#keys" class="px-3 py-1.5 rounded-lg bg-yellow-500/10 text-yellow-400 text-sm hover:bg-yellow-500/20 transition-colors">Keys (18)</a>
             <a href="#transactions" class="px-3 py-1.5 rounded-lg bg-red-500/10 text-red-400 text-sm hover:bg-red-500/20 transition-colors">Transactions (3)</a>
-            <a href="#pubsub" class="px-3 py-1.5 rounded-lg bg-teal-500/10 text-teal-400 text-sm hover:bg-teal-500/20 transition-colors">Pub/Sub (5)</a>
-            <a href="#server" class="px-3 py-1.5 rounded-lg bg-slate-500/10 text-slate-400 text-sm hover:bg-slate-500/20 transition-colors">Server (11)</a>
+            <a href="#pubsub" class="px-3 py-1.5 rounded-lg bg-teal-500/10 text-teal-400 text-sm hover:bg-teal-500/20 transition-colors">Pub/Sub (8)</a>
+            <a href="#scripting" class="px-3 py-1.5 rounded-lg bg-indigo-500/10 text-indigo-400 text-sm hover:bg-indigo-500/20 transition-colors">Scripting (5)</a>
+            <a href="#bitmap" class="px-3 py-1.5 rounded-lg bg-amber-500/10 text-amber-400 text-sm hover:bg-amber-500/20 transition-colors">Bitmap (4)</a>
+            <a href="#hyperloglog" class="px-3 py-1.5 rounded-lg bg-violet-500/10 text-violet-400 text-sm hover:bg-violet-500/20 transition-colors">HyperLogLog (3)</a>
+            <a href="#bloom-filter" class="px-3 py-1.5 rounded-lg bg-rose-500/10 text-rose-400 text-sm hover:bg-rose-500/20 transition-colors">Bloom Filter (6)</a>
+            <a href="#geospatial" class="px-3 py-1.5 rounded-lg bg-teal-500/10 text-teal-400 text-sm hover:bg-teal-500/20 transition-colors">Geospatial (6)</a>
+            <a href="#server" class="px-3 py-1.5 rounded-lg bg-slate-500/10 text-slate-400 text-sm hover:bg-slate-500/20 transition-colors">Server (18)</a>
         </div>
     </div>
 
@@ -155,6 +161,44 @@
                 <div class="text-white">"13.25"</div>
             </div>
         </div>
+
+        <!-- GETDEL / GETEX -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-emerald-400">GETDEL / GETEX</h3>
+            <div class="text-sm text-slate-400 mb-3">GETDEL returns and deletes the value atomically. GETEX returns value and optionally sets expiry.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">GETDEL key<br>GETEX key [EX seconds | PX milliseconds | PERSIST]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET temp "value"</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GETDEL temp</span></div>
+                <div class="text-white">"value"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GET temp</span></div>
+                <div class="text-white">(nil)</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET session "data"</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GETEX session EX 3600</span></div>
+                <div class="text-white">"data"</div>
+            </div>
+        </div>
+
+        <!-- GETRANGE / SETRANGE -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-emerald-400">GETRANGE / SETRANGE</h3>
+            <div class="text-sm text-slate-400 mb-3">GETRANGE returns a substring. SETRANGE overwrites bytes starting at offset.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">GETRANGE key start end<br>SETRANGE key offset value</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET greeting "hello world"</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GETRANGE greeting 0 4</span></div>
+                <div class="text-white">"hello"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GETRANGE greeting -6 -1</span></div>
+                <div class="text-white">"world"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SETRANGE greeting 6 "rust"</span></div>
+                <div class="text-white">(integer) 11</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GET greeting</span></div>
+                <div class="text-white">"hello rust"</div>
+            </div>
+        </div>
     </div>
 
     <!-- ==================== LISTS ==================== -->
@@ -186,15 +230,16 @@
         <!-- LPOP / RPOP -->
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-cyan-400">LPOP / RPOP</h3>
-            <div class="text-sm text-slate-400 mb-3">Remove and return an element from the head (LPOP) or tail (RPOP). Returns nil if empty.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">LPOP key<br>RPOP key</div>
+            <div class="text-sm text-slate-400 mb-3">Remove and return an element from the head (LPOP) or tail (RPOP). Returns nil if empty. Optional count removes multiple elements.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">LPOP key [count]<br>RPOP key [count]</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPUSH tasks a b c</span></div>
-                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPUSH tasks a b c d e</span></div>
+                <div class="text-white">(integer) 5</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LPOP tasks</span></div>
                 <div class="text-white">"a"</div>
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPOP tasks</span></div>
-                <div class="text-white">"c"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPOP tasks 2</span></div>
+                <div class="text-white">1) "d"</div>
+                <div class="text-white">2) "e"</div>
             </div>
         </div>
 
@@ -219,11 +264,11 @@
             </div>
         </div>
 
-        <!-- LREM / LTRIM / LINSERT / LPOS / RPOPLPUSH -->
+        <!-- LREM / LTRIM / LINSERT / LPOS -->
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
-            <h3 class="text-xl font-semibold mb-1 font-mono text-cyan-400">LREM / LTRIM / LINSERT / LPOS / RPOPLPUSH</h3>
+            <h3 class="text-xl font-semibold mb-1 font-mono text-cyan-400">LREM / LTRIM / LINSERT / LPOS</h3>
             <div class="text-sm text-slate-400 mb-3">Advanced list manipulation.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">LREM key count value<br>LTRIM key start stop<br>LINSERT key BEFORE|AFTER pivot value<br>LPOS key value<br>RPOPLPUSH source destination</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">LREM key count value<br>LTRIM key start stop<br>LINSERT key BEFORE|AFTER pivot value<br>LPOS key value</div>
             <div class="text-xs text-slate-500 mb-3">
                 <span class="text-slate-400">LREM count&gt;0</span> &mdash; remove first N from head.
                 <span class="text-slate-400">count&lt;0</span> &mdash; remove first N from tail.
@@ -238,8 +283,12 @@
                 <div class="text-white">(integer) 3</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LINSERT mylist BEFORE c X</span></div>
                 <div class="text-white">(integer) 5</div>
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPOPLPUSH mylist other</span></div>
-                <div class="text-white">"d"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LTRIM mylist 0 2</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LRANGE mylist 0 -1</span></div>
+                <div class="text-white">1) "a"</div>
+                <div class="text-white">2) "X"</div>
+                <div class="text-white">3) "c"</div>
             </div>
         </div>
     </div>
@@ -268,11 +317,11 @@
             </div>
         </div>
 
-        <!-- HGETALL / HKEYS / HVALS / HLEN / HMSET / HMGET / HINCRBY -->
+        <!-- HGETALL / HKEYS / HVALS / HLEN / HMSET / HMGET / HINCRBY / HINCRBYFLOAT -->
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
-            <h3 class="text-xl font-semibold mb-1 font-mono text-purple-400">HGETALL / HKEYS / HVALS / HLEN / HMSET / HMGET / HINCRBY</h3>
+            <h3 class="text-xl font-semibold mb-1 font-mono text-purple-400">HGETALL / HKEYS / HVALS / HLEN / HMSET / HMGET / HINCRBY / HINCRBYFLOAT</h3>
             <div class="text-sm text-slate-400 mb-3">Bulk hash operations and introspection.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">HGETALL key<br>HKEYS key<br>HVALS key<br>HLEN key<br>HMSET key field val [field val ...]<br>HMGET key field [field ...]<br>HINCRBY key field amount</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">HGETALL key<br>HKEYS key<br>HVALS key<br>HLEN key<br>HMSET key field val [field val ...]<br>HMGET key field [field ...]<br>HINCRBY key field amount<br>HINCRBYFLOAT key field amount</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HGETALL user:1</span></div>
                 <div class="text-white">1) "name"</div>
@@ -284,10 +333,29 @@
                 <div class="text-white">2) "age"</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HINCRBY user:1 age 1</span></div>
                 <div class="text-white">(integer) 31</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HINCRBYFLOAT user:1 score 5.5</span></div>
+                <div class="text-white">"5.5"</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HMGET user:1 name age email</span></div>
                 <div class="text-white">1) "Alice"</div>
                 <div class="text-white">2) "31"</div>
                 <div class="text-white">3) (nil)</div>
+            </div>
+        </div>
+
+        <!-- HSETNX / HSCAN -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-purple-400">HSETNX / HSCAN</h3>
+            <div class="text-sm text-slate-400 mb-3">HSETNX sets a field only if it doesn't exist. HSCAN iterates over hash fields.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">HSETNX key field value<br>HSCAN key cursor [MATCH pattern] [COUNT count]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HSET user:1 name Alice</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HSETNX user:1 name Bob</span></div>
+                <div class="text-white">(integer) 0</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HSCAN user:1 0</span></div>
+                <div class="text-white">1) "0"</div>
+                <div class="text-white">2) 1) "name"</div>
+                <div class="text-white">3) "Alice"</div>
             </div>
         </div>
     </div>
@@ -318,11 +386,11 @@
             </div>
         </div>
 
-        <!-- SPOP / SRANDMEMBER / SUNION / SINTER / SDIFF -->
+        <!-- SPOP / SRANDMEMBER / SUNION / SINTER / SDIFF / SMOVE -->
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
-            <h3 class="text-xl font-semibold mb-1 font-mono text-pink-400">SPOP / SRANDMEMBER / SUNION / SINTER / SDIFF</h3>
-            <div class="text-sm text-slate-400 mb-3">Random access and set algebra.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SPOP key [count]<br>SRANDMEMBER key [count]<br>SUNION key [key ...]<br>SINTER key [key ...]<br>SDIFF key [key ...]</div>
+            <h3 class="text-xl font-semibold mb-1 font-mono text-pink-400">SPOP / SRANDMEMBER / SUNION / SINTER / SDIFF / SMOVE</h3>
+            <div class="text-sm text-slate-400 mb-3">Random access and set algebra. SMOVE moves a member between sets.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SPOP key [count]<br>SRANDMEMBER key [count]<br>SUNION key [key ...]<br>SINTER key [key ...]<br>SDIFF key [key ...]<br>SMOVE source destination member</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SADD s1 a b c d</span></div>
                 <div class="text-white">(integer) 4</div>
@@ -334,8 +402,14 @@
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SDIFF s1 s2</span></div>
                 <div class="text-white">1) "a"</div>
                 <div class="text-white">2) "b"</div>
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SPOP s1</span></div>
-                <div class="text-white">"b"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SMOVE s1 s2 a</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SMEMBERS s2</span></div>
+                <div class="text-white">1) "a"</div>
+                <div class="text-white">2) "c"</div>
+                <div class="text-white">3) "d"</div>
+                <div class="text-white">4) "e"</div>
+                <div class="text-white">5) "f"</div>
             </div>
         </div>
     </div>
@@ -406,6 +480,260 @@
                 <div class="text-slate-600 text-xs"># No members with score &lt;= 100 after ZINCRBY</div>
             </div>
         </div>
+
+        <!-- ZPOPMIN / ZPOPMAX -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-orange-400">ZPOPMIN / ZPOPMAX</h3>
+            <div class="text-sm text-slate-400 mb-3">Remove and return the lowest/highest scoring members.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">ZPOPMIN key [count]<br>ZPOPMAX key [count]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZADD prices 10 apple 30 banana 20 cherry</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZPOPMIN prices 2</span></div>
+                <div class="text-white">1) "apple"</div>
+                <div class="text-white">2) "10"</div>
+                <div class="text-white">3) "cherry"</div>
+                <div class="text-white">4) "20"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZPOPMAX prices</span></div>
+                <div class="text-white">1) "banana"</div>
+                <div class="text-white">2) "30"</div>
+            </div>
+        </div>
+
+        <!-- ZUNIONSTORE / ZINTERSTORE -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-orange-400">ZUNIONSTORE / ZINTERSTORE</h3>
+            <div class="text-sm text-slate-400 mb-3">Store the union/intersection of sorted sets with optional weights and aggregation.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">ZUNIONSTORE dest numkeys key [key ...] [WEIGHTS weight ...] [AGGREGATE SUM|MIN|MAX]<br>ZINTERSTORE dest numkeys key [key ...] [WEIGHTS weight ...] [AGGREGATE SUM|MIN|MAX]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZADD z1 1 a 2 b</span></div>
+                <div class="text-white">(integer) 2</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZADD z2 1 b 2 c</span></div>
+                <div class="text-white">(integer) 2</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZUNIONSTORE result 2 z1 z2</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZRANGE result 0 -1 WITHSCORES</span></div>
+                <div class="text-white">1) "a"</div>
+                <div class="text-white">2) "1"</div>
+                <div class="text-white">3) "b"</div>
+                <div class="text-white">4) "3"</div>
+                <div class="text-white">5) "c"</div>
+                <div class="text-white">6) "2"</div>
+            </div>
+        </div>
+
+        <!-- ZSCAN -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-orange-400">ZSCAN</h3>
+            <div class="text-sm text-slate-400 mb-3">Iterate over members in a sorted set.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">ZSCAN key cursor [MATCH pattern] [COUNT count]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZSCAN leaderboard 0</span></div>
+                <div class="text-white">1) "0"</div>
+                <div class="text-white">2) 1) "alice"</div>
+                <div class="text-white">3) "100"</div>
+                <div class="text-white">4) "bob"</div>
+                <div class="text-white">5) "200"</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== STREAMS ==================== -->
+    <div id="streams">
+        <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-sky-500/20 flex items-center justify-center text-lg font-bold text-sky-400">S</span>
+            Streams
+        </h2>
+
+        <!-- XADD / XLEN -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XADD / XLEN</h3>
+            <div class="text-sm text-slate-400 mb-3">Append entries to a stream and query its length. Use <code>*</code> for auto-generated IDs. NOMKSTREAM prevents creating a new stream. MAXLEN/MINID trim older entries on write.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XADD key [NOMKSTREAM] [MAXLEN|MINID [=|~] N] *|id field value [field value ...]<br>XLEN key</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XADD events * user alice action login</span></div>
+                <div class="text-white">"1709000000000-0"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XADD events * user bob action purchase item hat</span></div>
+                <div class="text-white">"1709000000001-0"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XADD events MAXLEN 1000 * user charlie action logout</span></div>
+                <div class="text-white">"1709000000002-0"</div>
+                <div class="text-slate-600 text-xs mt-1"># Trims stream to 1000 entries after adding</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XLEN events</span></div>
+                <div class="text-white">(integer) 3</div>
+            </div>
+        </div>
+
+        <!-- XRANGE / XREVRANGE -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XRANGE / XREVRANGE</h3>
+            <div class="text-sm text-slate-400 mb-3">Query entries by ID range. Use <code>-</code> for minimum and <code>+</code> for maximum. XREVRANGE returns entries in reverse order. COUNT limits results.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XRANGE key start end [COUNT n]<br>XREVRANGE key end start [COUNT n]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XRANGE events - +</span></div>
+                <div class="text-white">1) 1) "1709000000000-0"</div>
+                <div class="text-white">&nbsp;&nbsp; 2) 1) "user" 2) "alice" 3) "action" 4) "login"</div>
+                <div class="text-white">2) 1) "1709000000001-0"</div>
+                <div class="text-white">&nbsp;&nbsp; 2) 1) "user" 2) "bob" 3) "action" 4) "purchase" 5) "item" 6) "hat"</div>
+                <div class="text-white">3) 1) "1709000000002-0"</div>
+                <div class="text-white">&nbsp;&nbsp; 2) 1) "user" 2) "charlie" 3) "action" 4) "logout"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XRANGE events 1709000000001-0 + COUNT 1</span></div>
+                <div class="text-white">1) 1) "1709000000001-0"</div>
+                <div class="text-white">&nbsp;&nbsp; 2) 1) "user" 2) "bob" 3) "action" 4) "purchase" 5) "item" 6) "hat"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XREVRANGE events + - COUNT 1</span></div>
+                <div class="text-white">1) 1) "1709000000002-0"</div>
+                <div class="text-white">&nbsp;&nbsp; 2) 1) "user" 2) "charlie" 3) "action" 4) "logout"</div>
+                <div class="text-slate-600 text-xs mt-1"># Most recent entry</div>
+            </div>
+        </div>
+
+        <!-- XREAD -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XREAD</h3>
+            <div class="text-sm text-slate-400 mb-3">Read new entries from one or more streams after the given IDs. Use <code>0-0</code> to read from the beginning. BLOCK is accepted but returns immediately in v1.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XREAD [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XREAD COUNT 2 STREAMS events 0-0</span></div>
+                <div class="text-white">1) 1) "events"</div>
+                <div class="text-white">&nbsp;&nbsp; 2) 1) 1) "1709000000000-0"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 2) 1) "user" 2) "alice" 3) "action" 4) "login"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 2) 1) "1709000000001-0"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 2) 1) "user" 2) "bob" 3) "action" 4) "purchase" 5) "item" 6) "hat"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XREAD STREAMS events 1709000000002-0</span></div>
+                <div class="text-white">(nil)</div>
+                <div class="text-slate-600 text-xs mt-1"># No entries after the last ID</div>
+            </div>
+        </div>
+
+        <!-- XDEL / XTRIM -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XDEL / XTRIM</h3>
+            <div class="text-sm text-slate-400 mb-3">Remove specific entries or trim the stream. MAXLEN caps the total number of entries. MINID removes entries below a threshold ID. Use <code>~</code> for approximate trimming.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XDEL key id [id ...]<br>XTRIM key MAXLEN|MINID [=|~] N</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XDEL events 1709000000000-0</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XLEN events</span></div>
+                <div class="text-white">(integer) 2</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XTRIM events MAXLEN 1</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div class="text-slate-600 text-xs mt-1"># Removed 1 entry, stream now has 1 entry</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XTRIM events MINID 1709000000003-0</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div class="text-slate-600 text-xs"># Removed entries older than the given ID</div>
+            </div>
+        </div>
+
+        <!-- XINFO -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XINFO</h3>
+            <div class="text-sm text-slate-400 mb-3">Introspect stream metadata: length, first/last entry, consumer group count, and last generated ID.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XINFO STREAM key</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XADD logs * level info msg "server started"</span></div>
+                <div class="text-white">"1709000000000-0"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XINFO STREAM logs</span></div>
+                <div class="text-white">&nbsp;1) "length"</div>
+                <div class="text-white">&nbsp;2) (integer) 1</div>
+                <div class="text-white">&nbsp;3) "first-entry"</div>
+                <div class="text-white">&nbsp;4) 1) "1709000000000-0"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp; 2) 1) "level" 2) "info" 3) "msg" 4) "server started"</div>
+                <div class="text-white">&nbsp;5) "last-entry"</div>
+                <div class="text-white">&nbsp;6) 1) "1709000000000-0"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp; 2) 1) "level" 2) "info" 3) "msg" 4) "server started"</div>
+                <div class="text-white">&nbsp;7) "groups"</div>
+                <div class="text-white">&nbsp;8) (integer) 0</div>
+                <div class="text-white">&nbsp;9) "last-generated-id"</div>
+                <div class="text-white">10) "1709000000000-0"</div>
+            </div>
+        </div>
+
+        <!-- XGROUP CREATE / DESTROY / DELCONSUMER -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XGROUP CREATE / DESTROY / DELCONSUMER</h3>
+            <div class="text-sm text-slate-400 mb-3">Manage consumer groups. CREATE attaches a group to a stream starting from a given ID (<code>0</code> = all history, <code>$</code> = new entries only). MKSTREAM creates the stream if it doesn't exist. DELCONSUMER removes a consumer and its pending entries.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XGROUP CREATE key group id|$ [MKSTREAM]<br>XGROUP DESTROY key group<br>XGROUP DELCONSUMER key group consumer</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XGROUP CREATE events workers 0</span></div>
+                <div class="text-white">OK</div>
+                <div class="text-slate-600 text-xs mt-1"># Group "workers" reads all existing entries</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XGROUP CREATE newstream analytics $ MKSTREAM</span></div>
+                <div class="text-white">OK</div>
+                <div class="text-slate-600 text-xs"># Creates the stream + group, reads only new entries</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XGROUP DELCONSUMER events workers consumer1</span></div>
+                <div class="text-white">(integer) 0</div>
+                <div class="text-slate-600 text-xs"># Returns the number of pending entries that were deleted</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XGROUP DESTROY events workers</span></div>
+                <div class="text-white">(integer) 1</div>
+            </div>
+        </div>
+
+        <!-- XREADGROUP -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XREADGROUP</h3>
+            <div class="text-sm text-slate-400 mb-3">Read entries via a consumer group. Use <code>&gt;</code> to get new undelivered entries. Use <code>0</code> to re-read your own pending entries. Each delivered entry is tracked until acknowledged with XACK.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XREADGROUP GROUP group consumer [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XADD tasks * job build</span></div>
+                <div class="text-white">"1709000000000-0"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XADD tasks * job test</span></div>
+                <div class="text-white">"1709000000001-0"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XGROUP CREATE tasks ci 0</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XREADGROUP GROUP ci runner1 COUNT 1 STREAMS tasks &gt;</span></div>
+                <div class="text-white">1) 1) "tasks"</div>
+                <div class="text-white">&nbsp;&nbsp; 2) 1) 1) "1709000000000-0"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 2) 1) "job" 2) "build"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XREADGROUP GROUP ci runner1 COUNT 10 STREAMS tasks &gt;</span></div>
+                <div class="text-white">1) 1) "tasks"</div>
+                <div class="text-white">&nbsp;&nbsp; 2) 1) 1) "1709000000001-0"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 2) 1) "job" 2) "test"</div>
+                <div class="text-slate-600 text-xs mt-1"># Each call delivers the next undelivered entry</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XREADGROUP GROUP ci runner1 STREAMS tasks 0</span></div>
+                <div class="text-slate-600 text-xs"># Re-reads all pending entries for runner1</div>
+            </div>
+        </div>
+
+        <!-- XACK -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XACK</h3>
+            <div class="text-sm text-slate-400 mb-3">Acknowledge processed entries. Removes them from the consumer's pending list. Returns the number of entries successfully acknowledged.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XACK key group id [id ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XACK tasks ci 1709000000000-0</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XACK tasks ci 1709000000000-0 1709000000001-0</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div class="text-slate-600 text-xs mt-1"># First ID was already acked, only second counts</div>
+            </div>
+        </div>
+
+        <!-- XPENDING -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XPENDING</h3>
+            <div class="text-sm text-slate-400 mb-3">Inspect pending entries. Summary form shows total count, min/max ID, and per-consumer counts. Detail form shows individual entries with idle time and delivery count.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XPENDING key group<br>XPENDING key group start end count [consumer]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XPENDING tasks ci</span></div>
+                <div class="text-white">1) (integer) 2</div>
+                <div class="text-white">2) "1709000000000-0"</div>
+                <div class="text-white">3) "1709000000001-0"</div>
+                <div class="text-white">4) 1) 1) "runner1"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp;&nbsp; 2) "2"</div>
+                <div class="text-slate-600 text-xs mt-1"># Summary: 2 pending, min/max IDs, runner1 has 2</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XPENDING tasks ci - + 10</span></div>
+                <div class="text-white">1) 1) "1709000000000-0"</div>
+                <div class="text-white">&nbsp;&nbsp; 2) "runner1"</div>
+                <div class="text-white">&nbsp;&nbsp; 3) (integer) 5000</div>
+                <div class="text-white">&nbsp;&nbsp; 4) (integer) 1</div>
+                <div class="text-white">2) 1) "1709000000001-0"</div>
+                <div class="text-white">&nbsp;&nbsp; 2) "runner1"</div>
+                <div class="text-white">&nbsp;&nbsp; 3) (integer) 3000</div>
+                <div class="text-white">&nbsp;&nbsp; 4) (integer) 1</div>
+                <div class="text-slate-600 text-xs mt-1"># Detail: ID, consumer, idle ms, delivery count</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XPENDING tasks ci - + 10 runner1</span></div>
+                <div class="text-slate-600 text-xs"># Same but filtered to a specific consumer</div>
+            </div>
+        </div>
     </div>
 
     <!-- ==================== KEYS ==================== -->
@@ -416,9 +744,9 @@
         </h2>
 
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
-            <h3 class="text-xl font-semibold mb-1 font-mono text-yellow-400">DEL / EXISTS / TYPE / RENAME / RENAMENX</h3>
-            <div class="text-sm text-slate-400 mb-3">Key management. These work across all data types.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">DEL key [key ...]<br>EXISTS key [key ...]<br>TYPE key<br>RENAME key newkey<br>RENAMENX key newkey</div>
+            <h3 class="text-xl font-semibold mb-1 font-mono text-yellow-400">DEL / UNLINK / EXISTS / TYPE / RENAME / RENAMENX</h3>
+            <div class="text-sm text-slate-400 mb-3">Key management. UNLINK is async alternative to DEL. These work across all data types.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">DEL key [key ...]<br>UNLINK key [key ...]<br>EXISTS key [key ...]<br>TYPE key<br>RENAME key newkey<br>RENAMENX key newkey</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET foo bar</span></div>
                 <div class="text-white">OK</div>
@@ -428,15 +756,15 @@
                 <div class="text-white">(integer) 1</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RENAME foo baz</span></div>
                 <div class="text-white">OK</div>
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">DEL baz</span></div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">UNLINK baz</span></div>
                 <div class="text-white">(integer) 1</div>
             </div>
         </div>
 
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
-            <h3 class="text-xl font-semibold mb-1 font-mono text-yellow-400">EXPIRE / PEXPIRE / TTL / PTTL / PERSIST / KEYS</h3>
-            <div class="text-sm text-slate-400 mb-3">TTL management and key search. EXPIRE sets TTL in seconds, PEXPIRE in milliseconds. PERSIST removes TTL.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">EXPIRE key seconds<br>PEXPIRE key milliseconds<br>TTL key<br>PTTL key<br>PERSIST key<br>KEYS pattern</div>
+            <h3 class="text-xl font-semibold mb-1 font-mono text-yellow-400">EXPIRE / PEXPIRE / EXPIREAT / PEXPIREAT / TTL / PTTL / PERSIST / KEYS</h3>
+            <div class="text-sm text-slate-400 mb-3">TTL management and key search. EXPIRE/PEXPIRE set relative TTL. EXPIREAT/PEXPIREAT set absolute timestamp.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">EXPIRE key seconds<br>PEXPIRE key milliseconds<br>EXPIREAT key timestamp<br>PEXPIREAT key milliseconds<br>TTL key<br>PTTL key<br>PERSIST key<br>KEYS pattern</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET temp hello</span></div>
                 <div class="text-white">OK</div>
@@ -448,6 +776,22 @@
                 <div class="text-white">(integer) 1</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">KEYS user:*</span></div>
                 <div class="text-white">1) "user:1"</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-yellow-400">SCAN / RANDOMKEY / OBJECT</h3>
+            <div class="text-sm text-slate-400 mb-3">Key iteration and introspection. SCAN iterates keys without blocking. OBJECT reports internal encoding.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SCAN cursor [MATCH pattern] [COUNT count]<br>RANDOMKEY<br>OBJECT ENCODING key</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SCAN 0 MATCH user:* COUNT 100</span></div>
+                <div class="text-white">1) "0"</div>
+                <div class="text-white">2) 1) "user:1"</div>
+                <div class="text-white">3) "user:2"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RANDOMKEY</span></div>
+                <div class="text-white">"user:1"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">OBJECT ENCODING mystring</span></div>
+                <div class="text-white">"embstr"</div>
             </div>
         </div>
     </div>
@@ -492,9 +836,9 @@
         </h2>
 
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
-            <h3 class="text-xl font-semibold mb-1 font-mono text-teal-400">SUBSCRIBE / UNSUBSCRIBE / PUBLISH / PSUBSCRIBE / PUNSUBSCRIBE</h3>
-            <div class="text-sm text-slate-400 mb-3">Publish-subscribe messaging. Subscribers receive messages in real-time. PSUBSCRIBE supports glob patterns. Uses a separate mutex &mdash; does not contend with data operations.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SUBSCRIBE channel [channel ...]<br>UNSUBSCRIBE [channel ...]<br>PUBLISH channel message<br>PSUBSCRIBE pattern [pattern ...]<br>PUNSUBSCRIBE [pattern ...]</div>
+            <h3 class="text-xl font-semibold mb-1 font-mono text-teal-400">SUBSCRIBE / UNSUBSCRIBE / PUBLISH / PSUBSCRIBE / PUNSUBSCRIBE / PUBSUB</h3>
+            <div class="text-sm text-slate-400 mb-3">Publish-subscribe messaging. PSUBSCRIBE supports glob patterns. PUBSUB provides introspection.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SUBSCRIBE channel [channel ...]<br>UNSUBSCRIBE [channel ...]<br>PUBLISH channel message<br>PSUBSCRIBE pattern [pattern ...]<br>PUNSUBSCRIBE [pattern ...]<br>PUBSUB CHANNELS [pattern]<br>PUBSUB NUMSUB [channel ...]</div>
             <div class="grid grid-cols-2 gap-4">
                 <div>
                     <div class="text-xs text-slate-500 uppercase mb-2">Terminal 1 (subscriber)</div>
@@ -515,13 +859,403 @@
                         <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">PUBLISH news "breaking: SoliKV released"</span></div>
                         <div class="text-white">(integer) 1</div>
                         <div class="text-slate-600 text-xs mt-1"># 1 subscriber received it</div>
+                        <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">PUBSUB CHANNELS</span></div>
+                        <div class="text-white">1) "news"</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <!-- Keyspace Notifications -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-teal-400">Keyspace Notifications</h3>
+            <div class="text-sm text-slate-400 mb-3">
+                Enable event-driven notifications when keys are modified, deleted, or expire.
+                Clients subscribe via PSUBSCRIBE to channels like <code>__keyevent@0__:expired</code> or <code>__keyspace@0__:mykey</code>.
+                Disabled by default &mdash; enable with <code>CONFIG SET notify-keyspace-events</code>.
+            </div>
+            <div class="text-xs text-slate-500 mb-3">
+                <span class="text-slate-400">K</span> &mdash; keyspace events (<code>__keyspace@0__:&lt;key&gt;</code>).
+                <span class="text-slate-400">E</span> &mdash; keyevent events (<code>__keyevent@0__:&lt;event&gt;</code>).
+                <span class="text-slate-400">g</span> &mdash; generic commands (DEL, EXPIRE, RENAME...).
+                <span class="text-slate-400">$</span> &mdash; string commands.
+                <span class="text-slate-400">l</span> &mdash; list commands.
+                <span class="text-slate-400">s</span> &mdash; set commands.
+                <span class="text-slate-400">h</span> &mdash; hash commands.
+                <span class="text-slate-400">z</span> &mdash; sorted set commands.
+                <span class="text-slate-400">t</span> &mdash; stream commands.
+                <span class="text-slate-400">x</span> &mdash; expired events.
+                <span class="text-slate-400">e</span> &mdash; evicted events.
+                <span class="text-slate-400">A</span> &mdash; alias for g$lshztxe (all events).
+            </div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">CONFIG SET notify-keyspace-events KEA</div>
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <div class="text-xs text-slate-500 uppercase mb-2">Terminal 1 (subscriber)</div>
+                    <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                        <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">PSUBSCRIBE __keyevent@0__:*</span></div>
+                        <div class="text-slate-600 text-xs mt-1"># Waiting for events...</div>
+                        <div class="text-white mt-2">1) "pmessage"</div>
+                        <div class="text-white">2) "__keyevent@0__:*"</div>
+                        <div class="text-white">3) "__keyevent@0__:set"</div>
+                        <div class="text-white">4) "mykey"</div>
+                        <div class="text-white mt-2">1) "pmessage"</div>
+                        <div class="text-white">2) "__keyevent@0__:*"</div>
+                        <div class="text-white">3) "__keyevent@0__:expired"</div>
+                        <div class="text-white">4) "mykey"</div>
+                    </div>
+                </div>
+                <div>
+                    <div class="text-xs text-slate-500 uppercase mb-2">Terminal 2 (publisher)</div>
+                    <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                        <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">CONFIG SET notify-keyspace-events KEA</span></div>
+                        <div class="text-white">OK</div>
+                        <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET mykey hello PX 1000</span></div>
+                        <div class="text-white">OK</div>
+                        <div class="text-slate-600 text-xs mt-1"># After 1 second, expired event fires</div>
                     </div>
                 </div>
             </div>
         </div>
     </div>
 
+    <!-- ==================== SCRIPTING ==================== -->
+    <div id="scripting">
+        <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-indigo-500/20 flex items-center justify-center text-lg font-bold text-indigo-400">L</span>
+            Scripting
+        </h2>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-indigo-400">EVAL</h3>
+            <div class="text-sm text-slate-400 mb-3">Execute a Lua script server-side. Scripts receive KEYS and ARGV tables, and can call Redis commands via <code>redis.call()</code> and <code>redis.pcall()</code>.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">EVAL script numkeys [key ...] [arg ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">EVAL "return 42" 0</span></div>
+                <div class="text-white">(integer) 42</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">EVAL "return redis.call('SET',KEYS[1],ARGV[1])" 1 mykey myval</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">EVAL "return redis.call('GET',KEYS[1])" 1 mykey</span></div>
+                <div class="text-white">"myval"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">EVAL "return {1, 2, 3}" 0</span></div>
+                <div class="text-white">1) (integer) 1</div>
+                <div class="text-white">2) (integer) 2</div>
+                <div class="text-white">3) (integer) 3</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-indigo-400">EVALSHA</h3>
+            <div class="text-sm text-slate-400 mb-3">Execute a cached script by its SHA1 digest. Use SCRIPT LOAD to cache scripts first. Returns NOSCRIPT error if the script is not cached.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">EVALSHA sha1 numkeys [key ...] [arg ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">EVALSHA e0e1f9fabfc9d4800c877a703b823ac0578ff831 0</span></div>
+                <div class="text-white">"hello"</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-indigo-400">SCRIPT LOAD</h3>
+            <div class="text-sm text-slate-400 mb-3">Cache a Lua script and return its SHA1 digest for later use with EVALSHA.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SCRIPT LOAD script</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SCRIPT LOAD "return 'hello'"</span></div>
+                <div class="text-white">"e0e1f9fabfc9d4800c877a703b823ac0578ff831"</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-indigo-400">SCRIPT EXISTS</h3>
+            <div class="text-sm text-slate-400 mb-3">Check if one or more scripts are cached. Returns an array of 1 (cached) or 0 (not cached) for each SHA1.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SCRIPT EXISTS sha1 [sha1 ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SCRIPT EXISTS e0e1f9fabfc9d4800c877a703b823ac0578ff831 0000000000000000000000000000000000000000</span></div>
+                <div class="text-white">1) (integer) 1</div>
+                <div class="text-white">2) (integer) 0</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-indigo-400">SCRIPT FLUSH</h3>
+            <div class="text-sm text-slate-400 mb-3">Clear the script cache. All previously loaded scripts will need to be re-loaded.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SCRIPT FLUSH</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SCRIPT FLUSH</span></div>
+                <div class="text-white">OK</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== BITMAP ==================== -->
+    <div id="bitmap">
+        <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-amber-500/20 flex items-center justify-center text-lg font-bold text-amber-400">B</span>
+            Bitmap
+        </h2>
+
+        <!-- SETBIT -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-amber-400">SETBIT</h3>
+            <div class="text-sm text-slate-400 mb-3">Set or clear the bit at offset in the string value stored at key. Returns the original bit value. The string is auto-grown with zero bytes to ensure the offset can be addressed.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SETBIT key offset value</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-amber-400">SETBIT mykey 7 1</span></div>
+                <div class="text-white">(integer) 0</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-amber-400">SETBIT mykey 7 0</span></div>
+                <div class="text-white">(integer) 1</div>
+            </div>
+        </div>
+
+        <!-- GETBIT -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-amber-400">GETBIT</h3>
+            <div class="text-sm text-slate-400 mb-3">Returns the bit value at offset in the string value stored at key. Returns 0 if the key does not exist or the offset is beyond the string length.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">GETBIT key offset</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-amber-400">SETBIT mykey 7 1</span></div>
+                <div class="text-white">(integer) 0</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-amber-400">GETBIT mykey 7</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-amber-400">GETBIT mykey 100</span></div>
+                <div class="text-white">(integer) 0</div>
+            </div>
+        </div>
+
+        <!-- BITCOUNT -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-amber-400">BITCOUNT</h3>
+            <div class="text-sm text-slate-400 mb-3">Count the number of set bits (population counting) in a string. By default examines all bytes; optional start/end specify a byte range (negative indices count from the end).</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">BITCOUNT key [start end]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-amber-400">SET mykey "\xff\xf0"</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-amber-400">BITCOUNT mykey</span></div>
+                <div class="text-white">(integer) 12</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-amber-400">BITCOUNT mykey 0 0</span></div>
+                <div class="text-white">(integer) 8</div>
+            </div>
+        </div>
+
+        <!-- BITOP -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-amber-400">BITOP</h3>
+            <div class="text-sm text-slate-400 mb-3">Perform a bitwise operation between multiple keys and store the result in the destination key. Supported operations: AND, OR, XOR, NOT. NOT takes exactly one source key. Shorter strings are zero-padded.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">BITOP operation destkey key [key ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-amber-400">SET k1 "\xff"</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-amber-400">SET k2 "\x0f"</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-amber-400">BITOP AND dest k1 k2</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-amber-400">BITOP NOT negated k1</span></div>
+                <div class="text-white">(integer) 1</div>
+            </div>
+        </div>
+    </div>
+
     <!-- ==================== SERVER ==================== -->
+    <!-- ==================== HYPERLOGLOG ==================== -->
+    <div id="hyperloglog">
+        <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-violet-500/20 flex items-center justify-center text-lg font-bold text-violet-400">H</span>
+            HyperLogLog
+        </h2>
+
+        <!-- PFADD -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-violet-400">PFADD</h3>
+            <div class="text-sm text-slate-400 mb-3">Add elements to a HyperLogLog. Returns 1 if any internal register was altered, 0 otherwise.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">PFADD key element [element ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-violet-400">PFADD visitors alice bob charlie alice</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-violet-400">PFADD visitors alice</span></div>
+                <div class="text-white">(integer) 0</div>
+            </div>
+        </div>
+
+        <!-- PFCOUNT -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-violet-400">PFCOUNT</h3>
+            <div class="text-sm text-slate-400 mb-3">Return the approximate cardinality of the set(s). Multiple keys are merged internally before counting.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">PFCOUNT key [key ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-violet-400">PFCOUNT visitors</span></div>
+                <div class="text-white">(integer) 3</div>
+            </div>
+        </div>
+
+        <!-- PFMERGE -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-violet-400">PFMERGE</h3>
+            <div class="text-sm text-slate-400 mb-3">Merge multiple HyperLogLogs into a destination key. Creates or overwrites the destination.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">PFMERGE destkey sourcekey [sourcekey ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-violet-400">PFMERGE all visitors1 visitors2</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-violet-400">PFCOUNT all</span></div>
+                <div class="text-white">(integer) 5</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== BLOOM FILTER ==================== -->
+    <div id="bloom-filter">
+        <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-rose-500/20 flex items-center justify-center text-lg font-bold text-rose-400">B</span>
+            Bloom Filter
+        </h2>
+
+        <!-- BF.RESERVE -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-rose-400">BF.RESERVE</h3>
+            <div class="text-sm text-slate-400 mb-3">Create an empty Bloom filter with a given desired error rate and initial capacity. The filter auto-creates with defaults (0.01 error, 100 capacity) on first BF.ADD if not reserved.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">BF.RESERVE key error_rate capacity</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-rose-400">BF.RESERVE myfilter 0.001 10000</span></div>
+                <div class="text-white">OK</div>
+            </div>
+        </div>
+
+        <!-- BF.ADD -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-rose-400">BF.ADD</h3>
+            <div class="text-sm text-slate-400 mb-3">Add an item to the Bloom filter. Returns 1 if the item was newly added, 0 if it may have existed.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">BF.ADD key item</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-rose-400">BF.ADD myfilter hello</span></div>
+                <div class="text-white">(integer) 1</div>
+            </div>
+        </div>
+
+        <!-- BF.MADD -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-rose-400">BF.MADD</h3>
+            <div class="text-sm text-slate-400 mb-3">Add multiple items to the Bloom filter. Returns an array of 1/0 for each item.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">BF.MADD key item [item ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-rose-400">BF.MADD myfilter foo bar baz</span></div>
+                <div class="text-white">1) (integer) 1</div>
+                <div class="text-white">2) (integer) 1</div>
+                <div class="text-white">3) (integer) 1</div>
+            </div>
+        </div>
+
+        <!-- BF.EXISTS -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-rose-400">BF.EXISTS</h3>
+            <div class="text-sm text-slate-400 mb-3">Check if an item may exist in the Bloom filter. Returns 1 if it may exist (possible false positive), 0 if it definitely does not.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">BF.EXISTS key item</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-rose-400">BF.EXISTS myfilter hello</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-rose-400">BF.EXISTS myfilter unknown</span></div>
+                <div class="text-white">(integer) 0</div>
+            </div>
+        </div>
+
+        <!-- BF.MEXISTS -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-rose-400">BF.MEXISTS</h3>
+            <div class="text-sm text-slate-400 mb-3">Check if multiple items may exist in the Bloom filter. Returns an array of 1/0 for each item.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">BF.MEXISTS key item [item ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-rose-400">BF.MEXISTS myfilter hello unknown</span></div>
+                <div class="text-white">1) (integer) 1</div>
+                <div class="text-white">2) (integer) 0</div>
+            </div>
+        </div>
+
+        <!-- BF.INFO -->
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-rose-400">BF.INFO</h3>
+            <div class="text-sm text-slate-400 mb-3">Return information about a Bloom filter: capacity, size, number of filters, items inserted, and expansion rate.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">BF.INFO key</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-rose-400">BF.INFO myfilter</span></div>
+                <div class="text-white"> 1) "Capacity"</div>
+                <div class="text-white"> 2) (integer) 10000</div>
+                <div class="text-white"> 3) "Size"</div>
+                <div class="text-white"> 4) (integer) 14378</div>
+                <div class="text-white"> 5) "Number of filters"</div>
+                <div class="text-white"> 6) (integer) 1</div>
+                <div class="text-white"> 7) "Number of items inserted"</div>
+                <div class="text-white"> 8) (integer) 42</div>
+                <div class="text-white"> 9) "Expansion rate"</div>
+                <div class="text-white">10) (integer) 0</div>
+            </div>
+        </div>
+    </div>
+
+    <div id="geospatial">
+        <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-teal-500/20 flex items-center justify-center text-lg font-bold text-teal-400">G</span>
+            Geospatial
+        </h2>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-teal-400">GEOADD</h3>
+            <div class="text-sm text-slate-400 mb-3">Add one or more geospatial items (longitude, latitude, name) to a sorted set. Items are stored as 52-bit geohash scores.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">GEOADD key [NX|XX] [CH] longitude latitude member [longitude latitude member ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GEOADD mygeo 13.361389 38.115556 "Palermo" 15.087269 37.502669 "Catania"</span></div>
+                <div class="text-white">(integer) 2</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-teal-400">GEOPOS</h3>
+            <div class="text-sm text-slate-400 mb-3">Return the longitude and latitude of one or more members. Returns nil for missing members.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">GEOPOS key member [member ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GEOPOS mygeo Palermo</span></div>
+                <div class="text-white">1) 1) "13.36138933897018433"</div>
+                <div class="text-white">   2) "38.11555639549629859"</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-teal-400">GEOHASH</h3>
+            <div class="text-sm text-slate-400 mb-3">Return the standard 11-character geohash string for one or more members.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">GEOHASH key member [member ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GEOHASH mygeo Palermo</span></div>
+                <div class="text-white">1) "sqc8b49rny0"</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-teal-400">GEODIST</h3>
+            <div class="text-sm text-slate-400 mb-3">Return the distance between two members. Supports m (meters), km, ft, mi units. Returns nil if either member is missing.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">GEODIST key member1 member2 [M|KM|FT|MI]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GEODIST mygeo Palermo Catania km</span></div>
+                <div class="text-white">"166.2742"</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-teal-400">GEOSEARCH</h3>
+            <div class="text-sm text-slate-400 mb-3">Search for members within a radius or bounding box from a center point (coordinates or existing member). Supports sorting, counting, and returning coordinates/distances.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">GEOSEARCH key FROMMEMBER member | FROMLONLAT lon lat BYRADIUS radius M|KM|FT|MI | BYBOX width height M|KM|FT|MI [ASC|DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GEOSEARCH mygeo FROMLONLAT 15 37 BYRADIUS 200 km ASC</span></div>
+                <div class="text-white">1) "Catania"</div>
+                <div class="text-white">2) "Palermo"</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-teal-400">GEOSEARCHSTORE</h3>
+            <div class="text-sm text-slate-400 mb-3">Like GEOSEARCH, but stores the results in a destination sorted set. With STOREDIST, stores the distance as the score instead of the geohash.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">GEOSEARCHSTORE dest src FROMMEMBER member | FROMLONLAT lon lat BYRADIUS radius M|KM|FT|MI | BYBOX width height M|KM|FT|MI [ASC|DESC] [COUNT count [ANY]] [STOREDIST]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GEOSEARCHSTORE nearby mygeo FROMLONLAT 15 37 BYRADIUS 200 km ASC</span></div>
+                <div class="text-white">(integer) 2</div>
+            </div>
+        </div>
+    </div>
+
     <div id="server">
         <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
             <span class="w-10 h-10 rounded-xl bg-slate-500/20 flex items-center justify-center text-lg font-bold text-slate-400">*</span>
@@ -529,9 +1263,9 @@
         </h2>
 
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
-            <h3 class="text-xl font-semibold mb-1 font-mono text-slate-400">PING / ECHO / QUIT / SELECT / DBSIZE / FLUSHDB / FLUSHALL / INFO / COMMAND / CONFIG / TIME</h3>
-            <div class="text-sm text-slate-400 mb-3">Server management and diagnostics.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">PING [message]<br>ECHO message<br>QUIT<br>SELECT db (0-15)<br>DBSIZE<br>FLUSHDB<br>FLUSHALL<br>INFO [section]<br>COMMAND [DOCS|COUNT]<br>CONFIG GET pattern<br>TIME</div>
+            <h3 class="text-xl font-semibold mb-1 font-mono text-slate-400">PING / ECHO / QUIT / SELECT / DBSIZE / FLUSHDB / FLUSHALL / INFO / COMMAND / CONFIG / TIME / CLIENT / RESET / SAVE / BGSAVE</h3>
+            <div class="text-sm text-slate-400 mb-3">Server management, diagnostics, and persistence.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">PING [message]<br>ECHO message<br>QUIT<br>RESET<br>SELECT db (0-15)<br>DBSIZE<br>FLUSHDB<br>FLUSHALL<br>INFO [section]<br>COMMAND [DOCS|COUNT]<br>CONFIG GET pattern<br>TIME<br>CLIENT SETNAME name<br>CLIENT GETNAME<br>CLIENT ID<br>SAVE<br>BGSAVE</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">PING</span></div>
                 <div class="text-white">PONG</div>
@@ -543,6 +1277,8 @@
                 <div class="text-white">OK</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">DBSIZE</span></div>
                 <div class="text-white">(integer) 0</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">CLIENT ID</span></div>
+                <div class="text-white">(integer) 1</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">TIME</span></div>
                 <div class="text-white">1) "1708790400"</div>
                 <div class="text-white">2) "123456"</div>

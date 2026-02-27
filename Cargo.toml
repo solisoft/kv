@@ -24,6 +24,8 @@ crossbeam-skiplist = "0.1"
 dashmap = "6.1"
 crc16 = "0.4"
 parking_lot = "0.12"
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+sha1 = "0.10"
 
 # Workspace crates
 solikv-core = { path = "crates/solikv-core" }

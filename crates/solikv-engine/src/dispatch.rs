@@ -1,12 +1,152 @@
 use bytes::Bytes;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 
 use solikv_core::types::*;
 use solikv_core::zset_ops::Aggregate;
+
+// ── Keyspace notification flags ──
+// Manual bitflags (no extra crate).
+pub const NOTIFY_KEYSPACE: u16 = 0x001; // K
+pub const NOTIFY_KEYEVENT: u16 = 0x002; // E
+pub const NOTIFY_GENERIC: u16 = 0x004; // g
+pub const NOTIFY_STRING: u16 = 0x008; // $
+pub const NOTIFY_LIST: u16 = 0x010; // l
+pub const NOTIFY_SET: u16 = 0x020; // s
+pub const NOTIFY_HASH: u16 = 0x040; // h
+pub const NOTIFY_ZSET: u16 = 0x080; // z
+pub const NOTIFY_STREAM: u16 = 0x100; // t
+pub const NOTIFY_EXPIRED: u16 = 0x200; // x
+pub const NOTIFY_EVICTED: u16 = 0x400; // e
+pub const NOTIFY_ALL: u16 = NOTIFY_GENERIC
+    | NOTIFY_STRING
+    | NOTIFY_LIST
+    | NOTIFY_SET
+    | NOTIFY_HASH
+    | NOTIFY_ZSET
+    | NOTIFY_STREAM
+    | NOTIFY_EXPIRED
+    | NOTIFY_EVICTED; // A
+
+pub fn parse_notify_flags(s: &str) -> u16 {
+    let mut flags: u16 = 0;
+    for c in s.chars() {
+        match c {
+            'K' => flags |= NOTIFY_KEYSPACE,
+            'E' => flags |= NOTIFY_KEYEVENT,
+            'g' => flags |= NOTIFY_GENERIC,
+            '$' => flags |= NOTIFY_STRING,
+            'l' => flags |= NOTIFY_LIST,
+            's' => flags |= NOTIFY_SET,
+            'h' => flags |= NOTIFY_HASH,
+            'z' => flags |= NOTIFY_ZSET,
+            't' => flags |= NOTIFY_STREAM,
+            'x' => flags |= NOTIFY_EXPIRED,
+            'e' => flags |= NOTIFY_EVICTED,
+            'A' => flags |= NOTIFY_ALL,
+            _ => {}
+        }
+    }
+    // If neither K nor E is set, disable entirely
+    if flags & (NOTIFY_KEYSPACE | NOTIFY_KEYEVENT) == 0 {
+        return 0;
+    }
+    flags
+}
+
+pub fn flags_to_string(flags: u16) -> String {
+    if flags == 0 {
+        return String::new();
+    }
+    let mut s = String::new();
+    if flags & NOTIFY_KEYSPACE != 0 {
+        s.push('K');
+    }
+    if flags & NOTIFY_KEYEVENT != 0 {
+        s.push('E');
+    }
+    if flags & NOTIFY_GENERIC != 0 {
+        s.push('g');
+    }
+    if flags & NOTIFY_STRING != 0 {
+        s.push('$');
+    }
+    if flags & NOTIFY_LIST != 0 {
+        s.push('l');
+    }
+    if flags & NOTIFY_SET != 0 {
+        s.push('s');
+    }
+    if flags & NOTIFY_HASH != 0 {
+        s.push('h');
+    }
+    if flags & NOTIFY_ZSET != 0 {
+        s.push('z');
+    }
+    if flags & NOTIFY_STREAM != 0 {
+        s.push('t');
+    }
+    if flags & NOTIFY_EXPIRED != 0 {
+        s.push('x');
+    }
+    if flags & NOTIFY_EVICTED != 0 {
+        s.push('e');
+    }
+    s
+}
+
+fn parse_stream_id(arg: &Bytes) -> Option<StreamIdInput> {
+    let s = std::str::from_utf8(arg).ok()?;
+    StreamId::parse(s)
+}
+
+fn parse_stream_trim(args: &[Bytes], start: &mut usize) -> Result<Option<StreamTrim>, CommandResponse> {
+    let i = *start;
+    if i >= args.len() {
+        return Ok(None);
+    }
+    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+    match opt.as_str() {
+        "MAXLEN" | "MINID" => {
+            *start = i + 1;
+            let mut exact = true;
+            if *start < args.len() {
+                let next = std::str::from_utf8(&args[*start]).unwrap_or("");
+                if next == "~" || next == "=" {
+                    exact = next == "=";
+                    *start += 1;
+                }
+            }
+            if *start >= args.len() {
+                return Err(CommandResponse::syntax_error());
+            }
+            if opt == "MAXLEN" {
+                let threshold = std::str::from_utf8(&args[*start])
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .ok_or_else(CommandResponse::syntax_error)?;
+                *start += 1;
+                Ok(Some(StreamTrim::MaxLen { exact, threshold }))
+            } else {
+                let id_input = parse_stream_id(&args[*start])
+                    .ok_or_else(CommandResponse::syntax_error)?;
+                let threshold = match id_input {
+                    StreamIdInput::Explicit(id) => id,
+                    StreamIdInput::Partial(ms) => StreamId::new(ms, 0),
+                    _ => return Err(CommandResponse::syntax_error()),
+                };
+                *start += 1;
+                Ok(Some(StreamTrim::MinId { exact, threshold }))
+            }
+        }
+        _ => Ok(None),
+    }
+}
 use solikv_persist::AofWriter;
 use solikv_pubsub::PubSubBroker;
 
+use crate::lua::ScriptCache;
 use crate::shard::ShardManager;
 
 /// The central command engine that routes commands to appropriate shards.
@@ -15,6 +155,9 @@ pub struct CommandEngine {
     pub pubsub: Arc<PubSubBroker>,
     aof: Option<AofWriter>,
     start_time: Instant,
+    pub(crate) script_cache: ScriptCache,
+    weak_self: OnceLock<Weak<CommandEngine>>,
+    notify_flags: Arc<AtomicU16>,
 }
 
 impl CommandEngine {
@@ -24,7 +167,28 @@ impl CommandEngine {
             pubsub,
             aof: None,
             start_time: Instant::now(),
+            script_cache: ScriptCache::new(),
+            weak_self: OnceLock::new(),
+            notify_flags: Arc::new(AtomicU16::new(0)),
         }
+    }
+
+    pub fn with_notify_flags(mut self, flags: Arc<AtomicU16>) -> Self {
+        self.notify_flags = flags;
+        self
+    }
+
+    pub fn notify_flags(&self) -> &Arc<AtomicU16> {
+        &self.notify_flags
+    }
+
+    /// Store a weak self-reference so dispatch() can obtain Arc<Self> for Lua closures.
+    pub fn init_self_ref(&self, weak: Weak<CommandEngine>) {
+        let _ = self.weak_self.set(weak);
+    }
+
+    fn get_self_arc(&self) -> Option<Arc<CommandEngine>> {
+        self.weak_self.get().and_then(|w| w.upgrade())
     }
 
     pub fn with_aof(mut self, aof: AofWriter) -> Self {
@@ -38,12 +202,342 @@ impl CommandEngine {
 
         // AOF: log write commands that succeeded (lock-free channel send)
         if let Some(aof) = &self.aof {
-            if is_write_command(name) && !response.is_error() {
-                aof.log(name, args);
+            if !response.is_error() {
+                if name == "EVALSHA" {
+                    // Convert EVALSHA to EVAL in AOF so replay works without script cache
+                    if let Some(sha) = args.first() {
+                        let sha_str = std::str::from_utf8(sha).unwrap_or("");
+                        if let Some(source) = self.script_cache.get(sha_str) {
+                            let mut eval_args = vec![Bytes::from(source)];
+                            eval_args.extend_from_slice(&args[1..]);
+                            aof.log("EVAL", &eval_args);
+                        }
+                    }
+                } else if is_write_command(name) {
+                    aof.log(name, args);
+                }
             }
         }
 
+        // Keyspace notifications: emit after successful write commands
+        if !response.is_error() {
+            self.emit_notifications(name, args, &response);
+        }
+
         response
+    }
+
+    /// Emit a single keyspace event notification.
+    fn notify_keyspace_event(&self, event_flag: u16, event: &str, key: &Bytes) {
+        let flags = self.notify_flags.load(Ordering::Relaxed);
+        if flags == 0 {
+            return; // zero-cost bail when disabled
+        }
+        if flags & event_flag == 0 {
+            return; // this event type not enabled
+        }
+        let key_str = std::str::from_utf8(key).unwrap_or("<binary>");
+
+        // __keyspace@0__:<key> → event name as message
+        if flags & NOTIFY_KEYSPACE != 0 {
+            let channel = Bytes::from(format!("__keyspace@0__:{}", key_str));
+            self.pubsub.publish(channel, Bytes::from(event.to_string()));
+        }
+
+        // __keyevent@0__:<event> → key name as message
+        if flags & NOTIFY_KEYEVENT != 0 {
+            let channel = Bytes::from(format!("__keyevent@0__:{}", event));
+            self.pubsub.publish(channel, key.clone());
+        }
+    }
+
+    /// Map a completed command to its notification event(s) and emit them.
+    fn emit_notifications(&self, name: &str, args: &[Bytes], _response: &CommandResponse) {
+        let flags = self.notify_flags.load(Ordering::Relaxed);
+        if flags == 0 {
+            return;
+        }
+
+        match name {
+            // String commands → $ flag
+            "SET" | "SETNX" | "SETEX" | "PSETEX" | "GETSET" | "GETDEL" | "GETEX" | "SETRANGE"
+            | "APPEND" => {
+                if let Some(key) = args.first() {
+                    let event = match name {
+                        "GETDEL" => "getdel",
+                        "GETEX" => "getex",
+                        _ => "set",
+                    };
+                    self.notify_keyspace_event(NOTIFY_STRING, event, key);
+                }
+            }
+            "MSET" | "MSETNX" => {
+                // Emit "set" for each key
+                for pair in args.chunks(2) {
+                    if let Some(key) = pair.first() {
+                        self.notify_keyspace_event(NOTIFY_STRING, "set", key);
+                    }
+                }
+            }
+            "INCR" | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT" => {
+                if let Some(key) = args.first() {
+                    let event = match name {
+                        "INCR" | "INCRBY" => "incrby",
+                        "DECR" | "DECRBY" => "decrby",
+                        "INCRBYFLOAT" => "incrbyfloat",
+                        _ => "set",
+                    };
+                    self.notify_keyspace_event(NOTIFY_STRING, event, key);
+                }
+            }
+
+            // Generic key commands → g flag
+            "DEL" | "UNLINK" => {
+                for key in args {
+                    self.notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                }
+            }
+            "EXPIRE" | "PEXPIRE" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_GENERIC, "expire", key);
+                }
+            }
+            "EXPIREAT" | "PEXPIREAT" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_GENERIC, "expire", key);
+                }
+            }
+            "PERSIST" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_GENERIC, "persist", key);
+                }
+            }
+            "RENAME" | "RENAMENX" => {
+                if args.len() >= 2 {
+                    self.notify_keyspace_event(NOTIFY_GENERIC, "rename_from", &args[0]);
+                    self.notify_keyspace_event(NOTIFY_GENERIC, "rename_to", &args[1]);
+                }
+            }
+
+            // List commands → l flag
+            "LPUSH" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_LIST, "lpush", key);
+                }
+            }
+            "RPUSH" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_LIST, "rpush", key);
+                }
+            }
+            "LPOP" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_LIST, "lpop", key);
+                }
+            }
+            "RPOP" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_LIST, "rpop", key);
+                }
+            }
+            "LINSERT" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_LIST, "linsert", key);
+                }
+            }
+            "LSET" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_LIST, "lset", key);
+                }
+            }
+            "LTRIM" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_LIST, "ltrim", key);
+                }
+            }
+            "LREM" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_LIST, "lrem", key);
+                }
+            }
+
+            // Set commands → s flag
+            "SADD" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_SET, "sadd", key);
+                }
+            }
+            "SREM" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_SET, "srem", key);
+                }
+            }
+            "SPOP" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_SET, "spop", key);
+                }
+            }
+            "SMOVE" => {
+                if args.len() >= 2 {
+                    self.notify_keyspace_event(NOTIFY_SET, "srem", &args[0]);
+                    self.notify_keyspace_event(NOTIFY_SET, "sadd", &args[1]);
+                }
+            }
+
+            // Hash commands → h flag
+            "HSET" | "HMSET" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_HASH, "hset", key);
+                }
+            }
+            "HDEL" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_HASH, "hdel", key);
+                }
+            }
+            "HINCRBY" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_HASH, "hincrby", key);
+                }
+            }
+            "HINCRBYFLOAT" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_HASH, "hincrbyfloat", key);
+                }
+            }
+            "HSETNX" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_HASH, "hsetnx", key);
+                }
+            }
+
+            // Sorted set commands → z flag
+            "ZADD" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_ZSET, "zadd", key);
+                }
+            }
+            "ZREM" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_ZSET, "zrem", key);
+                }
+            }
+            "ZINCRBY" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_ZSET, "zincrby", key);
+                }
+            }
+            "ZPOPMIN" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_ZSET, "zpopmin", key);
+                }
+            }
+            "ZPOPMAX" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_ZSET, "zpopmax", key);
+                }
+            }
+            "ZUNIONSTORE" | "ZINTERSTORE" => {
+                if let Some(key) = args.first() {
+                    let event = if name == "ZUNIONSTORE" {
+                        "zunionstore"
+                    } else {
+                        "zinterstore"
+                    };
+                    self.notify_keyspace_event(NOTIFY_ZSET, event, key);
+                }
+            }
+            "ZREMRANGEBYRANK" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_ZSET, "zremrangebyrank", key);
+                }
+            }
+            "ZREMRANGEBYSCORE" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_ZSET, "zremrangebyscore", key);
+                }
+            }
+
+            // Stream commands → t flag
+            "XADD" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_STREAM, "xadd", key);
+                }
+            }
+            "XDEL" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_STREAM, "xdel", key);
+                }
+            }
+            "XTRIM" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_STREAM, "xtrim", key);
+                }
+            }
+            "XGROUP" => {
+                // The key is the second argument (after CREATE/DESTROY/etc.)
+                if args.len() >= 2 {
+                    self.notify_keyspace_event(NOTIFY_STREAM, "xgroup-create", &args[1]);
+                }
+            }
+
+            // Bitmap commands → $ flag
+            "SETBIT" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_STRING, "setbit", key);
+                }
+            }
+            "BITOP" => {
+                if args.len() >= 2 {
+                    self.notify_keyspace_event(NOTIFY_STRING, "bitop", &args[1]);
+                }
+            }
+
+            // HyperLogLog commands → $ flag
+            "PFADD" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_STRING, "pfadd", key);
+                }
+            }
+            "PFMERGE" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_STRING, "pfmerge", key);
+                }
+            }
+
+            // Bloom filter commands → $ flag
+            "BF.ADD" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_STRING, "bf.add", key);
+                }
+            }
+            "BF.MADD" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_STRING, "bf.madd", key);
+                }
+            }
+            "BF.RESERVE" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_STRING, "bf.reserve", key);
+                }
+            }
+
+            // Geospatial commands → z flag (stored as zsets)
+            "GEOADD" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_ZSET, "geoadd", key);
+                }
+            }
+            "GEOSEARCHSTORE" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_ZSET, "geosearchstore", key);
+                }
+            }
+
+            // FLUSHDB/FLUSHALL → g flag (no specific key)
+            // Redis does not emit per-key notifications for FLUSH
+            _ => {}
+        }
     }
 
     fn dispatch(&self, name: &str, args: &[Bytes]) -> CommandResponse {
@@ -87,10 +581,27 @@ impl CommandEngine {
                                 CommandResponse::bulk_string("databases"),
                                 CommandResponse::bulk_string("16"),
                             ]),
+                            "notify-keyspace-events" => {
+                                let flags = self.notify_flags.load(Ordering::Relaxed);
+                                CommandResponse::array(vec![
+                                    CommandResponse::bulk_string("notify-keyspace-events"),
+                                    CommandResponse::bulk(Bytes::from(flags_to_string(flags))),
+                                ])
+                            }
                             _ => CommandResponse::array(vec![]),
                         }
                     }
-                    "SET" => CommandResponse::ok(),
+                    "SET" => {
+                        if args.len() >= 3 {
+                            let param = std::str::from_utf8(&args[1]).unwrap_or("");
+                            let value = std::str::from_utf8(&args[2]).unwrap_or("");
+                            if param == "notify-keyspace-events" {
+                                let flags = parse_notify_flags(value);
+                                self.notify_flags.store(flags, Ordering::Relaxed);
+                            }
+                        }
+                        CommandResponse::ok()
+                    }
                     "RESETSTAT" => CommandResponse::ok(),
                     _ => CommandResponse::error(format!("ERR Unknown subcommand or wrong number of arguments for 'config|{}'", sub.to_lowercase())),
                 }
@@ -706,6 +1217,7 @@ impl CommandEngine {
                                 "hash" => CommandResponse::bulk_string("listpack"),
                                 "set" => CommandResponse::bulk_string("listpack"),
                                 "zset" => CommandResponse::bulk_string("skiplist"),
+                                "stream" => CommandResponse::bulk_string("stream"),
                                 _ => CommandResponse::nil(),
                             }
                         })
@@ -1448,6 +1960,708 @@ impl CommandEngine {
                 })
             }
 
+            // ---- Geospatial commands ----
+            "GEOADD" => {
+                // GEOADD key [NX|XX] [CH] longitude latitude member [longitude latitude member ...]
+                if args.len() < 4 {
+                    return CommandResponse::wrong_arity("geoadd");
+                }
+                let key = args[0].clone();
+                let mut i = 1usize;
+                let mut nx = false;
+                let mut xx = false;
+                let mut ch = false;
+
+                // Parse optional flags
+                while i < args.len() {
+                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                    match opt.as_str() {
+                        "NX" => { nx = true; i += 1; }
+                        "XX" => { xx = true; i += 1; }
+                        "CH" => { ch = true; i += 1; }
+                        _ => break,
+                    }
+                }
+
+                // Remaining args must be triplets: longitude latitude member
+                if (args.len() - i) < 3 || (args.len() - i) % 3 != 0 {
+                    return CommandResponse::wrong_arity("geoadd");
+                }
+
+                let mut items = Vec::new();
+                while i + 2 < args.len() {
+                    let lon = match std::str::from_utf8(&args[i]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                        Some(v) => v,
+                        None => return CommandResponse::error("ERR value is not a valid float"),
+                    };
+                    let lat = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                        Some(v) => v,
+                        None => return CommandResponse::error("ERR value is not a valid float"),
+                    };
+                    let member = args[i + 2].clone();
+                    items.push((lon, lat, member));
+                    i += 3;
+                }
+
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.geo_add(&key, nx, xx, ch, &items)
+                })
+            }
+            "GEOPOS" => {
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("geopos");
+                }
+                let key = args[0].clone();
+                let members: Vec<Bytes> = args[1..].to_vec();
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.geo_pos(&key, &members)
+                })
+            }
+            "GEOHASH" => {
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("geohash");
+                }
+                let key = args[0].clone();
+                let members: Vec<Bytes> = args[1..].to_vec();
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.geo_hash(&key, &members)
+                })
+            }
+            "GEODIST" => {
+                if args.len() < 3 {
+                    return CommandResponse::wrong_arity("geodist");
+                }
+                let key = args[0].clone();
+                let member1 = args[1].clone();
+                let member2 = args[2].clone();
+                let unit = args.get(3)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .unwrap_or("m")
+                    .to_lowercase();
+                match unit.as_str() {
+                    "m" | "km" | "ft" | "mi" => {}
+                    _ => return CommandResponse::error("ERR unsupported unit provided. please use M, KM, FT, MI"),
+                }
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.geo_dist(&key, &member1, &member2, &unit)
+                })
+            }
+            "GEOSEARCH" => {
+                // GEOSEARCH key FROMMEMBER member | FROMLONLAT lon lat
+                //   BYRADIUS radius unit | BYBOX width height unit
+                //   [ASC|DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("geosearch");
+                }
+                let key = args[0].clone();
+                let mut i = 1usize;
+                let mut from = None;
+                let mut by = None;
+                let mut sort_asc: Option<bool> = None;
+                let mut count: Option<usize> = None;
+                let mut withcoord = false;
+                let mut withdist = false;
+                let mut withhash = false;
+
+                while i < args.len() {
+                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                    match opt.as_str() {
+                        "FROMMEMBER" => {
+                            i += 1;
+                            if i >= args.len() { return CommandResponse::syntax_error(); }
+                            from = Some(solikv_core::geo_ops::GeoFrom::Member(args[i].clone()));
+                        }
+                        "FROMLONLAT" => {
+                            if i + 2 >= args.len() { return CommandResponse::syntax_error(); }
+                            let lon = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                                Some(v) => v,
+                                None => return CommandResponse::error("ERR value is not a valid float"),
+                            };
+                            let lat = match std::str::from_utf8(&args[i + 2]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                                Some(v) => v,
+                                None => return CommandResponse::error("ERR value is not a valid float"),
+                            };
+                            from = Some(solikv_core::geo_ops::GeoFrom::LonLat(lon, lat));
+                            i += 2;
+                        }
+                        "BYRADIUS" => {
+                            if i + 2 >= args.len() { return CommandResponse::syntax_error(); }
+                            let radius = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                                Some(v) => v,
+                                None => return CommandResponse::error("ERR value is not a valid float"),
+                            };
+                            let unit = std::str::from_utf8(&args[i + 2]).unwrap_or("m").to_lowercase();
+                            by = Some(solikv_core::geo_ops::GeoBy::Radius(radius, unit));
+                            i += 2;
+                        }
+                        "BYBOX" => {
+                            if i + 3 >= args.len() { return CommandResponse::syntax_error(); }
+                            let width = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                                Some(v) => v,
+                                None => return CommandResponse::error("ERR value is not a valid float"),
+                            };
+                            let height = match std::str::from_utf8(&args[i + 2]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                                Some(v) => v,
+                                None => return CommandResponse::error("ERR value is not a valid float"),
+                            };
+                            let unit = std::str::from_utf8(&args[i + 3]).unwrap_or("m").to_lowercase();
+                            by = Some(solikv_core::geo_ops::GeoBy::Box(width, height, unit));
+                            i += 3;
+                        }
+                        "ASC" => sort_asc = Some(true),
+                        "DESC" => sort_asc = Some(false),
+                        "COUNT" => {
+                            i += 1;
+                            count = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse().ok());
+                            // Skip optional ANY
+                            if i + 1 < args.len() {
+                                let next = std::str::from_utf8(&args[i + 1]).unwrap_or("").to_uppercase();
+                                if next == "ANY" { i += 1; }
+                            }
+                        }
+                        "WITHCOORD" => withcoord = true,
+                        "WITHDIST" => withdist = true,
+                        "WITHHASH" => withhash = true,
+                        _ => return CommandResponse::syntax_error(),
+                    }
+                    i += 1;
+                }
+
+                let from = match from {
+                    Some(f) => f,
+                    None => return CommandResponse::syntax_error(),
+                };
+                let by = match by {
+                    Some(b) => b,
+                    None => return CommandResponse::syntax_error(),
+                };
+
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.geo_search(&key, &from, &by, sort_asc, count, withcoord, withdist, withhash)
+                })
+            }
+            "GEOSEARCHSTORE" => {
+                // GEOSEARCHSTORE dest src [FROMMEMBER member | FROMLONLAT lon lat]
+                //   [BYRADIUS radius unit | BYBOX width height unit]
+                //   [ASC|DESC] [COUNT count [ANY]] [STOREDIST]
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("geosearchstore");
+                }
+                let dest = args[0].clone();
+                let src = args[1].clone();
+                let mut i = 2usize;
+                let mut from = None;
+                let mut by = None;
+                let mut sort_asc: Option<bool> = None;
+                let mut count: Option<usize> = None;
+                let mut store_dist = false;
+
+                while i < args.len() {
+                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                    match opt.as_str() {
+                        "FROMMEMBER" => {
+                            i += 1;
+                            if i >= args.len() { return CommandResponse::syntax_error(); }
+                            from = Some(solikv_core::geo_ops::GeoFrom::Member(args[i].clone()));
+                        }
+                        "FROMLONLAT" => {
+                            if i + 2 >= args.len() { return CommandResponse::syntax_error(); }
+                            let lon = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                                Some(v) => v,
+                                None => return CommandResponse::error("ERR value is not a valid float"),
+                            };
+                            let lat = match std::str::from_utf8(&args[i + 2]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                                Some(v) => v,
+                                None => return CommandResponse::error("ERR value is not a valid float"),
+                            };
+                            from = Some(solikv_core::geo_ops::GeoFrom::LonLat(lon, lat));
+                            i += 2;
+                        }
+                        "BYRADIUS" => {
+                            if i + 2 >= args.len() { return CommandResponse::syntax_error(); }
+                            let radius = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                                Some(v) => v,
+                                None => return CommandResponse::error("ERR value is not a valid float"),
+                            };
+                            let unit = std::str::from_utf8(&args[i + 2]).unwrap_or("m").to_lowercase();
+                            by = Some(solikv_core::geo_ops::GeoBy::Radius(radius, unit));
+                            i += 2;
+                        }
+                        "BYBOX" => {
+                            if i + 3 >= args.len() { return CommandResponse::syntax_error(); }
+                            let width = match std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                                Some(v) => v,
+                                None => return CommandResponse::error("ERR value is not a valid float"),
+                            };
+                            let height = match std::str::from_utf8(&args[i + 2]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                                Some(v) => v,
+                                None => return CommandResponse::error("ERR value is not a valid float"),
+                            };
+                            let unit = std::str::from_utf8(&args[i + 3]).unwrap_or("m").to_lowercase();
+                            by = Some(solikv_core::geo_ops::GeoBy::Box(width, height, unit));
+                            i += 3;
+                        }
+                        "ASC" => sort_asc = Some(true),
+                        "DESC" => sort_asc = Some(false),
+                        "COUNT" => {
+                            i += 1;
+                            count = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse().ok());
+                            if i + 1 < args.len() {
+                                let next = std::str::from_utf8(&args[i + 1]).unwrap_or("").to_uppercase();
+                                if next == "ANY" { i += 1; }
+                            }
+                        }
+                        "STOREDIST" => store_dist = true,
+                        _ => return CommandResponse::syntax_error(),
+                    }
+                    i += 1;
+                }
+
+                let from = match from {
+                    Some(f) => f,
+                    None => return CommandResponse::syntax_error(),
+                };
+                let by = match by {
+                    Some(b) => b,
+                    None => return CommandResponse::syntax_error(),
+                };
+
+                // GEOSEARCHSTORE operates on two keys (src + dest), route to dest shard
+                let shard = self.shards.shard_for_key(&dest).clone();
+                shard.execute(move |store| {
+                    store.geo_search_store(&dest, &src, &from, &by, sort_asc, count, store_dist)
+                })
+            }
+
+            // ---- Stream commands ----
+            "XADD" => {
+                // XADD key [NOMKSTREAM] [MAXLEN|MINID [=|~] N] *|id field value ...
+                if args.len() < 4 {
+                    return CommandResponse::wrong_arity("xadd");
+                }
+                let key = args[0].clone();
+                let mut i = 1usize;
+                let mut nomkstream = false;
+
+                // Parse optional NOMKSTREAM
+                if i < args.len() {
+                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                    if opt == "NOMKSTREAM" {
+                        nomkstream = true;
+                        i += 1;
+                    }
+                }
+
+                // Parse optional trim
+                let trim = match parse_stream_trim(args, &mut i) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+
+                // Parse ID
+                if i >= args.len() {
+                    return CommandResponse::wrong_arity("xadd");
+                }
+                let id_input = match parse_stream_id(&args[i]) {
+                    Some(id) => id,
+                    None => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                };
+                i += 1;
+
+                // Parse field-value pairs
+                if (args.len() - i) < 2 || (args.len() - i) % 2 != 0 {
+                    return CommandResponse::wrong_arity("xadd");
+                }
+                let fields: Vec<(Bytes, Bytes)> = args[i..]
+                    .chunks(2)
+                    .map(|c| (c[0].clone(), c[1].clone()))
+                    .collect();
+
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.stream_xadd(&key, id_input, fields, nomkstream, trim)
+                })
+            }
+            "XLEN" => {
+                if args.len() != 1 {
+                    return CommandResponse::wrong_arity("xlen");
+                }
+                let key = args[0].clone();
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.stream_xlen(&key)
+                })
+            }
+            "XRANGE" => {
+                // XRANGE key start end [COUNT n]
+                if args.len() < 3 {
+                    return CommandResponse::wrong_arity("xrange");
+                }
+                let key = args[0].clone();
+                let start = match parse_stream_id(&args[1]) {
+                    Some(StreamIdInput::Min) => StreamId::MIN,
+                    Some(StreamIdInput::Explicit(id)) => id,
+                    Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, 0),
+                    _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                };
+                let end = match parse_stream_id(&args[2]) {
+                    Some(StreamIdInput::Max) => StreamId::MAX,
+                    Some(StreamIdInput::Explicit(id)) => id,
+                    Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, u64::MAX),
+                    _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                };
+                let mut count = None;
+                if args.len() >= 5 {
+                    let opt = std::str::from_utf8(&args[3]).unwrap_or("").to_uppercase();
+                    if opt == "COUNT" {
+                        count = args.get(4).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok());
+                    }
+                }
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.stream_xrange(&key, start, end, count)
+                })
+            }
+            "XREVRANGE" => {
+                // XREVRANGE key end start [COUNT n]
+                if args.len() < 3 {
+                    return CommandResponse::wrong_arity("xrevrange");
+                }
+                let key = args[0].clone();
+                let end = match parse_stream_id(&args[1]) {
+                    Some(StreamIdInput::Max) => StreamId::MAX,
+                    Some(StreamIdInput::Explicit(id)) => id,
+                    Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, u64::MAX),
+                    _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                };
+                let start = match parse_stream_id(&args[2]) {
+                    Some(StreamIdInput::Min) => StreamId::MIN,
+                    Some(StreamIdInput::Explicit(id)) => id,
+                    Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, 0),
+                    _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                };
+                let mut count = None;
+                if args.len() >= 5 {
+                    let opt = std::str::from_utf8(&args[3]).unwrap_or("").to_uppercase();
+                    if opt == "COUNT" {
+                        count = args.get(4).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok());
+                    }
+                }
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.stream_xrevrange(&key, end, start, count)
+                })
+            }
+            "XREAD" => {
+                // XREAD [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]
+                if args.len() < 3 {
+                    return CommandResponse::wrong_arity("xread");
+                }
+                let mut i = 0usize;
+                let mut count = None;
+
+                // Parse options
+                while i < args.len() {
+                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                    match opt.as_str() {
+                        "COUNT" => {
+                            i += 1;
+                            count = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok());
+                            i += 1;
+                        }
+                        "BLOCK" => {
+                            // Parse but ignore for v1
+                            i += 2;
+                        }
+                        "STREAMS" => {
+                            i += 1;
+                            break;
+                        }
+                        _ => {
+                            return CommandResponse::syntax_error();
+                        }
+                    }
+                }
+
+                // Remaining args: keys... ids... (equal count)
+                let remaining = &args[i..];
+                if remaining.is_empty() || remaining.len() % 2 != 0 {
+                    return CommandResponse::syntax_error();
+                }
+                let half = remaining.len() / 2;
+                let keys = &remaining[..half];
+                let ids = &remaining[half..];
+
+                // Query each key on its shard, merge results
+                let mut results = Vec::new();
+                for (idx, key) in keys.iter().enumerate() {
+                    let id_arg = &ids[idx];
+                    let last_id = if std::str::from_utf8(id_arg).unwrap_or("") == "$" {
+                        // "$" means: only new entries from now; since we don't block, return nil
+                        continue;
+                    } else {
+                        match parse_stream_id(id_arg) {
+                            Some(StreamIdInput::Explicit(id)) => id,
+                            Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, 0),
+                            Some(StreamIdInput::Min) => StreamId::MIN,
+                            _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                        }
+                    };
+
+                    let k = key.clone();
+                    let resp = self.shards.shard_for_key(&k).execute(move |store| {
+                        store.stream_xread_single(&k, last_id, count)
+                    });
+
+                    if !matches!(resp, CommandResponse::Nil) {
+                        results.push(CommandResponse::array(vec![
+                            CommandResponse::bulk(key.clone()),
+                            resp,
+                        ]));
+                    }
+                }
+
+                if results.is_empty() {
+                    CommandResponse::nil()
+                } else {
+                    CommandResponse::array(results)
+                }
+            }
+            "XDEL" => {
+                // XDEL key id [id ...]
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("xdel");
+                }
+                let key = args[0].clone();
+                let mut ids = Vec::new();
+                for arg in &args[1..] {
+                    match parse_stream_id(arg) {
+                        Some(StreamIdInput::Explicit(id)) => ids.push(id),
+                        Some(StreamIdInput::Partial(ms)) => ids.push(StreamId::new(ms, 0)),
+                        _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                    }
+                }
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.stream_xdel(&key, &ids)
+                })
+            }
+            "XTRIM" => {
+                // XTRIM key MAXLEN|MINID [=|~] N
+                if args.len() < 3 {
+                    return CommandResponse::wrong_arity("xtrim");
+                }
+                let key = args[0].clone();
+                let mut i = 1;
+                let trim = match parse_stream_trim(args, &mut i) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => return CommandResponse::syntax_error(),
+                    Err(e) => return e,
+                };
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.stream_xtrim(&key, trim)
+                })
+            }
+            "XINFO" => {
+                // XINFO STREAM key
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("xinfo");
+                }
+                let sub = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
+                match sub.as_str() {
+                    "STREAM" => {
+                        let key = args[1].clone();
+                        self.shards.shard_for_key(&key).execute(move |store| {
+                            store.stream_xinfo(&key)
+                        })
+                    }
+                    _ => CommandResponse::error(format!("ERR Unknown XINFO subcommand '{}'", sub)),
+                }
+            }
+            "XGROUP" => {
+                if args.is_empty() {
+                    return CommandResponse::wrong_arity("xgroup");
+                }
+                let sub = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
+                match sub.as_str() {
+                    "CREATE" => {
+                        // XGROUP CREATE key group id|$ [MKSTREAM]
+                        if args.len() < 4 {
+                            return CommandResponse::wrong_arity("xgroup|create");
+                        }
+                        let key = args[1].clone();
+                        let group = args[2].clone();
+                        let id_str = std::str::from_utf8(&args[3]).unwrap_or("0");
+                        let id = if id_str == "$" {
+                            StreamIdInput::Max
+                        } else {
+                            match StreamId::parse(id_str) {
+                                Some(id) => id,
+                                None => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                            }
+                        };
+                        let mkstream = args.get(4)
+                            .map(|a| std::str::from_utf8(a).unwrap_or("").to_uppercase() == "MKSTREAM")
+                            .unwrap_or(false);
+                        self.shards.shard_for_key(&key).execute(move |store| {
+                            store.stream_xgroup_create(&key, group, id, mkstream)
+                        })
+                    }
+                    "DESTROY" => {
+                        if args.len() < 3 {
+                            return CommandResponse::wrong_arity("xgroup|destroy");
+                        }
+                        let key = args[1].clone();
+                        let group = args[2].clone();
+                        self.shards.shard_for_key(&key).execute(move |store| {
+                            store.stream_xgroup_destroy(&key, &group)
+                        })
+                    }
+                    "DELCONSUMER" => {
+                        if args.len() < 4 {
+                            return CommandResponse::wrong_arity("xgroup|delconsumer");
+                        }
+                        let key = args[1].clone();
+                        let group = args[2].clone();
+                        let consumer = args[3].clone();
+                        self.shards.shard_for_key(&key).execute(move |store| {
+                            store.stream_xgroup_delconsumer(&key, &group, &consumer)
+                        })
+                    }
+                    _ => CommandResponse::error(format!("ERR Unknown XGROUP subcommand '{}'", sub)),
+                }
+            }
+            "XREADGROUP" => {
+                // XREADGROUP GROUP group consumer [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]
+                if args.len() < 7 {
+                    return CommandResponse::wrong_arity("xreadgroup");
+                }
+                let mut i = 0;
+                // Expect GROUP keyword
+                let kw = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                if kw != "GROUP" {
+                    return CommandResponse::syntax_error();
+                }
+                i += 1;
+                let group = args[i].clone();
+                i += 1;
+                let consumer = args[i].clone();
+                i += 1;
+
+                let mut count = None;
+
+                while i < args.len() {
+                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                    match opt.as_str() {
+                        "COUNT" => {
+                            i += 1;
+                            count = args.get(i).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok());
+                            i += 1;
+                        }
+                        "BLOCK" => {
+                            i += 2; // parse and ignore for v1
+                        }
+                        "STREAMS" => {
+                            i += 1;
+                            break;
+                        }
+                        _ => return CommandResponse::syntax_error(),
+                    }
+                }
+
+                let remaining = &args[i..];
+                if remaining.is_empty() || remaining.len() % 2 != 0 {
+                    return CommandResponse::syntax_error();
+                }
+                let half = remaining.len() / 2;
+                let keys = &remaining[..half];
+                let ids = &remaining[half..];
+
+                let mut results = Vec::new();
+                for (idx, key) in keys.iter().enumerate() {
+                    let id_arg = &ids[idx];
+                    let id_str = std::str::from_utf8(id_arg).unwrap_or(">");
+                    let id_input = if id_str == ">" {
+                        StreamIdInput::Max
+                    } else {
+                        match parse_stream_id(id_arg) {
+                            Some(id) => id,
+                            None => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                        }
+                    };
+
+                    let k = key.clone();
+                    let g = group.clone();
+                    let c = consumer.clone();
+                    let resp = self.shards.shard_for_key(&k).execute(move |store| {
+                        store.stream_xreadgroup_single(&k, &g, &c, id_input, count)
+                    });
+
+                    if !matches!(resp, CommandResponse::Nil) {
+                        results.push(CommandResponse::array(vec![
+                            CommandResponse::bulk(key.clone()),
+                            resp,
+                        ]));
+                    }
+                }
+
+                if results.is_empty() {
+                    CommandResponse::nil()
+                } else {
+                    CommandResponse::array(results)
+                }
+            }
+            "XACK" => {
+                // XACK key group id [id ...]
+                if args.len() < 3 {
+                    return CommandResponse::wrong_arity("xack");
+                }
+                let key = args[0].clone();
+                let group = args[1].clone();
+                let mut ids = Vec::new();
+                for arg in &args[2..] {
+                    match parse_stream_id(arg) {
+                        Some(StreamIdInput::Explicit(id)) => ids.push(id),
+                        Some(StreamIdInput::Partial(ms)) => ids.push(StreamId::new(ms, 0)),
+                        _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                    }
+                }
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.stream_xack(&key, &group, &ids)
+                })
+            }
+            "XPENDING" => {
+                // XPENDING key group [start end count [consumer]]
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("xpending");
+                }
+                let key = args[0].clone();
+                let group = args[1].clone();
+
+                if args.len() == 2 {
+                    // Summary form
+                    self.shards.shard_for_key(&key).execute(move |store| {
+                        store.stream_xpending(&key, &group, None, None, None, None)
+                    })
+                } else if args.len() >= 5 {
+                    // Detail form: start end count [consumer]
+                    let start = match parse_stream_id(&args[2]) {
+                        Some(StreamIdInput::Min) => StreamId::MIN,
+                        Some(StreamIdInput::Explicit(id)) => id,
+                        Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, 0),
+                        _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                    };
+                    let end = match parse_stream_id(&args[3]) {
+                        Some(StreamIdInput::Max) => StreamId::MAX,
+                        Some(StreamIdInput::Explicit(id)) => id,
+                        Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, u64::MAX),
+                        _ => return CommandResponse::error("ERR Invalid stream ID specified as stream command argument"),
+                    };
+                    let count = std::str::from_utf8(&args[4]).ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
+                    let consumer_filter = args.get(5).cloned();
+                    self.shards.shard_for_key(&key).execute(move |store| {
+                        store.stream_xpending(&key, &group, Some(start), Some(end), Some(count), consumer_filter.as_ref())
+                    })
+                } else {
+                    CommandResponse::syntax_error()
+                }
+            }
+
             // ---- Pub/Sub commands ----
             "PUBLISH" => {
                 if args.len() != 2 {
@@ -1499,10 +2713,386 @@ impl CommandEngine {
                 CommandResponse::ok()
             }
 
+            // ---- Scripting commands ----
+            "EVAL" => {
+                // EVAL script numkeys [key ...] [arg ...]
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("eval");
+                }
+                let script = match std::str::from_utf8(&args[0]) {
+                    Ok(s) => s,
+                    Err(_) => return CommandResponse::error("ERR invalid script encoding"),
+                };
+                let numkeys: usize = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                {
+                    Some(n) => n,
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
+                };
+                if args.len() < 2 + numkeys {
+                    return CommandResponse::error(
+                        "ERR Number of keys can't be greater than number of args",
+                    );
+                }
+                let keys: Vec<Bytes> = args[2..2 + numkeys].to_vec();
+                let argv: Vec<Bytes> = args[2 + numkeys..].to_vec();
+
+                // Cache the script
+                self.script_cache.load(script);
+
+                match self.get_self_arc() {
+                    Some(arc) => crate::lua::execute_script(&arc, script, keys, argv),
+                    None => CommandResponse::error("ERR scripting not initialized (call init_self_ref)"),
+                }
+            }
+            "EVALSHA" => {
+                // EVALSHA sha1 numkeys [key ...] [arg ...]
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("evalsha");
+                }
+                let sha = match std::str::from_utf8(&args[0]) {
+                    Ok(s) => s.to_lowercase(),
+                    Err(_) => return CommandResponse::error("ERR invalid SHA encoding"),
+                };
+                let script = match self.script_cache.get(&sha) {
+                    Some(s) => s,
+                    None => {
+                        return CommandResponse::error(
+                            "NOSCRIPT No matching script. Use EVAL.",
+                        )
+                    }
+                };
+                let numkeys: usize = match std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                {
+                    Some(n) => n,
+                    None => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
+                };
+                if args.len() < 2 + numkeys {
+                    return CommandResponse::error(
+                        "ERR Number of keys can't be greater than number of args",
+                    );
+                }
+                let keys: Vec<Bytes> = args[2..2 + numkeys].to_vec();
+                let argv: Vec<Bytes> = args[2 + numkeys..].to_vec();
+
+                match self.get_self_arc() {
+                    Some(arc) => crate::lua::execute_script(&arc, &script, keys, argv),
+                    None => CommandResponse::error("ERR scripting not initialized (call init_self_ref)"),
+                }
+            }
+            "SCRIPT" => {
+                if args.is_empty() {
+                    return CommandResponse::wrong_arity("script");
+                }
+                let sub = std::str::from_utf8(&args[0])
+                    .unwrap_or("")
+                    .to_uppercase();
+                match sub.as_str() {
+                    "LOAD" => {
+                        if args.len() != 2 {
+                            return CommandResponse::wrong_arity("script|load");
+                        }
+                        match std::str::from_utf8(&args[1]) {
+                            Ok(script) => {
+                                let sha = self.script_cache.load(script);
+                                CommandResponse::BulkString(Bytes::from(sha))
+                            }
+                            Err(_) => CommandResponse::error("ERR invalid script encoding"),
+                        }
+                    }
+                    "EXISTS" => {
+                        if args.len() < 2 {
+                            return CommandResponse::wrong_arity("script|exists");
+                        }
+                        let shas: Vec<&str> = args[1..]
+                            .iter()
+                            .map(|a| std::str::from_utf8(a).unwrap_or(""))
+                            .collect();
+                        let results = self.script_cache.exists(&shas);
+                        CommandResponse::Array(
+                            results
+                                .into_iter()
+                                .map(|b| CommandResponse::Integer(if b { 1 } else { 0 }))
+                                .collect(),
+                        )
+                    }
+                    "FLUSH" => {
+                        self.script_cache.flush();
+                        CommandResponse::ok()
+                    }
+                    _ => CommandResponse::error(format!(
+                        "ERR Unknown SCRIPT subcommand '{}'",
+                        sub
+                    )),
+                }
+            }
+
             // ---- Transaction commands (basic support) ----
             "MULTI" | "EXEC" | "DISCARD" | "WATCH" | "UNWATCH" => {
                 // These are handled at the connection level in the server
                 CommandResponse::error("ERR transactions are handled at connection level")
+            }
+
+            // ---- HyperLogLog commands ----
+            "PFADD" => {
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("pfadd");
+                }
+                let key = args[0].clone();
+                let elements: Vec<Bytes> = args[1..].to_vec();
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.pfadd(&key, &elements)
+                })
+            }
+            "PFCOUNT" => {
+                if args.is_empty() {
+                    return CommandResponse::wrong_arity("pfcount");
+                }
+                if args.len() == 1 {
+                    let key = args[0].clone();
+                    self.shards.shard_for_key(&key).execute(move |store| {
+                        store.pfcount(&[key])
+                    })
+                } else {
+                    // Multi-key: collect registers from each shard, merge, count
+                    let mut merged_registers = vec![0u8; 16384];
+                    for key in args {
+                        let k = key.clone();
+                        let resp = self.shards.shard_for_key(key).execute(move |store| {
+                            store.pfget_registers(&k)
+                        });
+                        match resp {
+                            CommandResponse::BulkString(data) => {
+                                for (i, &r) in data.iter().enumerate() {
+                                    merged_registers[i] = merged_registers[i].max(r);
+                                }
+                            }
+                            CommandResponse::Nil => {}
+                            CommandResponse::Error(_) => return resp,
+                            _ => {}
+                        }
+                    }
+                    let hll = solikv_core::types::HyperLogLogValue { registers: merged_registers };
+                    CommandResponse::integer(hll.count() as i64)
+                }
+            }
+            "PFMERGE" => {
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("pfmerge");
+                }
+                // Cross-shard merge: collect registers from dest + all sources
+                let mut merged_registers = vec![0u8; 16384];
+                let dest = args[0].clone();
+
+                // Include dest's existing HLL if any
+                let dest_resp = self.shards.shard_for_key(&dest).execute({
+                    let d = dest.clone();
+                    move |store| store.pfget_registers(&d)
+                });
+                match dest_resp {
+                    CommandResponse::BulkString(data) => {
+                        for (i, &r) in data.iter().enumerate() {
+                            merged_registers[i] = merged_registers[i].max(r);
+                        }
+                    }
+                    CommandResponse::Nil => {}
+                    CommandResponse::Error(_) => return dest_resp,
+                    _ => {}
+                }
+
+                // Merge all source HLLs
+                for src in &args[1..] {
+                    let src_key = src.clone();
+                    let resp = self.shards.shard_for_key(src).execute(move |store| {
+                        store.pfget_registers(&src_key)
+                    });
+                    match resp {
+                        CommandResponse::BulkString(data) => {
+                            for (i, &r) in data.iter().enumerate() {
+                                merged_registers[i] = merged_registers[i].max(r);
+                            }
+                        }
+                        CommandResponse::Nil => {}
+                        CommandResponse::Error(_) => return resp,
+                        _ => {}
+                    }
+                }
+
+                // Store merged result in dest's shard
+                self.shards.shard_for_key(&dest).execute(move |store| {
+                    store.pfset_registers(&dest, merged_registers)
+                })
+            }
+
+            // ---- Bloom Filter commands ----
+            "BF.RESERVE" => {
+                if args.len() != 3 {
+                    return CommandResponse::wrong_arity("bf.reserve");
+                }
+                let key = args[0].clone();
+                let error_rate = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<f64>().ok()) {
+                    Some(r) if r > 0.0 && r < 1.0 => r,
+                    _ => return CommandResponse::error("ERR bad error rate value"),
+                };
+                let capacity = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(c) if c > 0 => c,
+                    _ => return CommandResponse::error("ERR bad capacity value"),
+                };
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.bf_reserve(&key, error_rate, capacity)
+                })
+            }
+            "BF.ADD" => {
+                if args.len() != 2 {
+                    return CommandResponse::wrong_arity("bf.add");
+                }
+                let key = args[0].clone();
+                let item = args[1].clone();
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.bf_add(&key, &item)
+                })
+            }
+            "BF.MADD" => {
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("bf.madd");
+                }
+                let key = args[0].clone();
+                let items: Vec<Bytes> = args[1..].to_vec();
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.bf_madd(&key, &items)
+                })
+            }
+            "BF.EXISTS" => {
+                if args.len() != 2 {
+                    return CommandResponse::wrong_arity("bf.exists");
+                }
+                let key = args[0].clone();
+                let item = args[1].clone();
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.bf_exists(&key, &item)
+                })
+            }
+            "BF.MEXISTS" => {
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("bf.mexists");
+                }
+                let key = args[0].clone();
+                let items: Vec<Bytes> = args[1..].to_vec();
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.bf_mexists(&key, &items)
+                })
+            }
+            "BF.INFO" => {
+                if args.len() != 1 {
+                    return CommandResponse::wrong_arity("bf.info");
+                }
+                let key = args[0].clone();
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.bf_info(&key)
+                })
+            }
+
+            // ---- Bitmap commands ----
+            "SETBIT" => {
+                if args.len() != 3 {
+                    return CommandResponse::wrong_arity("setbit");
+                }
+                let key = args[0].clone();
+                let offset = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(o) => o,
+                    None => return CommandResponse::error("ERR bit offset is not an integer or out of range"),
+                };
+                let value = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<u8>().ok()) {
+                    Some(v) if v <= 1 => v,
+                    _ => return CommandResponse::error("ERR bit is not an integer or out of range"),
+                };
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.string_setbit(&key, offset, value)
+                })
+            }
+            "GETBIT" => {
+                if args.len() != 2 {
+                    return CommandResponse::wrong_arity("getbit");
+                }
+                let key = args[0].clone();
+                let offset = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(o) => o,
+                    None => return CommandResponse::error("ERR bit offset is not an integer or out of range"),
+                };
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.string_getbit(&key, offset)
+                })
+            }
+            "BITCOUNT" => {
+                if args.is_empty() || args.len() == 2 || args.len() > 3 {
+                    return CommandResponse::wrong_arity("bitcount");
+                }
+                let key = args[0].clone();
+                let (start, end) = if args.len() == 3 {
+                    let s = match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                        Some(v) => v,
+                        None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    };
+                    let e = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                        Some(v) => v,
+                        None => return CommandResponse::error("ERR value is not an integer or out of range"),
+                    };
+                    (Some(s), Some(e))
+                } else {
+                    (None, None)
+                };
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    store.string_bitcount(&key, start, end)
+                })
+            }
+            "BITOP" => {
+                if args.len() < 3 {
+                    return CommandResponse::wrong_arity("bitop");
+                }
+                let op = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
+                let dest = args[1].clone();
+                let src_keys = &args[2..];
+
+                match op.as_str() {
+                    "NOT" => {
+                        if src_keys.len() != 1 {
+                            return CommandResponse::error("ERR BITOP NOT requires one and only one key");
+                        }
+                    }
+                    "AND" | "OR" | "XOR" => {}
+                    _ => return CommandResponse::syntax_error(),
+                }
+
+                // Fetch raw bytes from each source key (cross-shard)
+                let mut sources: Vec<Vec<u8>> = Vec::with_capacity(src_keys.len());
+                for src_key in src_keys {
+                    let k = src_key.clone();
+                    let resp = self.shards.shard_for_key(src_key).execute(move |store| {
+                        store.string_get_raw(&k)
+                    });
+                    match resp {
+                        CommandResponse::BulkString(data) => sources.push(data.to_vec()),
+                        CommandResponse::Nil => sources.push(Vec::new()),
+                        CommandResponse::Error(_) => return resp,
+                        _ => sources.push(Vec::new()),
+                    }
+                }
+
+                // Store result in dest shard
+                self.shards.shard_for_key(&dest).execute(move |store| {
+                    store.string_bitop(dest, &op, &sources)
+                })
             }
 
             // ---- Catch-all ----
@@ -1566,6 +3156,22 @@ fn is_write_command(name: &str) -> bool {
             | "ZPOPMAX"
             | "ZUNIONSTORE"
             | "ZINTERSTORE"
+            | "XADD"
+            | "XDEL"
+            | "XTRIM"
+            | "XGROUP"
+            | "XREADGROUP"
+            | "XACK"
+            | "EVAL"
+            | "PFADD"
+            | "PFMERGE"
+            | "BF.RESERVE"
+            | "BF.ADD"
+            | "BF.MADD"
+            | "SETBIT"
+            | "BITOP"
+            | "GEOADD"
+            | "GEOSEARCHSTORE"
     )
 }
 

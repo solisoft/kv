@@ -9,6 +9,28 @@
         <p class="text-slate-400">SoliKV exposes two interfaces: the <a href="/docs/tcp-protocol" class="text-indigo-400 hover:text-indigo-300 transition-colors">Redis protocol</a> on port 6379 for RESP2 operations, and this REST API on port 5020 for HTTP access to all data types. Both share the same engine &mdash; AOF persistence covers both interfaces automatically.</p>
     </div>
 
+    <!-- Authentication -->
+    <div class="space-y-4">
+        <h2 class="text-2xl font-semibold flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-yellow-500/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-yellow-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+            </span>
+            Authentication
+        </h2>
+        <p class="text-slate-400">When the server is started with <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--requirepass &lt;PASSWORD&gt;</code>, all REST API requests must include a Bearer token in the <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">Authorization</code> header. Without the flag, no authentication is required.</p>
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
+            <div class="p-4 font-mono text-sm">
+                <div class="text-slate-500"># With authentication enabled (--requirepass secret123)</div>
+                <div class="text-emerald-400">curl -H "Authorization: Bearer secret123" \</div>
+                <div class="text-emerald-400 ml-4">http://localhost:5020/kv/mykey</div>
+                <div class="text-white mt-1">{"result":"hello"}</div>
+                <div class="text-slate-500 mt-3"># Missing or invalid token returns 401</div>
+                <div class="text-emerald-400">curl http://localhost:5020/kv/mykey</div>
+                <div class="text-white mt-1">{"error":"Unauthorized"}</div>
+            </div>
+        </div>
+    </div>
+
     <!-- Key-Value (Strings) -->
     <div class="space-y-4">
         <h2 class="text-2xl font-semibold flex items-center gap-3">
@@ -195,6 +217,161 @@
         </div>
     </div>
 
+    <!-- HyperLogLog -->
+    <div class="space-y-4">
+        <h2 class="text-2xl font-semibold flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-violet-500/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-violet-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
+            </span>
+            HyperLogLog
+        </h2>
+        <div class="space-y-3">
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs font-mono">POST</span>
+                <div class="flex-1">
+                    <code class="text-white">/pfadd/:key</code>
+                    <p class="text-sm text-slate-400 mt-1">Add elements to a HyperLogLog. Returns 1 if any register was altered, 0 otherwise.</p>
+                    <div class="mt-2 text-sm text-slate-500 font-mono">{"elements": ["alice", "bob", "charlie"]}</div>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/pfcount/:key</code>
+                    <p class="text-sm text-slate-400 mt-1">Return the approximate cardinality of the HyperLogLog.</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs font-mono">POST</span>
+                <div class="flex-1">
+                    <code class="text-white">/pfmerge/:dest</code>
+                    <p class="text-sm text-slate-400 mt-1">Merge multiple HyperLogLogs into a destination key.</p>
+                    <div class="mt-2 text-sm text-slate-500 font-mono">{"sources": ["hll1", "hll2"]}</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bloom Filter -->
+    <div class="space-y-4">
+        <h2 class="text-2xl font-semibold flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-rose-500/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-rose-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" /></svg>
+            </span>
+            Bloom Filter
+        </h2>
+        <div class="space-y-3">
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs font-mono">POST</span>
+                <div class="flex-1">
+                    <code class="text-white">/bf/reserve/:key</code>
+                    <p class="text-sm text-slate-400 mt-1">Create an empty Bloom filter with a given error rate and capacity.</p>
+                    <div class="mt-2 text-sm text-slate-500 font-mono">{"error_rate": 0.001, "capacity": 10000}</div>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs font-mono">POST</span>
+                <div class="flex-1">
+                    <code class="text-white">/bf/add/:key</code>
+                    <p class="text-sm text-slate-400 mt-1">Add an item to the Bloom filter. Returns 1 if newly added, 0 if it may have existed.</p>
+                    <div class="mt-2 text-sm text-slate-500 font-mono">{"item": "hello"}</div>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/bf/exists/:key/:item</code>
+                    <p class="text-sm text-slate-400 mt-1">Check if an item may exist in the filter. Returns 1 (maybe exists) or 0 (definitely not).</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/bf/info/:key</code>
+                    <p class="text-sm text-slate-400 mt-1">Return information about a Bloom filter (capacity, size, filters, items inserted).</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Geospatial -->
+    <div class="space-y-4">
+        <h2 class="text-2xl font-semibold flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-teal-500/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-teal-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+            </span>
+            Geospatial
+        </h2>
+        <div class="space-y-3">
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs font-mono">POST</span>
+                <div class="flex-1">
+                    <code class="text-white">/geo/:key/add</code>
+                    <p class="text-sm text-slate-400 mt-1">Add geospatial items (longitude, latitude, member) to a sorted set.</p>
+                    <div class="mt-2 text-sm text-slate-500 font-mono">{"members": [{"longitude": 13.361389, "latitude": 38.115556, "member": "Palermo"}]}</div>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/geo/:key/pos/:member</code>
+                    <p class="text-sm text-slate-400 mt-1">Return the longitude and latitude of a member.</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/geo/:key/dist/:member1/:member2?unit=km</code>
+                    <p class="text-sm text-slate-400 mt-1">Return the distance between two members. Unit: m, km, ft, mi (default: m).</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs font-mono">POST</span>
+                <div class="flex-1">
+                    <code class="text-white">/geo/:key/search</code>
+                    <p class="text-sm text-slate-400 mt-1">Search for members within a radius or bounding box.</p>
+                    <div class="mt-2 text-sm text-slate-500 font-mono">{"longitude": 15, "latitude": 37, "radius": 200, "unit": "km", "count": 10, "sort": "ASC", "withcoord": true, "withdist": true}</div>
+                </div>
+            </div>
+        </div>
+        <p class="text-sm text-slate-500">GEOHASH and GEOSEARCHSTORE are available via the <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">POST /cmd</code> generic endpoint.</p>
+    </div>
+
+    <!-- Bitmap -->
+    <div class="space-y-4">
+        <h2 class="text-2xl font-semibold flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-amber-500/20 flex items-center justify-center">
+                <svg class="w-5 h-5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" /></svg>
+            </span>
+            Bitmap
+        </h2>
+        <div class="space-y-3">
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs font-mono">POST</span>
+                <div class="flex-1">
+                    <code class="text-white">/bitmap/:key/setbit</code>
+                    <p class="text-sm text-slate-400 mt-1">Set or clear the bit at offset. Returns the original bit value.</p>
+                    <div class="mt-2 text-sm text-slate-500 font-mono">{"offset": 7, "value": 1}</div>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/bitmap/:key/getbit/:offset</code>
+                    <p class="text-sm text-slate-400 mt-1">Returns the bit value at offset. Returns 0 if key missing or offset beyond length.</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/bitmap/:key/bitcount?start=N&amp;end=N</code>
+                    <p class="text-sm text-slate-400 mt-1">Count set bits in the string. Optional start/end specify a byte range.</p>
+                </div>
+            </div>
+        </div>
+        <p class="text-sm text-slate-500">BITOP is available via the <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">POST /cmd</code> generic endpoint.</p>
+    </div>
+
     <!-- Generic Command -->
     <div class="space-y-4">
         <h2 class="text-2xl font-semibold flex items-center gap-3">
@@ -203,7 +380,7 @@
             </span>
             Generic Command Endpoint
         </h2>
-        <p class="text-slate-400">Execute any Redis command via HTTP. This gives you access to all 92 commands without needing dedicated REST endpoints.</p>
+        <p class="text-slate-400">Execute any Redis command via HTTP. This gives you access to all 100+ commands without needing dedicated REST endpoints.</p>
         <div class="space-y-3">
             <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
                 <span class="shrink-0 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs font-mono">POST</span>

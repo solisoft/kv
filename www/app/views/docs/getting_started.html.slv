@@ -29,9 +29,9 @@
             </div>
             <div class="p-4 font-mono text-sm">
                 <div class="text-slate-500"># Clone the repository</div>
-                <div class="text-emerald-400">git clone https://github.com/solisoft/solikv.git</div>
+                <div class="text-emerald-400">git clone https://github.com/solisoft/kv.git</div>
                 <div class="text-slate-500 mt-3"># Build in release mode</div>
-                <div class="text-emerald-400">cd solikv && cargo build --release</div>
+                <div class="text-emerald-400">cd kv && cargo build --release</div>
                 <div class="text-slate-500 mt-3"># Binary is at target/release/solikv</div>
             </div>
         </div>
@@ -164,6 +164,16 @@
                         <td class="py-3 pr-4 font-mono text-indigo-400">--log-level</td>
                         <td class="py-3 pr-4">info</td>
                         <td class="py-3">Log level (trace, debug, info, warn, error)</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--import-redis-rdb</td>
+                        <td class="py-3 pr-4">&mdash;</td>
+                        <td class="py-3">Path to a Redis <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">dump.rdb</code> file to import at startup</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--requirepass</td>
+                        <td class="py-3 pr-4">&mdash;</td>
+                        <td class="py-3">Require password for client authentication (RESP <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">AUTH</code> + REST <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">Bearer</code> token)</td>
                     </tr>
                 </tbody>
             </table>

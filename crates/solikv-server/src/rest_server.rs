@@ -1,6 +1,7 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::StatusCode,
+    middleware::Next,
     response::Json,
     routing::{delete, get, post, put},
     Router,
@@ -18,13 +19,15 @@ use solikv_engine::CommandEngine;
 #[derive(Clone)]
 struct AppState {
     engine: Arc<CommandEngine>,
+    password: Option<Arc<String>>,
 }
 
 pub async fn run(
     addr: &str,
     engine: Arc<CommandEngine>,
+    password: Option<Arc<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = AppState { engine };
+    let state = AppState { engine, password };
 
     let app = Router::new()
         // Key-value operations
@@ -49,17 +52,73 @@ pub async fn run(
         // Sorted set operations
         .route("/zset/{key}", get(zset_range))
         .route("/zset/{key}", put(zset_add))
+        // HyperLogLog operations
+        .route("/pfadd/{key}", post(pfadd))
+        .route("/pfcount/{key}", get(pfcount))
+        .route("/pfmerge/{dest}", post(pfmerge))
+        // Bitmap operations
+        .route("/bitmap/{key}/setbit", post(bitmap_setbit))
+        .route("/bitmap/{key}/getbit/{offset}", get(bitmap_getbit))
+        .route("/bitmap/{key}/bitcount", get(bitmap_bitcount))
+        // Bloom filter operations
+        .route("/bf/reserve/{key}", post(bf_reserve))
+        .route("/bf/add/{key}", post(bf_add))
+        .route("/bf/exists/{key}/{item}", get(bf_exists))
+        .route("/bf/info/{key}", get(bf_info))
+        // Geospatial operations
+        .route("/geo/{key}/add", post(geo_add))
+        .route("/geo/{key}/pos/{member}", get(geo_pos))
+        .route("/geo/{key}/dist/{member1}/{member2}", get(geo_dist))
+        .route("/geo/{key}/search", post(geo_search))
         // Generic command endpoint
         .route("/cmd", post(execute_command))
         // Server info
         .route("/info", get(server_info))
         .route("/dbsize", get(dbsize))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("REST API listening on {}", addr);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    let password = match &state.password {
+        None => return Ok(next.run(req).await),
+        Some(p) => p,
+    };
+
+    let auth_header = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
+
+    match auth_header {
+        Some(header) if header.starts_with("Bearer ") => {
+            let token = &header[7..];
+            if token == password.as_str() {
+                Ok(next.run(req).await)
+            } else {
+                Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "Unauthorized"})),
+                ))
+            }
+        }
+        _ => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Unauthorized"})),
+        )),
+    }
 }
 
 // ---- Request/Response types ----
@@ -109,6 +168,71 @@ struct RangeQuery {
 struct CommandBody {
     command: String,
     args: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PfAddBody {
+    elements: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PfMergeBody {
+    sources: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct BfReserveBody {
+    error_rate: f64,
+    capacity: u64,
+}
+
+#[derive(Deserialize)]
+struct BfAddBody {
+    item: String,
+}
+
+#[derive(Deserialize)]
+struct SetBitBody {
+    offset: u64,
+    value: u8,
+}
+
+#[derive(Deserialize)]
+struct BitcountQuery {
+    start: Option<i64>,
+    end: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct GeoAddBody {
+    members: Vec<GeoAddMember>,
+}
+
+#[derive(Deserialize)]
+struct GeoAddMember {
+    longitude: f64,
+    latitude: f64,
+    member: String,
+}
+
+#[derive(Deserialize)]
+struct GeoDistQuery {
+    unit: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GeoSearchBody {
+    longitude: Option<f64>,
+    latitude: Option<f64>,
+    member: Option<String>,
+    radius: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+    unit: Option<String>,
+    count: Option<usize>,
+    sort: Option<String>,
+    withcoord: Option<bool>,
+    withdist: Option<bool>,
 }
 
 // ---- Handlers ----
@@ -314,6 +438,207 @@ async fn dbsize(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let resp = state.engine.execute("DBSIZE", &[]);
+    to_json_response(resp)
+}
+
+// ---- HyperLogLog handlers ----
+
+async fn pfadd(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<PfAddBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut args = vec![Bytes::from(key)];
+    args.extend(body.elements.into_iter().map(Bytes::from));
+    let resp = state.engine.execute("PFADD", &args);
+    to_json_response(resp)
+}
+
+async fn pfcount(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let resp = state.engine.execute("PFCOUNT", &[Bytes::from(key)]);
+    to_json_response(resp)
+}
+
+async fn pfmerge(
+    State(state): State<AppState>,
+    Path(dest): Path<String>,
+    Json(body): Json<PfMergeBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut args = vec![Bytes::from(dest)];
+    args.extend(body.sources.into_iter().map(Bytes::from));
+    let resp = state.engine.execute("PFMERGE", &args);
+    to_json_response(resp)
+}
+
+// ---- Bloom filter handlers ----
+
+async fn bf_reserve(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<BfReserveBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let resp = state.engine.execute("BF.RESERVE", &[
+        Bytes::from(key),
+        Bytes::from(body.error_rate.to_string()),
+        Bytes::from(body.capacity.to_string()),
+    ]);
+    to_json_response(resp)
+}
+
+async fn bf_add(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<BfAddBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let resp = state.engine.execute("BF.ADD", &[Bytes::from(key), Bytes::from(body.item)]);
+    to_json_response(resp)
+}
+
+async fn bf_exists(
+    State(state): State<AppState>,
+    Path((key, item)): Path<(String, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let resp = state.engine.execute("BF.EXISTS", &[Bytes::from(key), Bytes::from(item)]);
+    to_json_response(resp)
+}
+
+async fn bf_info(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let resp = state.engine.execute("BF.INFO", &[Bytes::from(key)]);
+    to_json_response(resp)
+}
+
+// ---- Bitmap handlers ----
+
+async fn bitmap_setbit(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<SetBitBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let resp = state.engine.execute("SETBIT", &[
+        Bytes::from(key),
+        Bytes::from(body.offset.to_string()),
+        Bytes::from(body.value.to_string()),
+    ]);
+    to_json_response(resp)
+}
+
+async fn bitmap_getbit(
+    State(state): State<AppState>,
+    Path((key, offset)): Path<(String, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let resp = state.engine.execute("GETBIT", &[Bytes::from(key), Bytes::from(offset)]);
+    to_json_response(resp)
+}
+
+async fn bitmap_bitcount(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Query(query): Query<BitcountQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut args = vec![Bytes::from(key)];
+    if let (Some(start), Some(end)) = (query.start, query.end) {
+        args.push(Bytes::from(start.to_string()));
+        args.push(Bytes::from(end.to_string()));
+    }
+    let resp = state.engine.execute("BITCOUNT", &args);
+    to_json_response(resp)
+}
+
+// ---- Geospatial handlers ----
+
+async fn geo_add(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<GeoAddBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut args = vec![Bytes::from(key)];
+    for m in body.members {
+        args.push(Bytes::from(m.longitude.to_string()));
+        args.push(Bytes::from(m.latitude.to_string()));
+        args.push(Bytes::from(m.member));
+    }
+    let resp = state.engine.execute("GEOADD", &args);
+    to_json_response(resp)
+}
+
+async fn geo_pos(
+    State(state): State<AppState>,
+    Path((key, member)): Path<(String, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let resp = state.engine.execute("GEOPOS", &[Bytes::from(key), Bytes::from(member)]);
+    to_json_response(resp)
+}
+
+async fn geo_dist(
+    State(state): State<AppState>,
+    Path((key, member1, member2)): Path<(String, String, String)>,
+    Query(query): Query<GeoDistQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut args = vec![Bytes::from(key), Bytes::from(member1), Bytes::from(member2)];
+    if let Some(unit) = query.unit {
+        args.push(Bytes::from(unit));
+    }
+    let resp = state.engine.execute("GEODIST", &args);
+    to_json_response(resp)
+}
+
+async fn geo_search(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<GeoSearchBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut args = vec![Bytes::from(key)];
+
+    // FROM
+    if let (Some(lon), Some(lat)) = (body.longitude, body.latitude) {
+        args.push(Bytes::from("FROMLONLAT"));
+        args.push(Bytes::from(lon.to_string()));
+        args.push(Bytes::from(lat.to_string()));
+    } else if let Some(member) = body.member {
+        args.push(Bytes::from("FROMMEMBER"));
+        args.push(Bytes::from(member));
+    }
+
+    let unit = body.unit.unwrap_or_else(|| "m".to_string());
+
+    // BY
+    if let Some(radius) = body.radius {
+        args.push(Bytes::from("BYRADIUS"));
+        args.push(Bytes::from(radius.to_string()));
+        args.push(Bytes::from(unit.clone()));
+    } else if let (Some(w), Some(h)) = (body.width, body.height) {
+        args.push(Bytes::from("BYBOX"));
+        args.push(Bytes::from(w.to_string()));
+        args.push(Bytes::from(h.to_string()));
+        args.push(Bytes::from(unit.clone()));
+    }
+
+    // Sort
+    if let Some(sort) = body.sort {
+        args.push(Bytes::from(sort.to_uppercase()));
+    }
+
+    // Count
+    if let Some(count) = body.count {
+        args.push(Bytes::from("COUNT"));
+        args.push(Bytes::from(count.to_string()));
+    }
+
+    // Flags
+    if body.withcoord.unwrap_or(false) {
+        args.push(Bytes::from("WITHCOORD"));
+    }
+    if body.withdist.unwrap_or(false) {
+        args.push(Bytes::from("WITHDIST"));
+    }
+
+    let resp = state.engine.execute("GEOSEARCH", &args);
     to_json_response(resp)
 }
 

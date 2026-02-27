@@ -10,8 +10,8 @@ use tracing_subscriber::EnvFilter;
 
 use solikv_persist::{AofPersistence, FsyncPolicy};
 
-mod resp_server;
-mod rest_server;
+use solikv_server::resp_server;
+use solikv_server::rest_server;
 
 #[derive(Parser, Debug)]
 #[command(name = "solikv", about = "SoliKV - High-Performance In-Memory Database")]
@@ -51,6 +51,18 @@ struct Args {
     /// AOF fsync policy: always, everysec, no
     #[arg(long, default_value = "everysec")]
     appendfsync: String,
+
+    /// Import a Redis RDB file (dump.rdb) at startup
+    #[arg(long, value_name = "PATH")]
+    import_redis_rdb: Option<PathBuf>,
+
+    /// Require password for client authentication (RESP AUTH + REST Bearer token)
+    #[arg(long, value_name = "PASSWORD")]
+    requirepass: Option<String>,
+
+    /// Keyspace notification flags (e.g. "KEA" for all events, "" to disable)
+    #[arg(long, default_value = "")]
+    notify_keyspace_events: String,
 }
 
 #[tokio::main]
@@ -76,13 +88,64 @@ async fn main() {
         _ => FsyncPolicy::Everysec,
     };
 
+    let password: Option<Arc<String>> = args.requirepass.map(Arc::new);
+
     tracing::info!(
         "SoliKV starting with {} shards, RESP on port {}, REST on port {}",
         num_shards, args.port, args.rest_port
     );
+    if password.is_some() {
+        tracing::info!("Authentication enabled");
+    } else {
+        tracing::info!("Authentication disabled (no password set)");
+    }
 
-    let shards = Arc::new(solikv_engine::ShardManager::new(num_shards));
     let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
+
+    // Parse keyspace notification flags
+    let notify_flags = Arc::new(std::sync::atomic::AtomicU16::new(
+        solikv_engine::dispatch::parse_notify_flags(&args.notify_keyspace_events),
+    ));
+    if notify_flags.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        tracing::info!(
+            "Keyspace notifications enabled: {}",
+            args.notify_keyspace_events
+        );
+    }
+
+    // Create shards with notification context (pubsub + flags) for expiry notifications
+    let shards = Arc::new(solikv_engine::ShardManager::with_notifications(
+        num_shards,
+        pubsub.clone(),
+        notify_flags.clone(),
+    ));
+
+    // --- Import Redis RDB if requested ---
+    if let Some(ref redis_rdb_path) = args.import_redis_rdb {
+        tracing::info!("Importing Redis RDB from {:?}...", redis_rdb_path);
+        match solikv_persist::redis_rdb::import_redis_rdb(redis_rdb_path, num_shards) {
+            Ok((shard_data, stats)) => {
+                let mut total = 0usize;
+                for (idx, entries) in shard_data.into_iter().enumerate() {
+                    let count = entries.len();
+                    if count > 0 {
+                        shards.shard(idx).execute(|store| {
+                            for (key, entry) in entries {
+                                store.insert_entry(key, entry);
+                            }
+                            solikv_core::CommandResponse::ok()
+                        });
+                    }
+                    total += count;
+                }
+                tracing::info!("Redis RDB import complete: {stats} ({total} keys loaded into {num_shards} shards)");
+            }
+            Err(e) => {
+                tracing::error!("Failed to import Redis RDB from {:?}: {}", redis_rdb_path, e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     // --- Load RDB snapshots ---
     match solikv_persist::load_all_shards(&args.dir, &args.dbfilename, num_shards, |idx, f| {
@@ -142,11 +205,13 @@ async fn main() {
     };
 
     // --- Create engine with AOF ---
-    let mut engine = solikv_engine::CommandEngine::new(shards.clone(), pubsub.clone());
+    let mut engine = solikv_engine::CommandEngine::new(shards.clone(), pubsub.clone())
+        .with_notify_flags(notify_flags);
     if let Some(writer) = aof_writer {
         engine = engine.with_aof(writer);
     }
     let engine = Arc::new(engine);
+    engine.init_self_ref(Arc::downgrade(&engine));
 
     // --- Spawn background RDB save task ---
     {
@@ -175,15 +240,18 @@ async fn main() {
 
     let engine_resp = engine.clone();
     let pubsub_resp = pubsub.clone();
+    let password_resp = password.clone();
     let resp_handle = tokio::spawn(async move {
-        if let Err(e) = resp_server::run(&resp_addr, engine_resp, pubsub_resp).await {
+        if let Err(e) = resp_server::run(&resp_addr, engine_resp, pubsub_resp, password_resp).await
+        {
             tracing::error!("RESP server error: {}", e);
         }
     });
 
     let engine_rest = engine.clone();
+    let password_rest = password.clone();
     let rest_handle = tokio::spawn(async move {
-        if let Err(e) = rest_server::run(&rest_addr, engine_rest).await {
+        if let Err(e) = rest_server::run(&rest_addr, engine_rest, password_rest).await {
             tracing::error!("REST server error: {}", e);
         }
     });

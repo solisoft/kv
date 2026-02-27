@@ -14,6 +14,8 @@ const TYPE_LIST: u8 = 1;
 const TYPE_HASH: u8 = 2;
 const TYPE_SET: u8 = 3;
 const TYPE_ZSET: u8 = 4;
+const TYPE_HLL: u8 = 5;
+const TYPE_BLOOM: u8 = 6;
 const ENTRY_END: u8 = 0xFF;
 
 pub struct RdbPersistence;
@@ -76,6 +78,25 @@ impl RdbPersistence {
                         write_bytes(writer, member)?;
                         writer.write_all(&score.into_inner().to_le_bytes())?;
                     }
+                }
+                RedisValue::Stream(_) => {
+                    // Stream RDB serialization not yet implemented; streams are persisted via AOF
+                    continue;
+                }
+                RedisValue::HyperLogLog(hll) => {
+                    writer.write_all(&[TYPE_HLL])?;
+                    write_bytes(writer, key)?;
+                    write_bytes(writer, &hll.registers)?;
+                }
+                RedisValue::BloomFilter(bf) => {
+                    writer.write_all(&[TYPE_BLOOM])?;
+                    write_bytes(writer, key)?;
+                    writer.write_all(&bf.num_bits.to_le_bytes())?;
+                    writer.write_all(&bf.num_hashes.to_le_bytes())?;
+                    writer.write_all(&bf.num_items.to_le_bytes())?;
+                    writer.write_all(&bf.capacity.to_le_bytes())?;
+                    writer.write_all(&bf.error_rate.to_le_bytes())?;
+                    write_bytes(writer, &bf.bits)?;
                 }
             }
         }
@@ -164,6 +185,45 @@ impl RdbPersistence {
                         zset.insert(score, member);
                     }
                     let entry = make_entry(RedisValue::ZSet(zset), current_expiry.take());
+                    store.insert_entry(key, entry);
+                }
+                TYPE_HLL => {
+                    let key = read_bytes(reader)?;
+                    let registers_bytes = read_bytes(reader)?;
+                    if registers_bytes.len() != 16384 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid HLL register size",
+                        ));
+                    }
+                    let hll = HyperLogLogValue { registers: registers_bytes.to_vec() };
+                    let entry = make_entry(RedisValue::HyperLogLog(hll), current_expiry.take());
+                    store.insert_entry(key, entry);
+                }
+                TYPE_BLOOM => {
+                    let key = read_bytes(reader)?;
+                    let mut buf8 = [0u8; 8];
+                    reader.read_exact(&mut buf8)?;
+                    let num_bits = u64::from_le_bytes(buf8);
+                    let mut buf4 = [0u8; 4];
+                    reader.read_exact(&mut buf4)?;
+                    let num_hashes = u32::from_le_bytes(buf4);
+                    reader.read_exact(&mut buf8)?;
+                    let num_items = u64::from_le_bytes(buf8);
+                    reader.read_exact(&mut buf8)?;
+                    let capacity = u64::from_le_bytes(buf8);
+                    reader.read_exact(&mut buf8)?;
+                    let error_rate = f64::from_le_bytes(buf8);
+                    let bits_bytes = read_bytes(reader)?;
+                    let bf = BloomFilterValue {
+                        bits: bits_bytes.to_vec(),
+                        num_bits,
+                        num_hashes,
+                        num_items,
+                        capacity,
+                        error_rate,
+                    };
+                    let entry = make_entry(RedisValue::BloomFilter(bf), current_expiry.take());
                     store.insert_entry(key, entry);
                 }
                 b => {
@@ -347,5 +407,45 @@ mod tests {
         let mut loaded = ShardStore::new();
         RdbPersistence::load(&mut Cursor::new(&buf), &mut loaded).unwrap();
         assert_eq!(loaded.dbsize(), 1);
+    }
+
+    #[test]
+    fn test_rdb_roundtrip_hll() {
+        let mut store = ShardStore::new();
+        store.pfadd(&Bytes::from("myhll"), &[Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]);
+
+        let mut buf = Vec::new();
+        RdbPersistence::save(&store, &mut buf).unwrap();
+
+        let mut loaded = ShardStore::new();
+        RdbPersistence::load(&mut Cursor::new(&buf), &mut loaded).unwrap();
+        assert_eq!(loaded.dbsize(), 1);
+
+        // Verify count is preserved
+        let count = match loaded.pfcount(&[Bytes::from("myhll")]) {
+            CommandResponse::Integer(c) => c,
+            _ => panic!("expected integer"),
+        };
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_rdb_roundtrip_bloom() {
+        let mut store = ShardStore::new();
+        store.bf_reserve(&Bytes::from("mybf"), 0.01, 1000);
+        store.bf_add(&Bytes::from("mybf"), &Bytes::from("hello"));
+        store.bf_add(&Bytes::from("mybf"), &Bytes::from("world"));
+
+        let mut buf = Vec::new();
+        RdbPersistence::save(&store, &mut buf).unwrap();
+
+        let mut loaded = ShardStore::new();
+        RdbPersistence::load(&mut Cursor::new(&buf), &mut loaded).unwrap();
+        assert_eq!(loaded.dbsize(), 1);
+
+        // Verify membership is preserved
+        assert!(matches!(loaded.bf_exists(&Bytes::from("mybf"), &Bytes::from("hello")), CommandResponse::Integer(1)));
+        assert!(matches!(loaded.bf_exists(&Bytes::from("mybf"), &Bytes::from("world")), CommandResponse::Integer(1)));
+        assert!(matches!(loaded.bf_exists(&Bytes::from("mybf"), &Bytes::from("nothere")), CommandResponse::Integer(0)));
     }
 }

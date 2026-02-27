@@ -154,6 +154,61 @@
         </div>
     </div>
 
+    <!-- Redis RDB Import -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Migrating from Redis</h2>
+        <p class="text-slate-400 mb-6">SoliKV can import standard Redis <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">dump.rdb</code> snapshot files at startup. This lets you migrate from Redis without re-inserting all your data.</p>
+
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden mb-6">
+            <div class="flex items-center gap-2 px-4 py-2 bg-white/5 border-b border-white/5">
+                <div class="w-3 h-3 rounded-full bg-red-500/60"></div>
+                <div class="w-3 h-3 rounded-full bg-yellow-500/60"></div>
+                <div class="w-3 h-3 rounded-full bg-green-500/60"></div>
+                <span class="ml-2 text-xs text-slate-500 font-mono">Terminal</span>
+            </div>
+            <div class="p-4 font-mono text-sm">
+                <div class="text-slate-500"># 1. Generate a dump on your Redis instance</div>
+                <div class="text-emerald-400">redis-cli BGSAVE</div>
+                <div class="text-emerald-400">cp /var/lib/redis/dump.rdb /tmp/dump.rdb</div>
+                <div class="text-slate-500 mt-3"># 2. Import into SoliKV</div>
+                <div class="text-emerald-400">./solikv --import-redis-rdb /tmp/dump.rdb</div>
+                <div class="text-white mt-1">Parsing Redis RDB version 11</div>
+                <div class="text-white">Redis RDB import complete: RDB v11: 4821 keys imported, 0 skipped, 12 expired, 1 database(s)</div>
+                <div class="text-slate-500 mt-3"># 3. Verify your data</div>
+                <div class="text-emerald-400">redis-cli DBSIZE</div>
+                <div class="text-white mt-1">(integer) 4821</div>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-6">
+            <div class="p-5 rounded-xl bg-white/5 border border-white/10">
+                <h3 class="text-lg font-semibold text-emerald-400 mb-3">Supported Types</h3>
+                <ul class="space-y-1.5 text-sm text-slate-400">
+                    <li class="flex items-center gap-2"><span class="text-emerald-400">&#10003;</span> Strings</li>
+                    <li class="flex items-center gap-2"><span class="text-emerald-400">&#10003;</span> Lists (plain, ziplist, quicklist, quicklist v2)</li>
+                    <li class="flex items-center gap-2"><span class="text-emerald-400">&#10003;</span> Sets (plain, intset, listpack)</li>
+                    <li class="flex items-center gap-2"><span class="text-emerald-400">&#10003;</span> Sorted Sets (plain, ziplist, listpack, binary scores)</li>
+                    <li class="flex items-center gap-2"><span class="text-emerald-400">&#10003;</span> Hashes (plain, ziplist, listpack)</li>
+                    <li class="flex items-center gap-2"><span class="text-emerald-400">&#10003;</span> LZF compressed values</li>
+                    <li class="flex items-center gap-2"><span class="text-emerald-400">&#10003;</span> Key expiry (absolute timestamps, ms precision)</li>
+                </ul>
+            </div>
+            <div class="p-5 rounded-xl bg-white/5 border border-white/10">
+                <h3 class="text-lg font-semibold text-slate-400 mb-3">Skipped (with warning)</h3>
+                <ul class="space-y-1.5 text-sm text-slate-500">
+                    <li class="flex items-center gap-2"><span class="text-slate-600">&mdash;</span> Streams</li>
+                    <li class="flex items-center gap-2"><span class="text-slate-600">&mdash;</span> Modules</li>
+                    <li class="flex items-center gap-2"><span class="text-slate-600">&mdash;</span> Hash with per-field expiry (Redis 7.4+)</li>
+                </ul>
+                <p class="text-xs text-slate-600 mt-4">Unsupported keys are skipped and logged. All other keys are imported normally.</p>
+            </div>
+        </div>
+
+        <div class="mt-6 p-4 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-sm text-slate-400">
+            <strong class="text-white">Multi-database RDB files:</strong> If your Redis instance uses multiple databases (DB 0, DB 1, ...), all keys are flattened into SoliKV's single namespace. Already-expired keys are automatically filtered out during import.
+        </div>
+    </div>
+
     <!-- File Layout -->
     <div>
         <h2 class="text-2xl font-semibold mb-4">File Layout</h2>

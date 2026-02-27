@@ -313,6 +313,136 @@ impl ShardStore {
         self.set(key.clone(), RedisValue::String(buf.freeze()), None);
         CommandResponse::integer(new_len)
     }
+    // ---- SETBIT ----
+    pub fn string_setbit(&mut self, key: &Bytes, offset: u64, value: u8) -> CommandResponse {
+        let current = match self.get(key) {
+            None => Bytes::new(),
+            Some(entry) => match &entry.value {
+                RedisValue::String(v) => v.clone(),
+                _ => return CommandResponse::wrong_type(),
+            },
+        };
+
+        let byte_offset = (offset / 8) as usize;
+        let bit_pos = 7 - (offset % 8) as u8;
+
+        let mut buf = BytesMut::from(current.as_ref());
+        // Auto-grow with zero bytes if needed
+        if byte_offset >= buf.len() {
+            buf.resize(byte_offset + 1, 0);
+        }
+
+        let old_bit = (buf[byte_offset] >> bit_pos) & 1;
+
+        if value != 0 {
+            buf[byte_offset] |= 1 << bit_pos;
+        } else {
+            buf[byte_offset] &= !(1 << bit_pos);
+        }
+
+        self.set(key.clone(), RedisValue::String(buf.freeze()), None);
+        CommandResponse::integer(old_bit as i64)
+    }
+
+    // ---- GETBIT ----
+    pub fn string_getbit(&mut self, key: &Bytes, offset: u64) -> CommandResponse {
+        match self.get(key) {
+            None => CommandResponse::integer(0),
+            Some(entry) => match &entry.value {
+                RedisValue::String(v) => {
+                    let byte_offset = (offset / 8) as usize;
+                    if byte_offset >= v.len() {
+                        return CommandResponse::integer(0);
+                    }
+                    let bit_pos = 7 - (offset % 8) as u8;
+                    let bit = (v[byte_offset] >> bit_pos) & 1;
+                    CommandResponse::integer(bit as i64)
+                }
+                _ => CommandResponse::wrong_type(),
+            },
+        }
+    }
+
+    // ---- BITCOUNT ----
+    pub fn string_bitcount(&mut self, key: &Bytes, start: Option<i64>, end: Option<i64>) -> CommandResponse {
+        match self.get(key) {
+            None => CommandResponse::integer(0),
+            Some(entry) => match &entry.value {
+                RedisValue::String(v) => {
+                    let len = v.len() as i64;
+                    if len == 0 {
+                        return CommandResponse::integer(0);
+                    }
+                    let (s, e) = match (start, end) {
+                        (Some(s), Some(e)) => {
+                            let s = if s < 0 { (len + s).max(0) } else { s.min(len) };
+                            let e = if e < 0 { (len + e).max(0) } else { e.min(len - 1) };
+                            (s as usize, e as usize)
+                        }
+                        _ => (0, (len - 1) as usize),
+                    };
+                    if s > e {
+                        return CommandResponse::integer(0);
+                    }
+                    let count: u32 = v[s..=e].iter().map(|b| b.count_ones()).sum();
+                    CommandResponse::integer(count as i64)
+                }
+                _ => CommandResponse::wrong_type(),
+            },
+        }
+    }
+
+    // ---- BITOP ----
+    /// Takes pre-fetched source byte arrays (dispatch handles cross-shard fetching).
+    pub fn string_bitop(&mut self, dest: Bytes, op: &str, sources: &[Vec<u8>]) -> CommandResponse {
+        if sources.is_empty() {
+            self.set(dest, RedisValue::String(Bytes::new()), None);
+            return CommandResponse::integer(0);
+        }
+
+        let max_len = sources.iter().map(|s| s.len()).max().unwrap_or(0);
+
+        let result: Vec<u8> = match op {
+            "NOT" => {
+                let src = &sources[0];
+                (0..max_len)
+                    .map(|i| !src.get(i).copied().unwrap_or(0))
+                    .collect()
+            }
+            _ => {
+                (0..max_len)
+                    .map(|i| {
+                        let mut val = sources[0].get(i).copied().unwrap_or(0);
+                        for src in &sources[1..] {
+                            let b = src.get(i).copied().unwrap_or(0);
+                            match op {
+                                "AND" => val &= b,
+                                "OR" => val |= b,
+                                "XOR" => val ^= b,
+                                _ => {}
+                            }
+                        }
+                        val
+                    })
+                    .collect()
+            }
+        };
+
+        let len = result.len() as i64;
+        self.set(dest, RedisValue::String(Bytes::from(result)), None);
+        CommandResponse::integer(len)
+    }
+
+    // ---- GET_RAW (helper for cross-shard BITOP) ----
+    pub fn string_get_raw(&mut self, key: &Bytes) -> CommandResponse {
+        match self.get(key) {
+            None => CommandResponse::nil(),
+            Some(entry) => match &entry.value {
+                RedisValue::String(v) => CommandResponse::bulk(v.clone()),
+                _ => CommandResponse::wrong_type(),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -571,5 +701,131 @@ mod tests {
             }
             _ => panic!("expected bulk"),
         }
+    }
+
+    // ---- Bitmap tests ----
+
+    #[test]
+    fn test_setbit_getbit() {
+        let mut store = ShardStore::new();
+        // Set bit 7 (last bit of first byte) to 1
+        let old = store.string_setbit(&Bytes::from("bm"), 7, 1);
+        assert!(matches!(old, CommandResponse::Integer(0)));
+        let bit = store.string_getbit(&Bytes::from("bm"), 7);
+        assert!(matches!(bit, CommandResponse::Integer(1)));
+        // Bit 0 should still be 0
+        let bit = store.string_getbit(&Bytes::from("bm"), 0);
+        assert!(matches!(bit, CommandResponse::Integer(0)));
+    }
+
+    #[test]
+    fn test_setbit_auto_grow() {
+        let mut store = ShardStore::new();
+        // Set bit at offset 24 (byte 3) on non-existent key
+        let old = store.string_setbit(&Bytes::from("bm"), 24, 1);
+        assert!(matches!(old, CommandResponse::Integer(0)));
+        // Underlying string should be 4 bytes
+        match store.string_get(&Bytes::from("bm")) {
+            CommandResponse::BulkString(v) => assert_eq!(v.len(), 4),
+            _ => panic!("expected bulk"),
+        }
+    }
+
+    #[test]
+    fn test_getbit_missing_key() {
+        let mut store = ShardStore::new();
+        let bit = store.string_getbit(&Bytes::from("nokey"), 100);
+        assert!(matches!(bit, CommandResponse::Integer(0)));
+    }
+
+    #[test]
+    fn test_bitcount() {
+        let mut store = ShardStore::new();
+        // 0xFF = 8 bits set
+        store.string_set(Bytes::from("bm"), Bytes::from(vec![0xFF]), None, false, false, false);
+        let count = store.string_bitcount(&Bytes::from("bm"), None, None);
+        assert!(matches!(count, CommandResponse::Integer(8)));
+    }
+
+    #[test]
+    fn test_bitcount_range() {
+        let mut store = ShardStore::new();
+        // Two bytes: 0xFF (8 bits), 0x0F (4 bits)
+        store.string_set(Bytes::from("bm"), Bytes::from(vec![0xFF, 0x0F]), None, false, false, false);
+        // Only count byte 1
+        let count = store.string_bitcount(&Bytes::from("bm"), Some(1), Some(1));
+        assert!(matches!(count, CommandResponse::Integer(4)));
+        // Negative index: last byte
+        let count = store.string_bitcount(&Bytes::from("bm"), Some(-1), Some(-1));
+        assert!(matches!(count, CommandResponse::Integer(4)));
+    }
+
+    #[test]
+    fn test_bitop_and() {
+        let mut store = ShardStore::new();
+        let result = store.string_bitop(
+            Bytes::from("dest"),
+            "AND",
+            &[vec![0xFF, 0x0F], vec![0x0F, 0xFF]],
+        );
+        assert!(matches!(result, CommandResponse::Integer(2)));
+        match store.string_get(&Bytes::from("dest")) {
+            CommandResponse::BulkString(v) => assert_eq!(v.as_ref(), &[0x0F, 0x0F]),
+            _ => panic!("expected bulk"),
+        }
+    }
+
+    #[test]
+    fn test_bitop_or() {
+        let mut store = ShardStore::new();
+        let result = store.string_bitop(
+            Bytes::from("dest"),
+            "OR",
+            &[vec![0xF0], vec![0x0F]],
+        );
+        assert!(matches!(result, CommandResponse::Integer(1)));
+        match store.string_get(&Bytes::from("dest")) {
+            CommandResponse::BulkString(v) => assert_eq!(v.as_ref(), &[0xFF]),
+            _ => panic!("expected bulk"),
+        }
+    }
+
+    #[test]
+    fn test_bitop_xor() {
+        let mut store = ShardStore::new();
+        let result = store.string_bitop(
+            Bytes::from("dest"),
+            "XOR",
+            &[vec![0xFF], vec![0xFF]],
+        );
+        assert!(matches!(result, CommandResponse::Integer(1)));
+        match store.string_get(&Bytes::from("dest")) {
+            CommandResponse::BulkString(v) => assert_eq!(v.as_ref(), &[0x00]),
+            _ => panic!("expected bulk"),
+        }
+    }
+
+    #[test]
+    fn test_bitop_not() {
+        let mut store = ShardStore::new();
+        let result = store.string_bitop(
+            Bytes::from("dest"),
+            "NOT",
+            &[vec![0xF0]],
+        );
+        assert!(matches!(result, CommandResponse::Integer(1)));
+        match store.string_get(&Bytes::from("dest")) {
+            CommandResponse::BulkString(v) => assert_eq!(v.as_ref(), &[0x0F]),
+            _ => panic!("expected bulk"),
+        }
+    }
+
+    #[test]
+    fn test_setbit_wrongtype() {
+        let mut store = ShardStore::new();
+        // Create a list key
+        store.list_lpush(&Bytes::from("mylist"), vec![Bytes::from("a")]);
+        let r = store.string_setbit(&Bytes::from("mylist"), 0, 1);
+        assert!(matches!(r, CommandResponse::Error(_)));
     }
 }

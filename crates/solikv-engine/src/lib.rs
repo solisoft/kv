@@ -1,4 +1,5 @@
 pub mod dispatch;
+pub mod lua;
 pub mod response;
 pub mod shard;
 

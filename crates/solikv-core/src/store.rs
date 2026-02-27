@@ -9,6 +9,8 @@ use crate::types::*;
 pub struct ShardStore {
     data: HashMap<Bytes, KeyEntry>,
     expiry_heap: ExpiryHeap,
+    /// Buffer of keys that were lazily expired during get/get_mut. Drained by ShardHandle.
+    pub expired_buffer: Vec<Bytes>,
 }
 
 impl ShardStore {
@@ -16,6 +18,7 @@ impl ShardStore {
         Self {
             data: HashMap::new(),
             expiry_heap: ExpiryHeap::new(),
+            expired_buffer: Vec::new(),
         }
     }
 
@@ -24,6 +27,7 @@ impl ShardStore {
         // Lazy expiry: check on access
         if let Some(entry) = self.data.get(key) {
             if entry.is_expired() {
+                self.expired_buffer.push(key.clone());
                 self.data.remove(key);
                 return None;
             }
@@ -35,6 +39,7 @@ impl ShardStore {
     pub fn get_mut(&mut self, key: &Bytes) -> Option<&mut KeyEntry> {
         if let Some(entry) = self.data.get(key) {
             if entry.is_expired() {
+                self.expired_buffer.push(key.clone());
                 self.data.remove(key);
                 return None;
             }
@@ -220,20 +225,20 @@ impl ShardStore {
         self.expiry_heap = ExpiryHeap::new();
     }
 
-    /// Run active expiry: remove expired keys from the heap.
-    pub fn run_active_expiry(&mut self) -> usize {
+    /// Run active expiry: remove expired keys from the heap. Returns the expired key names.
+    pub fn run_active_expiry(&mut self) -> Vec<Bytes> {
         let now = now_millis();
         let expired_keys = self.expiry_heap.drain_expired(now);
-        let mut count = 0;
+        let mut removed = Vec::new();
         for key in expired_keys {
             if let Some(entry) = self.data.get(&key) {
                 if entry.is_expired() {
                     self.data.remove(&key);
-                    count += 1;
+                    removed.push(key);
                 }
             }
         }
-        count
+        removed
     }
 
     /// Rename a key. Returns error message if source doesn't exist.
