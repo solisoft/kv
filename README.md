@@ -14,6 +14,16 @@ A high-performance in-memory key-value database written in Rust, compatible with
 
 ## Getting Started
 
+### Quick Install
+
+```bash
+# Install to ~/.local/bin
+curl -sSL https://raw.githubusercontent.com/solisoft/kv/main/install.sh | sh
+
+# Or install system-wide (requires sudo)
+curl -sSL https://raw.githubusercontent.com/solisoft/kv/main/install.sh | sh -s -- --system
+```
+
 ### Build
 
 ```bash

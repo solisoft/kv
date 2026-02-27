@@ -17,6 +17,27 @@
         </ul>
     </div>
 
+    <!-- Quick Install -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Quick Install</h2>
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
+            <div class="flex items-center gap-2 px-4 py-2 bg-white/5 border-b border-white/5">
+                <div class="w-3 h-3 rounded-full bg-red-500/60"></div>
+                <div class="w-3 h-3 rounded-full bg-yellow-500/60"></div>
+                <div class="w-3 h-3 rounded-full bg-green-500/60"></div>
+                <span class="ml-2 text-xs text-slate-500 font-mono">Terminal</span>
+            </div>
+            <div class="p-4 font-mono text-sm">
+                <div class="text-slate-500"># Install to ~/.local/bin</div>
+                <div class="text-emerald-400">curl -sSL https://raw.githubusercontent.com/solisoft/kv/main/install.sh | sh</div>
+                <div class="text-slate-500 mt-3"># Or install system-wide (requires sudo)</div>
+                <div class="text-emerald-400">curl -sSL https://raw.githubusercontent.com/solisoft/kv/main/install.sh | sh -s -- --system</div>
+                <div class="text-slate-500 mt-3"># Verify installation</div>
+                <div class="text-emerald-400">solikv --version</div>
+            </div>
+        </div>
+    </div>
+
     <!-- Build -->
     <div>
         <h2 class="text-2xl font-semibold mb-4">Build</h2>
