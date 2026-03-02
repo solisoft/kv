@@ -43,7 +43,16 @@ cargo run --release -- \
 ### Docker
 
 ```bash
-docker run -p 6379:6379 -p 5020:5020 -v ./data:/data solikv:latest
+# Pull and run
+docker run -p 6379:6379 -p 5020:5020 -v ./data:/data ghcr.io/solisoft/kv:latest --dir /data
+
+# Or with custom config
+docker run -p 6379:6379 -p 5020:5020 -v ./data:/data \
+  ghcr.io/solisoft/kv:latest --dir /data --shards 4 --appendfsync always
+
+# Or build locally
+docker build -t solikv .
+docker run -p 6379:6379 -p 5020:5020 -v ./data:/data solikv --dir /data
 ```
 
 ## Usage
