@@ -4,6 +4,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 use clap::Parser;
+use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -66,17 +67,74 @@ struct Args {
     /// Keyspace notification flags (e.g. "KEA" for all events, "" to disable)
     #[arg(long, default_value = "")]
     notify_keyspace_events: String,
+
+    /// Run as daemon in background (kills old instance if running)
+    #[arg(short, long)]
+    daemon: bool,
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
-        )
-        .init();
+    let pidfile = PathBuf::from("/tmp/solikv.pid");
+
+    if args.daemon {
+        if pidfile.exists() {
+            if let Ok(pid_str) = fs::read_to_string(&pidfile) {
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    if pid > 0 {
+                        println!("Killing old solikv process (PID: {})...", pid);
+                        let _ = std::process::Command::new("kill")
+                            .arg("-9")
+                            .arg(pid.to_string())
+                            .output();
+                        let _ = fs::remove_file(&pidfile);
+                    }
+                }
+            }
+        }
+
+        let log_file = PathBuf::from("/tmp/solikv.log");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file)
+            .expect("Failed to open log file");
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(std::env::args().skip(1).filter(|a| *a != "-d" && *a != "--daemon"))
+            .stdout(file.try_clone().expect("Failed to clone log"))
+            .stderr(file)
+            .spawn()
+            .expect("Failed to spawn daemon");
+
+        let pid = child.id();
+        fs::write(&pidfile, pid.to_string()).expect("Failed to write pidfile");
+        println!("Started daemon, PID: {}", pid);
+        return;
+    }
+
+    if args.daemon {
+        let log_file = PathBuf::from("/tmp/solikv.log");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file)
+            .expect("Failed to open log file");
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+            )
+            .with_writer(std::sync::Mutex::new(file))
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+            )
+            .init();
+    }
 
     let num_shards = if args.shards == 0 {
         num_cpus().max(1)
@@ -248,6 +306,9 @@ async fn main() {
 
     let resp_addr = format!("{}:{}", args.bind, args.port);
     let rest_addr = format!("{}:{}", args.bind, args.rest_port);
+
+    tracing::info!("Starting RESP server on {}", resp_addr);
+    tracing::info!("Starting REST server on {}", rest_addr);
 
     let engine_resp = engine.clone();
     let pubsub_resp = pubsub.clone();
