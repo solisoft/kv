@@ -309,7 +309,7 @@ impl ClusterManager {
         for (i, slot) in slots.iter().enumerate() {
             let _current_owner = slot.owner.clone().unwrap_or_default();
             match (start, &last_owner, &slot.owner) {
-                (Some(s), Some(lo), Some(co)) if lo == co => {
+                (Some(_s), Some(lo), Some(co)) if lo == co => {
                     // Continue current range
                 }
                 (Some(s), Some(lo), _) => {
