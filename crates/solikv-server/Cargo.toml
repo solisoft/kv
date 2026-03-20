@@ -1,6 +1,6 @@
 [package]
 name = "solikv-server"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [[bin]]
@@ -13,6 +13,7 @@ solikv-resp = { workspace = true }
 solikv-engine = { workspace = true }
 solikv-pubsub = { workspace = true }
 solikv-persist = { workspace = true }
+solikv-cluster = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }

@@ -66,7 +66,7 @@
                     </div>
                     <h3 class="font-semibold">Clustering</h3>
                 </div>
-                <p class="text-sm text-zinc-500">Peer-to-peer distributed architecture with CRC16 sharding across 16384 hash slots</p>
+                <p class="text-sm text-zinc-500">Redis Cluster-compatible with 16384 hash slots, MOVED redirects, gossip protocol, and master-replica replication</p>
             </div>
             <div class="bg-zinc-950 p-5 hover:bg-zinc-900/50 transition-colors">
                 <div class="flex items-center gap-3 mb-2">

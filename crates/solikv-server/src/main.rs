@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 use solikv_persist::{AofPersistence, FsyncPolicy};
 
+use solikv_cluster::{generate_node_id, ClusterManager, GossipState};
 use solikv_server::resp_server;
 use solikv_server::rest_server;
 
@@ -71,6 +72,10 @@ struct Args {
     /// Run as daemon in background (kills old instance if running)
     #[arg(short, long)]
     daemon: bool,
+
+    /// Enable cluster mode (Redis Cluster compatible)
+    #[arg(long)]
+    cluster_enabled: bool,
 }
 
 #[tokio::main]
@@ -103,7 +108,11 @@ async fn main() {
             .expect("Failed to open log file");
 
         let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(std::env::args().skip(1).filter(|a| *a != "-d" && *a != "--daemon"))
+            .args(
+                std::env::args()
+                    .skip(1)
+                    .filter(|a| *a != "-d" && *a != "--daemon"),
+            )
             .stdout(file.try_clone().expect("Failed to clone log"))
             .stderr(file)
             .spawn()
@@ -124,14 +133,16 @@ async fn main() {
             .expect("Failed to open log file");
         tracing_subscriber::fmt()
             .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
             )
             .with_writer(std::sync::Mutex::new(file))
             .init();
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
             )
             .init();
     }
@@ -163,6 +174,23 @@ async fn main() {
     }
 
     let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
+
+    // Initialize cluster if enabled
+    let cluster_manager: Option<Arc<ClusterManager>> = if args.cluster_enabled {
+        let node_id = generate_node_id();
+        let bind_ip = if args.bind == "0.0.0.0" || args.bind == "127.0.0.1" {
+            "127.0.0.1".to_string()
+        } else {
+            args.bind.clone()
+        };
+        let gossip = GossipState::new(node_id.clone(), bind_ip.clone(), args.port);
+        let cluster = Arc::new(ClusterManager::new(node_id, bind_ip, args.port, gossip));
+        cluster.enable();
+        tracing::info!("Cluster mode enabled");
+        Some(cluster)
+    } else {
+        None
+    };
 
     // Parse keyspace notification flags
     let notify_flags = Arc::new(std::sync::atomic::AtomicU16::new(
@@ -313,8 +341,16 @@ async fn main() {
     let engine_resp = engine.clone();
     let pubsub_resp = pubsub.clone();
     let password_resp = password.clone();
+    let cluster_resp = cluster_manager.clone();
     let resp_handle = tokio::spawn(async move {
-        if let Err(e) = resp_server::run(&resp_addr, engine_resp, pubsub_resp, password_resp).await
+        if let Err(e) = resp_server::run(
+            &resp_addr,
+            engine_resp,
+            pubsub_resp,
+            password_resp,
+            cluster_resp,
+        )
+        .await
         {
             tracing::error!("RESP server error: {}", e);
         }

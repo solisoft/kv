@@ -12,6 +12,7 @@ use solikv_resp::codec::{decode_frame, encode_frame, RespFrame};
 use solikv_resp::connection::ClientConnection;
 use solikv_resp::parser::ParsedCommand;
 
+use solikv_cluster::{generate_node_id, ClusterManager, CLUSTER_BUS_PORT_OFFSET};
 use solikv_core::CommandResponse;
 
 pub async fn run(
@@ -19,6 +20,7 @@ pub async fn run(
     engine: Arc<CommandEngine>,
     pubsub: Arc<PubSubBroker>,
     password: Option<Arc<String>>,
+    cluster: Option<Arc<ClusterManager>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("RESP server listening on {}", addr);
@@ -30,9 +32,12 @@ pub async fn run(
         let engine = engine.clone();
         let pubsub = pubsub.clone();
         let password = password.clone();
+        let cluster = cluster.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, engine, pubsub, peer_addr, password).await {
+            if let Err(e) =
+                handle_connection(socket, engine, pubsub, peer_addr, password, cluster).await
+            {
                 tracing::debug!("Connection error from {}: {}", peer_addr, e);
             }
         });
@@ -45,6 +50,7 @@ async fn handle_connection(
     pubsub: Arc<PubSubBroker>,
     peer_addr: std::net::SocketAddr,
     password: Option<Arc<String>>,
+    cluster: Option<Arc<ClusterManager>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut read_buf = BytesMut::with_capacity(65536);
     let mut write_buf = BytesMut::with_capacity(65536);
@@ -108,6 +114,7 @@ async fn handle_connection(
                         | "PUNSUBSCRIBE"
                         | "QUIT"
                         | "AUTH"
+                        | "CLUSTER"
                 )
             });
 
@@ -115,6 +122,11 @@ async fn handle_connection(
             // Pre-reserve write buffer for batch responses
             write_buf.reserve(commands.len() * 16);
             for cmd in commands {
+                // Check for MOVED redirect in cluster mode
+                if let Some(moved_frame) = check_cluster_moved(&cluster, &cmd.name, &cmd.args) {
+                    encode_frame(&moved_frame, &mut write_buf);
+                    continue;
+                }
                 let resp = engine.execute(&cmd.name, &cmd.args);
                 encode_frame(&command_response_to_frame(resp), &mut write_buf);
             }
@@ -309,6 +321,169 @@ async fn handle_connection(
                         socket.write_all(&write_buf).await?;
                         return Ok(());
                     }
+                    "CLUSTER" => {
+                        if let Some(ref cluster_mgr) = cluster {
+                            if cmd.args.is_empty() {
+                                encode_frame(
+                                    &RespFrame::error(
+                                        "ERR wrong number of arguments for 'cluster' command",
+                                    ),
+                                    &mut write_buf,
+                                );
+                                continue;
+                            }
+                            let sub_cmd = std::str::from_utf8(&cmd.args[0])
+                                .unwrap_or("")
+                                .to_uppercase();
+                            match sub_cmd.as_str() {
+                                "INFO" => {
+                                    let info = cluster_mgr.cluster_info();
+                                    encode_frame(
+                                        &RespFrame::BulkString(Bytes::from(info)),
+                                        &mut write_buf,
+                                    );
+                                }
+                                "NODES" => {
+                                    let nodes = cluster_mgr.cluster_nodes();
+                                    encode_frame(
+                                        &RespFrame::BulkString(Bytes::from(nodes)),
+                                        &mut write_buf,
+                                    );
+                                }
+                                "SLOTS" => {
+                                    let slots = cluster_mgr.cluster_slots();
+                                    let mut result = Vec::new();
+                                    for slot_info in slots {
+                                        let mut slot_array = Vec::new();
+                                        for part in slot_info {
+                                            slot_array
+                                                .push(RespFrame::BulkString(Bytes::from(part)));
+                                        }
+                                        result.push(RespFrame::Array(slot_array));
+                                    }
+                                    encode_frame(&RespFrame::Array(result), &mut write_buf);
+                                }
+                                "MEET" => {
+                                    if cmd.args.len() != 3 {
+                                        encode_frame(
+                                            &RespFrame::error("ERR CLUSTER MEET ip port"),
+                                            &mut write_buf,
+                                        );
+                                        continue;
+                                    }
+                                    let ip =
+                                        std::str::from_utf8(&cmd.args[1]).unwrap_or("127.0.0.1");
+                                    let port = std::str::from_utf8(&cmd.args[2])
+                                        .unwrap_or("7000")
+                                        .parse::<u16>()
+                                        .unwrap_or(7000);
+                                    cluster_mgr.meet(ip.to_string(), port);
+                                    encode_frame(
+                                        &RespFrame::SimpleString(Bytes::from("OK")),
+                                        &mut write_buf,
+                                    );
+                                }
+                                "ADDSLOTS" => {
+                                    if cmd.args.len() < 2 {
+                                        encode_frame(
+                                            &RespFrame::error(
+                                                "ERR CLUSTER ADDSLOTS slot [slot ...]",
+                                            ),
+                                            &mut write_buf,
+                                        );
+                                        continue;
+                                    }
+                                    for slot_arg in &cmd.args[1..] {
+                                        let slot_str = std::str::from_utf8(slot_arg).unwrap_or("");
+                                        if let Some((start, end)) = slot_str.split_once('-') {
+                                            let start: u16 = start.parse().unwrap_or(0);
+                                            let end: u16 = end.parse().unwrap_or(0);
+                                            if let Err(e) = cluster_mgr.add_slots(start, end) {
+                                                encode_frame(&RespFrame::error(e), &mut write_buf);
+                                                break;
+                                            }
+                                        } else {
+                                            let slot: u16 = slot_str.parse().unwrap_or(0);
+                                            if let Err(e) = cluster_mgr.add_slots(slot, slot) {
+                                                encode_frame(&RespFrame::error(e), &mut write_buf);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if write_buf.is_empty()
+                                        || !matches!(write_buf.last(), Some(b'*'))
+                                    {
+                                        encode_frame(
+                                            &RespFrame::SimpleString(Bytes::from("OK")),
+                                            &mut write_buf,
+                                        );
+                                    }
+                                }
+                                "DELSLOTS" => {
+                                    if cmd.args.len() < 2 {
+                                        encode_frame(
+                                            &RespFrame::error(
+                                                "ERR CLUSTER DELSLOTS slot [slot ...]",
+                                            ),
+                                            &mut write_buf,
+                                        );
+                                        continue;
+                                    }
+                                    for slot_arg in &cmd.args[1..] {
+                                        let slot_str = std::str::from_utf8(slot_arg).unwrap_or("");
+                                        if let Some((start, end)) = slot_str.split_once('-') {
+                                            let start: u16 = start.parse().unwrap_or(0);
+                                            let end: u16 = end.parse().unwrap_or(0);
+                                            if let Err(e) = cluster_mgr.del_slots(start, end) {
+                                                encode_frame(&RespFrame::error(e), &mut write_buf);
+                                                break;
+                                            }
+                                        } else {
+                                            let slot: u16 = slot_str.parse().unwrap_or(0);
+                                            if let Err(e) = cluster_mgr.del_slots(slot, slot) {
+                                                encode_frame(&RespFrame::error(e), &mut write_buf);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if write_buf.is_empty()
+                                        || !matches!(write_buf.last(), Some(b'*'))
+                                    {
+                                        encode_frame(
+                                            &RespFrame::SimpleString(Bytes::from("OK")),
+                                            &mut write_buf,
+                                        );
+                                    }
+                                }
+                                "KEYSLOT" => {
+                                    if cmd.args.len() != 2 {
+                                        encode_frame(
+                                            &RespFrame::error("ERR CLUSTER KEYSLOT key"),
+                                            &mut write_buf,
+                                        );
+                                        continue;
+                                    }
+                                    let slot = cluster_mgr.key_slot(&cmd.args[1]);
+                                    encode_frame(&RespFrame::Integer(slot as i64), &mut write_buf);
+                                }
+                                _ => {
+                                    encode_frame(
+                                        &RespFrame::error(format!(
+                                            "ERR Unknown cluster subcommand '{}'",
+                                            sub_cmd
+                                        )),
+                                        &mut write_buf,
+                                    );
+                                }
+                            }
+                        } else {
+                            encode_frame(
+                                &RespFrame::error("ERR This instance has cluster support disabled"),
+                                &mut write_buf,
+                            );
+                        }
+                        continue;
+                    }
                     _ => {}
                 }
 
@@ -322,8 +497,13 @@ async fn handle_connection(
                         &mut write_buf,
                     );
                 } else {
-                    let response = engine.execute(&cmd.name, &cmd.args);
-                    encode_frame(&command_response_to_frame(response), &mut write_buf);
+                    // Check for MOVED redirect in cluster mode
+                    if let Some(moved_frame) = check_cluster_moved(&cluster, &cmd.name, &cmd.args) {
+                        encode_frame(&moved_frame, &mut write_buf);
+                    } else {
+                        let response = engine.execute(&cmd.name, &cmd.args);
+                        encode_frame(&command_response_to_frame(response), &mut write_buf);
+                    }
                 }
             }
         }
@@ -659,6 +839,82 @@ async fn forward_broadcast(
             }
         }
     }
+}
+
+fn get_command_key<'a>(name: &'a str, args: &'a [bytes::Bytes]) -> Option<&'a [u8]> {
+    let name_upper = name.to_uppercase();
+    match name_upper.as_str() {
+        "GET" | "SET" | "DEL" | "EXISTS" | "EXPIRE" | "EXPIREAT" | "TTL" | "PTTL" | "PERSIST"
+        | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "APPEND" | "STRLEN"
+        | "GETSET" | "SETEX" | "PSETEX" | "SETNX" | "SETXX" | "GETEX" | "HDEL" | "HEXISTS"
+        | "HGET" | "HGETALL" | "HINCRBY" | "HINCRBYFLOAT" | "HMGET" | "HMSET" | "HSET"
+        | "HSETNX" | "HVALS" | "HKEYS" | "HLEN" | "HSCAN" | "LGET" | "LPUSH" | "LPOP" | "RPUSH"
+        | "RPOP" | "LLEN" | "LRANGE" | "LSET" | "LREM" | "LTRIM" | "LINDEX" | "LSET" | "SADD"
+        | "SCARD" | "SDIFF" | "SINTER" | "SISMEMBER" | "SMEMBERS" | "SPOP" | "SRANDMEMBER"
+        | "SUNION" | "ZADD" | "ZCARD" | "ZCOUNT" | "ZRANGE" | "ZRANGEBYSCORE" | "ZRANK"
+        | "ZREVRANGE" | "ZREVRANGEBYSCORE" | "ZREVRANK" | "ZSCORE" | "ZINCRBY" | "ZREM"
+        | "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" | "ZSCAN" | "MGET" | "MSET" | "MSETNX"
+        | "GETBIT" | "SETBIT" | "BITCOUNT" | "BITPOS" | "BITOP" | "BITFIELD" | "PFADD"
+        | "PFCOUNT" | "PFMERGE" => {
+            if args.is_empty() {
+                None
+            } else {
+                Some(&args[0])
+            }
+        }
+        "MGET" | "MSET" | "MSETNX" => {
+            if args.is_empty() {
+                None
+            } else {
+                Some(&args[0])
+            }
+        }
+        _ => None,
+    }
+}
+
+fn check_cluster_moved(
+    cluster: &Option<Arc<ClusterManager>>,
+    cmd_name: &str,
+    args: &[bytes::Bytes],
+) -> Option<RespFrame> {
+    let cluster = cluster.as_ref()?;
+    if !cluster.is_enabled() {
+        return None;
+    }
+
+    let key = get_command_key(cmd_name, args)?;
+    let slot = cluster.key_slot(key);
+
+    if !cluster.is_my_slot(key) {
+        let owner = match cluster.get_slot_owner_for_key(key) {
+            Some(o) => o,
+            None => {
+                return Some(RespFrame::Error(format!("MOVED {} 127.0.0.1:7000", slot)));
+            }
+        };
+
+        let owner_info: Vec<&str> = owner.split('@').collect();
+        let (ip, port) = if owner_info.len() >= 2 {
+            let addr: Vec<&str> = owner_info[1].split(':').collect();
+            if addr.len() >= 2 {
+                (addr[0], addr[1])
+            } else {
+                return Some(RespFrame::Error(format!("MOVED {} 127.0.0.1:7000", slot)));
+            }
+        } else {
+            let addr: Vec<&str> = owner.split(':').collect();
+            if addr.len() >= 2 {
+                (addr[0], addr[1])
+            } else {
+                return Some(RespFrame::Error(format!("MOVED {} 127.0.0.1:7000", slot)));
+            }
+        };
+
+        return Some(RespFrame::Error(format!("MOVED {} {}:{}", slot, ip, port)));
+    }
+
+    None
 }
 
 /// Convert our CommandResponse to a RESP frame for the wire.

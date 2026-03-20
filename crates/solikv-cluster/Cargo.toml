@@ -11,5 +11,6 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 crc16 = { workspace = true }
 serde = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]

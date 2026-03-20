@@ -210,6 +210,26 @@
                         <td class="py-3 pr-4">&mdash;</td>
                         <td class="py-3">Require password for client authentication (RESP <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">AUTH</code> + REST <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">Bearer</code> token)</td>
                     </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--replicaof</td>
+                        <td class="py-3 pr-4">&mdash;</td>
+                        <td class="py-3">Become replica of master at <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">HOST:PORT</code></td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--generate-master-keyfile</td>
+                        <td class="py-3 pr-4">&mdash;</td>
+                        <td class="py-3">Generate <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">master.keyfile</code> in data dir and exit</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--daemon, -d</td>
+                        <td class="py-3 pr-4">false</td>
+                        <td class="py-3">Run as daemon in background</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--cluster-enabled</td>
+                        <td class="py-3 pr-4">false</td>
+                        <td class="py-3">Enable Redis Cluster-compatible mode</td>
+                    </tr>
                 </tbody>
             </table>
         </div>

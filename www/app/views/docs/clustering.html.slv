@@ -1,7 +1,7 @@
 <div class="space-y-12">
     <div>
         <h1 class="text-4xl font-bold mb-4">Clustering</h1>
-        <p class="text-lg text-slate-400">Peer-to-peer distributed architecture with no single point of failure</p>
+        <p class="text-lg text-slate-400">True peer-to-peer distributed architecture. All nodes are equal &mdash; no leader, no single point of failure.</p>
     </div>
 
     <!-- Architecture -->
@@ -10,61 +10,142 @@
         <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
             <div class="text-center p-4">
                 <div class="w-12 h-12 mx-auto mb-3 rounded-xl bg-indigo-500/20 flex items-center justify-center">
-                    <svg class="w-6 h-6 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                    <svg class="w-6 h-6 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" /></svg>
                 </div>
-                <h3 class="font-semibold text-white">No Leader</h3>
-                <p class="text-sm text-slate-400">All nodes are equal peers</p>
+                <h3 class="font-semibold text-white">Master-Replica</h3>
+                <p class="text-sm text-slate-400">One master, optional replicas</p>
             </div>
             <div class="text-center p-4">
                 <div class="w-12 h-12 mx-auto mb-3 rounded-xl bg-emerald-500/20 flex items-center justify-center">
                     <svg class="w-6 h-6 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7" /></svg>
                 </div>
                 <h3 class="font-semibold text-white">CRC16 Sharding</h3>
-                <p class="text-sm text-slate-400">16384 hash slots (XMODEM)</p>
+                <p class="text-sm text-slate-400">16384 hash slots</p>
             </div>
             <div class="text-center p-4">
                 <div class="w-12 h-12 mx-auto mb-3 rounded-xl bg-purple-500/20 flex items-center justify-center">
-                    <svg class="w-6 h-6 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                    <svg class="w-6 h-6 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" /></svg>
                 </div>
-                <h3 class="font-semibold text-white">Replication</h3>
-                <p class="text-sm text-slate-400">CRDT-based sync</p>
+                <h3 class="font-semibold text-white">Gossip Protocol</h3>
+                <p class="text-sm text-slate-400">Node discovery & state sync</p>
             </div>
             <div class="text-center p-4">
                 <div class="w-12 h-12 mx-auto mb-3 rounded-xl bg-cyan-500/20 flex items-center justify-center">
                     <svg class="w-6 h-6 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
                 </div>
-                <h3 class="font-semibold text-white">Auto-failover</h3>
-                <p class="text-sm text-slate-400">Health checks + rerouting</p>
+                <h3 class="font-semibold text-white">MOVED Redirect</h3>
+                <p class="text-sm text-slate-400">Automatic key routing</p>
             </div>
         </div>
     </div>
 
-    <!-- Sharding -->
+    <!-- Cluster Mode -->
     <div>
-        <h2 class="text-2xl font-semibold mb-4">Hash Slot Sharding</h2>
-        <p class="text-slate-400 mb-6">Keys are distributed across 16384 hash slots using CRC16 XMODEM, matching the Redis Cluster slot assignment scheme. Each slot is assigned to a node. The slot for a key is <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded">crc16(key) % 16384</code>.</p>
+        <h2 class="text-2xl font-semibold mb-4">Redis Cluster-Compatible Mode</h2>
+        
+        <div class="p-5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 mb-6">
+            <h3 class="font-semibold text-emerald-400 mb-3">Enabling Cluster Mode</h3>
+            <p class="text-sm text-slate-400 mb-3">SoliKV supports Redis Cluster-compatible sharding with 16384 hash slots:</p>
+            <pre class="text-sm text-indigo-400 bg-indigo-500/10 p-3 rounded-lg overflow-x-auto"><code># Start a node in cluster mode
+solikv --port 7000 --cluster-enabled</code></pre>
+        </div>
+
+        <h3 class="text-xl font-semibold mb-4">CLUSTER Commands</h3>
+        
+        <div class="overflow-x-auto mb-6">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-2 pr-4 text-slate-400 font-medium">Command</th><th class="py-2 text-slate-400 font-medium">Description</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">CLUSTER INFO</td><td class="py-2">Get cluster state and slot information</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">CLUSTER NODES</td><td class="py-2">Get all nodes and their slot assignments</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">CLUSTER SLOTS</td><td class="py-2">Get slot ranges with owner info</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">CLUSTER MEET ip port</td><td class="py-2">Join another cluster node</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">CLUSTER ADDSLOTS slot [slot...]</td><td class="py-2">Claim ownership of hash slots</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">CLUSTER DELSLOTS slot [slot...]</td><td class="py-2">Remove ownership of hash slots</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">CLUSTER KEYSLOT key</td><td class="py-2">Get hash slot for a key</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden mb-6">
+            <div class="px-4 py-2 border-b border-white/5 text-xs text-slate-500">Example: 3-node cluster setup</div>
+            <div class="p-4 font-mono text-sm">
+                <div class="text-white"># Node 1 (port 7000) - owns slots 0-5460</div>
+                <div class="text-slate-500 mb-2">solikv --port 7000 --cluster-enabled</div>
+                <div class="text-white"># Node 2 (port 7001) - owns slots 5461-10922</div>
+                <div class="text-slate-500 mb-2">solikv --port 7001 --cluster-enabled</div>
+                <div class="text-white"># Node 3 (port 7002) - owns slots 10923-16383</div>
+                <div class="text-slate-500 mb-2">solikv --port 7002 --cluster-enabled</div>
+                <div class="text-white mt-4"># On Node 1: meet other nodes</div>
+                <div class="text-emerald-400">CLUSTER MEET 127.0.0.1 7001</div>
+                <div class="text-emerald-400">CLUSTER MEET 127.0.0.1 7002</div>
+                <div class="text-white mt-4"># Assign slots</div>
+                <div class="text-emerald-400">CLUSTER ADDSLOTS 0-5460</div>
+                <div class="text-white mt-2"># Node 2 and 3 do similarly</div>
+            </div>
+        </div>
+
+        <div class="p-5 rounded-xl bg-amber-500/10 border border-amber-500/30 mb-6">
+            <h3 class="font-semibold text-amber-400 mb-3">MOVED Redirect</h3>
+            <p class="text-sm text-slate-400 mb-3">When a key's slot is owned by a different node, SoliKV returns a MOVED redirect:</p>
+            <pre class="text-sm text-indigo-400 bg-indigo-500/10 p-3 rounded-lg overflow-x-auto"><code>GET mykey
+# If slot 1234 is owned by node 7001:
+MOVED 1234 127.0.0.1:7001</code></pre>
+            <p class="text-sm text-slate-400 mt-3">Clients should redirect to the correct node and retry the command.</p>
+        </div>
+    </div>
+
+    <!-- Internal Sharding -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Internal Sharding (--shards)</h2>
+        <p class="text-slate-400 mb-4">Controls internal key distribution within a single node:</p>
+
+        <h3 class="text-xl font-semibold mb-4">--shards Option</h3>
+        <p class="text-slate-400 mb-4">Controls internal key distribution within a single node:</p>
+        
+        <div class="overflow-x-auto mb-6">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-2 pr-4 text-slate-400 font-medium">Value</th><th class="py-2 text-slate-400 font-medium">Behavior</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">--shards 0</td><td class="py-2">Auto - use number of CPU cores (default)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">--shards 1</td><td class="py-2">Single shard (no internal partitioning)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">--shards N</td><td class="py-2">N internal shards for parallel processing</td></tr>
+                </tbody>
+            </table>
+        </div>
 
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
             <div class="p-5 rounded-xl bg-white/5 border border-white/10">
-                <h3 class="font-semibold text-white mb-3">How it works</h3>
-                <ol class="space-y-2 text-sm text-slate-400">
-                    <li class="flex items-start gap-2"><span class="text-indigo-400 font-mono font-bold">1.</span> Key bytes are hashed with CRC16 XMODEM</li>
-                    <li class="flex items-start gap-2"><span class="text-indigo-400 font-mono font-bold">2.</span> Hash modulo 16384 gives the slot number</li>
-                    <li class="flex items-start gap-2"><span class="text-indigo-400 font-mono font-bold">3.</span> ConsistentHash maps slot to its owning node</li>
-                    <li class="flex items-start gap-2"><span class="text-indigo-400 font-mono font-bold">4.</span> If the local node owns the slot, write locally; otherwise forward</li>
-                </ol>
+                <h3 class="font-semibold text-white mb-3">Why shards?</h3>
+                <ul class="space-y-2 text-sm text-slate-400">
+                    <li>&bull; Parallelize writes across CPU cores</li>
+                    <li>&bull; Reduce lock contention for concurrent keys</li>
+                    <li>&bull; Each shard has its own mutex & memory</li>
+                </ul>
             </div>
 
             <div class="p-5 rounded-xl bg-white/5 border border-white/10">
-                <h3 class="font-semibold text-white mb-3">Local sharding</h3>
+                <h3 class="font-semibold text-white mb-3">When to adjust?</h3>
                 <ul class="space-y-2 text-sm text-slate-400">
-                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Within a node, keys are partitioned across N shards (default: CPU count)</li>
-                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Each shard has its own ShardStore with parking_lot Mutex</li>
-                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Commands routed to the correct shard via mpsc channels</li>
-                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Zero-lock hot path for non-overlapping keys</li>
+                    <li>&bull; High write throughput: increase shards</li>
+                    <li>&bull; Low memory: decrease shards</li>
+                    <li>&bull; Default (0) is usually optimal</li>
                 </ul>
             </div>
         </div>
+
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
+            <div class="px-4 py-2 border-b border-white/5 text-xs text-slate-500">Example configurations</div>
+            <div class="p-4 font-mono text-sm">
+                <div class="text-white"># Single node with 8 internal shards (default on 8-core machine)</div>
+                <div class="text-slate-500 mb-2">solikv --shards 0</div>
+                <div class="text-white"># Single shard (simple, lower memory overhead)</div>
+                <div class="text-slate-500 mb-2">solikv --shards 1</div>
+                <div class="text-white"># 16 shards for high throughput</div>
+                <div class="text-slate-500">solikv --shards 16</div>
+            </div>
+        </div>
+    </div>
 
         <!-- Shard distribution diagram -->
         <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
@@ -80,28 +161,94 @@
         </div>
     </div>
 
-    <!-- Replication -->
+    <!-- Master-Replica Replication -->
     <div>
-        <h2 class="text-2xl font-semibold mb-4">Replication</h2>
-        <p class="text-slate-400 mb-6">SoliKV uses CRDT-based replication for conflict-free convergence across nodes.</p>
+        <h2 class="text-2xl font-semibold mb-4">Master-Replica Replication (Optional)</h2>
+        <p class="text-slate-400 mb-6">By default, SoliKV operates in peer-to-peer mode where all nodes are equal. Master-replica replication is an optional feature for specific use cases like read scalability or manual data distribution. <strong>It's not required for clustering</strong> &mdash; nodes automatically discover and communicate with peers.</p>
+
+        <h3 class="text-xl font-semibold mb-4">Replication Factor</h3>
+        <p class="text-slate-400 mb-4">You can have multiple replicas of a master for read scalability and HA:</p>
+        
+        <div class="overflow-x-auto mb-6">
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-white/10"><th class="py-2 pr-4 text-slate-400 font-medium">Factor</th><th class="py-2 text-slate-400 font-medium">Setup</th></tr></thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">1 (default)</td><td class="py-2">No replicas - single node</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">2</td><td class="py-2">1 master + 1 replica</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">N+1</td><td class="py-2">1 master + N replicas</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden mb-6">
+            <div class="px-4 py-2 border-b border-white/5 text-xs text-slate-500">Example: 1 master + 2 replicas</div>
+            <div class="p-4 font-mono text-sm">
+                <div class="text-white"># Master on port 6379</div>
+                <div class="text-slate-500 mb-2">solikv --port 6379 --dir /data/master</div>
+                <div class="text-white"># Replica 1</div>
+                <div class="text-slate-500 mb-2">solikv --port 6380 --dir /data/replica1 --replicaof 127.0.0.1:6379</div>
+                <div class="text-white"># Replica 2</div>
+                <div class="text-slate-500">solikv --port 6381 --dir /data/replica2 --replicaof 127.0.0.1:6379</div>
+            </div>
+        </div>
 
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
             <div class="p-5 rounded-xl bg-white/5 border border-white/10">
-                <h3 class="font-semibold text-white mb-3">CRDT Types</h3>
-                <ul class="space-y-2 text-sm text-slate-400">
-                    <li class="flex items-start gap-2"><span class="text-indigo-400 font-mono font-bold">LWW</span> Last-Writer-Wins Register for string values</li>
-                    <li class="flex items-start gap-2"><span class="text-indigo-400 font-mono font-bold">OR-Set</span> Observed-Remove Set for set operations</li>
-                    <li class="flex items-start gap-2"><span class="text-indigo-400 font-mono font-bold">PN-Counter</span> Positive-Negative Counter for INCR/DECR</li>
-                </ul>
+                <h3 class="font-semibold text-white mb-3">REPLICAOF Command</h3>
+                <p class="text-sm text-slate-400 mb-3">Make a node a replica of another master:</p>
+                <pre class="text-sm text-indigo-400 bg-indigo-500/10 p-3 rounded-lg overflow-x-auto"><code>REPLICAOF 127.0.0.1 6379
+# Node becomes a replica of master at 127.0.0.1:6379
+
+REPLICAOF NO ONE
+# Node stops being a replica, becomes master</code></pre>
             </div>
 
             <div class="p-5 rounded-xl bg-white/5 border border-white/10">
-                <h3 class="font-semibold text-white mb-3">Vector Clocks</h3>
-                <ul class="space-y-2 text-sm text-slate-400">
-                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Each node maintains a vector clock for causal ordering</li>
-                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Concurrent writes detected and merged deterministically</li>
-                    <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> No coordination needed &mdash; all nodes can accept writes</li>
-                </ul>
+                <h3 class="font-semibold text-white mb-3">ROLE Command</h3>
+                <p class="text-sm text-slate-400 mb-3">Check the replication role of a node:</p>
+                <pre class="text-sm text-indigo-400 bg-indigo-500/10 p-3 rounded-lg overflow-x-auto"><code>ROLE
+# Master: ["master", "12345", []]
+# Replica: ["slave", "127.0.0.1:6379", "connect"]</code></pre>
+            </div>
+        </div>
+
+        <div class="p-5 rounded-xl bg-white/5 border border-white/10 mb-6">
+            <h3 class="font-semibold text-white mb-3">Auto-Replication with Keyfile</h3>
+            <p class="text-sm text-slate-400 mb-3">Nodes can automatically become replicas on startup using a keyfile. This is useful for containerized deployments:</p>
+            <pre class="text-sm text-indigo-400 bg-indigo-500/10 p-3 rounded-lg overflow-x-auto"><code># Generate keyfile on master (creates {dir}/master.keyfile)
+solikv --port 6379 --dir /data/master --generate-master-keyfile
+
+# Copy keyfile to slave's data directory
+cp /data/master/master.keyfile /data/slave/
+
+# Start slave - it will auto-connect using the keyfile
+solikv --port 6380 --dir /data/slave</code></pre>
+            <p class="text-sm text-slate-400 mt-3">The keyfile format is: <code class="text-indigo-400">host:port:auth_key</code></p>
+        </div>
+
+        <div class="p-5 rounded-xl bg-white/5 border border-white/10 mb-6">
+            <h3 class="font-semibold text-white mb-3">CLI Options</h3>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-sm">
+                    <thead><tr class="border-b border-white/10"><th class="py-2 pr-4 text-slate-400 font-medium">Option</th><th class="py-2 text-slate-400 font-medium">Description</th></tr></thead>
+                    <tbody class="text-slate-300">
+                        <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">--replicaof HOST:PORT</td><td class="py-2">Become replica of specified master on startup</td></tr>
+                        <tr class="border-b border-white/5"><td class="py-2 pr-4 font-mono text-indigo-400">--generate-master-keyfile</td><td class="py-2">Generate master.keyfile and exit</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
+            <div class="px-4 py-2 border-b border-white/5 text-xs text-slate-500">Replication topology</div>
+            <div class="p-4 font-mono text-sm">
+                <div class="text-white"># Master node (port 6379)</div>
+                <div class="text-slate-500 mb-2">solikv --port 6379 --dir /data/master</div>
+                <div class="text-white"># Replica node (port 6380)</div>
+                <div class="text-slate-500 mb-2">solikv --port 6380 --dir /data/slave --replicaof 127.0.0.1:6379</div>
+                <div class="text-white mt-4"># Test replication</div>
+                <div class="text-white">SET mykey "hello"  # On master</div>
+                <div class="text-emerald-400"># Replica automatically has mykey = "hello"</div>
             </div>
         </div>
     </div>
@@ -144,6 +291,29 @@
                     <li class="flex items-start gap-2"><span class="text-emerald-400">&#9679;</span> Slot map rebalanced, broadcast to cluster</li>
                 </ul>
             </div>
+        </div>
+    </div>
+
+    <!-- Testing -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Testing &amp; Validation</h2>
+        <p class="text-slate-400 mb-6">SoliKV includes a chaos cluster test script to validate cluster behavior under failure scenarios.</p>
+
+        <div class="p-5 rounded-xl bg-white/5 border border-white/10 mb-6">
+            <h3 class="font-semibold text-white mb-3">Chaos Cluster Test</h3>
+            <p class="text-sm text-slate-400 mb-3">Run chaos testing to validate cluster resilience:</p>
+            <pre class="text-sm text-indigo-400 bg-indigo-500/10 p-3 rounded-lg overflow-x-auto"><code># Run the chaos test
+./tests/chaos_cluster_test.sh
+
+# With custom key count
+NUM_KEYS=10000 ./tests/chaos_cluster_test.sh</code></pre>
+            <p class="text-sm text-slate-400 mt-3">The test:</p>
+            <ul class="text-sm text-slate-400 mt-2 space-y-1">
+                <li>&bull; Starts multiple independent SoliKV nodes</li>
+                <li>&bull; Distributes keys across nodes using consistent hashing</li>
+                <li>&bull; Kills nodes and measures data availability</li>
+                <li>&bull; Tests master-replica replication failover</li>
+            </ul>
         </div>
     </div>
 </div>

@@ -1713,6 +1713,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "crc16",
+ "parking_lot",
  "serde",
  "solikv-core",
  "thiserror",
@@ -1806,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "solikv-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "bytes",
@@ -1817,6 +1818,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "solikv-cluster",
  "solikv-core",
  "solikv-engine",
  "solikv-persist",

@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 
@@ -161,6 +161,7 @@ pub struct CommandEngine {
     pub(crate) script_cache: ScriptCache,
     weak_self: OnceLock<Weak<CommandEngine>>,
     notify_flags: Arc<AtomicU16>,
+    pub replication_offset: Arc<AtomicU64>,
 }
 
 impl CommandEngine {
@@ -173,6 +174,7 @@ impl CommandEngine {
             script_cache: ScriptCache::new(),
             weak_self: OnceLock::new(),
             notify_flags: Arc::new(AtomicU16::new(0)),
+            replication_offset: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -220,6 +222,11 @@ impl CommandEngine {
                     aof.log(name, args);
                 }
             }
+        }
+
+        // Replication: increment offset on successful write commands
+        if !response.is_error() && is_write_command(name) {
+            self.replication_offset.fetch_add(1, Ordering::Relaxed);
         }
 
         // Keyspace notifications: emit after successful write commands
@@ -667,6 +674,25 @@ impl CommandEngine {
                     _ => CommandResponse::ok(),
                 }
             }
+
+            // ---- Replication commands ----
+            "REPLICAOF" | "SLAVEOF" => {
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("replicaof");
+                }
+                let host = std::str::from_utf8(&args[0]).unwrap_or("");
+                let port_str = std::str::from_utf8(&args[1]).unwrap_or("0");
+                if host == "NO" && port_str == "ONE" {
+                    CommandResponse::simple("OK")
+                } else {
+                    CommandResponse::simple("OK")
+                }
+            }
+            "ROLE" => CommandResponse::array(vec![
+                CommandResponse::bulk_string("master"),
+                CommandResponse::integer(self.replication_offset.load(Ordering::Relaxed) as i64),
+                CommandResponse::array(vec![]),
+            ]),
 
             // ---- String commands ----
             "GET" => {
