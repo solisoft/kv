@@ -153,23 +153,20 @@ pub fn execute_script(
     let lua = take_lua(engine);
 
     // Set instruction limit to prevent infinite loops / DoS
-    lua.set_hook(
-        mlua::HookTriggers::new().every_nth_instruction(10_000),
-        {
-            let limit = std::cell::Cell::new(LUA_INSTRUCTION_LIMIT);
-            move |_lua, _debug| {
-                let remaining = limit.get();
-                if remaining == 0 {
-                    Err(LuaError::RuntimeError(
-                        "ERR script exceeded maximum allowed execution time".into(),
-                    ))
-                } else {
-                    limit.set(remaining.saturating_sub(10_000));
-                    Ok(mlua::VmState::Continue)
-                }
+    lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(10_000), {
+        let limit = std::cell::Cell::new(LUA_INSTRUCTION_LIMIT);
+        move |_lua, _debug| {
+            let remaining = limit.get();
+            if remaining == 0 {
+                Err(LuaError::RuntimeError(
+                    "ERR script exceeded maximum allowed execution time".into(),
+                ))
+            } else {
+                limit.set(remaining.saturating_sub(10_000));
+                Ok(mlua::VmState::Continue)
             }
-        },
-    );
+        }
+    });
 
     setup_keys_argv(&lua, &keys, &argv);
 
@@ -202,8 +199,8 @@ fn sandbox_lua(lua: &Lua) {
         "dofile",
         "package",
         "require",
-        "load",         // can load bytecode — sandbox escape vector
-        "loadstring",   // alias in some Lua versions
+        "load",           // can load bytecode — sandbox escape vector
+        "loadstring",     // alias in some Lua versions
         "collectgarbage", // DoS vector
     ];
     for name in &remove {

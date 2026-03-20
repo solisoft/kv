@@ -36,7 +36,11 @@ pub async fn run(
         let permit = match conn_semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                tracing::warn!("Connection limit reached ({}), rejecting {}", MAX_CONNECTIONS, peer_addr);
+                tracing::warn!(
+                    "Connection limit reached ({}), rejecting {}",
+                    MAX_CONNECTIONS,
+                    peer_addr
+                );
                 drop(socket);
                 continue;
             }

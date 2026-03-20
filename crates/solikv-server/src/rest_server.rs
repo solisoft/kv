@@ -469,10 +469,12 @@ async fn execute_command(
     Json(body): Json<CommandBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let cmd = body.command.to_uppercase();
-    if REST_BLOCKED_COMMANDS.iter().any(|b| *b == cmd.as_str()) {
+    if REST_BLOCKED_COMMANDS.contains(&cmd.as_str()) {
         return (
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": format!("ERR command '{}' is not allowed via REST API", cmd)})),
+            Json(
+                serde_json::json!({"error": format!("ERR command '{}' is not allowed via REST API", cmd)}),
+            ),
         );
     }
     let args: Vec<Bytes> = body.args.into_iter().map(Bytes::from).collect();

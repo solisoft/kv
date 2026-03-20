@@ -297,4 +297,75 @@ impl ClusterManager {
                 .join(" ")
         }
     }
+
+    pub fn export_state(&self) -> ClusterStateSnapshot {
+        let my_slots = self.get_my_slots();
+        let slots = self.slots.read();
+        let mut slot_owners: Vec<(u16, u16, String)> = Vec::new();
+
+        let mut start: Option<u16> = None;
+        let mut last_owner: Option<String> = None;
+
+        for (i, slot) in slots.iter().enumerate() {
+            let _current_owner = slot.owner.clone().unwrap_or_default();
+            match (start, &last_owner, &slot.owner) {
+                (Some(s), Some(lo), Some(co)) if lo == co => {
+                    // Continue current range
+                }
+                (Some(s), Some(lo), _) => {
+                    // End current range
+                    slot_owners.push((s, (i - 1) as u16, lo.clone()));
+                    start = None;
+                    last_owner = None;
+                }
+                (None, _, Some(co)) => {
+                    // Start new range
+                    start = Some(i as u16);
+                    last_owner = Some(co.clone());
+                }
+                _ => {}
+            }
+        }
+
+        // Handle last range
+        if let (Some(s), Some(lo)) = (start, last_owner) {
+            slot_owners.push((s, 16383, lo));
+        }
+
+        // Get known cluster nodes (excluding self)
+        let known_nodes = self.gossip.get_known_nodes();
+
+        ClusterStateSnapshot {
+            node_id: self.my_node_id.clone(),
+            ip: self.my_ip.clone(),
+            port: self.my_port,
+            my_slots,
+            slot_owners,
+            known_nodes,
+        }
+    }
+
+    pub fn import_state(&self, snapshot: &ClusterStateSnapshot) {
+        // Restore slot ownership for this node
+        for (start, end, owner) in &snapshot.slot_owners {
+            if owner == &self.my_node_id {
+                let _ = self.add_slots(*start, *end);
+            }
+        }
+
+        // Reconnect to known cluster nodes
+        for (ip, port) in &snapshot.known_nodes {
+            self.meet(ip.clone(), *port);
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClusterStateSnapshot {
+    pub node_id: String,
+    pub ip: String,
+    pub port: u16,
+    pub my_slots: Vec<(u16, u16)>,
+    pub slot_owners: Vec<(u16, u16, String)>,
+    pub known_nodes: Vec<(String, u16)>,
 }

@@ -234,6 +234,16 @@ impl GossipState {
         result
     }
 
+    pub fn get_known_nodes(&self) -> Vec<(String, u16)> {
+        let myself_id = self.myself.read().node_id.clone();
+        self.nodes
+            .read()
+            .values()
+            .filter(|n| n.node_id != myself_id)
+            .map(|n| (n.ip.clone(), n.port))
+            .collect()
+    }
+
     pub fn get_alive_nodes(&self) -> Vec<ClusterNodeInfo> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -325,7 +335,10 @@ pub async fn start_gossip_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await?;
-    tracing::info!("Cluster gossip server listening on {} (localhost only)", addr);
+    tracing::info!(
+        "Cluster gossip server listening on {} (localhost only)",
+        addr
+    );
 
     let state_clone = state.clone();
 
@@ -384,6 +397,14 @@ pub fn generate_node_id() -> String {
         .as_nanos();
     let rand: u64 = rand_simple();
     format!("{:x}-{:x}", ts, rand)
+}
+
+pub fn generate_stable_node_id(ip: &str, port: u16) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{}:{}", ip, port).hash(&mut hasher);
+    let hash = hasher.finish();
+    format!("{:016x}-{:016x}", hash, port)
 }
 
 fn rand_simple() -> u64 {

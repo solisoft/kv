@@ -11,7 +11,8 @@ use tracing_subscriber::EnvFilter;
 
 use solikv_persist::{AofPersistence, FsyncPolicy};
 
-use solikv_cluster::{generate_node_id, ClusterManager, GossipState};
+use solikv_cluster::{generate_stable_node_id, ClusterManager, GossipState};
+use solikv_server::cluster_dump;
 use solikv_server::resp_server;
 use solikv_server::rest_server;
 
@@ -76,6 +77,26 @@ struct Args {
     /// Enable cluster mode (Redis Cluster compatible)
     #[arg(long)]
     cluster_enabled: bool,
+
+    /// Cluster dump: export all cluster data to file
+    #[arg(long)]
+    cluster_dump: Option<String>,
+
+    /// Cluster dump format: binary or jsonl
+    #[arg(long, default_value = "jsonl")]
+    cluster_dump_format: String,
+
+    /// Cluster restore: import data from dump file
+    #[arg(long)]
+    cluster_restore: Option<String>,
+
+    /// Cluster connect: initial node for dump/restore (host:port)
+    #[arg(long)]
+    cluster_connect: Option<String>,
+
+    /// Cluster password for dump/restore
+    #[arg(long)]
+    cluster_password: Option<String>,
 }
 
 #[tokio::main]
@@ -133,10 +154,60 @@ async fn main() {
         return;
     }
 
+    // Handle cluster dump/restore operations (run standalone, don't start server)
+    if let Some(dump_path) = &args.cluster_dump {
+        if args.cluster_connect.is_none() {
+            eprintln!("Error: --cluster-connect required for cluster dump");
+            std::process::exit(1);
+        }
+        let result = cluster_dump::dump_cluster(
+            std::path::Path::new(dump_path),
+            &args.cluster_dump_format,
+            args.cluster_connect.as_ref().unwrap(),
+            args.cluster_password.as_deref(),
+            4, // parallel connections
+        );
+        match result {
+            Ok((keys, nodes)) => {
+                println!("Cluster dump complete: {} keys from {} nodes", keys, nodes);
+            }
+            Err(e) => {
+                eprintln!("Cluster dump failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if let Some(restore_path) = &args.cluster_restore {
+        if args.cluster_connect.is_none() {
+            eprintln!("Error: --cluster-connect required for cluster restore");
+            std::process::exit(1);
+        }
+        let result = cluster_dump::restore_cluster(
+            std::path::Path::new(restore_path),
+            args.cluster_connect.as_ref().unwrap(),
+            args.cluster_password.as_deref(),
+            4, // parallel connections
+        );
+        match result {
+            Ok((success, errors)) => {
+                println!(
+                    "Cluster restore complete: {} success, {} errors",
+                    success, errors
+                );
+            }
+            Err(e) => {
+                eprintln!("Cluster restore failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
         )
         .init();
 
@@ -170,14 +241,44 @@ async fn main() {
 
     // Initialize cluster if enabled
     let cluster_manager: Option<Arc<ClusterManager>> = if args.cluster_enabled {
-        let node_id = generate_node_id();
         let bind_ip = if args.bind == "0.0.0.0" || args.bind == "127.0.0.1" {
             "127.0.0.1".to_string()
         } else {
             args.bind.clone()
         };
+
+        // Try to load existing node_id from cluster.json for stability
+        let node_id = {
+            let cluster_path = args.dir.join("cluster.json");
+            if cluster_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&cluster_path) {
+                    if let Ok(state) =
+                        serde_json::from_str::<solikv_cluster::ClusterStateSnapshot>(&content)
+                    {
+                        if state.ip == bind_ip && state.port == args.port {
+                            tracing::info!("Using persisted node_id: {}", state.node_id);
+                            state.node_id
+                        } else {
+                            generate_stable_node_id(&bind_ip, args.port)
+                        }
+                    } else {
+                        generate_stable_node_id(&bind_ip, args.port)
+                    }
+                } else {
+                    generate_stable_node_id(&bind_ip, args.port)
+                }
+            } else {
+                generate_stable_node_id(&bind_ip, args.port)
+            }
+        };
+
         let gossip = GossipState::new(node_id.clone(), bind_ip.clone(), args.port);
-        let cluster = Arc::new(ClusterManager::new(node_id, bind_ip, args.port, gossip));
+        let cluster = Arc::new(ClusterManager::new(
+            node_id,
+            bind_ip.clone(),
+            args.port,
+            gossip,
+        ));
         cluster.enable();
         tracing::info!("Cluster mode enabled");
         Some(cluster)
@@ -249,6 +350,29 @@ async fn main() {
         }
         Ok(_) => tracing::info!("No RDB snapshots found in {:?}, starting fresh", args.dir),
         Err(e) => tracing::warn!("RDB load error: {}", e),
+    }
+
+    // --- Load cluster state from RDB ---
+    if let Some(ref cluster) = cluster_manager {
+        let cluster_path = args.dir.join("cluster.json");
+        if cluster_path.exists() {
+            match std::fs::read_to_string(&cluster_path) {
+                Ok(content) => {
+                    match serde_json::from_str::<solikv_cluster::ClusterStateSnapshot>(&content) {
+                        Ok(state) => {
+                            cluster.import_state(&state);
+                            tracing::info!("Loaded cluster state from {:?}", cluster_path);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse cluster state: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to read cluster state file: {}", e);
+                }
+            }
+        }
     }
 
     // --- Replay AOF ---
@@ -369,6 +493,24 @@ async fn main() {
                 tracing::error!("Shutdown RDB save error: {}", e);
             } else {
                 tracing::info!("Final RDB snapshot saved to {:?}", args.dir);
+            }
+
+            // Save cluster state
+            if let Some(ref cluster) = cluster_manager {
+                let cluster_state = cluster.export_state();
+                let cluster_path = args.dir.join("cluster.json");
+                match serde_json::to_string_pretty(&cluster_state) {
+                    Ok(json) => {
+                        if let Err(e) = std::fs::write(&cluster_path, json) {
+                            tracing::error!("Failed to save cluster state: {}", e);
+                        } else {
+                            tracing::info!("Cluster state saved to {:?}", cluster_path);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to serialize cluster state: {}", e);
+                    }
+                }
             }
         }
     }

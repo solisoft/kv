@@ -6,7 +6,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const RDB_MAGIC: &[u8] = b"SOLIKV";
-const RDB_VERSION: u8 = 1;
+const RDB_VERSION: u8 = 2;
 
 // Type markers
 const TYPE_STRING: u8 = 0;

@@ -144,4 +144,31 @@ impl ShardManager {
     pub fn num_shards(&self) -> usize {
         self.num_shards
     }
+
+    /// Scan all keys across all shards, returning key, type, and TTL info
+    pub fn scan_all(&self) -> Vec<(bytes::Bytes, String, Option<u64>)> {
+        let mut results = Vec::new();
+        for shard in &self.shards {
+            let shard_data = shard.with_store(|store| {
+                store
+                    .iter()
+                    .map(|(key, entry)| {
+                        let r#type = match &entry.value {
+                            solikv_core::types::RedisValue::String(_) => "string",
+                            solikv_core::types::RedisValue::List(_) => "list",
+                            solikv_core::types::RedisValue::Hash(_) => "hash",
+                            solikv_core::types::RedisValue::Set(_) => "set",
+                            solikv_core::types::RedisValue::ZSet(_) => "zset",
+                            solikv_core::types::RedisValue::HyperLogLog(_) => "hll",
+                            solikv_core::types::RedisValue::BloomFilter(_) => "bloom",
+                            solikv_core::types::RedisValue::Stream(_) => "stream",
+                        };
+                        (key.clone(), r#type.to_string(), entry.expires_at)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            results.extend(shard_data);
+        }
+        results
+    }
 }
