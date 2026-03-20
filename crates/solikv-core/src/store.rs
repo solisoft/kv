@@ -186,7 +186,8 @@ impl ShardStore {
             .collect()
     }
 
-    /// SCAN implementation: cursor-based iteration.
+    /// SCAN implementation: cursor-based iteration using reverse-bit increment
+    /// (same algorithm as Redis dictScan) to remain stable across mutations.
     pub fn scan(
         &mut self,
         cursor: usize,
@@ -199,30 +200,42 @@ impl ShardStore {
             return (0, Vec::new());
         }
 
-        let start = cursor;
+        let table_size = total.next_power_of_two();
+        let mask = table_size - 1;
+        let mut v = cursor;
         let mut result = Vec::new();
-        let mut i = start;
-        let mut checked = 0;
+        let mut iterations = 0;
 
-        while checked < count && i < total {
-            let key = &all_keys[i];
-            if self.get(key).is_some() {
-                let matches = pattern
-                    .map(|p| {
-                        let key_str = std::str::from_utf8(key).unwrap_or("");
-                        glob_match(p, key_str)
-                    })
-                    .unwrap_or(true);
-                if matches {
-                    result.push(key.clone());
+        loop {
+            let idx = v & mask;
+            if idx < total {
+                let key = &all_keys[idx];
+                if self.get(key).is_some() {
+                    let matches = pattern
+                        .map(|p| {
+                            let key_str = std::str::from_utf8(key).unwrap_or("");
+                            glob_match(p, key_str)
+                        })
+                        .unwrap_or(true);
+                    if matches {
+                        result.push(key.clone());
+                    }
                 }
             }
-            i += 1;
-            checked += 1;
+            iterations += 1;
+
+            // Redis reverse-bit increment: v |= ~mask; v = rev(rev(v) + 1)
+            v |= !mask;
+            v = v.reverse_bits();
+            v = v.wrapping_add(1);
+            v = v.reverse_bits();
+
+            if v == 0 || iterations >= count {
+                break;
+            }
         }
 
-        let next_cursor = if i >= total { 0 } else { i };
-        (next_cursor, result)
+        (v, result)
     }
 
     /// Flush all keys.
@@ -244,7 +257,24 @@ impl ShardStore {
                 }
             }
         }
+
+        // Compact the expiry heap if it has grown much larger than the data set.
+        // This prevents unbounded heap growth from repeated EXPIRE updates.
+        if self.expiry_heap.len() > self.data.len() * 4 + 1024 {
+            self.rebuild_expiry_heap();
+        }
+
         removed
+    }
+
+    /// Rebuild the expiry heap from scratch, removing stale entries.
+    fn rebuild_expiry_heap(&mut self) {
+        self.expiry_heap = ExpiryHeap::new();
+        for (key, entry) in &self.data {
+            if let Some(exp) = entry.expires_at {
+                self.expiry_heap.push(key.clone(), exp);
+            }
+        }
     }
 
     /// Rename a key. Returns error message if source doesn't exist.
@@ -258,9 +288,19 @@ impl ShardStore {
         Ok(())
     }
 
-    /// Get random key.
+    /// Get a pseudo-random key using hash-based sampling.
     pub fn random_key(&self) -> Option<Bytes> {
-        self.data.keys().next().cloned()
+        let len = self.data.len();
+        if len == 0 {
+            return None;
+        }
+        // Use a cheap entropy source to pick a random index
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as usize;
+        let idx = seed % len;
+        self.data.keys().nth(idx).cloned()
     }
 
     /// Get all data for persistence/snapshotting.
@@ -486,12 +526,17 @@ mod tests {
                 None,
             );
         }
-        let (cursor, first_batch) = store.scan(0, None, 10);
-        assert_eq!(first_batch.len(), 10);
-        assert_ne!(cursor, 0);
-
-        let (cursor2, second_batch) = store.scan(cursor, None, 10);
-        assert_eq!(second_batch.len(), 10);
-        assert_eq!(cursor2, 0);
+        // Collect all keys through full scan iteration
+        let mut all_keys = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let (next_cursor, batch) = store.scan(cursor, None, 10);
+            all_keys.extend(batch);
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+        assert_eq!(all_keys.len(), 20);
     }
 }

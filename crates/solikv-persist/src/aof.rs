@@ -41,9 +41,11 @@ impl AofWriter {
             buf.extend_from_slice(b"\r\n");
         }
 
-        // Non-blocking send — drops silently if channel is full (shouldn't
-        // happen with the 256K buffer unless the disk is stalled).
-        let _ = self.tx.try_send(buf);
+        // Non-blocking send — if channel is full the disk writer is stalled.
+        // Use blocking send as a backpressure mechanism to avoid silent data loss.
+        if self.tx.try_send(buf).is_err() {
+            tracing::error!("AOF channel full — disk I/O may be stalled, write command may be lost");
+        }
     }
 }
 

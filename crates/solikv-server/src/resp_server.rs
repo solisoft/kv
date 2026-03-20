@@ -15,6 +15,9 @@ use solikv_resp::parser::ParsedCommand;
 use solikv_cluster::ClusterManager;
 use solikv_core::CommandResponse;
 
+/// Maximum number of concurrent client connections.
+const MAX_CONNECTIONS: usize = 10_000;
+
 pub async fn run(
     addr: &str,
     engine: Arc<CommandEngine>,
@@ -25,8 +28,20 @@ pub async fn run(
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("RESP server listening on {}", addr);
 
+    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+
     loop {
         let (socket, peer_addr) = listener.accept().await?;
+
+        let permit = match conn_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!("Connection limit reached ({}), rejecting {}", MAX_CONNECTIONS, peer_addr);
+                drop(socket);
+                continue;
+            }
+        };
+
         // TCP_NODELAY: disable Nagle's algorithm for lower latency
         let _ = socket.set_nodelay(true);
         let engine = engine.clone();
@@ -40,6 +55,7 @@ pub async fn run(
             {
                 tracing::debug!("Connection error from {}: {}", peer_addr, e);
             }
+            drop(permit); // release the connection slot
         });
     }
 }
@@ -52,6 +68,9 @@ async fn handle_connection(
     password: Option<Arc<String>>,
     cluster: Option<Arc<ClusterManager>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// Maximum read buffer size per connection (256 MB).
+    const MAX_READ_BUF: usize = 256 * 1024 * 1024;
+
     let mut read_buf = BytesMut::with_capacity(65536);
     let mut write_buf = BytesMut::with_capacity(65536);
     let mut conn = ClientConnection::new(peer_addr, password.is_some());
@@ -76,6 +95,9 @@ async fn handle_connection(
 
         // If no complete frames, read more data from socket
         if frames.is_empty() {
+            if read_buf.len() > MAX_READ_BUF {
+                return Err("read buffer exceeded maximum size".into());
+            }
             let n = socket.read_buf(&mut read_buf).await?;
             if n == 0 {
                 return Ok(()); // EOF
@@ -150,7 +172,7 @@ async fn handle_connection(
                                     ),
                                     &mut write_buf,
                                 );
-                            } else if cmd.args[0] == pass.as_bytes() {
+                            } else if constant_time_eq(&cmd.args[0], pass.as_bytes()) {
                                 conn.authenticated = true;
                                 encode_frame(&RespFrame::ok(), &mut write_buf);
                             } else {
@@ -907,6 +929,18 @@ fn check_cluster_moved(
     }
 
     None
+}
+
+/// Constant-time byte comparison to prevent timing side-channel attacks on password checks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Convert our CommandResponse to a RESP frame for the wire.

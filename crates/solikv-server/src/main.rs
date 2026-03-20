@@ -89,11 +89,19 @@ async fn main() {
             if let Ok(pid_str) = fs::read_to_string(&pidfile) {
                 if let Ok(pid) = pid_str.trim().parse::<u32>() {
                     if pid > 0 {
-                        println!("Killing old solikv process (PID: {})...", pid);
-                        let _ = std::process::Command::new("kill")
-                            .arg("-9")
-                            .arg(pid.to_string())
-                            .output();
+                        // Verify the PID belongs to a solikv process before killing
+                        let cmdline_path = format!("/proc/{}/cmdline", pid);
+                        let is_solikv = fs::read_to_string(&cmdline_path)
+                            .map(|s| s.contains("solikv"))
+                            .unwrap_or(false);
+                        if is_solikv {
+                            println!("Killing old solikv process (PID: {})...", pid);
+                            let _ = std::process::Command::new("kill")
+                                .arg(pid.to_string())
+                                .output();
+                        } else {
+                            println!("PID {} is not a solikv process, skipping kill", pid);
+                        }
                         let _ = fs::remove_file(&pidfile);
                     }
                 }
@@ -125,28 +133,12 @@ async fn main() {
         return;
     }
 
-    if args.daemon {
-        let log_file = PathBuf::from("/tmp/solikv.log");
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file)
-            .expect("Failed to open log file");
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
-            )
-            .with_writer(std::sync::Mutex::new(file))
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
-            )
-            .init();
-    }
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+        )
+        .init();
 
     let num_shards = if args.shards == 0 {
         num_cpus().max(1)

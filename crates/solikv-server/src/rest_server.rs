@@ -105,7 +105,7 @@ async fn auth_middleware(
     match auth_header {
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
-            if token == password.as_str() {
+            if constant_time_eq(token.as_bytes(), password.as_bytes()) {
                 Ok(next.run(req).await)
             } else {
                 Err((
@@ -119,6 +119,18 @@ async fn auth_middleware(
             Json(serde_json::json!({"error": "Unauthorized"})),
         )),
     }
+}
+
+/// Constant-time byte comparison to prevent timing side-channel attacks on password checks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // ---- Request/Response types ----
@@ -430,12 +442,41 @@ async fn zset_add(
     to_json_response(resp)
 }
 
+/// Commands blocked from the REST /cmd endpoint for security.
+const REST_BLOCKED_COMMANDS: &[&str] = &[
+    "FLUSHDB",
+    "FLUSHALL",
+    "SHUTDOWN",
+    "DEBUG",
+    "EVAL",
+    "EVALSHA",
+    "SCRIPT",
+    "MODULE",
+    "BGSAVE",
+    "BGREWRITEAOF",
+    "SLAVEOF",
+    "REPLICAOF",
+    "CLUSTER",
+    "CONFIG",
+    "MIGRATE",
+    "RESTORE",
+    "OBJECT",
+    "SAVE",
+];
+
 async fn execute_command(
     State(state): State<AppState>,
     Json(body): Json<CommandBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let cmd = body.command.to_uppercase();
+    if REST_BLOCKED_COMMANDS.iter().any(|b| *b == cmd.as_str()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": format!("ERR command '{}' is not allowed via REST API", cmd)})),
+        );
+    }
     let args: Vec<Bytes> = body.args.into_iter().map(Bytes::from).collect();
-    let resp = state.engine.execute(&body.command.to_uppercase(), &args);
+    let resp = state.engine.execute(&cmd, &args);
     to_json_response(resp)
 }
 

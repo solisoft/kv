@@ -283,6 +283,9 @@ pub fn rdb_path_for_shard(dir: &Path, basename: &str, shard_idx: usize) -> PathB
 
 /// Save all shards to individual RDB files using atomic write-rename.
 /// `with_store_fn` provides read-only access to each shard's store.
+///
+/// Serialization is done to an in-memory buffer while the lock is held (fast),
+/// then the buffer is flushed to disk after releasing the lock (no I/O under lock).
 pub fn save_all_shards<F>(
     dir: &Path,
     basename: &str,
@@ -297,17 +300,24 @@ where
         let final_path = rdb_path_for_shard(dir, basename, idx);
         let tmp_path = dir.join(format!("{}-{}.rdb.tmp", basename, idx));
 
+        // Serialize to memory buffer while holding the shard lock (fast, no I/O)
+        let rdb_buf = std::cell::RefCell::new(Vec::new());
         with_store_fn(idx, &|store: &ShardStore| {
-            let file = std::fs::File::create(&tmp_path)?;
-            let mut writer = BufWriter::new(file);
-            RdbPersistence::save(store, &mut writer)?;
-            writer.flush()?;
-            writer
-                .into_inner()
-                .map_err(|e| e.into_error())?
-                .sync_all()?;
+            let mut buf = rdb_buf.borrow_mut();
+            RdbPersistence::save(store, &mut *buf)?;
             Ok(())
         })?;
+        let rdb_buf = rdb_buf.into_inner();
+
+        // Write buffer to disk outside the lock (no shard blocking during I/O)
+        let file = std::fs::File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&rdb_buf)?;
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .sync_all()?;
 
         std::fs::rename(&tmp_path, &final_path)?;
     }

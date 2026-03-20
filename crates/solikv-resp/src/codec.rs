@@ -124,6 +124,12 @@ pub fn encode_frame(frame: &RespFrame, dst: &mut BytesMut) {
     }
 }
 
+/// Maximum size of a single bulk string (512 MB, same as Redis default).
+pub const MAX_BULK_STRING_LEN: usize = 512 * 1024 * 1024;
+
+/// Maximum number of elements in a single array.
+pub const MAX_ARRAY_LEN: usize = 1024 * 1024;
+
 /// Try to decode a frame from the buffer. Returns (frame, bytes_consumed) or None if incomplete.
 pub fn decode_frame(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
     if src.is_empty() {
@@ -193,7 +199,18 @@ fn decode_bulk_string(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> 
                 return Ok(Some((RespFrame::Null, 1 + pos + 2)));
             }
 
+            if len < 0 {
+                return Err(format!("invalid bulk length: {}", len));
+            }
+
             let len = len as usize;
+            if len > MAX_BULK_STRING_LEN {
+                return Err(format!(
+                    "bulk string length {} exceeds maximum {}",
+                    len, MAX_BULK_STRING_LEN
+                ));
+            }
+
             let data_start = 1 + pos + 2;
             let total_needed = data_start + len + 2;
 
@@ -221,7 +238,18 @@ fn decode_array(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
                 return Ok(Some((RespFrame::Null, 1 + pos + 2)));
             }
 
+            if count < 0 {
+                return Err(format!("invalid array count: {}", count));
+            }
+
             let count = count as usize;
+            if count > MAX_ARRAY_LEN {
+                return Err(format!(
+                    "array count {} exceeds maximum {}",
+                    count, MAX_ARRAY_LEN
+                ));
+            }
+
             let mut offset = 1 + pos + 2;
             let mut items = Vec::with_capacity(count);
 

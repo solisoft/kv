@@ -91,8 +91,10 @@ impl ClusterManager {
         let node_id = format!("{}:{}", ip, port);
         self.gossip.add_node(node_id, ip.clone(), port);
 
-        if *self.state.read() == ClusterState::Init {
-            *self.state.write() = ClusterState::Handshake;
+        // Use a single write lock to avoid TOCTOU race
+        let mut state = self.state.write();
+        if *state == ClusterState::Init {
+            *state = ClusterState::Handshake;
         }
     }
 

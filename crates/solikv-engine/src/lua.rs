@@ -141,6 +141,9 @@ fn return_lua(lua: Lua, engine: &Arc<CommandEngine>) {
 // Script execution entry point
 // ---------------------------------------------------------------------------
 
+/// Maximum number of Lua VM instructions before a script is killed.
+const LUA_INSTRUCTION_LIMIT: u32 = 1_000_000;
+
 pub fn execute_script(
     engine: &Arc<CommandEngine>,
     script: &str,
@@ -148,6 +151,25 @@ pub fn execute_script(
     argv: Vec<Bytes>,
 ) -> CommandResponse {
     let lua = take_lua(engine);
+
+    // Set instruction limit to prevent infinite loops / DoS
+    lua.set_hook(
+        mlua::HookTriggers::new().every_nth_instruction(10_000),
+        {
+            let limit = std::cell::Cell::new(LUA_INSTRUCTION_LIMIT);
+            move |_lua, _debug| {
+                let remaining = limit.get();
+                if remaining == 0 {
+                    Err(LuaError::RuntimeError(
+                        "ERR script exceeded maximum allowed execution time".into(),
+                    ))
+                } else {
+                    limit.set(remaining.saturating_sub(10_000));
+                    Ok(mlua::VmState::Continue)
+                }
+            }
+        },
+    );
 
     setup_keys_argv(&lua, &keys, &argv);
 
@@ -158,6 +180,9 @@ pub fn execute_script(
             CommandResponse::Error(format!("ERR {}", msg))
         }
     };
+
+    // Remove the hook before returning to pool
+    lua.remove_hook();
 
     return_lua(lua, engine);
     result
@@ -170,7 +195,16 @@ pub fn execute_script(
 fn sandbox_lua(lua: &Lua) {
     let globals = lua.globals();
     let remove = [
-        "os", "io", "debug", "loadfile", "dofile", "package", "require",
+        "os",
+        "io",
+        "debug",
+        "loadfile",
+        "dofile",
+        "package",
+        "require",
+        "load",         // can load bytecode — sandbox escape vector
+        "loadstring",   // alias in some Lua versions
+        "collectgarbage", // DoS vector
     ];
     for name in &remove {
         let _ = globals.set(*name, LuaValue::Nil);

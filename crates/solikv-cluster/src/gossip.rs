@@ -323,9 +323,9 @@ pub async fn start_gossip_server(
     state: GossipState,
     msg_tx: mpsc::UnboundedSender<GossipMessage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await?;
-    tracing::info!("Cluster gossip server listening on {}", addr);
+    tracing::info!("Cluster gossip server listening on {} (localhost only)", addr);
 
     let state_clone = state.clone();
 
@@ -334,8 +334,22 @@ pub async fn start_gossip_server(
 
         loop {
             match listener.accept().await {
-                Ok((mut stream, _peer_addr)) => {
-                    let _state = state_clone.clone();
+                Ok((mut stream, peer_addr)) => {
+                    // Only accept connections from loopback or known cluster peers
+                    if !peer_addr.ip().is_loopback() {
+                        let known = state_clone
+                            .get_all_nodes()
+                            .iter()
+                            .any(|n| n.ip == peer_addr.ip().to_string());
+                        if !known {
+                            tracing::warn!(
+                                "Gossip: rejecting connection from unknown peer {}",
+                                peer_addr
+                            );
+                            continue;
+                        }
+                    }
+
                     let tx = msg_tx.clone();
 
                     tokio::spawn(async move {
