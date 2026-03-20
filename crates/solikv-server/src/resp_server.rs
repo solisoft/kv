@@ -12,7 +12,7 @@ use solikv_resp::codec::{decode_frame, encode_frame, RespFrame};
 use solikv_resp::connection::ClientConnection;
 use solikv_resp::parser::ParsedCommand;
 
-use solikv_cluster::{generate_node_id, ClusterManager, CLUSTER_BUS_PORT_OFFSET};
+use solikv_cluster::ClusterManager;
 use solikv_core::CommandResponse;
 
 pub async fn run(
@@ -849,20 +849,12 @@ fn get_command_key<'a>(name: &'a str, args: &'a [bytes::Bytes]) -> Option<&'a [u
         | "GETSET" | "SETEX" | "PSETEX" | "SETNX" | "SETXX" | "GETEX" | "HDEL" | "HEXISTS"
         | "HGET" | "HGETALL" | "HINCRBY" | "HINCRBYFLOAT" | "HMGET" | "HMSET" | "HSET"
         | "HSETNX" | "HVALS" | "HKEYS" | "HLEN" | "HSCAN" | "LGET" | "LPUSH" | "LPOP" | "RPUSH"
-        | "RPOP" | "LLEN" | "LRANGE" | "LSET" | "LREM" | "LTRIM" | "LINDEX" | "LSET" | "SADD"
-        | "SCARD" | "SDIFF" | "SINTER" | "SISMEMBER" | "SMEMBERS" | "SPOP" | "SRANDMEMBER"
-        | "SUNION" | "ZADD" | "ZCARD" | "ZCOUNT" | "ZRANGE" | "ZRANGEBYSCORE" | "ZRANK"
-        | "ZREVRANGE" | "ZREVRANGEBYSCORE" | "ZREVRANK" | "ZSCORE" | "ZINCRBY" | "ZREM"
-        | "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" | "ZSCAN" | "MGET" | "MSET" | "MSETNX"
-        | "GETBIT" | "SETBIT" | "BITCOUNT" | "BITPOS" | "BITOP" | "BITFIELD" | "PFADD"
-        | "PFCOUNT" | "PFMERGE" => {
-            if args.is_empty() {
-                None
-            } else {
-                Some(&args[0])
-            }
-        }
-        "MGET" | "MSET" | "MSETNX" => {
+        | "RPOP" | "LLEN" | "LRANGE" | "LSET" | "LREM" | "LTRIM" | "LINDEX" | "SADD" | "SCARD"
+        | "SDIFF" | "SINTER" | "SISMEMBER" | "SMEMBERS" | "SPOP" | "SRANDMEMBER" | "SUNION"
+        | "ZADD" | "ZCARD" | "ZCOUNT" | "ZRANGE" | "ZRANGEBYSCORE" | "ZRANK" | "ZREVRANGE"
+        | "ZREVRANGEBYSCORE" | "ZREVRANK" | "ZSCORE" | "ZINCRBY" | "ZREM" | "ZREMRANGEBYSCORE"
+        | "ZREMRANGEBYRANK" | "ZSCAN" | "MGET" | "MSET" | "MSETNX" | "GETBIT" | "SETBIT"
+        | "BITCOUNT" | "BITPOS" | "BITOP" | "BITFIELD" | "PFADD" | "PFCOUNT" | "PFMERGE" => {
             if args.is_empty() {
                 None
             } else {

@@ -107,6 +107,7 @@ async fn main() {
             .open(&log_file)
             .expect("Failed to open log file");
 
+        #[allow(clippy::zombie_processes)]
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(
                 std::env::args()

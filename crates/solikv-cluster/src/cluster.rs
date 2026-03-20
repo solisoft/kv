@@ -1,7 +1,5 @@
-use crate::consistent_hash::ConsistentHash;
-use crate::gossip::{ClusterNodeInfo, GossipState, NodeFlag};
+use crate::gossip::GossipState;
 use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -150,11 +148,9 @@ impl ClusterManager {
                 if start.is_none() {
                     start = Some(i as u16);
                 }
-            } else {
-                if let Some(s) = start {
-                    ranges.push((s, (i - 1) as u16));
-                    start = None;
-                }
+            } else if let Some(s) = start {
+                ranges.push((s, (i - 1) as u16));
+                start = None;
             }
         }
 
@@ -234,7 +230,7 @@ impl ClusterManager {
                 "9999"
             };
             let pong = "9999";
-            let link_status = &node.link_status;
+            let _link_status = &node.link_status;
 
             let slot_str = if is_myself {
                 self.slots_to_string(&my_slots)

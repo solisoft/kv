@@ -682,11 +682,8 @@ impl CommandEngine {
                 }
                 let host = std::str::from_utf8(&args[0]).unwrap_or("");
                 let port_str = std::str::from_utf8(&args[1]).unwrap_or("0");
-                if host == "NO" && port_str == "ONE" {
-                    CommandResponse::simple("OK")
-                } else {
-                    CommandResponse::simple("OK")
-                }
+                let _ = (host, port_str);
+                CommandResponse::simple("OK")
             }
             "ROLE" => CommandResponse::array(vec![
                 CommandResponse::bulk_string("master"),

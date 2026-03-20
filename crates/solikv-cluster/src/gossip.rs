@@ -1,7 +1,5 @@
-use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
@@ -33,6 +31,7 @@ impl NodeFlag {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ClusterNodeInfo {
     pub node_id: String,
     pub ip: String,
@@ -143,7 +142,7 @@ impl GossipMessage {
 
     pub fn decode(data: &[u8]) -> Option<Self> {
         let msg = String::from_utf8(data.to_vec()).ok()?;
-        let parts: Vec<&str> = msg.trim().split_whitespace().collect();
+        let parts: Vec<&str> = msg.split_whitespace().collect();
 
         if parts.is_empty() {
             return None;
@@ -220,10 +219,9 @@ impl GossipState {
 
     pub fn add_node(&self, node_id: String, ip: String, port: u16) {
         let mut nodes = self.nodes.write();
-        if !nodes.contains_key(&node_id) {
-            let node = ClusterNodeInfo::from_gossip(node_id.clone(), ip, port);
-            nodes.insert(node_id, node);
-        }
+        nodes
+            .entry(node_id.clone())
+            .or_insert_with(|| ClusterNodeInfo::from_gossip(node_id, ip, port));
     }
 
     pub fn remove_node(&self, node_id: &str) {
@@ -253,12 +251,12 @@ impl GossipState {
 
     pub fn handle_ping(
         &self,
-        sender_id: &str,
-        ip: String,
-        port: u16,
+        _sender_id: &str,
+        _ip: String,
+        _port: u16,
         ping_id: u64,
     ) -> GossipMessage {
-        let now = std::time::SystemTime::now()
+        let _now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
@@ -336,8 +334,8 @@ pub async fn start_gossip_server(
 
         loop {
             match listener.accept().await {
-                Ok((mut stream, peer_addr)) => {
-                    let state = state_clone.clone();
+                Ok((mut stream, _peer_addr)) => {
+                    let _state = state_clone.clone();
                     let tx = msg_tx.clone();
 
                     tokio::spawn(async move {
