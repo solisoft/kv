@@ -176,6 +176,7 @@ pub fn connect_node(
     Ok(stream)
 }
 
+#[allow(clippy::type_complexity)]
 pub fn scan_all_keys(
     stream: &mut TcpStream,
 ) -> Result<Vec<(String, String, Option<i64>, serde_json::Value)>, std::io::Error> {
