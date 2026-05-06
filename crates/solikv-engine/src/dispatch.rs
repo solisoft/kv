@@ -2155,13 +2155,21 @@ impl CommandEngine {
                         )
                     }
                 };
-                if args.len() < 2 + numkeys {
+                let keys_end = match numkeys.checked_add(2) {
+                    Some(end) => end,
+                    None => {
+                        return CommandResponse::error(
+                            "ERR Number of keys can't be greater than number of args",
+                        )
+                    }
+                };
+                if args.len() < keys_end {
                     return CommandResponse::wrong_arity("zunionstore");
                 }
-                let keys: Vec<Bytes> = args[2..2 + numkeys].to_vec();
+                let keys: Vec<Bytes> = args[2..keys_end].to_vec();
                 let mut weights = Vec::new();
                 let mut aggregate = Aggregate::Sum;
-                let mut i = 2 + numkeys;
+                let mut i = keys_end;
                 while i < args.len() {
                     let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
                     match opt.as_str() {
@@ -2215,13 +2223,21 @@ impl CommandEngine {
                         )
                     }
                 };
-                if args.len() < 2 + numkeys {
+                let keys_end = match numkeys.checked_add(2) {
+                    Some(end) => end,
+                    None => {
+                        return CommandResponse::error(
+                            "ERR Number of keys can't be greater than number of args",
+                        )
+                    }
+                };
+                if args.len() < keys_end {
                     return CommandResponse::wrong_arity("zinterstore");
                 }
-                let keys: Vec<Bytes> = args[2..2 + numkeys].to_vec();
+                let keys: Vec<Bytes> = args[2..keys_end].to_vec();
                 let mut weights = Vec::new();
                 let mut aggregate = Aggregate::Sum;
-                let mut i = 2 + numkeys;
+                let mut i = keys_end;
                 while i < args.len() {
                     let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
                     match opt.as_str() {
@@ -3224,13 +3240,21 @@ impl CommandEngine {
                         )
                     }
                 };
-                if args.len() < 2 + numkeys {
+                let keys_start = match numkeys.checked_add(2) {
+                    Some(start) => start,
+                    None => {
+                        return CommandResponse::error(
+                            "ERR Number of keys can't be greater than number of args",
+                        )
+                    }
+                };
+                if args.len() < keys_start {
                     return CommandResponse::error(
                         "ERR Number of keys can't be greater than number of args",
                     );
                 }
-                let keys: Vec<Bytes> = args[2..2 + numkeys].to_vec();
-                let argv: Vec<Bytes> = args[2 + numkeys..].to_vec();
+                let keys: Vec<Bytes> = args[2..keys_start].to_vec();
+                let argv: Vec<Bytes> = args[keys_start..].to_vec();
 
                 // Cache the script
                 self.script_cache.load(script);
@@ -3268,13 +3292,21 @@ impl CommandEngine {
                         )
                     }
                 };
-                if args.len() < 2 + numkeys {
+                let keys_start = match numkeys.checked_add(2) {
+                    Some(start) => start,
+                    None => {
+                        return CommandResponse::error(
+                            "ERR Number of keys can't be greater than number of args",
+                        )
+                    }
+                };
+                if args.len() < keys_start {
                     return CommandResponse::error(
                         "ERR Number of keys can't be greater than number of args",
                     );
                 }
-                let keys: Vec<Bytes> = args[2..2 + numkeys].to_vec();
-                let argv: Vec<Bytes> = args[2 + numkeys..].to_vec();
+                let keys: Vec<Bytes> = args[2..keys_start].to_vec();
+                let argv: Vec<Bytes> = args[keys_start..].to_vec();
 
                 match self.get_self_arc() {
                     Some(arc) => crate::lua::execute_script(&arc, &script, keys, argv),
