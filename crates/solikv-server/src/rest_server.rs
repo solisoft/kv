@@ -10,16 +10,51 @@ use bytes::Bytes;
 use serde::Deserialize;
 #[allow(unused_imports)]
 use serde::Serialize;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use solikv_core::CommandResponse;
 use solikv_engine::response::response_to_json;
 use solikv_engine::CommandEngine;
 
+const MAX_AUTH_FAILURES_REST: u32 = 10;
+const AUTH_COOLDOWN_SECS_REST: u64 = 30;
+
+#[derive(Default)]
+struct AuthFailureTracker {
+    failures: RwLock<std::collections::HashMap<String, (u32, std::time::Instant)>>,
+}
+
+impl AuthFailureTracker {
+    fn is_blocked(&self, ip: &str) -> bool {
+        let failures = self.failures.read().unwrap();
+        if let Some((count, first_failure)) = failures.get(ip) {
+            if *count >= MAX_AUTH_FAILURES_REST {
+                let elapsed = first_failure.elapsed().as_secs();
+                return elapsed < AUTH_COOLDOWN_SECS_REST;
+            }
+        }
+        false
+    }
+
+    fn record_failure(&self, ip: &str) {
+        let mut failures = self.failures.write().unwrap();
+        let now = std::time::Instant::now();
+        let entry = failures.entry(ip.to_string()).or_insert((0, now));
+        entry.0 += 1;
+        entry.1 = now;
+    }
+
+    fn record_success(&self, ip: &str) {
+        let mut failures = self.failures.write().unwrap();
+        failures.remove(ip);
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     engine: Arc<CommandEngine>,
     password: Option<Arc<String>>,
+    auth_tracker: Arc<AuthFailureTracker>,
 }
 
 pub async fn run(
@@ -27,7 +62,11 @@ pub async fn run(
     engine: Arc<CommandEngine>,
     password: Option<Arc<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = AppState { engine, password };
+    let state = AppState {
+        engine,
+        password,
+        auth_tracker: Arc::new(AuthFailureTracker::default()),
+    };
 
     let app = Router::new()
         // Key-value operations
@@ -92,6 +131,20 @@ async fn auth_middleware(
     req: Request,
     next: Next,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    let ip = req
+        .extensions()
+        .get::<std::net::SocketAddr>()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    if state.auth_tracker.is_blocked(&ip) {
+        tracing::warn!("REST AUTH blocked for {} (too many failures)", ip);
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "Too many failures, please wait"})),
+        ));
+    }
+
     let password = match &state.password {
         None => return Ok(next.run(req).await),
         Some(p) => p,
@@ -106,18 +159,24 @@ async fn auth_middleware(
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
             if constant_time_eq(token.as_bytes(), password.as_bytes()) {
+                state.auth_tracker.record_success(&ip);
                 Ok(next.run(req).await)
             } else {
+                state.auth_tracker.record_failure(&ip);
+                tracing::warn!("Failed REST AUTH attempt from {}", ip);
                 Err((
                     StatusCode::UNAUTHORIZED,
                     Json(serde_json::json!({"error": "Unauthorized"})),
                 ))
             }
         }
-        _ => Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Unauthorized"})),
-        )),
+        _ => {
+            state.auth_tracker.record_failure(&ip);
+            Err((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Unauthorized"})),
+            ))
+        }
     }
 }
 

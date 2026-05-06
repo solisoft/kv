@@ -1,6 +1,6 @@
 use bytes::{Buf, Bytes, BytesMut};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -25,6 +25,47 @@ use solikv_core::CommandResponse;
 /// Maximum number of concurrent client connections.
 const MAX_CONNECTIONS: usize = 10_000;
 
+const MAX_AUTH_FAILURES: u32 = 10;
+const AUTH_COOLDOWN_SECS: u64 = 30;
+
+struct AuthFailureTracker {
+    failures: RwLock<std::collections::HashMap<String, (u32, std::time::Instant)>>,
+}
+
+impl Default for AuthFailureTracker {
+    fn default() -> Self {
+        Self {
+            failures: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl AuthFailureTracker {
+    fn is_blocked(&self, ip: &str) -> bool {
+        let failures = self.failures.read().unwrap();
+        if let Some((count, first_failure)) = failures.get(ip) {
+            if *count >= MAX_AUTH_FAILURES {
+                let elapsed = first_failure.elapsed().as_secs();
+                return elapsed < AUTH_COOLDOWN_SECS;
+            }
+        }
+        false
+    }
+
+    fn record_failure(&self, ip: &str) {
+        let mut failures = self.failures.write().unwrap();
+        let now = std::time::Instant::now();
+        let entry = failures.entry(ip.to_string()).or_insert((0, now));
+        entry.0 += 1;
+        entry.1 = now;
+    }
+
+    fn record_success(&self, ip: &str) {
+        let mut failures = self.failures.write().unwrap();
+        failures.remove(ip);
+    }
+}
+
 pub async fn run(
     addr: &str,
     engine: Arc<CommandEngine>,
@@ -38,6 +79,7 @@ pub async fn run(
     let tls_acceptor = tls_config.map(|c| TlsAcceptor::from(Arc::new(c)));
 
     let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let auth_tracker = Arc::new(AuthFailureTracker::default());
 
     loop {
         let (socket, peer_addr) = listener.accept().await?;
@@ -60,6 +102,7 @@ pub async fn run(
         let password = password.clone();
         let cluster = cluster.clone();
         let tls_acceptor = tls_acceptor.clone();
+        let auth_tracker = auth_tracker.clone();
 
         tokio::spawn(async move {
             let mut socket: Box<dyn AsyncSocket> = match tls_acceptor {
@@ -73,8 +116,16 @@ pub async fn run(
                 },
                 None => Box::new(socket),
             };
-            if let Err(e) =
-                handle_connection(&mut socket, engine, pubsub, peer_addr, password, cluster).await
+            if let Err(e) = handle_connection(
+                &mut socket,
+                engine,
+                pubsub,
+                peer_addr,
+                password,
+                cluster,
+                auth_tracker,
+            )
+            .await
             {
                 tracing::debug!("Connection error from {}: {}", peer_addr, e);
             }
@@ -90,6 +141,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     peer_addr: std::net::SocketAddr,
     password: Option<Arc<String>>,
     cluster: Option<Arc<ClusterManager>>,
+    auth_tracker: Arc<AuthFailureTracker>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     /// Maximum read buffer size per connection (256 MB).
     const MAX_READ_BUF: usize = 256 * 1024 * 1024;
@@ -180,6 +232,16 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             for cmd in commands {
                 // Handle AUTH command
                 if cmd.name == "AUTH" {
+                    let ip = peer_addr.ip().to_string();
+                    if auth_tracker.is_blocked(&ip) {
+                        tracing::warn!("AUTH blocked for {} (too many failures)", ip);
+                        encode_frame(
+                            &RespFrame::error("ERR too many failures, please wait"),
+                            &mut write_buf,
+                        );
+                        socket.write_all(&write_buf).await?;
+                        return Ok(());
+                    }
                     match &password {
                         None => {
                             encode_frame(
@@ -197,8 +259,11 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                                 );
                             } else if constant_time_eq(&cmd.args[0], pass.as_bytes()) {
                                 conn.authenticated = true;
+                                auth_tracker.record_success(&ip);
                                 encode_frame(&RespFrame::ok(), &mut write_buf);
                             } else {
+                                auth_tracker.record_failure(&ip);
+                                tracing::warn!("Failed AUTH attempt from {}", ip);
                                 encode_frame(
                                     &RespFrame::error("ERR invalid password"),
                                     &mut write_buf,
