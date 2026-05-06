@@ -8,6 +8,23 @@ use std::path::{Path, PathBuf};
 const RDB_MAGIC: &[u8] = b"SOLIKV";
 const RDB_VERSION: u8 = 2;
 
+const MAX_VALUE_LEN: usize = 512 * 1024 * 1024;
+const MAX_COLLECTION_LEN: usize = 16_000_000;
+
+fn sanitize_len(len: usize) -> io::Result<usize> {
+    if len > MAX_VALUE_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RDB value length exceeds maximum",
+        ));
+    }
+    Ok(len)
+}
+
+fn sanitize_collection_len(len: usize) -> usize {
+    len.min(MAX_COLLECTION_LEN)
+}
+
 // Type markers
 const TYPE_STRING: u8 = 0;
 const TYPE_LIST: u8 = 1;
@@ -149,7 +166,7 @@ impl RdbPersistence {
                 }
                 TYPE_LIST => {
                     let key = read_bytes(reader)?;
-                    let len = read_len(reader)?;
+                    let len = sanitize_collection_len(read_len(reader)?);
                     let mut list = VecDeque::with_capacity(len);
                     for _ in 0..len {
                         list.push_back(read_bytes(reader)?);
@@ -159,7 +176,7 @@ impl RdbPersistence {
                 }
                 TYPE_HASH => {
                     let key = read_bytes(reader)?;
-                    let len = read_len(reader)?;
+                    let len = sanitize_collection_len(read_len(reader)?);
                     let mut hash = std::collections::HashMap::with_capacity(len);
                     for _ in 0..len {
                         let field = read_bytes(reader)?;
@@ -171,7 +188,7 @@ impl RdbPersistence {
                 }
                 TYPE_SET => {
                     let key = read_bytes(reader)?;
-                    let len = read_len(reader)?;
+                    let len = sanitize_collection_len(read_len(reader)?);
                     let mut set = std::collections::HashSet::with_capacity(len);
                     for _ in 0..len {
                         set.insert(read_bytes(reader)?);
@@ -181,7 +198,7 @@ impl RdbPersistence {
                 }
                 TYPE_ZSET => {
                     let key = read_bytes(reader)?;
-                    let len = read_len(reader)?;
+                    let len = sanitize_collection_len(read_len(reader)?);
                     let mut zset = ZSetValue::new();
                     for _ in 0..len {
                         let member = read_bytes(reader)?;
@@ -264,7 +281,7 @@ fn write_len<W: Write>(writer: &mut W, len: usize) -> io::Result<()> {
 }
 
 fn read_bytes<R: Read>(reader: &mut R) -> io::Result<Bytes> {
-    let len = read_len(reader)?;
+    let len = sanitize_len(read_len(reader)?)?;
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
     Ok(Bytes::from(buf))

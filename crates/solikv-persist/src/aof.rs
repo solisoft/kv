@@ -2,6 +2,8 @@ use bytes::Bytes;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+const MAX_AOF_BULK_LEN: usize = 512 * 1024 * 1024;
+
 /// AOF fsync policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsyncPolicy {
@@ -194,7 +196,11 @@ impl AofPersistence {
                     .ok()
                     .and_then(|s| s.parse().ok())
                 {
-                    Some(l) => l,
+                    Some(l) if l <= MAX_AOF_BULK_LEN => l,
+                    Some(_) => {
+                        valid = false;
+                        break;
+                    }
                     None => {
                         valid = false;
                         break;
