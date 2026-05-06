@@ -70,6 +70,18 @@ struct Args {
     #[arg(long, default_value = "yes")]
     protected_mode: String,
 
+    /// TLS certificate file (enables TLS on RESP and REST if set)
+    #[arg(long, value_name = "PATH")]
+    tls_cert: Option<String>,
+
+    /// TLS private key file
+    #[arg(long, value_name = "PATH")]
+    tls_key: Option<String>,
+
+    /// TLS client CA certificate for client certificate verification
+    #[arg(long, value_name = "PATH")]
+    tls_client_ca: Option<String>,
+
     /// Keyspace notification flags (e.g. "KEA" for all events, "" to disable)
     #[arg(long, default_value = "")]
     notify_keyspace_events: String,
@@ -236,6 +248,39 @@ async fn main() {
         eprintln!("or pass --protected-mode no (NOT RECOMMENDED for exposed deployments).");
         std::process::exit(1);
     }
+
+    let tls_config = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert = std::fs::read(cert_path).expect("Failed to read TLS certificate");
+            let key = std::fs::read(key_path).expect("Failed to read TLS private key");
+            let certs = pem::parse_many(&cert).expect("Failed to parse TLS certificate");
+            let keys = pem::parse_many(&key).expect("Failed to parse TLS private key");
+            let certs: Vec<rustls::pki_types::CertificateDer> = certs
+                .iter()
+                .filter(|p| p.tag() == "CERTIFICATE")
+                .map(|p| p.contents().to_vec().into())
+                .collect();
+            let key_der = keys
+                .iter()
+                .filter(|p| p.tag() == "PRIVATE KEY")
+                .next()
+                .expect("No private key found")
+                .contents()
+                .to_vec();
+            let key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
+                .expect("Failed to create private key der");
+            let config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .expect("Failed to create TLS config");
+            tracing::info!("TLS enabled");
+            Some(config)
+        }
+        _ => {
+            tracing::info!("TLS disabled (no --tls-cert/--tls-key provided)");
+            None
+        }
+    };
 
     tracing::info!(
         "SoliKV starting with {} shards, RESP on port {}, REST on port {}",
@@ -471,6 +516,7 @@ async fn main() {
     let pubsub_resp = pubsub.clone();
     let password_resp = password.clone();
     let cluster_resp = cluster_manager.clone();
+    let tls_config_resp = tls_config.clone();
     let resp_handle = tokio::spawn(async move {
         if let Err(e) = resp_server::run(
             &resp_addr,
@@ -478,6 +524,7 @@ async fn main() {
             pubsub_resp,
             password_resp,
             cluster_resp,
+            tls_config_resp,
         )
         .await
         {

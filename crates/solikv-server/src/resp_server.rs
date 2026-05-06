@@ -1,12 +1,19 @@
 use bytes::{Buf, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use rustls::ServerConfig;
+use tokio_rustls::TlsAcceptor;
+
 use solikv_engine::CommandEngine;
+
+trait AsyncSocket: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncSocket for T {}
 use solikv_pubsub::{PubSubBroker, PubSubMessage};
 use solikv_resp::codec::{decode_frame, encode_frame, RespFrame};
 use solikv_resp::connection::ClientConnection;
@@ -24,9 +31,11 @@ pub async fn run(
     pubsub: Arc<PubSubBroker>,
     password: Option<Arc<String>>,
     cluster: Option<Arc<ClusterManager>>,
+    tls_config: Option<ServerConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("RESP server listening on {}", addr);
+    let tls_acceptor = tls_config.map(|c| TlsAcceptor::from(Arc::new(c)));
 
     let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
@@ -46,26 +55,36 @@ pub async fn run(
             }
         };
 
-        // TCP_NODELAY: disable Nagle's algorithm for lower latency
-        let _ = socket.set_nodelay(true);
         let engine = engine.clone();
         let pubsub = pubsub.clone();
         let password = password.clone();
         let cluster = cluster.clone();
+        let tls_acceptor = tls_acceptor.clone();
 
         tokio::spawn(async move {
+            let mut socket: Box<dyn AsyncSocket> = match tls_acceptor {
+                Some(acceptor) => match acceptor.accept(socket).await {
+                    Ok(stream) => Box::new(stream),
+                    Err(e) => {
+                        tracing::debug!("TLS accept error from {}: {}", peer_addr, e);
+                        drop(permit);
+                        return;
+                    }
+                },
+                None => Box::new(socket),
+            };
             if let Err(e) =
-                handle_connection(socket, engine, pubsub, peer_addr, password, cluster).await
+                handle_connection(&mut socket, engine, pubsub, peer_addr, password, cluster).await
             {
                 tracing::debug!("Connection error from {}: {}", peer_addr, e);
             }
-            drop(permit); // release the connection slot
+            drop(permit);
         });
     }
 }
 
-async fn handle_connection(
-    mut socket: tokio::net::TcpStream,
+async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    mut socket: S,
     engine: Arc<CommandEngine>,
     pubsub: Arc<PubSubBroker>,
     peer_addr: std::net::SocketAddr,
@@ -546,8 +565,8 @@ async fn handle_connection(
 /// Uses a fan-in mpsc channel: each subscription spawns a forwarding task from
 /// broadcast::Receiver -> mpsc::UnboundedSender. The main loop select!s between
 /// the fan-in receiver and new frames from the socket.
-async fn handle_pubsub_mode(
-    socket: &mut tokio::net::TcpStream,
+async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut S,
     pubsub: &Arc<PubSubBroker>,
     _engine: &Arc<CommandEngine>,
     conn: &mut ClientConnection,

@@ -27,6 +27,9 @@ clap = { version = "4", features = ["derive"] }
 mimalloc = { version = "0.1", default-features = false }
 futures = "0.3"
 chrono = "0.4"
+rustls = "0.23"
+tokio-rustls = "0.26"
+pem = "3"
 
 [dev-dependencies]
 redis = { version = "0.27", features = ["tokio-comp"] }
