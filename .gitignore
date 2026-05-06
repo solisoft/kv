@@ -1,2 +1,13 @@
 target
 data
+tasks
+*.rmeta
+*.rcgu.o
+*.rcgu
+*.o
+*.rlib
+*.dylib
+*.so
+*.dll
+*.pdb
+*.pdb.lock
