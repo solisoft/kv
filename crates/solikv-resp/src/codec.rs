@@ -130,6 +130,12 @@ pub const MAX_BULK_STRING_LEN: usize = 512 * 1024 * 1024;
 /// Maximum number of elements in a single array.
 pub const MAX_ARRAY_LEN: usize = 1024 * 1024;
 
+/// Maximum pre-auth array elements (before user is authenticated).
+const MAX_UNAUTH_ARRAY_LEN: usize = 32;
+
+/// Maximum pre-auth bulk string length (before user is authenticated).
+const MAX_UNAUTH_BULK_LEN: usize = 64 * 1024;
+
 /// Try to decode a frame from the buffer. Returns (frame, bytes_consumed) or None if incomplete.
 pub fn decode_frame(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
     if src.is_empty() {
@@ -251,7 +257,7 @@ fn decode_array(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
             }
 
             let mut offset = 1 + pos + 2;
-            let mut items = Vec::with_capacity(count);
+            let mut items = Vec::new();
 
             for _ in 0..count {
                 match decode_frame(&src[offset..])? {

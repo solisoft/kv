@@ -115,6 +115,8 @@ fn take_lua(engine: &Arc<CommandEngine>) -> Lua {
     });
 
     if let Some(lua) = cached {
+        sandbox_lua(&lua);
+        setup_redis_module(&lua, engine);
         return lua;
     }
 
