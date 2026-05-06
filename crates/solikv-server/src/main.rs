@@ -1,4 +1,5 @@
 use mimalloc::MiMalloc;
+use std::os::unix::fs::MetadataExt;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -69,6 +70,10 @@ struct Args {
     #[arg(long, value_name = "PASSWORD")]
     requirepass: Option<String>,
 
+    /// Read password from a file (mode 0600 enforced). Takes precedence over --requirepass.
+    #[arg(long, value_name = "PATH")]
+    requirepass_file: Option<PathBuf>,
+
     /// Enable protected mode (reject connections if binding to non-loopback with no password)
     #[arg(long, default_value = "yes")]
     protected_mode: String,
@@ -116,6 +121,10 @@ struct Args {
     /// Cluster password for dump/restore
     #[arg(long)]
     cluster_password: Option<String>,
+
+    /// Read cluster password from a file
+    #[arg(long)]
+    cluster_password_file: Option<PathBuf>,
 
     /// For cluster dump/restore: send password only to seed node, not to discovered nodes
     #[arg(long, default_value = "true")]
@@ -178,6 +187,22 @@ async fn main() {
         return;
     }
 
+    let cluster_password: Option<String> = if let Some(file_path) = &args.cluster_password_file {
+        Some(
+            std::fs::read_to_string(file_path)
+                .expect("Failed to read cluster password file")
+                .trim()
+                .to_string(),
+        )
+    } else if let Some(pw) = &args.cluster_password {
+        tracing::warn!("Cluster password via CLI flag is visible in /proc/cmdline. Consider using --cluster-password-file or SOLIKV_CLUSTER_PASSWORD env var.");
+        Some(pw.clone())
+    } else if let Ok(env_pw) = std::env::var("SOLIKV_CLUSTER_PASSWORD") {
+        Some(env_pw)
+    } else {
+        None
+    };
+
     // Handle cluster dump/restore operations (run standalone, don't start server)
     if let Some(dump_path) = &args.cluster_dump {
         if args.cluster_connect.is_none() {
@@ -188,11 +213,11 @@ async fn main() {
             std::path::Path::new(dump_path),
             &args.cluster_dump_format,
             args.cluster_connect.as_ref().unwrap(),
-            args.cluster_password.as_deref(),
+            cluster_password.as_deref(),
             if args.cluster_password_seed_only {
                 None
             } else {
-                args.cluster_password.as_deref()
+                cluster_password.as_deref()
             },
         );
         match result {
@@ -215,11 +240,11 @@ async fn main() {
         let result = cluster_dump::restore_cluster(
             std::path::Path::new(restore_path),
             args.cluster_connect.as_ref().unwrap(),
-            args.cluster_password.as_deref(),
+            cluster_password.as_deref(),
             if args.cluster_password_seed_only {
                 None
             } else {
-                args.cluster_password.as_deref()
+                cluster_password.as_deref()
             },
         );
         match result {
@@ -255,7 +280,21 @@ async fn main() {
         _ => FsyncPolicy::Everysec,
     };
 
-    let password: Option<Arc<String>> = args.requirepass.map(Arc::new);
+    let password: Option<Arc<String>> = if let Some(file_path) = &args.requirepass_file {
+        let content = std::fs::read_to_string(file_path).expect("Failed to read password file");
+        let pw = content.trim_end_matches('\n').trim_end_matches('\r');
+        if file_path.metadata().map(|m| m.mode() & 0o777).unwrap_or(0) & 0o177 != 0 {
+            tracing::warn!("Password file has insecure permissions, recommend 0600");
+        }
+        Some(Arc::new(pw.to_string()))
+    } else if let Some(pw) = &args.requirepass {
+        tracing::warn!("Password supplied via CLI flag is visible in /proc/cmdline. Consider using --requirepass-file or SOLIKV_REQUIREPASS env var.");
+        Some(Arc::new(pw.clone()))
+    } else if let Ok(env_pw) = std::env::var("SOLIKV_REQUIREPASS") {
+        Some(Arc::new(env_pw))
+    } else {
+        None
+    };
 
     let is_loopback = args.bind == "127.0.0.1" || args.bind == "::1" || args.bind == "localhost";
     if !is_loopback && password.is_none() && args.protected_mode.to_lowercase() != "no" {
