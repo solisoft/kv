@@ -4,6 +4,24 @@ use std::path::Path;
 
 const MAX_AOF_BULK_LEN: usize = 512 * 1024 * 1024;
 
+const AOF_BLOCKED_COMMANDS: &[&str] = &[
+    "EVAL",
+    "EVALSHA",
+    "SCRIPT",
+    "DEBUG",
+    "SHUTDOWN",
+    "BGREWRITEAOF",
+    "BGSAVE",
+    "SLAVEOF",
+    "REPLICAOF",
+    "CLUSTER",
+    "MIGRATE",
+    "RESTORE",
+    "MODULE",
+    "SCRIPT FLUSH",
+    "SCRIPT KILL",
+];
+
 /// AOF fsync policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsyncPolicy {
@@ -221,6 +239,19 @@ impl AofPersistence {
                 args.push(Bytes::from(buf));
             }
             if valid && args.len() == count {
+                if let Some(cmd) = args.first() {
+                    let cmd_upper = std::str::from_utf8(cmd)
+                        .map(|s| s.to_uppercase())
+                        .unwrap_or_default();
+                    let blocked = AOF_BLOCKED_COMMANDS.iter().any(|b| {
+                        b.split_whitespace().collect::<Vec<_>>()
+                            == cmd_upper.split_whitespace().collect::<Vec<_>>()
+                    });
+                    if blocked {
+                        tracing::warn!("Skipping blocked command in AOF replay: {}", cmd_upper);
+                        continue;
+                    }
+                }
                 commands.push(args);
             }
         }
