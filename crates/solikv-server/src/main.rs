@@ -9,6 +9,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
+
 use solikv_persist::{AofPersistence, FsyncPolicy};
 
 use solikv_cluster::{generate_stable_node_id, ClusterManager, GossipState};
@@ -119,23 +122,24 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    let pidfile = PathBuf::from("/tmp/solikv.pid");
+    let pidfile = args.dir.join("solikv.pid");
 
     if args.daemon {
         if pidfile.exists() {
             if let Ok(pid_str) = fs::read_to_string(&pidfile) {
                 if let Ok(pid) = pid_str.trim().parse::<u32>() {
                     if pid > 0 {
-                        // Verify the PID belongs to a solikv process before killing
-                        let cmdline_path = format!("/proc/{}/cmdline", pid);
-                        let is_solikv = fs::read_to_string(&cmdline_path)
-                            .map(|s| s.contains("solikv"))
+                        let exe_path = format!("/proc/{}/exe", pid);
+                        let current_exe = std::env::current_exe()
+                            .map(|p| p.into_os_string().into_string().unwrap_or_default())
+                            .unwrap_or_default();
+                        let is_solikv = fs::read_to_string(&exe_path)
+                            .map(|exe| exe.contains(&current_exe))
                             .unwrap_or(false);
                         if is_solikv {
                             println!("Killing old solikv process (PID: {})...", pid);
-                            let _ = std::process::Command::new("kill")
-                                .arg(pid.to_string())
-                                .output();
+                            let _ =
+                                kill(Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGTERM);
                         } else {
                             println!("PID {} is not a solikv process, skipping kill", pid);
                         }

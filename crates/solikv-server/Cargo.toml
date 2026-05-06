@@ -30,6 +30,7 @@ chrono = "0.4"
 rustls = "0.23"
 tokio-rustls = "0.26"
 pem = "3"
+nix = { version = "0.27", features = ["process", "signal"] }
 
 [dev-dependencies]
 redis = { version = "0.27", features = ["tokio-comp"] }
