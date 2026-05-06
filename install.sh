@@ -59,22 +59,50 @@ if TAG=$(fetch "$API_URL" 2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"
 fi
 
 if [ -z "$TAG" ]; then
-  echo "Warning: could not fetch latest release, falling back to v0.1.0"
-  TAG="v0.1.0"
+  echo "Error: could not fetch latest release tag from GitHub API." >&2
+  echo "Please check your network connection and try again." >&2
+  exit 1
 fi
 
 echo "Installing SoliKV ${TAG} ..."
 
-# --- Download and extract ---
+# --- Download and verify ---
 TARBALL="solikv-${OS}-${ARCH}.tar.gz"
+CHECKSUMS_FILE="SHA256SUMS"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${TARBALL}"
+CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${TAG}/${CHECKSUMS_FILE}"
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 echo "Downloading ${DOWNLOAD_URL} ..."
 fetch "$DOWNLOAD_URL" > "${TMP_DIR}/${TARBALL}"
 
-tar xzf "${TMP_DIR}/${TARBALL}" -C "$TMP_DIR"
+echo "Downloading checksums ${CHECKSUMS_URL} ..."
+fetch "$CHECKSUMS_URL" > "${TMP_DIR}/${CHECKSUMS_FILE}"
+
+# --- Verify checksum ---
+echo "Verifying checksums ..."
+cd "${TMP_DIR}"
+if command -v sha256sum >/dev/null 2>&1; then
+  if ! sha256sum -c --strict "${CHECKSUMS_FILE}"; then
+    echo "Error: checksum verification failed for ${TARBALL}" >&2
+    exit 1
+  fi
+elif command -v shasum >/dev/null 2>&1; then
+  if ! shasum -a 256 -c --strict "${CHECKSUMS_FILE}"; then
+    echo "Error: checksum verification failed for ${TARBALL}" >&2
+    exit 1
+  fi
+else
+  echo "Error: sha256sum or shasum is required for checksum verification" >&2
+  exit 1
+fi
+cd - >/dev/null
+echo "Checksum verified."
+
+# --- Extract with security options ---
+echo "Extracting ..."
+tar --no-same-owner -xzf "${TMP_DIR}/${TARBALL}" -C "$TMP_DIR"
 
 # --- Install binary ---
 if [ "$SYSTEM_INSTALL" = "1" ]; then
