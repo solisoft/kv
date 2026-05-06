@@ -116,6 +116,10 @@ struct Args {
     /// Cluster password for dump/restore
     #[arg(long)]
     cluster_password: Option<String>,
+
+    /// For cluster dump/restore: send password only to seed node, not to discovered nodes
+    #[arg(long, default_value = "true")]
+    cluster_password_seed_only: bool,
 }
 
 #[tokio::main]
@@ -185,7 +189,11 @@ async fn main() {
             &args.cluster_dump_format,
             args.cluster_connect.as_ref().unwrap(),
             args.cluster_password.as_deref(),
-            4, // parallel connections
+            if args.cluster_password_seed_only {
+                None
+            } else {
+                args.cluster_password.as_deref()
+            },
         );
         match result {
             Ok((keys, nodes)) => {
@@ -208,7 +216,11 @@ async fn main() {
             std::path::Path::new(restore_path),
             args.cluster_connect.as_ref().unwrap(),
             args.cluster_password.as_deref(),
-            4, // parallel connections
+            if args.cluster_password_seed_only {
+                None
+            } else {
+                args.cluster_password.as_deref()
+            },
         );
         match result {
             Ok((success, errors)) => {

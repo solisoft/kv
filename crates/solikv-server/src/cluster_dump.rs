@@ -432,28 +432,33 @@ pub fn dump_cluster(
     format: &str,
     connect_addr: &str,
     password: Option<&str>,
-    _parallel: usize,
+    per_node_password: Option<&str>,
 ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
-    let (ip, port) = if let Some((ip, port)) = connect_addr.rsplit_once(':') {
+    let (seed_ip, seed_port) = if let Some((ip, port)) = connect_addr.rsplit_once(':') {
         (ip.to_string(), port.parse().unwrap_or(6379))
     } else {
         ("127.0.0.1".to_string(), 6379)
     };
 
-    tracing::info!("Connecting to initial node {}:{}", ip, port);
-    let mut stream = connect_node(&ip, port, password)?;
+    tracing::info!("Connecting to seed node {}:{}", seed_ip, seed_port);
+    let mut stream = connect_node(&seed_ip, seed_port, password)?;
 
-    // Get cluster nodes
     let nodes_resp = send_resp_command(&mut stream, &["CLUSTER", "NODES"])?;
     let nodes = parse_cluster_nodes(&nodes_resp);
 
     tracing::info!("Found {} nodes in cluster", nodes.len());
 
-    // Collect all keys from all nodes
     let mut all_data: Vec<DumpKey> = Vec::new();
-    let mut success_nodes = 0;
+    let mut success_nodes = 0usize;
+    let mut failed_nodes = 0usize;
 
     for node in &nodes {
+        let node_password = if node.ip == seed_ip && node.port == seed_port {
+            password
+        } else {
+            per_node_password
+        };
+
         tracing::info!(
             "Dumping node {}:{} (id: {})",
             node.ip,
@@ -461,7 +466,7 @@ pub fn dump_cluster(
             node.node_id
         );
 
-        match connect_node(&node.ip, node.port, password) {
+        match connect_node(&node.ip, node.port, node_password) {
             Ok(mut node_stream) => match scan_all_keys(&mut node_stream) {
                 Ok(keys) => {
                     for (key, r#type, ttl, value) in keys {
@@ -477,10 +482,12 @@ pub fn dump_cluster(
                 }
                 Err(e) => {
                     eprintln!("Failed to scan keys: {}", e);
+                    failed_nodes += 1;
                 }
             },
             Err(e) => {
                 eprintln!("Failed to connect: {}", e);
+                failed_nodes += 1;
             }
         }
     }
@@ -587,7 +594,7 @@ pub fn restore_cluster(
     input_path: &Path,
     connect_addr: &str,
     password: Option<&str>,
-    parallel: usize,
+    per_node_password: Option<&str>,
 ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
     // Read dump file
     let content = std::fs::read_to_string(input_path)?;
@@ -633,8 +640,7 @@ pub fn restore_cluster(
 
     tracing::info!("Restoring {} keys", keys_to_restore.len());
 
-    // Connect to initial node to get cluster info
-    let (ip, port) = if let Some((ip, port)) = connect_addr.rsplit_once(':') {
+    let (seed_ip, seed_port) = if let Some((ip, port)) = connect_addr.rsplit_once(':') {
         (ip.to_string(), port.parse().unwrap_or(6379))
     } else {
         (
@@ -643,7 +649,7 @@ pub fn restore_cluster(
         )
     };
 
-    let mut stream = connect_node(&ip, port, password)?;
+    let mut stream = connect_node(&seed_ip, seed_port, password)?;
 
     // Get current cluster nodes
     let nodes_resp = send_resp_command(&mut stream, &["CLUSTER", "NODES"])?;
@@ -662,7 +668,7 @@ pub fn restore_cluster(
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
-    let semaphore = Arc::new(AtomicUsize::new(parallel));
+    let semaphore = Arc::new(AtomicUsize::new(4));
     let mut handles = Vec::new();
     let success_count = Arc::new(AtomicUsize::new(0));
     let error_count = Arc::new(AtomicUsize::new(0));
@@ -678,6 +684,8 @@ pub fn restore_cluster(
         let sem = semaphore.clone();
         let success = success_count.clone();
         let errors = error_count.clone();
+        let seed_ip = seed_ip.clone();
+        let per_node_password = per_node_password.map(|s| s.to_string());
 
         let handle = thread::spawn(move || {
             // Calculate slot
@@ -687,7 +695,12 @@ pub fn restore_cluster(
             let target = slot_to_node.get(&slot).cloned();
 
             let result = if let Some((target_ip, target_port)) = target {
-                match connect_node(&target_ip, target_port, password.as_deref()) {
+                let node_password = if target_ip == seed_ip && target_port == seed_port {
+                    password.as_deref()
+                } else {
+                    per_node_password.as_deref()
+                };
+                match connect_node(&target_ip, target_port, node_password) {
                     Ok(mut stream) => {
                         // Restore based on type
                         let result = match r#type.as_str() {
