@@ -66,6 +66,10 @@ struct Args {
     #[arg(long, value_name = "PASSWORD")]
     requirepass: Option<String>,
 
+    /// Enable protected mode (reject connections if binding to non-loopback with no password)
+    #[arg(long, default_value = "yes")]
+    protected_mode: String,
+
     /// Keyspace notification flags (e.g. "KEA" for all events, "" to disable)
     #[arg(long, default_value = "")]
     notify_keyspace_events: String,
@@ -224,6 +228,14 @@ async fn main() {
     };
 
     let password: Option<Arc<String>> = args.requirepass.map(Arc::new);
+
+    let is_loopback = args.bind == "127.0.0.1" || args.bind == "::1" || args.bind == "localhost";
+    if !is_loopback && password.is_none() && args.protected_mode.to_lowercase() != "no" {
+        eprintln!("ERROR: SoliKV is running in protected mode because no password is set.");
+        eprintln!("To disable protected mode, either set a password with --requirepass PASSWORD");
+        eprintln!("or pass --protected-mode no (NOT RECOMMENDED for exposed deployments).");
+        std::process::exit(1);
+    }
 
     tracing::info!(
         "SoliKV starting with {} shards, RESP on port {}, REST on port {}",
