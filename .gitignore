@@ -11,3 +11,4 @@ tasks
 *.dll
 *.pdb
 *.pdb.lock
+tasks*
