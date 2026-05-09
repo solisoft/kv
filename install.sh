@@ -81,15 +81,24 @@ echo "Downloading checksums ${CHECKSUMS_URL} ..."
 fetch "$CHECKSUMS_URL" > "${TMP_DIR}/${CHECKSUMS_FILE}"
 
 # --- Verify checksum ---
-echo "Verifying checksums ..."
+# SHA256SUMS lists every release artifact (linux-amd64, darwin-arm64, ...).
+# Filter to just our tarball so verification doesn't fail on missing files
+# for other platforms. We require exactly one matching line.
+echo "Verifying checksum ..."
 cd "${TMP_DIR}"
+EXPECTED=$(grep -E "[[:space:]]\*?${TARBALL}\$" "${CHECKSUMS_FILE}" || true)
+if [ -z "$EXPECTED" ]; then
+  echo "Error: ${TARBALL} not found in ${CHECKSUMS_FILE}" >&2
+  exit 1
+fi
+echo "$EXPECTED" > "${CHECKSUMS_FILE}.filtered"
 if command -v sha256sum >/dev/null 2>&1; then
-  if ! sha256sum -c --strict "${CHECKSUMS_FILE}"; then
+  if ! sha256sum -c --strict "${CHECKSUMS_FILE}.filtered"; then
     echo "Error: checksum verification failed for ${TARBALL}" >&2
     exit 1
   fi
 elif command -v shasum >/dev/null 2>&1; then
-  if ! shasum -a 256 -c --strict "${CHECKSUMS_FILE}"; then
+  if ! shasum -a 256 -c --strict "${CHECKSUMS_FILE}.filtered"; then
     echo "Error: checksum verification failed for ${TARBALL}" >&2
     exit 1
   fi
