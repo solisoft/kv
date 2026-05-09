@@ -4,6 +4,13 @@ use std::path::Path;
 
 const MAX_AOF_BULK_LEN: usize = 512 * 1024 * 1024;
 
+// Commands rejected during AOF replay. The on-disk AOF is trusted only as
+// far as filesystem permissions go; an attacker who can write to the data
+// directory shouldn't be able to make us run scripting, server-control, or
+// data-migration commands at startup.
+//
+// Each entry is a single command name (no subcommand prefixes) — replay only
+// inspects args[0], so e.g. "SCRIPT LOAD" is matched as "SCRIPT".
 const AOF_BLOCKED_COMMANDS: &[&str] = &[
     "EVAL",
     "EVALSHA",
@@ -18,8 +25,6 @@ const AOF_BLOCKED_COMMANDS: &[&str] = &[
     "MIGRATE",
     "RESTORE",
     "MODULE",
-    "SCRIPT FLUSH",
-    "SCRIPT KILL",
 ];
 
 /// AOF fsync policy.
@@ -243,11 +248,7 @@ impl AofPersistence {
                     let cmd_upper = std::str::from_utf8(cmd)
                         .map(|s| s.to_uppercase())
                         .unwrap_or_default();
-                    let blocked = AOF_BLOCKED_COMMANDS.iter().any(|b| {
-                        b.split_whitespace().collect::<Vec<_>>()
-                            == cmd_upper.split_whitespace().collect::<Vec<_>>()
-                    });
-                    if blocked {
+                    if AOF_BLOCKED_COMMANDS.contains(&cmd_upper.as_str()) {
                         tracing::warn!("Skipping blocked command in AOF replay: {}", cmd_upper);
                         continue;
                     }
@@ -340,5 +341,55 @@ mod tests {
         let commands = AofPersistence::replay(&path).unwrap();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0][2], Bytes::from(b"hello\r\nworld".as_slice()));
+    }
+
+    // SEC-007: blocked commands must be skipped during replay.
+    #[test]
+    fn test_aof_replay_skips_blocked_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blocked.aof");
+
+        {
+            let mut aof = AofPersistence::new(&path, FsyncPolicy::Always).unwrap();
+            aof.append(&[Bytes::from("SET"), Bytes::from("ok"), Bytes::from("1")])
+                .unwrap();
+            aof.append(&[Bytes::from("EVAL"), Bytes::from("return 1"), Bytes::from("0")])
+                .unwrap();
+            aof.append(&[Bytes::from("FLUSHALL")]).unwrap();
+            aof.append(&[Bytes::from("SHUTDOWN")]).unwrap();
+            aof.append(&[Bytes::from("CLUSTER"), Bytes::from("RESET")])
+                .unwrap();
+            aof.append(&[Bytes::from("SET"), Bytes::from("ok2"), Bytes::from("2")])
+                .unwrap();
+        }
+
+        let commands = AofPersistence::replay(&path).unwrap();
+        // EVAL, SHUTDOWN, CLUSTER skipped (blocked); FLUSHALL is not on the
+        // AOF blocklist but still allowed today — see AOF_BLOCKED_COMMANDS.
+        let names: Vec<&[u8]> = commands.iter().map(|c| c[0].as_ref()).collect();
+        assert!(!names.contains(&b"EVAL".as_ref()));
+        assert!(!names.contains(&b"SHUTDOWN".as_ref()));
+        assert!(!names.contains(&b"CLUSTER".as_ref()));
+        assert!(names.contains(&b"SET".as_ref()));
+    }
+
+    // SEC-006: a forged AOF file declaring an over-large bulk length must
+    // abort replay rather than allocating gigabytes.
+    #[test]
+    fn test_aof_replay_rejects_oversized_bulk_length() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.aof");
+
+        // *2\r\n$3\r\nSET\r\n$<huge>\r\n... — replay should bail out without OOM.
+        let huge = MAX_AOF_BULK_LEN + 1;
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "*2\r\n$3\r\nSET\r\n${}\r\n", huge).unwrap();
+        // Don't even bother writing the body: the length check fires first.
+        drop(f);
+
+        let commands = AofPersistence::replay(&path).unwrap();
+        // Replay treats malformed/over-large entries as end-of-valid-stream.
+        assert!(commands.is_empty());
     }
 }

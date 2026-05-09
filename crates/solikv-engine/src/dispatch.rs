@@ -3753,3 +3753,103 @@ fn parse_score_bound(arg: &Bytes, default: f64) -> f64 {
         s.parse::<f64>().unwrap_or(default)
     }
 }
+
+#[cfg(test)]
+mod sec_tests {
+    use super::*;
+    use crate::ShardManager;
+    use solikv_pubsub::PubSubBroker;
+    use std::sync::Arc;
+
+    fn engine() -> Arc<CommandEngine> {
+        let shards = Arc::new(ShardManager::new(4));
+        let pubsub = Arc::new(PubSubBroker::new());
+        let engine = Arc::new(CommandEngine::new(shards, pubsub));
+        engine.init_self_ref(Arc::downgrade(&engine));
+        engine
+    }
+
+    fn err_string(resp: &CommandResponse) -> String {
+        match resp {
+            CommandResponse::Error(s) => s.clone(),
+            other => panic!("expected error, got {:?}", other),
+        }
+    }
+
+    // SEC-012: numkeys = usize::MAX must not panic the connection via
+    // wrapping `numkeys + 2`; the dispatcher returns a clean error.
+    #[test]
+    fn test_eval_numkeys_overflow_returns_error() {
+        let e = engine();
+        let resp = e.execute(
+            "EVAL",
+            &[
+                Bytes::from("return 1"),
+                Bytes::from(usize::MAX.to_string()),
+            ],
+        );
+        let msg = err_string(&resp);
+        assert!(
+            msg.contains("Number of keys"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_evalsha_numkeys_overflow_returns_error() {
+        let e = engine();
+        let resp = e.execute(
+            "EVALSHA",
+            &[
+                // SHA never matches anyway; the numkeys parse happens first
+                // only on EVAL. EVALSHA short-circuits on NOSCRIPT before the
+                // numkeys parse, so test EVAL specifically — but verify
+                // EVALSHA at least never panics on usize::MAX.
+                Bytes::from("0000000000000000000000000000000000000000"),
+                Bytes::from(usize::MAX.to_string()),
+            ],
+        );
+        // Either NOSCRIPT or "Number of keys" is acceptable; a panic is not.
+        let msg = err_string(&resp);
+        assert!(msg.contains("NOSCRIPT") || msg.contains("Number of keys"));
+    }
+
+    #[test]
+    fn test_zunionstore_numkeys_overflow_returns_error() {
+        let e = engine();
+        let resp = e.execute(
+            "ZUNIONSTORE",
+            &[
+                Bytes::from("dest"),
+                Bytes::from(usize::MAX.to_string()),
+                Bytes::from("src1"),
+            ],
+        );
+        let msg = err_string(&resp);
+        assert!(
+            msg.contains("Number of keys") || msg.to_lowercase().contains("arity"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_zinterstore_numkeys_overflow_returns_error() {
+        let e = engine();
+        let resp = e.execute(
+            "ZINTERSTORE",
+            &[
+                Bytes::from("dest"),
+                Bytes::from(usize::MAX.to_string()),
+                Bytes::from("src1"),
+            ],
+        );
+        let msg = err_string(&resp);
+        assert!(
+            msg.contains("Number of keys") || msg.to_lowercase().contains("arity"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+}

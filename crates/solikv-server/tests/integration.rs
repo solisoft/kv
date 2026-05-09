@@ -1309,7 +1309,7 @@ async fn start_full_server(port: u16) -> tokio::task::JoinHandle<()> {
 
     let addr = format!("127.0.0.1:{}", port);
     let handle = tokio::spawn(async move {
-        solikv_server::resp_server::run(&addr, engine, pubsub, None, None)
+        solikv_server::resp_server::run(&addr, engine, pubsub, None, None, None)
             .await
             .unwrap();
     });

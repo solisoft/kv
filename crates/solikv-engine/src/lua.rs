@@ -95,45 +95,106 @@ fn is_blocked_in_script(cmd: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// A pooled Lua VM tagged with its owning engine's identity.
+///
+/// `baseline_globals` is the set of global names present immediately after
+/// the VM has been sandboxed and the redis.* module installed. On reuse,
+/// any global key NOT in this snapshot is wiped — so a previous script
+/// cannot leak `_G.foo = 'secret'` or monkey-patch new entries onto the
+/// global table for the next script that lands on this thread (SEC-014).
+/// Mutations to the *contents* of pre-existing tables (e.g. replacing
+/// `string.upper`) are not protected by this; full isolation requires a
+/// fresh `_ENV`, which we reserve for a follow-up if it becomes load-bearing.
 struct PooledLua {
     lua: Lua,
     engine_id: usize,
+    baseline_globals: std::collections::HashSet<String>,
 }
 
 thread_local! {
     static LUA_POOL: RefCell<Vec<PooledLua>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Snapshot every key currently present on `_G`.
+fn snapshot_globals(lua: &Lua) -> std::collections::HashSet<String> {
+    let mut keys = std::collections::HashSet::new();
+    let globals = lua.globals();
+    for pair in globals.pairs::<LuaValue, LuaValue>().flatten() {
+        if let LuaValue::String(s) = pair.0 {
+            if let Ok(name) = s.to_str() {
+                keys.insert(name.to_string());
+            }
+        }
+    }
+    keys
+}
+
+/// Remove any global key not present in `baseline`.
+fn reset_globals_to(lua: &Lua, baseline: &std::collections::HashSet<String>) {
+    let globals = lua.globals();
+    let mut to_remove: Vec<String> = Vec::new();
+    for pair in globals.pairs::<LuaValue, LuaValue>().flatten() {
+        if let LuaValue::String(s) = pair.0 {
+            if let Ok(name) = s.to_str() {
+                let name: &str = &name;
+                if !baseline.contains(name) {
+                    to_remove.push(name.to_string());
+                }
+            }
+        }
+    }
+    for name in to_remove {
+        let _ = globals.set(name, LuaValue::Nil);
+    }
+}
+
 /// Take a pre-sandboxed Lua VM from the thread-local pool, or create a new one.
-fn take_lua(engine: &Arc<CommandEngine>) -> Lua {
+/// Returns the VM together with its baseline-global snapshot so the caller
+/// can return both to the pool when done.
+fn take_lua(engine: &Arc<CommandEngine>) -> (Lua, std::collections::HashSet<String>) {
     let engine_id = Arc::as_ptr(engine) as usize;
     let cached = LUA_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
         pool.iter()
             .rposition(|p| p.engine_id == engine_id)
-            .map(|idx| pool.swap_remove(idx).lua)
+            .map(|idx| {
+                let p = pool.swap_remove(idx);
+                (p.lua, p.baseline_globals)
+            })
     });
 
-    if let Some(lua) = cached {
+    if let Some((lua, baseline)) = cached {
+        // Re-apply sandbox + redis.* (defense in depth) and wipe any stray
+        // globals the previous script left behind.
+        reset_globals_to(&lua, &baseline);
         sandbox_lua(&lua);
         setup_redis_module(&lua, engine);
-        return lua;
+        return (lua, baseline);
     }
 
-    // Cold path: create, sandbox, and register redis.* once
+    // Cold path: create, sandbox, register redis.*, then snapshot the
+    // post-setup global key set.
     let lua = Lua::new();
     sandbox_lua(&lua);
     setup_redis_module(&lua, engine);
-    lua
+    let baseline = snapshot_globals(&lua);
+    (lua, baseline)
 }
 
-/// Return a Lua VM to the thread-local pool for reuse.
-fn return_lua(lua: Lua, engine: &Arc<CommandEngine>) {
+/// Return a Lua VM (with its baseline snapshot) to the thread-local pool.
+fn return_lua(
+    lua: Lua,
+    baseline: std::collections::HashSet<String>,
+    engine: &Arc<CommandEngine>,
+) {
     let engine_id = Arc::as_ptr(engine) as usize;
     LUA_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
         if pool.len() < LUA_POOL_MAX {
-            pool.push(PooledLua { lua, engine_id });
+            pool.push(PooledLua {
+                lua,
+                engine_id,
+                baseline_globals: baseline,
+            });
         }
         // else: drop the VM (pool full)
     });
@@ -152,7 +213,7 @@ pub fn execute_script(
     keys: Vec<Bytes>,
     argv: Vec<Bytes>,
 ) -> CommandResponse {
-    let lua = take_lua(engine);
+    let (lua, baseline) = take_lua(engine);
 
     // Set instruction limit to prevent infinite loops / DoS
     lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(10_000), {
@@ -183,7 +244,7 @@ pub fn execute_script(
     // Remove the hook before returning to pool
     lua.remove_hook();
 
-    return_lua(lua, engine);
+    return_lua(lua, baseline, engine);
     result
 }
 
@@ -741,6 +802,67 @@ mod tests {
         match resp {
             CommandResponse::Error(msg) => assert!(msg.starts_with("ERR")),
             other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    // SEC-014: a global set by one script must not be visible to a later
+    // script that lands on the same pooled VM.
+    #[test]
+    fn test_pooled_vm_globals_cleared_between_scripts() {
+        let shards = Arc::new(crate::ShardManager::new(4));
+        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
+        let engine = Arc::new(CommandEngine::new(shards, pubsub));
+        engine.init_self_ref(Arc::downgrade(&engine));
+
+        // Script 1: poison a global.
+        let r1 = execute_script(
+            &engine,
+            "_G.leaked_secret = 'badness'; return 1",
+            vec![],
+            vec![],
+        );
+        assert!(matches!(r1, CommandResponse::Integer(1)));
+
+        // Script 2: should observe a fresh global table — leaked_secret is gone.
+        let r2 = execute_script(
+            &engine,
+            "if _G.leaked_secret == nil then return 'clean' else return _G.leaked_secret end",
+            vec![],
+            vec![],
+        );
+        match r2 {
+            CommandResponse::BulkString(b) => assert_eq!(b.as_ref(), b"clean"),
+            other => panic!("expected BulkString('clean'), got {:?}", other),
+        }
+    }
+
+    // SEC-014: redis.* must be reinstalled on every VM reuse, so a script
+    // that overwrites redis.call cannot break the next script.
+    #[test]
+    fn test_pooled_vm_redis_module_restored() {
+        let shards = Arc::new(crate::ShardManager::new(4));
+        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
+        let engine = Arc::new(CommandEngine::new(shards, pubsub));
+        engine.init_self_ref(Arc::downgrade(&engine));
+
+        // Script 1: clobber redis.call.
+        let _ = execute_script(
+            &engine,
+            "redis.call = function() return 'pwned' end; return 1",
+            vec![],
+            vec![],
+        );
+
+        // Script 2: redis.call must work as expected.
+        let r = execute_script(
+            &engine,
+            "redis.call('SET', KEYS[1], ARGV[1]); return redis.call('GET', KEYS[1])",
+            vec![Bytes::from("k")],
+            vec![Bytes::from("v")],
+        );
+        match r {
+            CommandResponse::BulkString(b) => assert_eq!(b.as_ref(), b"v"),
+            other => panic!("expected BulkString('v'), got {:?}", other),
         }
     }
 }

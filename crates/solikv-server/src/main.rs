@@ -1,5 +1,5 @@
 use mimalloc::MiMalloc;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -142,13 +142,18 @@ async fn main() {
             if let Ok(pid_str) = fs::read_to_string(&pidfile) {
                 if let Ok(pid) = pid_str.trim().parse::<u32>() {
                     if pid > 0 {
-                        let exe_path = format!("/proc/{}/exe", pid);
-                        let current_exe = std::env::current_exe()
-                            .map(|p| p.into_os_string().into_string().unwrap_or_default())
-                            .unwrap_or_default();
-                        let is_solikv = fs::read_to_string(&exe_path)
-                            .map(|exe| exe.contains(&current_exe))
-                            .unwrap_or(false);
+                        // /proc/<pid>/exe is a symlink to the running binary.
+                        // Resolve both paths to canonical form before comparing
+                        // so we don't kill an unrelated PID that happens to be
+                        // recycled into the pidfile.
+                        let exe_path = PathBuf::from(format!("/proc/{}/exe", pid));
+                        let target = fs::read_link(&exe_path)
+                            .and_then(|p| p.canonicalize())
+                            .ok();
+                        let current = std::env::current_exe()
+                            .and_then(|p| p.canonicalize())
+                            .ok();
+                        let is_solikv = matches!((target, current), (Some(t), Some(c)) if t == c);
                         if is_solikv {
                             println!("Killing old solikv process (PID: {})...", pid);
                             let _ =
@@ -188,12 +193,14 @@ async fn main() {
     }
 
     let cluster_password: Option<String> = if let Some(file_path) = &args.cluster_password_file {
-        Some(
-            std::fs::read_to_string(file_path)
-                .expect("Failed to read cluster password file")
-                .trim()
-                .to_string(),
-        )
+        let pw = read_secret_file(file_path).unwrap_or_else(|e| {
+            eprintln!(
+                "ERROR: failed to read cluster password file {:?}: {}",
+                file_path, e
+            );
+            std::process::exit(1);
+        });
+        Some(pw)
     } else if let Some(pw) = &args.cluster_password {
         tracing::warn!("Cluster password via CLI flag is visible in /proc/cmdline. Consider using --cluster-password-file or SOLIKV_CLUSTER_PASSWORD env var.");
         Some(pw.clone())
@@ -281,12 +288,14 @@ async fn main() {
     };
 
     let password: Option<Arc<String>> = if let Some(file_path) = &args.requirepass_file {
-        let content = std::fs::read_to_string(file_path).expect("Failed to read password file");
-        let pw = content.trim_end_matches('\n').trim_end_matches('\r');
-        if file_path.metadata().map(|m| m.mode() & 0o777).unwrap_or(0) & 0o177 != 0 {
-            tracing::warn!("Password file has insecure permissions, recommend 0600");
-        }
-        Some(Arc::new(pw.to_string()))
+        let pw = read_secret_file(file_path).unwrap_or_else(|e| {
+            eprintln!(
+                "ERROR: failed to read password file {:?}: {}",
+                file_path, e
+            );
+            std::process::exit(1);
+        });
+        Some(Arc::new(pw))
     } else if let Some(pw) = &args.requirepass {
         tracing::warn!("Password supplied via CLI flag is visible in /proc/cmdline. Consider using --requirepass-file or SOLIKV_REQUIREPASS env var.");
         Some(Arc::new(pw.clone()))
@@ -634,4 +643,34 @@ fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
+}
+
+/// Read a secret from a file with hardening:
+/// - Open with O_NOFOLLOW so a symlink in place of the file is rejected.
+/// - Refuse if any group/world bit is set (mode must be ≤ 0o600).
+/// - Strip trailing whitespace/newlines, return the secret as a String.
+fn read_secret_file(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "secret file must be a regular file",
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "secret file permissions must be 0600 (no group/world access)",
+        ));
+    }
+
+    let mut buf = String::new();
+    f.read_to_string(&mut buf)?;
+    Ok(buf.trim_end_matches(['\n', '\r', ' ', '\t']).to_string())
 }

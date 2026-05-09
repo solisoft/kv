@@ -31,6 +31,7 @@ rustls = "0.23"
 tokio-rustls = "0.26"
 pem = "3"
 nix = { version = "0.27", features = ["process", "signal"] }
+libc = "0.2"
 
 [dev-dependencies]
 redis = { version = "0.27", features = ["tokio-comp"] }

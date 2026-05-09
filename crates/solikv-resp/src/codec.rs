@@ -131,13 +131,26 @@ pub const MAX_BULK_STRING_LEN: usize = 512 * 1024 * 1024;
 pub const MAX_ARRAY_LEN: usize = 1024 * 1024;
 
 /// Maximum pre-auth array elements (before user is authenticated).
-const MAX_UNAUTH_ARRAY_LEN: usize = 32;
+pub const MAX_UNAUTH_ARRAY_LEN: usize = 32;
 
 /// Maximum pre-auth bulk string length (before user is authenticated).
-const MAX_UNAUTH_BULK_LEN: usize = 64 * 1024;
+pub const MAX_UNAUTH_BULK_LEN: usize = 64 * 1024;
 
-/// Try to decode a frame from the buffer. Returns (frame, bytes_consumed) or None if incomplete.
+/// Try to decode a frame from an authenticated connection.
+/// Returns (frame, bytes_consumed) or None if incomplete.
 pub fn decode_frame(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
+    decode_frame_with_auth(src, true)
+}
+
+/// Try to decode a frame, applying tighter limits when the connection is
+/// not yet authenticated. An unauthenticated peer cannot declare arrays
+/// larger than `MAX_UNAUTH_ARRAY_LEN` or bulk strings larger than
+/// `MAX_UNAUTH_BULK_LEN`. This bounds the memory an attacker can force the
+/// server to allocate before completing AUTH.
+pub fn decode_frame_with_auth(
+    src: &[u8],
+    authenticated: bool,
+) -> Result<Option<(RespFrame, usize)>, String> {
     if src.is_empty() {
         return Ok(None);
     }
@@ -146,8 +159,8 @@ pub fn decode_frame(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
         b'+' => decode_simple_string(src),
         b'-' => decode_error(src),
         b':' => decode_integer(src),
-        b'$' => decode_bulk_string(src),
-        b'*' => decode_array(src),
+        b'$' => decode_bulk_string(src, authenticated),
+        b'*' => decode_array(src, authenticated),
         _ => {
             // Try inline command (plain text terminated by \r\n)
             decode_inline(src)
@@ -191,7 +204,7 @@ fn decode_integer(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
     }
 }
 
-fn decode_bulk_string(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
+fn decode_bulk_string(src: &[u8], authenticated: bool) -> Result<Option<(RespFrame, usize)>, String> {
     match find_crlf(&src[1..]) {
         None => Ok(None),
         Some(pos) => {
@@ -210,10 +223,15 @@ fn decode_bulk_string(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> 
             }
 
             let len = len as usize;
-            if len > MAX_BULK_STRING_LEN {
+            let max = if authenticated {
+                MAX_BULK_STRING_LEN
+            } else {
+                MAX_UNAUTH_BULK_LEN
+            };
+            if len > max {
                 return Err(format!(
                     "bulk string length {} exceeds maximum {}",
-                    len, MAX_BULK_STRING_LEN
+                    len, max
                 ));
             }
 
@@ -230,7 +248,7 @@ fn decode_bulk_string(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> 
     }
 }
 
-fn decode_array(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
+fn decode_array(src: &[u8], authenticated: bool) -> Result<Option<(RespFrame, usize)>, String> {
     match find_crlf(&src[1..]) {
         None => Ok(None),
         Some(pos) => {
@@ -249,18 +267,20 @@ fn decode_array(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
             }
 
             let count = count as usize;
-            if count > MAX_ARRAY_LEN {
-                return Err(format!(
-                    "array count {} exceeds maximum {}",
-                    count, MAX_ARRAY_LEN
-                ));
+            let max = if authenticated {
+                MAX_ARRAY_LEN
+            } else {
+                MAX_UNAUTH_ARRAY_LEN
+            };
+            if count > max {
+                return Err(format!("array count {} exceeds maximum {}", count, max));
             }
 
             let mut offset = 1 + pos + 2;
             let mut items = Vec::new();
 
             for _ in 0..count {
-                match decode_frame(&src[offset..])? {
+                match decode_frame_with_auth(&src[offset..], authenticated)? {
                     Some((frame, consumed)) => {
                         items.push(frame);
                         offset += consumed;
@@ -462,5 +482,84 @@ mod tests {
         let mut buf = BytesMut::new();
         codec.encode(RespFrame::ok(), &mut buf).unwrap();
         assert_eq!(&buf[..], b"+OK\r\n");
+    }
+
+    // SEC-013: an `*N\r\n` header with a huge N must NOT trigger a
+    // `Vec::with_capacity(N)` allocation. We verify this indirectly by
+    // sending a partial array — the decoder should return Ok(None)
+    // (incomplete) without panicking or hanging on a giant alloc.
+    #[test]
+    fn test_decode_array_huge_count_does_not_preallocate() {
+        let header = format!("*{}\r\n", MAX_ARRAY_LEN);
+        let result = decode_frame(header.as_bytes()).unwrap();
+        // Incomplete: header parses, but no elements present. The decoder
+        // must NOT have eagerly allocated MAX_ARRAY_LEN slots.
+        assert!(result.is_none(), "expected incomplete, got {:?}", result);
+    }
+
+    #[test]
+    fn test_decode_array_above_max_rejects() {
+        let header = format!("*{}\r\n", MAX_ARRAY_LEN + 1);
+        let err = decode_frame(header.as_bytes()).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("array"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_decode_bulk_above_max_rejects() {
+        let header = format!("${}\r\n", MAX_BULK_STRING_LEN + 1);
+        let err = decode_frame(header.as_bytes()).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("bulk"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    // SEC-013: unauthenticated connections cannot declare arrays beyond the
+    // tight pre-auth cap, even though the same payload is fine post-auth.
+    #[test]
+    fn test_decode_array_pre_auth_cap_rejects() {
+        let header = format!("*{}\r\n", MAX_UNAUTH_ARRAY_LEN + 1);
+        let err = decode_frame_with_auth(header.as_bytes(), false).unwrap_err();
+        assert!(err.contains("array"), "unexpected error: {}", err);
+
+        // Same payload with authenticated=true must NOT trip the limit.
+        let res = decode_frame_with_auth(header.as_bytes(), true).unwrap();
+        assert!(res.is_none(), "post-auth: expected incomplete, got {:?}", res);
+    }
+
+    #[test]
+    fn test_decode_bulk_pre_auth_cap_rejects() {
+        let header = format!("${}\r\n", MAX_UNAUTH_BULK_LEN + 1);
+        let err = decode_frame_with_auth(header.as_bytes(), false).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("bulk"),
+            "unexpected error: {}",
+            err
+        );
+
+        // Same payload with authenticated=true is below MAX_BULK_STRING_LEN
+        // and should be accepted (returns Ok(None) — needs more data).
+        let res = decode_frame_with_auth(header.as_bytes(), true).unwrap();
+        assert!(res.is_none(), "post-auth: expected incomplete, got {:?}", res);
+    }
+
+    // Bulk inside an array also gets the pre-auth cap (recursion).
+    #[test]
+    fn test_decode_array_with_oversized_bulk_pre_auth_rejects() {
+        // *2\r\n$<huge>\r\n... — the bulk inside the array must trip the cap.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"*2\r\n");
+        buf.extend_from_slice(format!("${}\r\n", MAX_UNAUTH_BULK_LEN + 1).as_bytes());
+        let err = decode_frame_with_auth(&buf, false).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("bulk"),
+            "unexpected error: {}",
+            err
+        );
     }
 }

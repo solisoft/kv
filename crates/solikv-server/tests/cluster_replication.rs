@@ -34,7 +34,7 @@ async fn start_cluster_server(port: u16) -> tokio::task::JoinHandle<()> {
 
     let addr = format!("127.0.0.1:{}", port);
     let handle = tokio::spawn(async move {
-        solikv_server::resp_server::run(&addr, engine, pubsub, None, None)
+        solikv_server::resp_server::run(&addr, engine, pubsub, None, None, None)
             .await
             .unwrap();
     });
@@ -59,7 +59,7 @@ async fn start_replication_server(port: u16) -> tokio::task::JoinHandle<()> {
 
     let addr = format!("127.0.0.1:{}", port);
     let handle = tokio::spawn(async move {
-        solikv_server::resp_server::run(&addr, engine, pubsub, None, None)
+        solikv_server::resp_server::run(&addr, engine, pubsub, None, None, None)
             .await
             .unwrap();
     });

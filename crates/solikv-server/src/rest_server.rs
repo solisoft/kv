@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::StatusCode,
     middleware::Next,
     response::Json,
@@ -10,6 +10,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 #[allow(unused_imports)]
 use serde::Serialize;
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
 use solikv_core::CommandResponse;
@@ -122,20 +123,21 @@ pub async fn run(
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("REST API listening on {}", addr);
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
 async fn auth_middleware(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request,
     next: Next,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
-    let ip = req
-        .extensions()
-        .get::<std::net::SocketAddr>()
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let ip = peer.ip().to_string();
 
     if state.auth_tracker.is_blocked(&ip) {
         tracing::warn!("REST AUTH blocked for {} (too many failures)", ip);
@@ -521,6 +523,21 @@ const REST_BLOCKED_COMMANDS: &[&str] = &[
     "RESTORE",
     "OBJECT",
     "SAVE",
+    "KEYS",
+    "SCAN",
+    "HSCAN",
+    "ZSCAN",
+    "SSCAN",
+    "RENAME",
+    "RENAMENX",
+    "RESET",
+    "LATENCY",
+    "MEMORY",
+    "WAIT",
+    "FAILOVER",
+    "CLIENT",
+    "INFO",
+    "DBSIZE",
 ];
 
 async fn execute_command(

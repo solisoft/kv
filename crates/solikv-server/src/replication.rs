@@ -5,6 +5,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
 
+// SECURITY NOTE (SEC-016): When wiring up replication:
+// - Add AUTH handshake to connect_to_master before replicating commands
+// - Add TLS support to replica->master connections
+// - Sign replicate_command payloads with HMAC-SHA-256
+// - Verify HMAC on master side before applying replicated commands
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReplicationRole {
     Master,

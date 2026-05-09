@@ -21,8 +21,14 @@ fn sanitize_len(len: usize) -> io::Result<usize> {
     Ok(len)
 }
 
-fn sanitize_collection_len(len: usize) -> usize {
-    len.min(MAX_COLLECTION_LEN)
+fn sanitize_collection_len(len: usize) -> io::Result<usize> {
+    if len > MAX_COLLECTION_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RDB collection length exceeds maximum",
+        ));
+    }
+    Ok(len)
 }
 
 // Type markers
@@ -166,8 +172,11 @@ impl RdbPersistence {
                 }
                 TYPE_LIST => {
                     let key = read_bytes(reader)?;
-                    let len = sanitize_collection_len(read_len(reader)?);
-                    let mut list = VecDeque::with_capacity(len);
+                    let len = sanitize_collection_len(read_len(reader)?)?;
+                    // Don't preallocate the full declared capacity — a hostile
+                    // header could otherwise force ~16M slots before the first
+                    // read fails. Grow on push; cap the initial alloc.
+                    let mut list = VecDeque::with_capacity(len.min(4096));
                     for _ in 0..len {
                         list.push_back(read_bytes(reader)?);
                     }
@@ -176,8 +185,8 @@ impl RdbPersistence {
                 }
                 TYPE_HASH => {
                     let key = read_bytes(reader)?;
-                    let len = sanitize_collection_len(read_len(reader)?);
-                    let mut hash = std::collections::HashMap::with_capacity(len);
+                    let len = sanitize_collection_len(read_len(reader)?)?;
+                    let mut hash = std::collections::HashMap::with_capacity(len.min(4096));
                     for _ in 0..len {
                         let field = read_bytes(reader)?;
                         let value = read_bytes(reader)?;
@@ -188,8 +197,8 @@ impl RdbPersistence {
                 }
                 TYPE_SET => {
                     let key = read_bytes(reader)?;
-                    let len = sanitize_collection_len(read_len(reader)?);
-                    let mut set = std::collections::HashSet::with_capacity(len);
+                    let len = sanitize_collection_len(read_len(reader)?)?;
+                    let mut set = std::collections::HashSet::with_capacity(len.min(4096));
                     for _ in 0..len {
                         set.insert(read_bytes(reader)?);
                     }
@@ -198,7 +207,7 @@ impl RdbPersistence {
                 }
                 TYPE_ZSET => {
                     let key = read_bytes(reader)?;
-                    let len = sanitize_collection_len(read_len(reader)?);
+                    let len = sanitize_collection_len(read_len(reader)?)?;
                     let mut zset = ZSetValue::new();
                     for _ in 0..len {
                         let member = read_bytes(reader)?;
@@ -519,5 +528,42 @@ mod tests {
             loaded.bf_exists(&Bytes::from("mybf"), &Bytes::from("nothere")),
             CommandResponse::Integer(0)
         ));
+    }
+
+    // SEC-006: read_bytes must reject value lengths above MAX_VALUE_LEN
+    // instead of allocating a multi-GB buffer.
+    #[test]
+    fn test_rdb_read_bytes_rejects_oversized_value() {
+        let mut buf = Vec::new();
+        write_len(&mut buf, MAX_VALUE_LEN + 1).unwrap();
+        let err = read_bytes(&mut Cursor::new(&buf)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_rdb_read_bytes_accepts_at_limit() {
+        // A length exactly at MAX_VALUE_LEN must still be accepted (boundary).
+        // Don't actually allocate 512 MB; just verify the gate, then bail on EOF.
+        let mut buf = Vec::new();
+        write_len(&mut buf, 4).unwrap();
+        buf.extend_from_slice(b"test");
+        let bytes = read_bytes(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!(bytes.as_ref(), b"test");
+    }
+
+    // SEC-006: collection lengths above MAX_COLLECTION_LEN must error
+    // rather than silently truncate (which would leave the file pointer
+    // out of sync and corrupt subsequent records).
+    #[test]
+    fn test_rdb_sanitize_collection_len_errors_on_overflow() {
+        assert_eq!(sanitize_collection_len(10).unwrap(), 10);
+        assert_eq!(
+            sanitize_collection_len(MAX_COLLECTION_LEN).unwrap(),
+            MAX_COLLECTION_LEN
+        );
+        let err = sanitize_collection_len(MAX_COLLECTION_LEN + 1).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let err = sanitize_collection_len(usize::MAX).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

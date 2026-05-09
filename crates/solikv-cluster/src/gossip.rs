@@ -5,6 +5,13 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+// SECURITY NOTE (SEC-016): When wiring up gossip server and replication:
+// - Add HMAC-SHA-256 signing to all gossip frames with a cluster-bus-secret
+// - Verify HMAC on receive and drop unverifiable messages
+// - Add TLS support to cluster bus and replica->master connections
+// - Reject UPDATE messages whose node_id differs from sender's verified identity
+// - Add per-connection auth handshake before accepting bus traffic
+
 pub const CLUSTER_BUS_PORT_OFFSET: u16 = 10000;
 
 #[derive(Debug, Clone, PartialEq)]

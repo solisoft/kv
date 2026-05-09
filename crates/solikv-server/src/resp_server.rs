@@ -15,7 +15,7 @@ trait AsyncSocket: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncSocket for T {}
 use solikv_pubsub::{PubSubBroker, PubSubMessage};
-use solikv_resp::codec::{decode_frame, encode_frame, RespFrame};
+use solikv_resp::codec::{decode_frame, decode_frame_with_auth, encode_frame, RespFrame};
 use solikv_resp::connection::ClientConnection;
 use solikv_resp::parser::ParsedCommand;
 
@@ -97,6 +97,10 @@ pub async fn run(
             }
         };
 
+        // TCP_NODELAY: disable Nagle's algorithm for lower latency. Set on
+        // the underlying TcpStream before any TLS wrap.
+        let _ = socket.set_nodelay(true);
+
         let engine = engine.clone();
         let pubsub = pubsub.clone();
         let password = password.clone();
@@ -152,9 +156,13 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
     loop {
         // ── Phase 1: Decode all complete frames from buffer ──
+        // Apply tighter pre-auth limits until the connection has AUTHed:
+        // a not-yet-authenticated peer cannot force the server to allocate
+        // arrays larger than MAX_UNAUTH_ARRAY_LEN or bulks larger than
+        // MAX_UNAUTH_BULK_LEN. (SEC-013)
         let mut frames = Vec::new();
         loop {
-            match decode_frame(&read_buf) {
+            match decode_frame_with_auth(&read_buf, conn.authenticated) {
                 Ok(Some((frame, consumed))) => {
                     read_buf.advance(consumed);
                     frames.push(frame);
