@@ -9,6 +9,7 @@ members = [
     "crates/solikv-cluster",
     "crates/solikv-replication",
     "crates/solikv-pubsub",
+    "crates/solikv-ffi",
 ]
 
 [workspace.dependencies]
