@@ -147,12 +147,8 @@ async fn main() {
                         // so we don't kill an unrelated PID that happens to be
                         // recycled into the pidfile.
                         let exe_path = PathBuf::from(format!("/proc/{}/exe", pid));
-                        let target = fs::read_link(&exe_path)
-                            .and_then(|p| p.canonicalize())
-                            .ok();
-                        let current = std::env::current_exe()
-                            .and_then(|p| p.canonicalize())
-                            .ok();
+                        let target = fs::read_link(&exe_path).and_then(|p| p.canonicalize()).ok();
+                        let current = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
                         let is_solikv = matches!((target, current), (Some(t), Some(c)) if t == c);
                         if is_solikv {
                             println!("Killing old solikv process (PID: {})...", pid);
@@ -287,10 +283,7 @@ async fn main() {
 
     let password: Option<Arc<String>> = if let Some(file_path) = &args.requirepass_file {
         let pw = read_secret_file(file_path).unwrap_or_else(|e| {
-            eprintln!(
-                "ERROR: failed to read password file {:?}: {}",
-                file_path, e
-            );
+            eprintln!("ERROR: failed to read password file {:?}: {}", file_path, e);
             std::process::exit(1);
         });
         Some(Arc::new(pw))

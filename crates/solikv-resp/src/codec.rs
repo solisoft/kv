@@ -204,7 +204,10 @@ fn decode_integer(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
     }
 }
 
-fn decode_bulk_string(src: &[u8], authenticated: bool) -> Result<Option<(RespFrame, usize)>, String> {
+fn decode_bulk_string(
+    src: &[u8],
+    authenticated: bool,
+) -> Result<Option<(RespFrame, usize)>, String> {
     match find_crlf(&src[1..]) {
         None => Ok(None),
         Some(pos) => {
@@ -529,7 +532,11 @@ mod tests {
 
         // Same payload with authenticated=true must NOT trip the limit.
         let res = decode_frame_with_auth(header.as_bytes(), true).unwrap();
-        assert!(res.is_none(), "post-auth: expected incomplete, got {:?}", res);
+        assert!(
+            res.is_none(),
+            "post-auth: expected incomplete, got {:?}",
+            res
+        );
     }
 
     #[test]
@@ -545,7 +552,11 @@ mod tests {
         // Same payload with authenticated=true is below MAX_BULK_STRING_LEN
         // and should be accepted (returns Ok(None) — needs more data).
         let res = decode_frame_with_auth(header.as_bytes(), true).unwrap();
-        assert!(res.is_none(), "post-auth: expected incomplete, got {:?}", res);
+        assert!(
+            res.is_none(),
+            "post-auth: expected incomplete, got {:?}",
+            res
+        );
     }
 
     // Bulk inside an array also gets the pre-auth cap (recursion).

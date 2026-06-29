@@ -3775,17 +3775,10 @@ mod sec_tests {
         let e = engine();
         let resp = e.execute(
             "EVAL",
-            &[
-                Bytes::from("return 1"),
-                Bytes::from(usize::MAX.to_string()),
-            ],
+            &[Bytes::from("return 1"), Bytes::from(usize::MAX.to_string())],
         );
         let msg = err_string(&resp);
-        assert!(
-            msg.contains("Number of keys"),
-            "unexpected error: {}",
-            msg
-        );
+        assert!(msg.contains("Number of keys"), "unexpected error: {}", msg);
     }
 
     #[test]

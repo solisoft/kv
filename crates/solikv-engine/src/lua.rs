@@ -181,11 +181,7 @@ fn take_lua(engine: &Arc<CommandEngine>) -> (Lua, std::collections::HashSet<Stri
 }
 
 /// Return a Lua VM (with its baseline snapshot) to the thread-local pool.
-fn return_lua(
-    lua: Lua,
-    baseline: std::collections::HashSet<String>,
-    engine: &Arc<CommandEngine>,
-) {
+fn return_lua(lua: Lua, baseline: std::collections::HashSet<String>, engine: &Arc<CommandEngine>) {
     let engine_id = Arc::as_ptr(engine) as usize;
     LUA_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();

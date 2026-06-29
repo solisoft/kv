@@ -353,8 +353,12 @@ mod tests {
             let mut aof = AofPersistence::new(&path, FsyncPolicy::Always).unwrap();
             aof.append(&[Bytes::from("SET"), Bytes::from("ok"), Bytes::from("1")])
                 .unwrap();
-            aof.append(&[Bytes::from("EVAL"), Bytes::from("return 1"), Bytes::from("0")])
-                .unwrap();
+            aof.append(&[
+                Bytes::from("EVAL"),
+                Bytes::from("return 1"),
+                Bytes::from("0"),
+            ])
+            .unwrap();
             aof.append(&[Bytes::from("FLUSHALL")]).unwrap();
             aof.append(&[Bytes::from("SHUTDOWN")]).unwrap();
             aof.append(&[Bytes::from("CLUSTER"), Bytes::from("RESET")])
