@@ -322,11 +322,9 @@ impl CommandEngine {
                     self.notify_keyspace_event(NOTIFY_GENERIC, "persist", key);
                 }
             }
-            "RENAME" | "RENAMENX" => {
-                if args.len() >= 2 {
-                    self.notify_keyspace_event(NOTIFY_GENERIC, "rename_from", &args[0]);
-                    self.notify_keyspace_event(NOTIFY_GENERIC, "rename_to", &args[1]);
-                }
+            "RENAME" | "RENAMENX" if args.len() >= 2 => {
+                self.notify_keyspace_event(NOTIFY_GENERIC, "rename_from", &args[0]);
+                self.notify_keyspace_event(NOTIFY_GENERIC, "rename_to", &args[1]);
             }
 
             // List commands → l flag
@@ -387,11 +385,9 @@ impl CommandEngine {
                     self.notify_keyspace_event(NOTIFY_SET, "spop", key);
                 }
             }
-            "SMOVE" => {
-                if args.len() >= 2 {
-                    self.notify_keyspace_event(NOTIFY_SET, "srem", &args[0]);
-                    self.notify_keyspace_event(NOTIFY_SET, "sadd", &args[1]);
-                }
+            "SMOVE" if args.len() >= 2 => {
+                self.notify_keyspace_event(NOTIFY_SET, "srem", &args[0]);
+                self.notify_keyspace_event(NOTIFY_SET, "sadd", &args[1]);
             }
 
             // Hash commands → h flag
@@ -484,11 +480,9 @@ impl CommandEngine {
                     self.notify_keyspace_event(NOTIFY_STREAM, "xtrim", key);
                 }
             }
-            "XGROUP" => {
-                // The key is the second argument (after CREATE/DESTROY/etc.)
-                if args.len() >= 2 {
-                    self.notify_keyspace_event(NOTIFY_STREAM, "xgroup-create", &args[1]);
-                }
+            // The key is the second argument (after CREATE/DESTROY/etc.)
+            "XGROUP" if args.len() >= 2 => {
+                self.notify_keyspace_event(NOTIFY_STREAM, "xgroup-create", &args[1]);
             }
 
             // Bitmap commands → $ flag
@@ -497,10 +491,8 @@ impl CommandEngine {
                     self.notify_keyspace_event(NOTIFY_STRING, "setbit", key);
                 }
             }
-            "BITOP" => {
-                if args.len() >= 2 {
-                    self.notify_keyspace_event(NOTIFY_STRING, "bitop", &args[1]);
-                }
+            "BITOP" if args.len() >= 2 => {
+                self.notify_keyspace_event(NOTIFY_STRING, "bitop", &args[1]);
             }
 
             // HyperLogLog commands → $ flag

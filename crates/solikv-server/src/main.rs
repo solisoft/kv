@@ -204,10 +204,8 @@ async fn main() {
     } else if let Some(pw) = &args.cluster_password {
         tracing::warn!("Cluster password via CLI flag is visible in /proc/cmdline. Consider using --cluster-password-file or SOLIKV_CLUSTER_PASSWORD env var.");
         Some(pw.clone())
-    } else if let Ok(env_pw) = std::env::var("SOLIKV_CLUSTER_PASSWORD") {
-        Some(env_pw)
     } else {
-        None
+        std::env::var("SOLIKV_CLUSTER_PASSWORD").ok()
     };
 
     // Handle cluster dump/restore operations (run standalone, don't start server)
@@ -326,8 +324,7 @@ async fn main() {
                 .collect();
             let key_der = keys
                 .iter()
-                .filter(|p| p.tag() == "PRIVATE KEY")
-                .next()
+                .find(|p| p.tag() == "PRIVATE KEY")
                 .expect("No private key found")
                 .contents()
                 .to_vec();

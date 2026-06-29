@@ -1338,14 +1338,9 @@ async fn send_raw_command(stream: &mut TcpStream, args: &[&str]) -> Vec<RespFram
     sleep(Duration::from_millis(50)).await;
     let _ = tokio::time::timeout(Duration::from_millis(200), stream.read_buf(&mut read_buf)).await;
 
-    loop {
-        match decode_frame(&read_buf) {
-            Ok(Some((frame, consumed))) => {
-                read_buf.advance(consumed);
-                responses.push(frame);
-            }
-            _ => break,
-        }
+    while let Ok(Some((frame, consumed))) = decode_frame(&read_buf) {
+        read_buf.advance(consumed);
+        responses.push(frame);
     }
     responses
 }
@@ -1361,14 +1356,9 @@ async fn read_frames(stream: &mut TcpStream, timeout_ms: u64) -> Vec<RespFrame> 
     )
     .await;
 
-    loop {
-        match decode_frame(&read_buf) {
-            Ok(Some((frame, consumed))) => {
-                read_buf.advance(consumed);
-                responses.push(frame);
-            }
-            _ => break,
-        }
+    while let Ok(Some((frame, consumed))) = decode_frame(&read_buf) {
+        read_buf.advance(consumed);
+        responses.push(frame);
     }
     responses
 }

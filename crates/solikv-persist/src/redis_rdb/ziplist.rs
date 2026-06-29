@@ -321,12 +321,13 @@ mod tests {
     #[test]
     fn test_ziplist_inline_int() {
         // Build ziplist with inline integers 0 (0xF1) and 12 (0xFD)
-        let mut body = Vec::new();
-        body.push(0); // prevlen
-        body.push(0xF1); // inline 0
-        body.push(1); // prevlen of previous entry (1 byte for prevlen + 1 byte for encoding)
-        body.push(0xFD); // inline 12
-        body.push(0xFF); // end
+        let body = vec![
+            0u8,  // prevlen
+            0xF1, // inline 0
+            1,    // prevlen of previous entry (1 byte for prevlen + 1 byte for encoding)
+            0xFD, // inline 12
+            0xFF, // end
+        ];
 
         let total_len = 10 + body.len();
         let mut data = Vec::new();

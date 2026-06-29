@@ -674,11 +674,11 @@ mod tests {
 
             // Type + key + value
             buf.push(entry.type_code);
-            write_rdb_string(&mut buf, &entry.key);
+            write_rdb_string(&mut buf, entry.key);
 
             match entry.type_code {
                 TYPE_STRING => {
-                    write_rdb_string(&mut buf, entry.string_val.as_deref().unwrap());
+                    write_rdb_string(&mut buf, entry.string_val.unwrap());
                 }
                 TYPE_LIST => {
                     let items = entry.list_val.as_ref().unwrap();

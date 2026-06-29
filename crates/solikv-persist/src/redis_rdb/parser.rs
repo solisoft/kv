@@ -382,10 +382,10 @@ mod tests {
 
     #[test]
     fn test_read_binary_f64() {
-        let val: f64 = 3.14;
+        let val: f64 = 3.5;
         let data = val.to_le_bytes();
         let mut reader = RdbReader::new(Cursor::new(data.as_slice()));
         let result = reader.read_binary_f64().unwrap();
-        assert!((result - 3.14).abs() < f64::EPSILON);
+        assert!((result - 3.5).abs() < f64::EPSILON);
     }
 }

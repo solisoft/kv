@@ -583,9 +583,10 @@ pub fn dump_cluster(
     }
 
     tracing::info!(
-        "Cluster dump complete: {} keys from {} nodes",
+        "Cluster dump complete: {} keys from {} nodes ({} failed)",
         all_data.len(),
-        success_nodes
+        success_nodes,
+        failed_nodes
     );
     Ok((all_data.len(), success_nodes))
 }
@@ -779,7 +780,7 @@ mod tests {
 
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_id, "abc123");
-        assert_eq!(nodes[0].ip.contains("127.0.0.1"), true);
+        assert!(nodes[0].ip.contains("127.0.0.1"));
         assert!(nodes[0].port > 0);
     }
 
@@ -800,7 +801,7 @@ mod tests {
         let nodes = parse_cluster_nodes(output);
 
         assert_eq!(nodes.len(), 1);
-        assert!(nodes[0].slots.len() >= 1);
+        assert!(!nodes[0].slots.is_empty());
     }
 
     #[test]
@@ -809,7 +810,7 @@ mod tests {
         let nodes = parse_cluster_nodes(output);
 
         assert_eq!(nodes.len(), 1);
-        assert!(nodes[0].slots.len() >= 1);
+        assert!(!nodes[0].slots.is_empty());
     }
 
     #[test]
@@ -920,7 +921,7 @@ mod tests {
         let resp = "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n";
         let result = parse_list_value(resp);
         let arr = result.as_array().unwrap();
-        assert!(arr.len() >= 1);
+        assert!(!arr.is_empty());
     }
 
     #[test]
@@ -935,7 +936,7 @@ mod tests {
         let resp = "*2\r\n$3\r\none\r\n$3\r\ntwo\r\n";
         let result = parse_set_value(resp);
         let arr = result.as_array().unwrap();
-        assert!(arr.len() >= 1);
+        assert!(!arr.is_empty());
     }
 
     #[test]
@@ -944,7 +945,7 @@ mod tests {
         let result = parse_hash_value(resp);
         match result {
             serde_json::Value::Object(map) => {
-                assert!(map.len() >= 1);
+                assert!(!map.is_empty());
             }
             _ => panic!("Expected object"),
         }

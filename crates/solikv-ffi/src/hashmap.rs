@@ -36,17 +36,8 @@ impl HashMap {
             if !self.used[idx] {
                 return None;
             }
-            if self.key_lens[idx] == key.len() {
-                let mut match_ = true;
-                for j in 0..key.len() {
-                    if self.keys[idx][j] != key[j] {
-                        match_ = false;
-                        break;
-                    }
-                }
-                if match_ {
-                    return Some(idx);
-                }
+            if self.key_lens[idx] == key.len() && self.keys[idx][..key.len()] == *key {
+                return Some(idx);
             }
             idx = (idx + 1) % CAPACITY;
             if idx == start {
@@ -56,12 +47,7 @@ impl HashMap {
     }
 
     fn empty_slot(&self) -> Option<usize> {
-        for i in 0..CAPACITY {
-            if !self.used[i] {
-                return Some(i);
-            }
-        }
-        None
+        (0..CAPACITY).find(|&i| !self.used[i])
     }
 
     pub fn set(&mut self, key: &[u8], value: &[u8]) {

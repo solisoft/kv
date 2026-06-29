@@ -5,12 +5,10 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Buf, BytesMut};
+use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
-
-use redis::AsyncCommands;
 
 // Port allocation
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(17000);
@@ -138,7 +136,7 @@ async fn test_replicaof_no_one() {
     assert!(!role.is_empty());
 
     // Replicaof NO ONE - should succeed
-    let result: redis::RedisResult<String> = redis::cmd("REPLICAOF")
+    let _result: redis::RedisResult<String> = redis::cmd("REPLICAOF")
         .arg("NO")
         .arg("ONE")
         .query_async(&mut con)
