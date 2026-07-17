@@ -34,9 +34,14 @@ struct Args {
     #[arg(long, default_value = "5020")]
     rest_port: u16,
 
-    /// Number of shards (0 = number of CPU cores)
+    /// Number of shards (0 = number of CPU cores). Ignored when --solo is set.
     #[arg(long, default_value = "0")]
     shards: usize,
+
+    /// Solo mode: Redis-shaped single-threaded engine (1 shard, no mutex).
+    /// Best for single-core / classic redis-benchmark fights. Uses one Tokio worker.
+    #[arg(long, default_value_t = false)]
+    solo: bool,
 
     /// Bind address
     #[arg(long, default_value = "0.0.0.0")]
@@ -131,10 +136,33 @@ struct Args {
     cluster_password_seed_only: bool,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let args = Args::parse();
 
+    if args.solo && args.cluster_enabled {
+        eprintln!("ERROR: --solo is incompatible with --cluster-enabled");
+        std::process::exit(1);
+    }
+
+    // Solo mode pins the whole server to one OS worker thread so the unlocked
+    // store is only ever touched by a single thread (Redis-shaped).
+    let mut builder = if args.solo {
+        let mut b = tokio::runtime::Builder::new_multi_thread();
+        b.worker_threads(1).thread_name("solikv-solo");
+        b
+    } else {
+        let mut b = tokio::runtime::Builder::new_multi_thread();
+        b.thread_name("solikv");
+        b
+    };
+    let rt = builder
+        .enable_all()
+        .build()
+        .expect("failed to build Tokio runtime");
+    rt.block_on(async_main(args));
+}
+
+async fn async_main(args: Args) {
     let pidfile = args.dir.join("solikv.pid");
 
     if args.daemon {
@@ -269,7 +297,9 @@ async fn main() {
         )
         .init();
 
-    let num_shards = if args.shards == 0 {
+    let num_shards = if args.solo {
+        1
+    } else if args.shards == 0 {
         num_cpus().max(1)
     } else {
         args.shards
@@ -336,12 +366,20 @@ async fn main() {
         }
     };
 
-    tracing::info!(
-        "SoliKV starting with {} shards, RESP on port {}, REST on port {}",
-        num_shards,
-        args.port,
-        args.rest_port
-    );
+    if args.solo {
+        tracing::info!(
+            "SoliKV starting in SOLO mode (1 shard, no mutex, 1 worker), RESP on port {}, REST on port {}",
+            args.port,
+            args.rest_port
+        );
+    } else {
+        tracing::info!(
+            "SoliKV starting with {} shards, RESP on port {}, REST on port {}",
+            num_shards,
+            args.port,
+            args.rest_port
+        );
+    }
     if password.is_some() {
         tracing::info!("Authentication enabled");
     } else {
@@ -408,12 +446,17 @@ async fn main() {
         );
     }
 
-    // Create shards with notification context (pubsub + flags) for expiry notifications
-    let shards = Arc::new(solikv_engine::ShardManager::with_notifications(
-        num_shards,
-        pubsub.clone(),
-        notify_flags.clone(),
-    ));
+    // Create shards with notification context (pubsub + flags) for expiry notifications.
+    // Solo mode: unlocked single shard (Redis-shaped hot path).
+    let shards = Arc::new(if args.solo {
+        solikv_engine::ShardManager::solo(pubsub.clone(), notify_flags.clone())
+    } else {
+        solikv_engine::ShardManager::with_notifications(
+            num_shards,
+            pubsub.clone(),
+            notify_flags.clone(),
+        )
+    });
 
     // --- Import Redis RDB if requested ---
     if let Some(ref redis_rdb_path) = args.import_redis_rdb {

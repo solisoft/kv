@@ -5,6 +5,7 @@ use crate::types::*;
 
 impl ShardStore {
     // ---- GET ----
+    #[inline]
     pub fn string_get(&mut self, key: &Bytes) -> CommandResponse {
         match self.get(key) {
             None => CommandResponse::nil(),
@@ -26,6 +27,12 @@ impl ShardStore {
         xx: bool,
         get: bool,
     ) -> CommandResponse {
+        // Fast path: plain SET (redis-benchmark default) — no NX/XX/GET, no extra lookups.
+        if !nx && !xx && !get {
+            self.set(key, RedisValue::String(value), expire_ms);
+            return CommandResponse::ok();
+        }
+
         let old = if get {
             match self.get(&key) {
                 Some(entry) => match &entry.value {

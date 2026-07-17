@@ -205,9 +205,16 @@ impl CommandEngine {
     pub fn execute(&self, name: &str, args: &[Bytes]) -> CommandResponse {
         let response = self.dispatch(name, args);
 
-        // AOF: log write commands that succeeded (lock-free channel send)
-        if let Some(aof) = &self.aof {
-            if !response.is_error() {
+        if response.is_error() {
+            return response;
+        }
+
+        // Single write-classification check (used for AOF + replication offset).
+        let write = is_write_command(name);
+
+        // AOF: log write commands that succeeded (channel send, backpressured).
+        if write {
+            if let Some(aof) = &self.aof {
                 if name == "EVALSHA" {
                     // Convert EVALSHA to EVAL in AOF so replay works without script cache
                     if let Some(sha) = args.first() {
@@ -218,21 +225,15 @@ impl CommandEngine {
                             aof.log("EVAL", &eval_args);
                         }
                     }
-                } else if is_write_command(name) {
+                } else {
                     aof.log(name, args);
                 }
             }
-        }
-
-        // Replication: increment offset on successful write commands
-        if !response.is_error() && is_write_command(name) {
             self.replication_offset.fetch_add(1, Ordering::Relaxed);
         }
 
-        // Keyspace notifications: emit after successful write commands
-        if !response.is_error() {
-            self.emit_notifications(name, args, &response);
-        }
+        // Keyspace notifications (zero-cost when flags == 0).
+        self.emit_notifications(name, args, &response);
 
         response
     }
@@ -635,16 +636,19 @@ impl CommandEngine {
                 CommandResponse::integer(total)
             }
             "FLUSHDB" | "FLUSHALL" => {
-                let shards = self.shards.clone();
-                let num = shards.num_shards();
-                for i in 0..num {
-                    let shard = shards.shard(i).clone();
-                    shard.execute(|store| {
-                        store.flush();
-                        CommandResponse::ok()
-                    });
-                }
-                CommandResponse::ok()
+                // Heavy: release the async worker while we lock every shard.
+                maybe_block_in_place(|| {
+                    let shards = self.shards.clone();
+                    let num = shards.num_shards();
+                    for i in 0..num {
+                        let shard = shards.shard(i).clone();
+                        shard.execute(|store| {
+                            store.flush();
+                            CommandResponse::ok()
+                        });
+                    }
+                    CommandResponse::ok()
+                })
             }
             "SELECT" => {
                 // We don't support multiple databases, but accept SELECT 0
@@ -688,14 +692,24 @@ impl CommandEngine {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("get");
                 }
-                let key = args[0].clone();
+                // No key clone: borrow into the shard lock.
+                let key = &args[0];
                 self.shards
-                    .shard_for_key(&key)
-                    .execute(move |store| store.string_get(&key))
+                    .shard_for_key(key)
+                    .execute(|store| store.string_get(key))
             }
             "SET" => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("set");
+                }
+                // Hot path: plain SET key value (no options) — skip option scan.
+                if args.len() == 2 {
+                    let key = args[0].clone();
+                    let value = args[1].clone();
+                    return self
+                        .shards
+                        .shard_for_key(&key)
+                        .execute(move |store| store.string_set(key, value, None, false, false, false));
                 }
                 let key = args[0].clone();
                 let value = args[1].clone();
@@ -876,11 +890,7 @@ impl CommandEngine {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("mget");
                 }
-                // For single-shard simplicity, route all to shard of first key
-                // TODO: proper multi-shard gather
-                let keys: Vec<Bytes> = args.to_vec();
-                let shard = self.shards.shard_for_key(&keys[0]).clone();
-                shard.execute(move |store| store.string_mget(&keys))
+                multi_shard_mget(&self.shards, args)
             }
             "MSET" => {
                 if args.len() < 2 || !args.len().is_multiple_of(2) {
@@ -890,9 +900,7 @@ impl CommandEngine {
                     .chunks(2)
                     .map(|c| (c[0].clone(), c[1].clone()))
                     .collect();
-                // Route to first key's shard for simplicity
-                let shard = self.shards.shard_for_key(&pairs[0].0).clone();
-                shard.execute(move |store| store.string_mset(pairs))
+                multi_shard_mset(&self.shards, pairs)
             }
             "MSETNX" => {
                 if args.len() < 2 || !args.len().is_multiple_of(2) {
@@ -902,8 +910,7 @@ impl CommandEngine {
                     .chunks(2)
                     .map(|c| (c[0].clone(), c[1].clone()))
                     .collect();
-                let shard = self.shards.shard_for_key(&pairs[0].0).clone();
-                shard.execute(move |store| store.string_msetnx(pairs))
+                multi_shard_msetnx(&self.shards, pairs)
             }
             "INCR" => {
                 if args.len() != 1 {
@@ -1260,24 +1267,26 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("keys");
                 }
                 let pattern = std::str::from_utf8(&args[0]).unwrap_or("*").to_string();
-                // Gather from all shards
-                let shards = self.shards.clone();
-                let num = shards.num_shards();
-                let mut all_keys = Vec::new();
-                for i in 0..num {
-                    let shard = shards.shard(i).clone();
-                    let p = pattern.clone();
-                    let resp = shard.execute(move |store| {
-                        let keys = store.keys(&p);
-                        CommandResponse::array(
-                            keys.into_iter().map(CommandResponse::bulk).collect(),
-                        )
-                    });
-                    if let CommandResponse::Array(items) = resp {
-                        all_keys.extend(items);
+                // Heavy full-space walk: don't pin the Tokio worker.
+                maybe_block_in_place(|| {
+                    let shards = self.shards.clone();
+                    let num = shards.num_shards();
+                    let mut all_keys = Vec::new();
+                    for i in 0..num {
+                        let shard = shards.shard(i).clone();
+                        let p = pattern.clone();
+                        let resp = shard.execute(move |store| {
+                            let keys = store.keys(&p);
+                            CommandResponse::array(
+                                keys.into_iter().map(CommandResponse::bulk).collect(),
+                            )
+                        });
+                        if let CommandResponse::Array(items) = resp {
+                            all_keys.extend(items);
+                        }
                     }
-                }
-                CommandResponse::array(all_keys)
+                    CommandResponse::array(all_keys)
+                })
             }
             "SCAN" => {
                 if args.is_empty() {
@@ -1285,7 +1294,7 @@ impl CommandEngine {
                 }
                 let cursor = std::str::from_utf8(&args[0])
                     .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0);
                 let mut pattern = None;
                 let mut count = 10usize;
@@ -1311,26 +1320,9 @@ impl CommandEngine {
                     }
                     i += 1;
                 }
-                // Simple single-shard scan
-                let shard = self.shards.shard(0).clone();
-                let pat = pattern.clone();
-                shard.execute(move |store| {
-                    let (next, keys) = store.scan(cursor, pat.as_deref(), count);
-                    CommandResponse::array(vec![
-                        CommandResponse::bulk(Bytes::from(next.to_string())),
-                        CommandResponse::array(
-                            keys.into_iter().map(CommandResponse::bulk).collect(),
-                        ),
-                    ])
-                })
+                multi_shard_scan(&self.shards, cursor, pattern, count)
             }
-            "RANDOMKEY" => {
-                let shard = self.shards.shard(0).clone();
-                shard.execute(|store| match store.random_key() {
-                    Some(k) => CommandResponse::bulk(k),
-                    None => CommandResponse::nil(),
-                })
-            }
+            "RANDOMKEY" => multi_shard_randomkey(&self.shards),
             "OBJECT" => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("object");
@@ -3195,16 +3187,19 @@ impl CommandEngine {
 
             // ---- Persistence commands ----
             "SAVE" | "BGSAVE" => {
-                let dir = std::path::Path::new("data");
-                let shards = self.shards.clone();
-                let num = shards.num_shards();
-                if let Err(e) = solikv_persist::save_all_shards(dir, "dump", num, |idx, f| {
-                    shards.shard(idx).with_store(|store| f(store))
-                }) {
-                    return CommandResponse::error(format!("ERR RDB save failed: {}", e));
-                }
-                tracing::info!("RDB saved {} shards to {:?}", num, dir);
-                CommandResponse::ok()
+                // Disk I/O under shard locks — release the async worker while saving.
+                maybe_block_in_place(|| {
+                    let dir = std::path::Path::new("data");
+                    let shards = self.shards.clone();
+                    let num = shards.num_shards();
+                    if let Err(e) = solikv_persist::save_all_shards(dir, "dump", num, |idx, f| {
+                        shards.shard(idx).with_store(|store| f(store))
+                    }) {
+                        return CommandResponse::error(format!("ERR RDB save failed: {}", e));
+                    }
+                    tracing::info!("RDB saved {} shards to {:?}", num, dir);
+                    CommandResponse::ok()
+                })
             }
             "BGREWRITEAOF" => {
                 // Rewrite AOF: not implemented yet, return OK for compatibility
@@ -3658,6 +3653,225 @@ impl CommandEngine {
     }
 }
 
+/// Run `f` via `block_in_place` when on Tokio's multi-thread runtime so other
+/// async tasks can progress while we hold shard locks / do disk I/O.
+/// On current-thread runtimes (e.g. some tests) `block_in_place` panics — run
+/// `f` directly instead.
+fn maybe_block_in_place<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle)
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+        {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
+/// Encode multi-shard SCAN cursor: high 16 bits = shard index, low 48 = local index.
+const SCAN_SHARD_SHIFT: u32 = 48;
+const SCAN_LOCAL_MASK: u64 = (1u64 << SCAN_SHARD_SHIFT) - 1;
+
+fn pack_scan_cursor(shard_idx: usize, local: usize) -> u64 {
+    ((shard_idx as u64) << SCAN_SHARD_SHIFT) | (local as u64 & SCAN_LOCAL_MASK)
+}
+
+fn unpack_scan_cursor(cursor: u64) -> (usize, usize) {
+    let shard = (cursor >> SCAN_SHARD_SHIFT) as usize;
+    let local = (cursor & SCAN_LOCAL_MASK) as usize;
+    (shard, local)
+}
+
+fn multi_shard_mget(shards: &crate::shard::ShardManager, keys: &[Bytes]) -> CommandResponse {
+    let num = shards.num_shards();
+    // Group (original_index, key) by shard so we lock each shard once.
+    let mut by_shard: Vec<Vec<(usize, Bytes)>> = vec![Vec::new(); num];
+    for (i, key) in keys.iter().enumerate() {
+        let shard_idx = shards.shard_index_for_key(key);
+        by_shard[shard_idx].push((i, key.clone()));
+    }
+
+    let mut results = vec![CommandResponse::Nil; keys.len()];
+    for (shard_idx, group) in by_shard.into_iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        let indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
+        let group_keys: Vec<Bytes> = group.into_iter().map(|(_, k)| k).collect();
+        let resp = shards.shard(shard_idx).execute(move |store| {
+            CommandResponse::Array(
+                group_keys
+                    .iter()
+                    .map(|k| store.string_get(k))
+                    .collect(),
+            )
+        });
+        if let CommandResponse::Array(items) = resp {
+            for (idx, item) in indices.into_iter().zip(items) {
+                results[idx] = item;
+            }
+        }
+    }
+    CommandResponse::Array(results)
+}
+
+fn multi_shard_mset(
+    shards: &crate::shard::ShardManager,
+    pairs: Vec<(Bytes, Bytes)>,
+) -> CommandResponse {
+    let num = shards.num_shards();
+    let mut by_shard: Vec<Vec<(Bytes, Bytes)>> = vec![Vec::new(); num];
+    for (key, value) in pairs {
+        let slot = shards.shard_index_for_key(&key);
+        by_shard[slot].push((key, value));
+    }
+    for (shard_idx, group) in by_shard.into_iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        shards
+            .shard(shard_idx)
+            .execute(move |store| store.string_mset(group));
+    }
+    CommandResponse::ok()
+}
+
+fn multi_shard_msetnx(
+    shards: &crate::shard::ShardManager,
+    pairs: Vec<(Bytes, Bytes)>,
+) -> CommandResponse {
+    let num = shards.num_shards();
+    let mut by_shard: Vec<Vec<(Bytes, Bytes)>> = vec![Vec::new(); num];
+    for (key, value) in pairs {
+        let slot = shards.shard_index_for_key(&key);
+        by_shard[slot].push((key, value));
+    }
+
+    // Phase 1: all keys must be absent (best-effort; not cross-shard atomic).
+    for (shard_idx, group) in by_shard.iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        let keys: Vec<Bytes> = group.iter().map(|(k, _)| k.clone()).collect();
+        let any = shards.shard(shard_idx).execute(move |store| {
+            for k in &keys {
+                if store.exists(k) {
+                    return CommandResponse::integer(1);
+                }
+            }
+            CommandResponse::integer(0)
+        });
+        if matches!(any, CommandResponse::Integer(1)) {
+            return CommandResponse::integer(0);
+        }
+    }
+
+    // Phase 2: set on every shard.
+    for (shard_idx, group) in by_shard.into_iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        shards
+            .shard(shard_idx)
+            .execute(move |store| store.string_mset(group));
+    }
+    CommandResponse::integer(1)
+}
+
+fn multi_shard_scan(
+    shards: &crate::shard::ShardManager,
+    cursor: u64,
+    pattern: Option<String>,
+    count: usize,
+) -> CommandResponse {
+    let num = shards.num_shards();
+    if num == 0 {
+        return CommandResponse::array(vec![
+            CommandResponse::bulk(Bytes::from_static(b"0")),
+            CommandResponse::array(vec![]),
+        ]);
+    }
+
+    let (mut shard_idx, local) = if cursor == 0 {
+        (0usize, 0usize)
+    } else {
+        unpack_scan_cursor(cursor)
+    };
+
+    if shard_idx >= num {
+        return CommandResponse::array(vec![
+            CommandResponse::bulk(Bytes::from_static(b"0")),
+            CommandResponse::array(vec![]),
+        ]);
+    }
+
+    // Scan the current shard; if it finishes, advance to the next shard (or 0 = done).
+    let pat = pattern.clone();
+    let resp = shards.shard(shard_idx).execute(move |store| {
+        let (next_local, keys) = store.scan(local, pat.as_deref(), count);
+        // Pack next_local into a temporary Integer so we can unwrap outside.
+        // We return Array [next_local_as_int, ...keys as bulk]
+        let mut items = Vec::with_capacity(1 + keys.len());
+        items.push(CommandResponse::integer(next_local as i64));
+        items.extend(keys.into_iter().map(CommandResponse::bulk));
+        CommandResponse::Array(items)
+    });
+
+    let (next_local, keys) = match resp {
+        CommandResponse::Array(mut items) if !items.is_empty() => {
+            let next = match items.remove(0) {
+                CommandResponse::Integer(n) => n.max(0) as usize,
+                _ => 0,
+            };
+            (next, items)
+        }
+        _ => (0, Vec::new()),
+    };
+
+    let next_cursor = if next_local != 0 {
+        pack_scan_cursor(shard_idx, next_local)
+    } else {
+        // Finished this shard — move to the next one, or complete.
+        shard_idx += 1;
+        if shard_idx >= num {
+            0
+        } else {
+            pack_scan_cursor(shard_idx, 0)
+        }
+    };
+
+    CommandResponse::array(vec![
+        CommandResponse::bulk(Bytes::from(next_cursor.to_string())),
+        CommandResponse::Array(keys),
+    ])
+}
+
+fn multi_shard_randomkey(shards: &crate::shard::ShardManager) -> CommandResponse {
+    let num = shards.num_shards();
+    if num == 0 {
+        return CommandResponse::nil();
+    }
+    // Sample a few random shards so we don't always hit shard 0.
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as usize;
+    for attempt in 0..num {
+        let idx = (seed + attempt) % num;
+        let resp = shards.shard(idx).execute(|store| match store.random_key() {
+            Some(k) => CommandResponse::bulk(k),
+            None => CommandResponse::nil(),
+        });
+        if !matches!(resp, CommandResponse::Nil) {
+            return resp;
+        }
+    }
+    CommandResponse::nil()
+}
+
 fn is_write_command(name: &str) -> bool {
     matches!(
         name,
@@ -3836,5 +4050,111 @@ mod sec_tests {
             "unexpected error: {}",
             msg
         );
+    }
+
+    /// Solo mode: unlocked store still serves SET/GET correctly.
+    #[test]
+    fn test_solo_set_get() {
+        let shards = Arc::new(ShardManager::solo_plain());
+        assert!(shards.is_solo());
+        let pubsub = Arc::new(PubSubBroker::new());
+        let e = Arc::new(CommandEngine::new(shards, pubsub));
+        e.init_self_ref(Arc::downgrade(&e));
+        assert!(matches!(
+            e.execute("SET", &[Bytes::from("k"), Bytes::from("v")]),
+            CommandResponse::Ok
+        ));
+        match e.execute("GET", &[Bytes::from("k")]) {
+            CommandResponse::BulkString(b) => assert_eq!(b.as_ref(), b"v"),
+            other => panic!("expected bulk, got {:?}", other),
+        }
+    }
+
+    /// Multi-shard MSET/MGET must route each key to its own shard (not only the first).
+    #[test]
+    fn test_multi_shard_mset_mget() {
+        let e = engine();
+        // Use many distinct keys so they land on different shards with high probability.
+        let mut args = Vec::new();
+        for i in 0..32 {
+            args.push(Bytes::from(format!("mk{i}")));
+            args.push(Bytes::from(format!("v{i}")));
+        }
+        assert!(matches!(e.execute("MSET", &args), CommandResponse::Ok));
+
+        let keys: Vec<Bytes> = (0..32).map(|i| Bytes::from(format!("mk{i}"))).collect();
+        let resp = e.execute("MGET", &keys);
+        match resp {
+            CommandResponse::Array(items) => {
+                assert_eq!(items.len(), 32);
+                for (i, item) in items.iter().enumerate() {
+                    match item {
+                        CommandResponse::BulkString(b) => {
+                            assert_eq!(b.as_ref(), format!("v{i}").as_bytes());
+                        }
+                        other => panic!("key mk{i} missing or wrong: {:?}", other),
+                    }
+                }
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_multi_shard_scan_visits_all_shards() {
+        let e = engine();
+        for i in 0..40 {
+            e.execute(
+                "SET",
+                &[Bytes::from(format!("sk{i}")), Bytes::from("1")],
+            );
+        }
+
+        let mut all = std::collections::HashSet::new();
+        let mut cursor = 0u64;
+        let mut steps = 0;
+        loop {
+            let resp = e.execute(
+                "SCAN",
+                &[
+                    Bytes::from(cursor.to_string()),
+                    Bytes::from("COUNT"),
+                    Bytes::from("10"),
+                ],
+            );
+            match resp {
+                CommandResponse::Array(items) if items.len() == 2 => {
+                    cursor = match &items[0] {
+                        CommandResponse::BulkString(b) => {
+                            std::str::from_utf8(b).unwrap().parse().unwrap()
+                        }
+                        _ => panic!("bad cursor"),
+                    };
+                    if let CommandResponse::Array(keys) = &items[1] {
+                        for k in keys {
+                            if let CommandResponse::BulkString(b) = k {
+                                all.insert(b.clone());
+                            }
+                        }
+                    }
+                }
+                other => panic!("unexpected SCAN response: {:?}", other),
+            }
+            steps += 1;
+            if cursor == 0 || steps > 100 {
+                break;
+            }
+        }
+        assert_eq!(all.len(), 40, "SCAN must return keys from all shards");
+    }
+
+    #[test]
+    fn test_scan_cursor_pack_unpack() {
+        assert_eq!(unpack_scan_cursor(0), (0, 0));
+        let c = pack_scan_cursor(3, 42);
+        assert_eq!(unpack_scan_cursor(c), (3, 42));
+        // shard boundary start
+        let c = pack_scan_cursor(1, 0);
+        assert_eq!(unpack_scan_cursor(c), (1, 0));
     }
 }

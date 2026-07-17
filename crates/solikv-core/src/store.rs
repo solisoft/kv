@@ -1,13 +1,16 @@
 use bytes::Bytes;
-use std::collections::HashMap;
+use indexmap::IndexMap;
 
-use crate::expiry::ExpiryHeap;
+use crate::expiry::{ExpiryHeap, MAX_EXPIRE_PER_TICK};
 use crate::types::*;
 
 /// Per-shard key-value store. Owned by a single thread — no locking needed.
+///
+/// Uses [`IndexMap`] so SCAN/RANDOMKEY can address keys by stable index in O(1)
+/// without cloning the full key set on every call.
 #[derive(Debug)]
 pub struct ShardStore {
-    data: HashMap<Bytes, KeyEntry>,
+    data: IndexMap<Bytes, KeyEntry>,
     expiry_heap: ExpiryHeap,
     /// Buffer of keys that were lazily expired during get/get_mut. Drained by ShardHandle.
     pub expired_buffer: Vec<Bytes>,
@@ -16,35 +19,37 @@ pub struct ShardStore {
 impl ShardStore {
     pub fn new() -> Self {
         Self {
-            data: HashMap::new(),
+            data: IndexMap::new(),
             expiry_heap: ExpiryHeap::new(),
             expired_buffer: Vec::new(),
         }
     }
 
     /// Get a reference to an entry, performing lazy expiry check.
+    #[inline]
     pub fn get(&mut self, key: &Bytes) -> Option<&KeyEntry> {
-        // Lazy expiry: check on access
-        if let Some(entry) = self.data.get(key) {
-            if entry.is_expired() {
-                self.expired_buffer.push(key.clone());
-                self.data.remove(key);
-                return None;
+        // Single index lookup (IndexMap) instead of get + get after expiry.
+        let idx = self.data.get_index_of(key)?;
+        if self.data[idx].is_expired() {
+            if let Some((k, _)) = self.data.swap_remove_index(idx) {
+                self.expired_buffer.push(k);
             }
+            return None;
         }
-        self.data.get(key)
+        self.data.get_index(idx).map(|(_, e)| e)
     }
 
     /// Get a mutable reference to an entry, performing lazy expiry check.
+    #[inline]
     pub fn get_mut(&mut self, key: &Bytes) -> Option<&mut KeyEntry> {
-        if let Some(entry) = self.data.get(key) {
-            if entry.is_expired() {
-                self.expired_buffer.push(key.clone());
-                self.data.remove(key);
-                return None;
+        let idx = self.data.get_index_of(key)?;
+        if self.data[idx].is_expired() {
+            if let Some((k, _)) = self.data.swap_remove_index(idx) {
+                self.expired_buffer.push(k);
             }
+            return None;
         }
-        self.data.get_mut(key)
+        self.data.get_index_mut(idx).map(|(_, e)| e)
     }
 
     /// Set a key-value pair with optional expiry in milliseconds.
@@ -76,7 +81,7 @@ impl ShardStore {
 
     /// Delete a key. Returns true if the key existed.
     pub fn del(&mut self, key: &Bytes) -> bool {
-        self.data.remove(key).is_some()
+        self.data.swap_remove(key).is_some()
     }
 
     /// Check if a key exists (non-expired).
@@ -88,7 +93,7 @@ impl ShardStore {
     pub fn expire(&mut self, key: &Bytes, expire_ms: u64) -> bool {
         if let Some(entry) = self.data.get_mut(key) {
             if entry.is_expired() {
-                self.data.remove(key);
+                self.data.swap_remove(key);
                 return false;
             }
             let expires_at = now_millis() + expire_ms;
@@ -104,7 +109,7 @@ impl ShardStore {
     pub fn expire_at(&mut self, key: &Bytes, expires_at_ms: u64) -> bool {
         if let Some(entry) = self.data.get_mut(key) {
             if entry.is_expired() {
-                self.data.remove(key);
+                self.data.swap_remove(key);
                 return false;
             }
             entry.expires_at = Some(expires_at_ms);
@@ -119,7 +124,7 @@ impl ShardStore {
     pub fn persist(&mut self, key: &Bytes) -> bool {
         if let Some(entry) = self.data.get_mut(key) {
             if entry.is_expired() {
-                self.data.remove(key);
+                self.data.swap_remove(key);
                 return false;
             }
             if entry.expires_at.is_some() {
@@ -176,66 +181,78 @@ impl ShardStore {
 
     /// Get all keys matching a glob pattern.
     pub fn keys(&mut self, pattern: &str) -> Vec<Bytes> {
-        let keys: Vec<Bytes> = self.data.keys().cloned().collect();
-        keys.into_iter()
+        // Only clone keys that match the pattern (avoid full-set clone when selective).
+        let candidates: Vec<Bytes> = self
+            .data
+            .keys()
             .filter(|k| {
                 let key_str = std::str::from_utf8(k).unwrap_or("");
                 glob_match(pattern, key_str)
             })
+            .cloned()
+            .collect();
+        candidates
+            .into_iter()
             .filter(|k| self.get(k).is_some()) // filter expired
             .collect()
     }
 
-    /// SCAN implementation: cursor-based iteration using reverse-bit increment
-    /// (same algorithm as Redis dictScan) to remain stable across mutations.
+    /// SCAN implementation: cursor is an index into the IndexMap.
+    ///
+    /// O(count) key clones per call — does **not** snapshot the full key set.
+    /// Expired keys found during the walk are deferred to `expired_buffer` after
+    /// the scan window so indices stay stable for this call.
     pub fn scan(
         &mut self,
         cursor: usize,
         pattern: Option<&str>,
         count: usize,
     ) -> (usize, Vec<Bytes>) {
-        let all_keys: Vec<Bytes> = self.data.keys().cloned().collect();
-        let total = all_keys.len();
-        if total == 0 {
+        let count = count.max(1);
+        let len = self.data.len();
+        if len == 0 {
             return (0, Vec::new());
         }
 
-        let table_size = total.next_power_of_two();
-        let mask = table_size - 1;
-        let mut v = cursor;
-        let mut result = Vec::new();
-        let mut iterations = 0;
+        let mut result = Vec::with_capacity(count);
+        let mut idx = cursor.min(len);
+        // Examine up to `count` slots; pattern non-matches still consume effort.
+        let end = (idx + count).min(len);
+        let mut deferred_expire: Vec<Bytes> = Vec::new();
 
-        loop {
-            let idx = v & mask;
-            if idx < total {
-                let key = &all_keys[idx];
-                if self.get(key).is_some() {
-                    let matches = pattern
-                        .map(|p| {
-                            let key_str = std::str::from_utf8(key).unwrap_or("");
-                            glob_match(p, key_str)
-                        })
-                        .unwrap_or(true);
-                    if matches {
-                        result.push(key.clone());
-                    }
+        while idx < end {
+            let (key, expired) = {
+                let (k, entry) = self.data.get_index(idx).expect("idx in range");
+                (k.clone(), entry.is_expired())
+            };
+            if expired {
+                deferred_expire.push(key);
+            } else {
+                let matches = pattern
+                    .map(|p| {
+                        let key_str = std::str::from_utf8(&key).unwrap_or("");
+                        glob_match(p, key_str)
+                    })
+                    .unwrap_or(true);
+                if matches {
+                    result.push(key);
                 }
             }
-            iterations += 1;
+            idx += 1;
+        }
 
-            // Redis reverse-bit increment: v |= ~mask; v = rev(rev(v) + 1)
-            v |= !mask;
-            v = v.reverse_bits();
-            v = v.wrapping_add(1);
-            v = v.reverse_bits();
+        // Cursor for the next call is based on the pre-removal map size so a
+        // full pass still terminates even if we expire keys in this window.
+        let next = if idx >= len { 0 } else { idx };
 
-            if v == 0 || iterations >= count {
-                break;
+        // Drop expired keys after the window walk so this call's indices stayed stable.
+        for key in deferred_expire {
+            if self.data.swap_remove(&key).is_some() {
+                self.expired_buffer.push(key);
             }
         }
 
-        (v, result)
+        (next, result)
     }
 
     /// Flush all keys.
@@ -244,15 +261,18 @@ impl ShardStore {
         self.expiry_heap = ExpiryHeap::new();
     }
 
-    /// Run active expiry: remove expired keys from the heap. Returns the expired key names.
+    /// Run active expiry: remove up to [`MAX_EXPIRE_PER_TICK`] expired keys.
+    /// Returns the expired key names that were actually removed from the map.
     pub fn run_active_expiry(&mut self) -> Vec<Bytes> {
         let now = now_millis();
-        let expired_keys = self.expiry_heap.drain_expired(now);
+        let expired_keys = self
+            .expiry_heap
+            .drain_expired(now, MAX_EXPIRE_PER_TICK);
         let mut removed = Vec::new();
         for key in expired_keys {
             if let Some(entry) = self.data.get(&key) {
                 if entry.is_expired() {
-                    self.data.remove(&key);
+                    self.data.swap_remove(&key);
                     removed.push(key);
                 }
             }
@@ -283,12 +303,12 @@ impl ShardStore {
         if self.get(from).is_none() {
             return Err("ERR no such key");
         }
-        let entry = self.data.remove(from).unwrap();
+        let entry = self.data.swap_remove(from).unwrap();
         self.data.insert(to, entry);
         Ok(())
     }
 
-    /// Get a pseudo-random key using hash-based sampling.
+    /// Get a pseudo-random key in O(1) via IndexMap index access.
     pub fn random_key(&self) -> Option<Bytes> {
         let len = self.data.len();
         if len == 0 {
@@ -300,7 +320,7 @@ impl ShardStore {
             .unwrap_or_default()
             .subsec_nanos() as usize;
         let idx = seed % len;
-        self.data.keys().nth(idx).cloned()
+        self.data.get_index(idx).map(|(k, _)| k.clone())
     }
 
     /// Get all data for persistence/snapshotting.
@@ -309,7 +329,7 @@ impl ShardStore {
     }
 
     /// Get mutable reference to underlying data (for restore).
-    pub fn data_mut(&mut self) -> &mut HashMap<Bytes, KeyEntry> {
+    pub fn data_mut(&mut self) -> &mut IndexMap<Bytes, KeyEntry> {
         &mut self.data
     }
 }
@@ -538,5 +558,45 @@ mod tests {
             }
         }
         assert_eq!(all_keys.len(), 20);
+    }
+
+    #[test]
+    fn test_scan_does_not_require_full_clone_for_partial() {
+        let mut store = ShardStore::new();
+        for i in 0..100 {
+            store.set(
+                Bytes::from(format!("k{i}")),
+                RedisValue::String(Bytes::from("v")),
+                None,
+            );
+        }
+        let (next, batch) = store.scan(0, None, 5);
+        assert_eq!(batch.len(), 5);
+        assert_eq!(next, 5);
+    }
+
+    #[test]
+    fn test_random_key_o1() {
+        let mut store = ShardStore::new();
+        assert!(store.random_key().is_none());
+        store.set(Bytes::from("only"), RedisValue::String(Bytes::from("v")), None);
+        assert_eq!(store.random_key().unwrap(), Bytes::from("only"));
+    }
+
+    #[test]
+    fn test_active_expiry_capped() {
+        let mut store = ShardStore::new();
+        for i in 0..50 {
+            let key = Bytes::from(format!("e{i}"));
+            store.set(key.clone(), RedisValue::String(Bytes::from("v")), None);
+            // Force already-expired
+            store.data.get_mut(&key).unwrap().expires_at = Some(1);
+            store.expiry_heap.push(key, 1);
+        }
+        let removed = store.run_active_expiry();
+        assert_eq!(removed.len(), MAX_EXPIRE_PER_TICK);
+        // More remain for the next tick
+        let removed2 = store.run_active_expiry();
+        assert_eq!(removed2.len(), MAX_EXPIRE_PER_TICK);
     }
 }

@@ -120,10 +120,27 @@ SoliKV is built as a Rust workspace with several crates:
 ## Performance
 
 SoliKV is designed for high performance with:
-- Lock-free sharding with crossbeam-skiplist
+- Multi-shard stores (`IndexMap` + `parking_lot` mutex per shard)
+- Multi-shard MGET/MSET/SCAN routing
 - MiMalloc memory allocator
-- Async I/O with Tokio
-- Configurable fsync policies for durability vs performance tradeoffs
+- Async I/O with Tokio + RESP pipeline fast-path
+- AOF via channel with backpressure; configurable fsync policies
+
+### Benchmarks (AOF everysec)
+
+| Workload | SoliKV | Redis 8.6 | Delta |
+|----------|--------|-----------|-------|
+| Standard SET (`--solo`) | **~103K** | ~102K | **+0.8%** |
+| Pipeline SET (P=16, multi or solo) | **1.45–1.6M** | ~0.93M | **+56–70%** |
+| REST GET `/kv/:key` | 485K | — | — |
+
+**Solo mode** (`--solo`): Redis-shaped single worker, 1 shard, no mutex — best for single-core / classic `redis-benchmark`. Multi-shard remains the default for multi-core production.
+
+```bash
+./target/release/solikv --solo --bind 127.0.0.1 --port 6379 --protected-mode no
+```
+
+Reproduce: `./scripts/bench_compare.sh`. Full tables: [`benches/RESULTS.md`](benches/RESULTS.md).
 
 ## License
 

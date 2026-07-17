@@ -383,11 +383,11 @@ impl KeyEntry {
         }
     }
 
+    #[inline]
     pub fn is_expired(&self) -> bool {
-        if let Some(exp) = self.expires_at {
-            now_millis() >= exp
-        } else {
-            false
+        match self.expires_at {
+            Some(exp) => now_millis() >= exp,
+            None => false,
         }
     }
 
@@ -405,20 +405,45 @@ impl KeyEntry {
     }
 }
 
+/// Cached wall-clock ms (updated lazily). Avoids a `SystemTime::now()` syscall
+/// on every GET/SET/TTL when many ops land in the same millisecond.
+static CACHED_NOW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CACHE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Current time in milliseconds since UNIX epoch.
+///
+/// Refreshes from the OS at most every ~16 calls (amortized), which is plenty
+/// for second/ms TTLs while keeping the hot path off `clock_gettime`.
+#[inline]
 pub fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+    use std::sync::atomic::Ordering;
+    // Refresh every 16th call; also force-refresh if cache is still zero.
+    let tick = CACHE_TICK.fetch_add(1, Ordering::Relaxed);
+    if tick & 15 == 0 {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        CACHED_NOW_MS.store(ms, Ordering::Relaxed);
+        return ms;
+    }
+    let cached = CACHED_NOW_MS.load(Ordering::Relaxed);
+    if cached != 0 {
+        cached
+    } else {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        CACHED_NOW_MS.store(ms, Ordering::Relaxed);
+        ms
+    }
 }
 
 /// Current time in seconds since UNIX epoch.
+#[inline]
 pub fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+    now_millis() / 1000
 }
 
 /// Command response type for all operations.

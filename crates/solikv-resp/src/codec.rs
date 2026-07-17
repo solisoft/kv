@@ -100,12 +100,12 @@ pub fn encode_frame(frame: &RespFrame, dst: &mut BytesMut) {
         }
         RespFrame::Integer(n) => {
             dst.extend_from_slice(b":");
-            dst.extend_from_slice(n.to_string().as_bytes());
+            write_i64(dst, *n);
             dst.extend_from_slice(b"\r\n");
         }
         RespFrame::BulkString(data) => {
             dst.extend_from_slice(b"$");
-            dst.extend_from_slice(data.len().to_string().as_bytes());
+            write_usize(dst, data.len());
             dst.extend_from_slice(b"\r\n");
             dst.extend_from_slice(data);
             dst.extend_from_slice(b"\r\n");
@@ -115,13 +115,47 @@ pub fn encode_frame(frame: &RespFrame, dst: &mut BytesMut) {
         }
         RespFrame::Array(items) => {
             dst.extend_from_slice(b"*");
-            dst.extend_from_slice(items.len().to_string().as_bytes());
+            write_usize(dst, items.len());
             dst.extend_from_slice(b"\r\n");
             for item in items {
                 encode_frame(item, dst);
             }
         }
     }
+}
+
+/// Format `n` as decimal into `dst` without allocating a `String`.
+#[inline]
+fn write_i64(dst: &mut BytesMut, n: i64) {
+    // itoa-style stack buffer
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let neg = n < 0;
+    let mut v = if neg {
+        // careful with i64::MIN
+        (n as i128).unsigned_abs()
+    } else {
+        n as u128
+    };
+    if v == 0 {
+        dst.extend_from_slice(b"0");
+        return;
+    }
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    if neg {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    dst.extend_from_slice(&buf[i..]);
+}
+
+#[inline]
+fn write_usize(dst: &mut BytesMut, n: usize) {
+    write_i64(dst, n as i64);
 }
 
 /// Maximum size of a single bulk string (512 MB, same as Redis default).

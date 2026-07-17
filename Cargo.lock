@@ -1852,6 +1852,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "crossbeam-skiplist",
+ "indexmap",
  "ordered-float",
  "parking_lot",
  "serde",
@@ -1877,6 +1878,7 @@ dependencies = [
  "solikv-persist",
  "solikv-pubsub",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

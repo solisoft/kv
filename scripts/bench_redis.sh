@@ -1,45 +1,38 @@
-#!/bin/bash
-# Run redis-benchmark against a server
-# Usage: ./bench_redis.sh [PORT] [CLIENTS] [REQUESTS]
+#!/usr/bin/env bash
+# Run redis-benchmark against a SoliKV (or Redis) server.
+# Usage: ./scripts/bench_redis.sh [PORT] [CLIENTS] [REQUESTS]
+set -euo pipefail
 
 PORT=${1:-6379}
 CLIENTS=${2:-50}
-REQUESTS=${3:-100000}
+REQUESTS=${3:-200000}
+HOST=${BENCH_HOST:-127.0.0.1}
 
-echo "=== SoliKV Benchmark ==="
-echo "Port: $PORT, Clients: $CLIENTS, Requests: $REQUESTS"
+echo "=== SoliKV / Redis Benchmark ==="
+echo "Host: $HOST  Port: $PORT  Clients: $CLIENTS  Requests: $REQUESTS"
 echo ""
 
-echo "--- SET ---"
-redis-benchmark -p "$PORT" -c "$CLIENTS" -n "$REQUESTS" -t set -q
+run() {
+  local label=$1
+  shift
+  echo "--- $label ---"
+  redis-benchmark -h "$HOST" -p "$PORT" -c "$CLIENTS" -n "$REQUESTS" "$@" -q
+  echo ""
+}
 
-echo "--- GET ---"
-redis-benchmark -p "$PORT" -c "$CLIENTS" -n "$REQUESTS" -t get -q
+run "PING"  -t ping_inline
+run "SET"   -t set
+run "GET"   -t get
+run "INCR"  -t incr
+run "LPUSH" -t lpush
+run "RPUSH" -t rpush
+run "LPOP"  -t lpop
+run "RPOP"  -t rpop
+run "SADD"  -t sadd
+run "HSET"  -t hset
+run "ZADD"  -t zadd
+run "MSET (10 keys)" -t mset
 
-echo "--- INCR ---"
-redis-benchmark -p "$PORT" -c "$CLIENTS" -n "$REQUESTS" -t incr -q
-
-echo "--- LPUSH ---"
-redis-benchmark -p "$PORT" -c "$CLIENTS" -n "$REQUESTS" -t lpush -q
-
-echo "--- RPUSH ---"
-redis-benchmark -p "$PORT" -c "$CLIENTS" -n "$REQUESTS" -t rpush -q
-
-echo "--- SADD ---"
-redis-benchmark -p "$PORT" -c "$CLIENTS" -n "$REQUESTS" -t sadd -q
-
-echo "--- ZADD ---"
-redis-benchmark -p "$PORT" -c "$CLIENTS" -n "$REQUESTS" -t zadd -q
-
-echo "--- HSET ---"
-redis-benchmark -p "$PORT" -c "$CLIENTS" -n "$REQUESTS" -t hset -q
-
-echo "--- PING ---"
-redis-benchmark -p "$PORT" -c "$CLIENTS" -n "$REQUESTS" -t ping_inline -q
-
-echo "--- MSET (10 keys) ---"
-redis-benchmark -p "$PORT" -c "$CLIENTS" -n "$REQUESTS" -t mset -q
-
+echo "--- Pipeline SET+GET (P=16) ---"
+redis-benchmark -h "$HOST" -p "$PORT" -c "$CLIENTS" -n "$REQUESTS" -P 16 -t set,get -q
 echo ""
-echo "--- Pipeline SET+GET (16 pipeline) ---"
-redis-benchmark -p "$PORT" -c "$CLIENTS" -n "$REQUESTS" -P 16 -t set,get -q

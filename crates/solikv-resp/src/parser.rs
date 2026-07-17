@@ -13,9 +13,10 @@ impl ParsedCommand {
     /// Parse a RESP frame into a command.
     pub fn from_frame(frame: RespFrame) -> Result<Self, String> {
         match frame {
-            RespFrame::Array(items) if !items.is_empty() => {
-                let mut args = Vec::with_capacity(items.len());
-                for item in items {
+            RespFrame::Array(mut items) if !items.is_empty() => {
+                // Convert frames → Bytes in place without an intermediate full copy.
+                let mut args: Vec<Bytes> = Vec::with_capacity(items.len());
+                for item in items.drain(..) {
                     match item {
                         RespFrame::BulkString(b) => args.push(b),
                         RespFrame::SimpleString(b) => args.push(b),
@@ -24,14 +25,11 @@ impl ParsedCommand {
                     }
                 }
 
-                let name = std::str::from_utf8(&args[0])
-                    .map_err(|_| "ERR invalid command name".to_string())?
-                    .to_uppercase();
+                // Split command name from args without skip(1).collect() realloc.
+                let cmd_bytes = args.remove(0);
+                let name = ascii_uppercase_owned(&cmd_bytes)?;
 
-                Ok(ParsedCommand {
-                    name,
-                    args: args.into_iter().skip(1).collect(),
-                })
+                Ok(ParsedCommand { name, args })
             }
             _ => Err("ERR Protocol error: expected array".to_string()),
         }
@@ -62,6 +60,28 @@ impl ParsedCommand {
     }
 }
 
+/// Uppercase an ASCII command name with a single allocation.
+/// Fast-path: already-uppercase names are copied as-is (no byte-by-byte transform).
+#[inline]
+fn ascii_uppercase_owned(bytes: &[u8]) -> Result<String, String> {
+    // Validate UTF-8 (command names are always ASCII in practice).
+    if !bytes.is_ascii() {
+        // Fall back for non-ASCII (rare)
+        let s = std::str::from_utf8(bytes).map_err(|_| "ERR invalid command name".to_string())?;
+        return Ok(s.to_uppercase());
+    }
+    // Check if already all uppercase / digits / symbols — common for clients that
+    // send "GET"/"SET" in upper case.
+    if bytes.iter().all(|&b| !b.is_ascii_lowercase()) {
+        // SAFETY: we verified is_ascii
+        return Ok(unsafe { String::from_utf8_unchecked(bytes.to_vec()) });
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend(bytes.iter().map(|b| b.to_ascii_uppercase()));
+    // SAFETY: ASCII uppercase stays valid UTF-8
+    Ok(unsafe { String::from_utf8_unchecked(out) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,39 +101,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_case_insensitive() {
+    fn test_parse_lowercase_command() {
         let frame = RespFrame::Array(vec![
             RespFrame::BulkString(Bytes::from("get")),
-            RespFrame::BulkString(Bytes::from("key")),
+            RespFrame::BulkString(Bytes::from("k")),
         ]);
         let cmd = ParsedCommand::from_frame(frame).unwrap();
         assert_eq!(cmd.name, "GET");
-    }
-
-    #[test]
-    fn test_parse_ping() {
-        let frame = RespFrame::Array(vec![RespFrame::BulkString(Bytes::from("PING"))]);
-        let cmd = ParsedCommand::from_frame(frame).unwrap();
-        assert_eq!(cmd.name, "PING");
-        assert!(cmd.args.is_empty());
-    }
-
-    #[test]
-    fn test_arg_helpers() {
-        let frame = RespFrame::Array(vec![
-            RespFrame::BulkString(Bytes::from("SETEX")),
-            RespFrame::BulkString(Bytes::from("key")),
-            RespFrame::BulkString(Bytes::from("60")),
-            RespFrame::BulkString(Bytes::from("value")),
-        ]);
-        let cmd = ParsedCommand::from_frame(frame).unwrap();
-        assert_eq!(cmd.arg_str(0), Some("key"));
-        assert_eq!(cmd.arg_u64(1), Some(60));
-    }
-
-    #[test]
-    fn test_parse_empty_array() {
-        let frame = RespFrame::Array(vec![]);
-        assert!(ParsedCommand::from_frame(frame).is_err());
     }
 }

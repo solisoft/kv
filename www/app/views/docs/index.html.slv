@@ -11,12 +11,12 @@
     <!-- Stats -->
     <div class="grid grid-cols-4 gap-3">
         <div class="p-5 rounded-lg bg-zinc-900 border border-zinc-800">
-            <div class="text-2xl font-bold font-mono text-teal-400">1.81M</div>
-            <div class="text-xs text-zinc-500 mt-1">pipelined SET/s</div>
+            <div class="text-2xl font-bold font-mono text-teal-400">1.60M</div>
+            <div class="text-xs text-zinc-500 mt-1">pipelined SET/s (+57% vs Redis)</div>
         </div>
         <div class="p-5 rounded-lg bg-zinc-900 border border-zinc-800">
-            <div class="text-2xl font-bold font-mono text-teal-400">125K</div>
-            <div class="text-xs text-zinc-500 mt-1">req/s (standard)</div>
+            <div class="text-2xl font-bold font-mono text-teal-400">108K</div>
+            <div class="text-xs text-zinc-500 mt-1">req/s (standard, AOF)</div>
         </div>
         <div class="p-5 rounded-lg bg-zinc-900 border border-zinc-800">
             <div class="text-2xl font-bold font-mono text-amber-400">100+</div>
@@ -46,9 +46,9 @@
                     <div class="w-8 h-8 rounded-lg bg-teal-500/10 border border-teal-500/20 flex items-center justify-center">
                         <svg class="w-4 h-4 text-teal-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
                     </div>
-                    <h3 class="font-semibold">Faster than Redis</h3>
+                    <h3 class="font-semibold">Faster pipelines</h3>
                 </div>
-                <p class="text-sm text-zinc-500">Beats Redis 7.0 on every benchmark. 9% faster on pipelined SET even with AOF persistence.</p>
+                <p class="text-sm text-zinc-500">Matches Redis on single-command load; +57% pipelined SET vs Redis 7.0 with AOF everysec on the same host.</p>
             </div>
             <div class="bg-zinc-950 p-5 hover:bg-zinc-900/50 transition-colors">
                 <div class="flex items-center gap-3 mb-2">

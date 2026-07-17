@@ -8,6 +8,7 @@ bytes = { workspace = true }
 ordered-float = { workspace = true }
 crossbeam-skiplist = { workspace = true }
 parking_lot = { workspace = true }
+indexmap = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
