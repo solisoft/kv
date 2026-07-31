@@ -6,5 +6,5 @@ stop_script = ""
 health_check = "/health"
 drain_delay = 1
 graceful_timeout = 5
-port_range_start = 9000
-port_range_end = 9999
+port_range_start = 20000
+port_range_end = 30000
