@@ -75,10 +75,19 @@ TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 echo "Downloading ${DOWNLOAD_URL} ..."
-fetch "$DOWNLOAD_URL" > "${TMP_DIR}/${TARBALL}"
+if ! fetch "$DOWNLOAD_URL" > "${TMP_DIR}/${TARBALL}"; then
+  echo "Error: could not download ${TARBALL} from release ${TAG}." >&2
+  echo "No build may be published for ${OS}-${ARCH}. See https://github.com/${REPO}/releases/tag/${TAG}" >&2
+  exit 1
+fi
 
 echo "Downloading checksums ${CHECKSUMS_URL} ..."
-fetch "$CHECKSUMS_URL" > "${TMP_DIR}/${CHECKSUMS_FILE}"
+if ! fetch "$CHECKSUMS_URL" > "${TMP_DIR}/${CHECKSUMS_FILE}"; then
+  echo "Error: could not download ${CHECKSUMS_FILE} from release ${TAG}." >&2
+  echo "The release is missing its checksum file, so the download cannot be verified." >&2
+  echo "Please report this at https://github.com/${REPO}/issues" >&2
+  exit 1
+fi
 
 # --- Verify checksum ---
 # SHA256SUMS lists every release artifact (linux-amd64, darwin-arm64, ...).
@@ -136,11 +145,23 @@ case ":${PATH}:" in
 esac
 
 # --- Verify ---
-if command -v solikv >/dev/null 2>&1; then
-  echo ""
-  echo "SoliKV installed successfully!"
+# Run the binary we just installed by absolute path. Checking `command -v solikv`
+# instead would report success on an unrelated solikv already on PATH.
+echo ""
+if VERSION=$("${INSTALL_DIR}/solikv" --version 2>/dev/null); then
+  echo "SoliKV installed successfully: ${VERSION} (${INSTALL_DIR}/solikv)"
+elif "${INSTALL_DIR}/solikv" --help >/dev/null 2>&1; then
+  # Releases up to and including v0.4.1 have no --version flag.
+  echo "SoliKV ${TAG} installed successfully (${INSTALL_DIR}/solikv)"
 else
+  echo "SoliKV installed to ${INSTALL_DIR}/solikv, but running it failed." >&2
+  echo "The download may be corrupt or built for a different platform." >&2
+  exit 1
+fi
+
+# A different solikv earlier in PATH would shadow the one just installed.
+RESOLVED=$(command -v solikv 2>/dev/null || true)
+if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "${INSTALL_DIR}/solikv" ]; then
   echo ""
-  echo "SoliKV installed to ${INSTALL_DIR}/solikv"
-  echo "Run 'solikv --version' to verify (you may need to reload your shell)."
+  echo "NOTE: 'solikv' on your PATH resolves to ${RESOLVED}, not the copy just installed."
 fi

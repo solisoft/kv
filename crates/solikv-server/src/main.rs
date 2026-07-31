@@ -23,6 +23,7 @@ use solikv_server::rest_server;
 #[derive(Parser, Debug)]
 #[command(
     name = "solikv",
+    version,
     about = "SoliKV - High-Performance In-Memory Database"
 )]
 struct Args {
@@ -160,6 +161,16 @@ fn main() {
         .build()
         .expect("failed to build Tokio runtime");
     rt.block_on(async_main(args));
+}
+
+/// Best-effort absolute rendering of a path, for error messages. `--dir` defaults
+/// to the relative "data", so a bare path tells the user nothing about where the
+/// server actually tried to write.
+fn abs_display(p: &std::path::Path) -> String {
+    std::path::absolute(p)
+        .unwrap_or_else(|_| p.to_path_buf())
+        .display()
+        .to_string()
 }
 
 async fn async_main(args: Args) {
@@ -556,7 +567,13 @@ async fn async_main(args: Args) {
 
     // --- Create lock-free AOF writer (channel-based, background task handles I/O + fsync) ---
     let aof_writer = if args.appendonly {
-        std::fs::create_dir_all(&args.dir).ok();
+        if let Err(e) = std::fs::create_dir_all(&args.dir) {
+            tracing::error!(
+                "Cannot create data directory {}: {} — pass --dir <writable path>",
+                abs_display(&args.dir),
+                e
+            );
+        }
         let aof_path = args.dir.join("appendonly.aof");
         match solikv_persist::spawn_aof_writer(&aof_path, fsync_policy) {
             Ok(writer) => {
@@ -564,7 +581,12 @@ async fn async_main(args: Args) {
                 Some(writer)
             }
             Err(e) => {
-                tracing::error!("Failed to open AOF file: {}", e);
+                tracing::error!(
+                    "Failed to open AOF file {}: {} — WRITES WILL NOT BE PERSISTED. \
+                     Pass --dir <writable path>, or --appendonly false to run in-memory only.",
+                    abs_display(&aof_path),
+                    e
+                );
                 None
             }
         }
@@ -595,7 +617,7 @@ async fn async_main(args: Args) {
                 if let Err(e) = solikv_persist::save_all_shards(&dir, &dbfilename, ns, |idx, f| {
                     shards_ref.shard(idx).with_store(|store| f(store))
                 }) {
-                    tracing::error!("Background RDB save error: {}", e);
+                    tracing::error!("Background RDB save to {} failed: {}", abs_display(&dir), e);
                 } else {
                     tracing::debug!("Background RDB snapshot saved");
                 }
@@ -646,7 +668,11 @@ async fn async_main(args: Args) {
             if let Err(e) = solikv_persist::save_all_shards(&args.dir, &args.dbfilename, ns, |idx, f| {
                 shards.shard(idx).with_store(|store| f(store))
             }) {
-                tracing::error!("Shutdown RDB save error: {}", e);
+                tracing::error!(
+                    "Shutdown RDB save to {} failed: {}",
+                    abs_display(&args.dir),
+                    e
+                );
             } else {
                 tracing::info!("Final RDB snapshot saved to {:?}", args.dir);
             }
