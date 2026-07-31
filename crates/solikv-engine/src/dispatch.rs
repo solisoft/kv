@@ -706,10 +706,9 @@ impl CommandEngine {
                 if args.len() == 2 {
                     let key = args[0].clone();
                     let value = args[1].clone();
-                    return self
-                        .shards
-                        .shard_for_key(&key)
-                        .execute(move |store| store.string_set(key, value, None, false, false, false));
+                    return self.shards.shard_for_key(&key).execute(move |store| {
+                        store.string_set(key, value, None, false, false, false)
+                    });
                 }
                 let key = args[0].clone();
                 let value = args[1].clone();
@@ -3662,9 +3661,7 @@ where
     F: FnOnce() -> R,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle)
-            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
-        {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(f)
         }
         _ => f(),
@@ -3702,12 +3699,7 @@ fn multi_shard_mget(shards: &crate::shard::ShardManager, keys: &[Bytes]) -> Comm
         let indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
         let group_keys: Vec<Bytes> = group.into_iter().map(|(_, k)| k).collect();
         let resp = shards.shard(shard_idx).execute(move |store| {
-            CommandResponse::Array(
-                group_keys
-                    .iter()
-                    .map(|k| store.string_get(k))
-                    .collect(),
-            )
+            CommandResponse::Array(group_keys.iter().map(|k| store.string_get(k)).collect())
         });
         if let CommandResponse::Array(items) = resp {
             for (idx, item) in indices.into_iter().zip(items) {
@@ -4104,10 +4096,7 @@ mod sec_tests {
     fn test_multi_shard_scan_visits_all_shards() {
         let e = engine();
         for i in 0..40 {
-            e.execute(
-                "SET",
-                &[Bytes::from(format!("sk{i}")), Bytes::from("1")],
-            );
+            e.execute("SET", &[Bytes::from(format!("sk{i}")), Bytes::from("1")]);
         }
 
         let mut all = std::collections::HashSet::new();

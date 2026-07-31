@@ -265,9 +265,7 @@ impl ShardStore {
     /// Returns the expired key names that were actually removed from the map.
     pub fn run_active_expiry(&mut self) -> Vec<Bytes> {
         let now = now_millis();
-        let expired_keys = self
-            .expiry_heap
-            .drain_expired(now, MAX_EXPIRE_PER_TICK);
+        let expired_keys = self.expiry_heap.drain_expired(now, MAX_EXPIRE_PER_TICK);
         let mut removed = Vec::new();
         for key in expired_keys {
             if let Some(entry) = self.data.get(&key) {
@@ -579,7 +577,11 @@ mod tests {
     fn test_random_key_o1() {
         let mut store = ShardStore::new();
         assert!(store.random_key().is_none());
-        store.set(Bytes::from("only"), RedisValue::String(Bytes::from("v")), None);
+        store.set(
+            Bytes::from("only"),
+            RedisValue::String(Bytes::from("v")),
+            None,
+        );
         assert_eq!(store.random_key().unwrap(), Bytes::from("only"));
     }
 
