@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
@@ -162,6 +163,16 @@ pub struct CommandEngine {
     weak_self: OnceLock<Weak<CommandEngine>>,
     notify_flags: Arc<AtomicU16>,
     pub replication_offset: Arc<AtomicU64>,
+    /// Where `SAVE`/`BGSAVE` write, mirroring `--dir` and `--dbfilename`.
+    ///
+    /// These used to be hardcoded to `data`/`dump` in the command handler, so a
+    /// server started with `--dir /var/lib/solikv` wrote its background and
+    /// shutdown snapshots there but an explicit `SAVE` wrote to `./data`
+    /// relative to the process CWD — a snapshot that the next startup never
+    /// loads, and an operator-triggered save that silently does not protect the
+    /// data it appears to.
+    rdb_dir: PathBuf,
+    rdb_basename: String,
 }
 
 impl CommandEngine {
@@ -175,6 +186,8 @@ impl CommandEngine {
             weak_self: OnceLock::new(),
             notify_flags: Arc::new(AtomicU16::new(0)),
             replication_offset: Arc::new(AtomicU64::new(0)),
+            rdb_dir: PathBuf::from("data"),
+            rdb_basename: "dump".to_string(),
         }
     }
 
@@ -198,6 +211,14 @@ impl CommandEngine {
 
     pub fn with_aof(mut self, aof: AofWriter) -> Self {
         self.aof = Some(aof);
+        self
+    }
+
+    /// Point `SAVE`/`BGSAVE` at the server's configured `--dir` and
+    /// `--dbfilename` instead of the `data`/`dump` defaults.
+    pub fn with_rdb_path(mut self, dir: impl Into<PathBuf>, basename: impl Into<String>) -> Self {
+        self.rdb_dir = dir.into();
+        self.rdb_basename = basename.into();
         self
     }
 
@@ -3188,12 +3209,14 @@ impl CommandEngine {
             "SAVE" | "BGSAVE" => {
                 // Disk I/O under shard locks — release the async worker while saving.
                 maybe_block_in_place(|| {
-                    let dir = std::path::Path::new("data");
+                    let dir = self.rdb_dir.as_path();
                     let shards = self.shards.clone();
                     let num = shards.num_shards();
-                    if let Err(e) = solikv_persist::save_all_shards(dir, "dump", num, |idx, f| {
-                        shards.shard(idx).with_store(|store| f(store))
-                    }) {
+                    if let Err(e) =
+                        solikv_persist::save_all_shards(dir, &self.rdb_basename, num, |idx, f| {
+                            shards.shard(idx).with_store(|store| f(store))
+                        })
+                    {
                         return CommandResponse::error(format!("ERR RDB save failed: {}", e));
                     }
                     tracing::info!("RDB saved {} shards to {:?}", num, dir);
@@ -3201,8 +3224,26 @@ impl CommandEngine {
                 })
             }
             "BGREWRITEAOF" => {
-                // Rewrite AOF: not implemented yet, return OK for compatibility
-                CommandResponse::ok()
+                // Report the truth instead of `+OK`.
+                //
+                // This has always been a no-op, so an operator who ran it —
+                // or a maintenance job that runs it on a schedule — was told
+                // the append log had been compacted when it had not. The AOF
+                // grows without bound either way; the difference is whether
+                // anyone finds out before the disk fills.
+                //
+                // Implementing it needs more than a snapshot-and-swap.
+                // `execute()` mutates the store and *then* enqueues to the AOF
+                // writer, so a rewrite that snapshots between those two steps
+                // captures a command that is also about to be appended to the
+                // new log — replaying it applies the command twice. That is
+                // harmless for SET and wrong for RPUSH/INCR. Closing the window
+                // means holding a shared guard across (mutate, append) on the
+                // write path and an exclusive one for the rewrite, which is a
+                // hot-path change worth benchmarking on its own.
+                CommandResponse::error(
+                    "ERR BGREWRITEAOF is not implemented; the append log is never compacted",
+                )
             }
 
             // ---- Scripting commands ----
@@ -3972,6 +4013,46 @@ mod sec_tests {
             CommandResponse::Error(s) => s.clone(),
             other => panic!("expected error, got {:?}", other),
         }
+    }
+
+    /// `SAVE` used to hardcode `data`/`dump`, ignoring `--dir` and
+    /// `--dbfilename`. A server started with a custom data directory therefore
+    /// wrote its background and shutdown snapshots there, while an explicit
+    /// `SAVE` wrote to `./data` relative to the process CWD — a snapshot the
+    /// next startup never loads, from a command that reports success.
+    #[test]
+    fn save_writes_to_the_configured_dir_and_basename() {
+        let dir = std::env::temp_dir().join(format!("solikv-save-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let shards = Arc::new(ShardManager::new(2));
+        let pubsub = Arc::new(PubSubBroker::new());
+        let engine =
+            Arc::new(CommandEngine::new(shards, pubsub).with_rdb_path(dir.clone(), "snapshot"));
+        engine.init_self_ref(Arc::downgrade(&engine));
+
+        engine.execute("SET", &[Bytes::from("k"), Bytes::from("v")]);
+        let resp = engine.execute("SAVE", &[]);
+        assert!(!resp.is_error(), "SAVE failed: {:?}", resp);
+
+        let written: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            written.iter().any(|name| name.starts_with("snapshot-")),
+            "expected snapshot-*.rdb in the configured dir, found {:?}",
+            written
+        );
+        assert!(
+            !written.iter().any(|name| name.starts_with("dump-")),
+            "SAVE still used the hardcoded basename: {:?}",
+            written
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // SEC-012: numkeys = usize::MAX must not panic the connection via

@@ -28,6 +28,10 @@ parking_lot = "0.12"
 indexmap = "2"
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
 sha1 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
 
 # Workspace crates
 solikv-core = { path = "crates/solikv-core" }

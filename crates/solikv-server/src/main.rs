@@ -432,7 +432,69 @@ async fn async_main(args: Args) {
             }
         };
 
+        // The bus secret. Required, and checked before anything is bound.
+        //
+        // This used to be the whole of cluster mode: build a `GossipState`, call
+        // `enable()`, log success, and never start the server. Every node then
+        // listened for no peer and reached none — three nodes were three
+        // independent nodes, each reporting healthy. The server is started
+        // below, and it authenticates every frame.
+        //
+        // Refusing without a secret rather than starting open is the same rule
+        // `db/` now follows: gossip decides who is in the cluster and which node
+        // owns which slots, so an unauthenticated bus is a stranger deciding the
+        // topology.
+        let bus_secret = match cluster_password.as_deref() {
+            Some(pw) => match solikv_cluster::auth::ClusterSecret::new(pw) {
+                Ok(secret) => secret,
+                Err(e) => {
+                    eprintln!("ERROR: cluster mode needs a usable bus secret: {e}");
+                    eprintln!("       set --cluster-password-file or SOLIKV_CLUSTER_PASSWORD");
+                    std::process::exit(1);
+                }
+            },
+            None => {
+                eprintln!(
+                    "ERROR: --cluster-enabled requires a cluster password: the gossip bus decides \
+                     cluster membership and slot ownership, and an unauthenticated bus lets \
+                     anyone who can reach the port decide both."
+                );
+                eprintln!("       set --cluster-password-file or SOLIKV_CLUSTER_PASSWORD");
+                std::process::exit(1);
+            }
+        };
+
         let gossip = GossipState::new(node_id.clone(), bind_ip.clone(), args.port);
+        let (gossip_tx, mut gossip_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // The bus listens on the data port plus the standard offset, on the same
+        // address the node advertises — not on loopback, which the previous
+        // version hardcoded and which cannot reach a peer on another machine.
+        let bus_port = args.port + solikv_cluster::CLUSTER_BUS_PORT_OFFSET;
+        let bus_bind: std::net::SocketAddr = format!("{}:{}", bind_ip, bus_port)
+            .parse()
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "ERROR: cannot form a cluster bus address from {bind_ip}:{bus_port}: {e}"
+                );
+                std::process::exit(1);
+            });
+
+        let bus_secret_for_tasks = bus_secret.clone();
+        let gossip_for_tasks = gossip.clone();
+
+        if let Err(e) = solikv_cluster::gossip::start_gossip_server(
+            bus_bind,
+            bus_secret,
+            gossip.clone(),
+            gossip_tx,
+        )
+        .await
+        {
+            eprintln!("ERROR: cluster bus failed to bind {bus_bind}: {e}");
+            std::process::exit(1);
+        }
+
         let cluster = Arc::new(ClusterManager::new(
             node_id,
             bind_ip.clone(),
@@ -440,7 +502,69 @@ async fn async_main(args: Args) {
             gossip,
         ));
         cluster.enable();
-        tracing::info!("Cluster mode enabled");
+
+        // Drain the authenticated frames into the manager, and answer the ones
+        // that need answering. Without this the channel fills and the server
+        // blocks — the quiet version of the bug this whole change is about.
+        let cluster_for_gossip = cluster.clone();
+        let reply_secret = bus_secret_for_tasks.clone();
+        tokio::spawn(async move {
+            while let Some(message) = gossip_rx.recv().await {
+                let sender = match &message {
+                    solikv_cluster::GossipMessage::Ping { ip, port, .. } => {
+                        format!("{}:{}", ip, port + solikv_cluster::CLUSTER_BUS_PORT_OFFSET)
+                            .parse::<std::net::SocketAddr>()
+                            .ok()
+                    }
+                    _ => None,
+                };
+                if let Some(reply) = cluster_for_gossip.handle_gossip(message) {
+                    // A pong goes back over a fresh connection to the address the
+                    // ping advertised, not back down the inbound socket: the
+                    // inbound one may be a client that only writes, and the
+                    // advertised address is the one the rest of the cluster uses.
+                    if let Some(peer) = sender {
+                        let secret = reply_secret.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = solikv_cluster::gossip::send_frame(
+                                peer,
+                                &reply,
+                                &secret,
+                                std::time::Duration::from_secs(3),
+                            )
+                            .await
+                            {
+                                tracing::debug!(%peer, error = %e, "gossip pong failed");
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        // The outbound half. Nothing dialled a peer before this: there was a
+        // listener and no caller, so even a correctly configured cluster sat
+        // silent. One round every second, failures logged and skipped — a single
+        // unreachable node is what the failure detector is for, not a reason to
+        // stop pinging everyone after it.
+        let gossip_for_round = gossip_for_tasks.clone();
+        let round_secret = bus_secret_for_tasks.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                solikv_cluster::gossip::gossip_round(
+                    &gossip_for_round,
+                    &round_secret,
+                    solikv_cluster::CLUSTER_BUS_PORT_OFFSET,
+                    std::time::Duration::from_secs(3),
+                )
+                .await;
+            }
+        });
+
+        tracing::info!(%bus_bind, "cluster mode enabled, gossip bus authenticated");
         Some(cluster)
     } else {
         None
@@ -596,7 +720,11 @@ async fn async_main(args: Args) {
 
     // --- Create engine with AOF ---
     let mut engine = solikv_engine::CommandEngine::new(shards.clone(), pubsub.clone())
-        .with_notify_flags(notify_flags);
+        .with_notify_flags(notify_flags)
+        // Without this, an explicit SAVE/BGSAVE writes to ./data/dump-*.rdb
+        // regardless of --dir/--dbfilename, so it lands somewhere startup never
+        // reads from.
+        .with_rdb_path(args.dir.clone(), args.dbfilename.clone());
     if let Some(writer) = aof_writer {
         engine = engine.with_aof(writer);
     }

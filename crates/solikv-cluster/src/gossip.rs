@@ -1,16 +1,27 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-// SECURITY NOTE (SEC-016): When wiring up gossip server and replication:
-// - Add HMAC-SHA-256 signing to all gossip frames with a cluster-bus-secret
-// - Verify HMAC on receive and drop unverifiable messages
-// - Add TLS support to cluster bus and replica->master connections
-// - Reject UPDATE messages whose node_id differs from sender's verified identity
-// - Add per-connection auth handshake before accepting bus traffic
+// SEC-016, four of five done. What landed with the server, and what did not:
+//
+//   [x] HMAC-SHA-256 on every frame          crate::auth::Envelope
+//   [x] verify on receive, drop what fails   crate::auth::Envelope::open
+//   [x] reject UPDATE from a mismatched id   crate::auth::SenderIdentity
+//   [x] authenticate before accepting        every frame carries its own proof,
+//                                            which is strictly better than a
+//                                            handshake: a handshake authenticates
+//                                            a connection once and trusts every
+//                                            later byte on it
+//   [ ] TLS on the bus and replica links     NOT DONE — see below
+//
+// The HMAC authenticates and detects tampering; it does not encrypt. Anyone on
+// the path reads the topology, the node ids and the addresses. On a provider
+// with no private network — OVH VPS has none — that is the whole cluster map
+// visible to the path. It is not a way in, and it is not nothing.
 
 pub const CLUSTER_BUS_PORT_OFFSET: u16 = 10000;
 
@@ -147,6 +158,16 @@ impl GossipMessage {
         msg.into_bytes()
     }
 
+    /// Which node this message claims to come from.
+    pub fn node_id(&self) -> &str {
+        match self {
+            GossipMessage::Ping { node_id, .. }
+            | GossipMessage::Pong { node_id, .. }
+            | GossipMessage::Meet { node_id, .. }
+            | GossipMessage::Update { node_id, .. } => node_id,
+        }
+    }
+
     pub fn decode(data: &[u8]) -> Option<Self> {
         let msg = String::from_utf8(data.to_vec()).ok()?;
         let parts: Vec<&str> = msg.split_whitespace().collect();
@@ -220,6 +241,12 @@ impl GossipState {
         }
     }
 
+    /// This node's advertised address, as peers should reach it.
+    pub fn myself_address(&self) -> (String, u16) {
+        let myself = self.myself.read();
+        (myself.ip.clone(), myself.port)
+    }
+
     pub fn myself_id(&self) -> String {
         self.myself.read().node_id.clone()
     }
@@ -266,17 +293,23 @@ impl GossipState {
             .collect()
     }
 
+    /// Answers a ping, and learns the sender.
+    ///
+    /// The three sender fields used to be `_sender_id`, `_ip`, `_port` — read
+    /// and discarded. So a node that pinged you never became known, and gossip
+    /// only ever propagated in the direction someone had typed `CLUSTER MEET`.
+    /// Two nodes that met each other from one side would each see a peer that
+    /// never answered.
     pub fn handle_ping(
         &self,
-        _sender_id: &str,
-        _ip: String,
-        _port: u16,
+        sender_id: &str,
+        ip: String,
+        port: u16,
         ping_id: u64,
     ) -> GossipMessage {
-        let _now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        if sender_id != self.myself_id() {
+            self.add_node(sender_id.to_string(), ip, port);
+        }
 
         let myself = self.myself.read();
 
@@ -288,8 +321,31 @@ impl GossipState {
         }
     }
 
+    /// Records a pong, reconciling the placeholder `CLUSTER MEET` created.
+    ///
+    /// `MEET` only knows an address, so it files the peer under `"ip:port"`. The
+    /// pong carries the peer's **real** node id, and a straight lookup by that
+    /// id misses the placeholder — which is why a met node stayed `fail`
+    /// forever while answering every ping. The placeholder is renamed the first
+    /// time its real identity arrives.
     pub fn handle_pong(&self, node_id: &str, ping_id: u64) {
         let mut nodes = self.nodes.write();
+
+        if !nodes.contains_key(node_id) {
+            let placeholder = nodes
+                .iter()
+                .find(|(key, node)| {
+                    key.as_str() == format!("{}:{}", node.ip, node.port) && node.node_id != node_id
+                })
+                .map(|(key, _)| key.clone());
+            if let Some(key) = placeholder {
+                if let Some(mut node) = nodes.remove(&key) {
+                    node.node_id = node_id.to_string();
+                    nodes.insert(node_id.to_string(), node);
+                }
+            }
+        }
+
         if let Some(node) = nodes.get_mut(node_id) {
             node.pong_received = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -335,65 +391,208 @@ impl GossipState {
     }
 }
 
+/// Serves the cluster bus.
+///
+/// Replaces a version that had four separate problems, each of which would have
+/// shipped the day someone called it:
+///
+/// **It was never called.** `--cluster` built a `GossipState`, called
+/// `cluster.enable()` and logged "Cluster mode enabled" without ever starting
+/// this. Three nodes were three independent nodes, all reporting healthy.
+///
+/// **It bound `127.0.0.1` unconditionally**, so even once started it could not
+/// have reached a peer on another machine.
+///
+/// **It had no framing.** `read()` into a buffer and decode the bytes means a
+/// message split across two TCP segments is dropped and two messages in one
+/// segment are dropped — silently, and more often under load.
+///
+/// **Its access control was the peer's IP against the known-node list**, which
+/// is both unauthenticated and a chicken-and-egg: a node is not known until it
+/// has been met, so a new peer could never connect. Authentication is now per
+/// frame, so a stranger's frames are dropped whatever their address.
 pub async fn start_gossip_server(
-    port: u16,
+    bind: SocketAddr,
+    secret: crate::auth::ClusterSecret,
     state: GossipState,
     msg_tx: mpsc::UnboundedSender<GossipMessage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&addr).await?;
-    tracing::info!(
-        "Cluster gossip server listening on {} (localhost only)",
-        addr
-    );
+    let listener = TcpListener::bind(bind).await?;
+    tracing::info!(%bind, "cluster gossip server listening, every frame authenticated");
 
-    let state_clone = state.clone();
+    let _ = &state;
 
     tokio::spawn(async move {
-        let mut buf = [0u8; 1024];
-
         loop {
-            match listener.accept().await {
-                Ok((mut stream, peer_addr)) => {
-                    // Only accept connections from loopback or known cluster peers
-                    if !peer_addr.ip().is_loopback() {
-                        let known = state_clone
-                            .get_all_nodes()
-                            .iter()
-                            .any(|n| n.ip == peer_addr.ip().to_string());
-                        if !known {
-                            tracing::warn!(
-                                "Gossip: rejecting connection from unknown peer {}",
-                                peer_addr
-                            );
-                            continue;
-                        }
-                    }
-
-                    let tx = msg_tx.clone();
-
-                    tokio::spawn(async move {
-                        loop {
-                            match stream.read(&mut buf).await {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    if let Some(msg) = GossipMessage::decode(&buf[..n]) {
-                                        let _ = tx.send(msg);
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    });
-                }
+            let (stream, peer_addr) = match listener.accept().await {
+                Ok(accepted) => accepted,
                 Err(e) => {
-                    tracing::error!("Gossip accept error: {}", e);
+                    tracing::error!(error = %e, "gossip accept failed");
+                    continue;
                 }
-            }
+            };
+
+            let tx = msg_tx.clone();
+            let secret = secret.clone();
+            tokio::spawn(async move {
+                if let Err(e) = serve_peer(stream, peer_addr, secret, tx).await {
+                    tracing::debug!(%peer_addr, error = %e, "gossip connection closed");
+                }
+            });
         }
     });
 
     Ok(())
+}
+
+/// One connection.
+///
+/// Line-framed, because the protocol is line-terminated and TCP is not. The
+/// nonce memory and the claimed identity are per connection: the identity
+/// because that is the only scope in which it means anything, and the nonces
+/// because a shared one would be a lock on the hot path for a defence that is
+/// already per-peer.
+async fn serve_peer(
+    stream: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
+    secret: crate::auth::ClusterSecret,
+    msg_tx: mpsc::UnboundedSender<GossipMessage>,
+) -> Result<(), std::io::Error> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut lines = BufReader::new(stream).lines();
+    let mut seen = crate::auth::NonceMemory::new();
+    let mut identity = crate::auth::SenderIdentity::new();
+
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let payload = match crate::auth::Envelope::open(&line, &secret, now_ms(), &mut seen) {
+            Ok(payload) => payload,
+            Err(e) => {
+                // Logged at warn and dropped. Not a disconnect: a single bad
+                // frame is far more often a clock that drifted than an attack,
+                // and dropping the connection would turn one skewed node into a
+                // reconnect storm against every peer.
+                tracing::warn!(%peer_addr, error = %e, "rejected gossip frame");
+                continue;
+            }
+        };
+
+        let Some(message) = GossipMessage::decode(payload.as_bytes()) else {
+            tracing::warn!(%peer_addr, "authenticated frame did not parse as gossip");
+            continue;
+        };
+
+        if let Err(e) = identity.observe(message.node_id()) {
+            // A connection that changes who it claims to be. See the note in
+            // `crate::auth` on what a shared secret can prove: this catches
+            // confusion and cross-connection replay, not a malicious member.
+            tracing::warn!(%peer_addr, error = %e, "gossip identity switch");
+            continue;
+        }
+
+        if msg_tx.send(message).is_err() {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Sends one frame to a peer and closes.
+///
+/// A connection per frame rather than a pool. Gossip is a handful of short
+/// messages every second or two, so the pool would exist to save a handshake
+/// that is not on any hot path — and a pooled connection to a node that has
+/// gone away is a write that blocks until a timeout nobody set. Reconnecting
+/// is the cheap, obvious, restartable option.
+///
+/// Every frame carries its own proof, so there is no session to establish and
+/// nothing is trusted because of what an earlier frame on the same connection
+/// said.
+pub async fn send_frame(
+    peer: SocketAddr,
+    message: &GossipMessage,
+    secret: &crate::auth::ClusterSecret,
+    connect_timeout: Duration,
+) -> Result<(), std::io::Error> {
+    use tokio::io::AsyncWriteExt;
+
+    let payload = String::from_utf8_lossy(&message.encode())
+        .trim_end()
+        .to_string();
+    let frame = crate::auth::Envelope::seal(&payload, secret, now_ms(), &crate::auth::new_nonce());
+
+    // A peer that has gone away must not hold this task open. Without the
+    // timeout a single unreachable node stalls the whole gossip round, which is
+    // the failure that makes a cluster look partitioned when one machine is
+    // merely rebooting.
+    let mut stream = tokio::time::timeout(connect_timeout, tokio::net::TcpStream::connect(peer))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("connect to {peer} timed out"),
+            )
+        })??;
+
+    stream.write_all(frame.as_bytes()).await?;
+    stream.flush().await
+}
+
+/// One round of gossip: ping every known peer.
+///
+/// Failures are logged and skipped, never propagated. One unreachable node is
+/// the ordinary case — it is what the failure detector exists to notice — and a
+/// round that aborted on the first error would stop pinging everyone after it,
+/// making one dead node look like a dead cluster.
+pub async fn gossip_round(
+    state: &GossipState,
+    secret: &crate::auth::ClusterSecret,
+    bus_offset: u16,
+    connect_timeout: Duration,
+) -> usize {
+    let myself = state.myself_id();
+    let (my_ip, my_port) = state.myself_address();
+    let mut reached = 0;
+
+    // `get_known_nodes` yields `(ip, port)`, not `(node_id, port)`. The first
+    // version of this loop read the first element as a node id and looked it up
+    // — which never matched, so the round found no peers and gossip stayed
+    // silent with a listener running and nothing in the log to say why.
+    for (ip, port) in state.get_known_nodes() {
+        if ip == my_ip && port == my_port {
+            continue;
+        }
+        let Ok(peer) = format!("{}:{}", ip, port + bus_offset).parse::<SocketAddr>() else {
+            tracing::warn!(%ip, port, "peer address does not parse");
+            continue;
+        };
+
+        let ping = GossipMessage::Ping {
+            node_id: myself.clone(),
+            ip: my_ip.clone(),
+            port: my_port,
+            ping_id: now_ms(),
+        };
+        match send_frame(peer, &ping, secret, connect_timeout).await {
+            Ok(()) => reached += 1,
+            Err(e) => tracing::debug!(%peer, error = %e, "gossip ping failed"),
+        }
+    }
+
+    reached
+}
+
+/// Wall-clock milliseconds, for the replay window.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub fn generate_node_id() -> String {

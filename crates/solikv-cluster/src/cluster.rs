@@ -1,4 +1,4 @@
-use crate::gossip::GossipState;
+use crate::gossip::{GossipMessage, GossipState};
 use parking_lot::RwLock;
 use std::sync::Arc;
 
@@ -85,6 +85,46 @@ impl ClusterManager {
 
     pub fn node_id(&self) -> &str {
         &self.my_node_id
+    }
+
+    /// Applies one authenticated gossip frame.
+    ///
+    /// The dispatch the server drains into. Kept on the manager rather than in
+    /// the server loop so that "what a frame does to cluster state" is one
+    /// place, and so it can be exercised without a socket.
+    ///
+    /// A `Ping` produces a `Pong` for the caller to send back; everything else
+    /// is applied and returns nothing.
+    pub fn handle_gossip(&self, message: GossipMessage) -> Option<GossipMessage> {
+        match message {
+            GossipMessage::Ping {
+                node_id,
+                ip,
+                port,
+                ping_id,
+            } => Some(self.gossip.handle_ping(&node_id, ip, port, ping_id)),
+            GossipMessage::Pong {
+                node_id, ping_id, ..
+            } => {
+                self.gossip.handle_pong(&node_id, ping_id);
+                None
+            }
+            GossipMessage::Meet { node_id, ip, port } => {
+                self.gossip.handle_meet(node_id, ip, port);
+                None
+            }
+            GossipMessage::Update {
+                node_id,
+                ip,
+                port,
+                flags,
+                master_id,
+            } => {
+                self.gossip
+                    .handle_update(node_id, ip, port, flags, master_id);
+                None
+            }
+        }
     }
 
     pub fn meet(&self, ip: String, port: u16) {
