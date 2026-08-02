@@ -104,9 +104,12 @@ impl ClusterManager {
                 ping_id,
             } => Some(self.gossip.handle_ping(&node_id, ip, port, ping_id)),
             GossipMessage::Pong {
-                node_id, ping_id, ..
+                node_id,
+                ip,
+                port,
+                ping_id,
             } => {
-                self.gossip.handle_pong(&node_id, ping_id);
+                self.gossip.handle_pong(&node_id, &ip, port, ping_id);
                 None
             }
             GossipMessage::Meet { node_id, ip, port } => {

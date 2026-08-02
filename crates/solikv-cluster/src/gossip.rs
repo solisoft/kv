@@ -308,7 +308,11 @@ impl GossipState {
         ping_id: u64,
     ) -> GossipMessage {
         if sender_id != self.myself_id() {
-            self.add_node(sender_id.to_string(), ip, port);
+            let mut nodes = self.nodes.write();
+            nodes.entry(sender_id.to_string()).or_insert_with(|| {
+                ClusterNodeInfo::from_gossip(sender_id.to_string(), ip.clone(), port)
+            });
+            absorb_placeholder(&mut nodes, sender_id, &ip, port);
         }
 
         let myself = self.myself.read();
@@ -328,23 +332,9 @@ impl GossipState {
     /// id misses the placeholder — which is why a met node stayed `fail`
     /// forever while answering every ping. The placeholder is renamed the first
     /// time its real identity arrives.
-    pub fn handle_pong(&self, node_id: &str, ping_id: u64) {
+    pub fn handle_pong(&self, node_id: &str, ip: &str, port: u16, ping_id: u64) {
         let mut nodes = self.nodes.write();
-
-        if !nodes.contains_key(node_id) {
-            let placeholder = nodes
-                .iter()
-                .find(|(key, node)| {
-                    key.as_str() == format!("{}:{}", node.ip, node.port) && node.node_id != node_id
-                })
-                .map(|(key, _)| key.clone());
-            if let Some(key) = placeholder {
-                if let Some(mut node) = nodes.remove(&key) {
-                    node.node_id = node_id.to_string();
-                    nodes.insert(node_id.to_string(), node);
-                }
-            }
-        }
+        absorb_placeholder(&mut nodes, node_id, ip, port);
 
         if let Some(node) = nodes.get_mut(node_id) {
             node.pong_received = std::time::SystemTime::now()
@@ -587,6 +577,41 @@ pub async fn gossip_round(
     reached
 }
 
+/// Drops the `CLUSTER MEET` placeholder for an address once the real node id
+/// for that address is known.
+///
+/// `MEET` files a peer under `"ip:port"` because its identity is not known
+/// yet. Two things then reveal it — the peer's pong, and the peer's own ping —
+/// and **either** can arrive first.
+///
+/// The first version only reconciled when the real id was still absent, so a
+/// peer whose ping beat its pong left the placeholder behind for good: five
+/// rows for three nodes, two of them permanently `fail` because nothing ever
+/// answers for an address that is already represented. Found on three real
+/// machines; two would not have raced.
+fn absorb_placeholder(
+    nodes: &mut HashMap<String, ClusterNodeInfo>,
+    node_id: &str,
+    ip: &str,
+    port: u16,
+) {
+    let placeholder = format!("{ip}:{port}");
+    if placeholder == node_id {
+        return;
+    }
+    let Some(stale) = nodes.remove(&placeholder) else {
+        return;
+    };
+
+    // Keep whatever the real entry already learned; the placeholder only ever
+    // held an address, which is the one thing both agree on.
+    nodes.entry(node_id.to_string()).or_insert_with(|| {
+        let mut node = stale;
+        node.node_id = node_id.to_string();
+        node
+    });
+}
+
 /// Wall-clock milliseconds, for the replay window.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -617,4 +642,158 @@ fn rand_simple() -> u64 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     RandomState::new().build_hasher().finish()
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::*;
+
+    /// Everyone but this node. `get_all_nodes` always puts self first, which is
+    /// right for `CLUSTER NODES` and wrong for counting peers.
+    fn peers(state: &GossipState) -> Vec<ClusterNodeInfo> {
+        let me = state.myself_id();
+        state
+            .get_all_nodes()
+            .into_iter()
+            .filter(|n| n.node_id != me)
+            .collect()
+    }
+
+    /// Two outstanding `MEET`s, two pongs. Each peer must end up under its own
+    /// address.
+    ///
+    /// The regression this exists for was found on three machines and could not
+    /// have been found on two: with one placeholder there is nothing to confuse
+    /// it with. Node 1 ended up believing peer A lived at peer B's address,
+    /// because the reconciliation matched *any* entry that looked like a
+    /// placeholder and `HashMap` order decided which.
+    #[test]
+    fn two_pending_meets_do_not_swap_their_peers() {
+        let state = GossipState::new("me".into(), "10.0.0.1".into(), 6379);
+
+        // What `CLUSTER MEET` leaves behind: an entry keyed by address,
+        // because the real node id is not known until the peer answers.
+        state.add_node("10.0.0.2:6379".into(), "10.0.0.2".into(), 6379);
+        state.add_node("10.0.0.3:6379".into(), "10.0.0.3".into(), 6379);
+
+        state.handle_pong("real-id-of-two", "10.0.0.2", 6379, 1);
+        state.handle_pong("real-id-of-three", "10.0.0.3", 6379, 2);
+
+        // `get_all_nodes` puts this node first, always. Peers are the rest.
+        let by_id: std::collections::HashMap<String, String> = state
+            .get_all_nodes()
+            .into_iter()
+            .filter(|n| n.node_id != "me")
+            .map(|n| (n.node_id, n.ip))
+            .collect();
+        assert_eq!(
+            by_id.get("real-id-of-two").map(String::as_str),
+            Some("10.0.0.2")
+        );
+        assert_eq!(
+            by_id.get("real-id-of-three").map(String::as_str),
+            Some("10.0.0.3")
+        );
+        assert!(!by_id.contains_key("10.0.0.2:6379"), "placeholder survived");
+        assert!(!by_id.contains_key("10.0.0.3:6379"), "placeholder survived");
+    }
+
+    #[test]
+    fn a_pong_from_an_address_nobody_met_creates_nothing() {
+        // A stranger's pong must not invent a member. It is authenticated, so
+        // it is a cluster peer — but membership comes from MEET and from being
+        // pinged, not from answering a ping nobody sent.
+        let state = GossipState::new("me".into(), "10.0.0.1".into(), 6379);
+        state.handle_pong("someone-else", "10.9.9.9", 6379, 1);
+        assert_eq!(peers(&state).len(), 0);
+    }
+
+    #[test]
+    fn a_ping_adds_its_sender_so_gossip_flows_both_ways() {
+        // Without this, membership only ever propagated in the direction
+        // someone had typed MEET.
+        let state = GossipState::new("me".into(), "10.0.0.1".into(), 6379);
+        state.handle_ping("peer-a", "10.0.0.2".to_string(), 6379, 7);
+        assert_eq!(peers(&state).len(), 1);
+        assert_eq!(peers(&state)[0].node_id, "peer-a");
+    }
+
+    #[test]
+    fn a_node_does_not_add_itself_from_its_own_ping() {
+        let state = GossipState::new("me".into(), "10.0.0.1".into(), 6379);
+        state.handle_ping("me", "10.0.0.1".to_string(), 6379, 7);
+        assert_eq!(peers(&state).len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod placeholder_race_tests {
+    use super::*;
+
+    fn peers(state: &GossipState) -> Vec<ClusterNodeInfo> {
+        let me = state.myself_id();
+        state
+            .get_all_nodes()
+            .into_iter()
+            .filter(|n| n.node_id != me)
+            .collect()
+    }
+
+    /// The peer's ping arrives before its pong.
+    ///
+    /// Both reveal the same identity, and either may be first. The version that
+    /// only reconciled when the id was still unknown left the placeholder
+    /// behind on this ordering — five rows for three nodes on real machines,
+    /// two of them permanently `fail`.
+    #[test]
+    fn a_ping_that_beats_the_pong_still_clears_the_placeholder() {
+        let state = GossipState::new("me".into(), "10.0.0.1".into(), 6379);
+        state.add_node("10.0.0.2:6379".into(), "10.0.0.2".into(), 6379);
+
+        state.handle_ping("real-two", "10.0.0.2".to_string(), 6379, 1);
+        state.handle_pong("real-two", "10.0.0.2", 6379, 1);
+
+        let found = peers(&state);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].node_id, "real-two");
+    }
+
+    /// And the other ordering, which already worked.
+    #[test]
+    fn a_pong_that_arrives_first_also_clears_it() {
+        let state = GossipState::new("me".into(), "10.0.0.1".into(), 6379);
+        state.add_node("10.0.0.3:6379".into(), "10.0.0.3".into(), 6379);
+
+        state.handle_pong("real-three", "10.0.0.3", 6379, 1);
+        state.handle_ping("real-three", "10.0.0.3".to_string(), 6379, 1);
+
+        assert_eq!(peers(&state).len(), 1);
+    }
+
+    /// Three nodes, both orderings at once — the shape that failed in Paris.
+    #[test]
+    fn three_nodes_converge_to_exactly_two_peers() {
+        let state = GossipState::new("seed".into(), "10.0.0.1".into(), 6379);
+        state.add_node("10.0.0.2:6379".into(), "10.0.0.2".into(), 6379);
+        state.add_node("10.0.0.3:6379".into(), "10.0.0.3".into(), 6379);
+
+        state.handle_ping("id-two", "10.0.0.2".to_string(), 6379, 1);
+        state.handle_pong("id-three", "10.0.0.3", 6379, 2);
+        state.handle_pong("id-two", "10.0.0.2", 6379, 1);
+        state.handle_ping("id-three", "10.0.0.3".to_string(), 6379, 2);
+
+        let found = peers(&state);
+        assert_eq!(found.len(), 2, "{found:?}");
+        let mut addresses: Vec<(String, String)> =
+            found.into_iter().map(|n| (n.node_id, n.ip)).collect();
+        addresses.sort();
+        assert_eq!(
+            addresses,
+            vec![
+                ("id-three".to_string(), "10.0.0.3".to_string()),
+                ("id-two".to_string(), "10.0.0.2".to_string())
+            ],
+            "peers must keep their own addresses"
+        );
+    }
 }
