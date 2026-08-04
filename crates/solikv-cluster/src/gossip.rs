@@ -89,7 +89,10 @@ impl ClusterNodeInfo {
     }
 }
 
-#[derive(Debug, Clone)]
+// `PartialEq` so a wire round trip can be asserted as an equation. Without it a
+// test has to destructure and compare fields, which is how a test comes to check
+// four of six and pass for a message that lost the other two.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GossipMessage {
     Ping {
         node_id: String,
@@ -114,7 +117,59 @@ pub enum GossipMessage {
         port: u16,
         flags: Vec<String>,
         master_id: Option<String>,
+        /// The slot ranges this node claims to own, inclusive.
+        ///
+        /// The missing half of cluster mode. Membership propagated and ownership
+        /// did not, so every node kept claiming 0-16383 after meeting its peers:
+        /// members agreed and sharding did not, which looks correct from
+        /// `CLUSTER NODES` and sends every key to the wrong place.
+        slots: Vec<(u16, u16)>,
     },
+}
+
+/// `0-5460,10923-16383`, or `-` for a node that owns nothing.
+///
+/// A separate encoding rather than one number per slot: 16384 numbers is 80 KiB
+/// per gossip frame, and this rides on the failure detector's traffic.
+pub fn encode_slots(ranges: &[(u16, u16)]) -> String {
+    if ranges.is_empty() {
+        return "-".to_string();
+    }
+    ranges
+        .iter()
+        .map(|(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Reads what [`encode_slots`] wrote, dropping anything malformed.
+///
+/// A garbled range is dropped rather than failing the whole frame: the sender's
+/// membership is still worth learning, and losing it because one range did not
+/// parse would turn a cosmetic problem into an unreachable node. What is *not*
+/// done is inventing a range — an unparseable claim means no claim.
+pub fn decode_slots(text: &str) -> Vec<(u16, u16)> {
+    if text == "-" {
+        return Vec::new();
+    }
+    text.split(',')
+        .filter_map(|part| match part.split_once('-') {
+            Some((start, end)) => Some((start.parse().ok()?, end.parse().ok()?)),
+            None => {
+                let only: u16 = part.parse().ok()?;
+                Some((only, only))
+            }
+        })
+        // Backwards is not a range. Accepting one would have every reader
+        // iterating an empty span and silently recording no owner.
+        .filter(|(start, end)| start <= end)
+        .collect()
 }
 
 impl GossipMessage {
@@ -145,14 +200,22 @@ impl GossipMessage {
                 port,
                 flags,
                 master_id,
+                slots,
             } => {
                 let flags_str = flags.join(",");
-                match master_id {
-                    Some(mid) => {
-                        format!("UPDATE {} {} {} {} {}\n", node_id, ip, port, flags_str, mid)
-                    }
-                    None => format!("UPDATE {} {} {} {}\n", node_id, ip, port, flags_str),
-                }
+                // Fixed positions, with `-` for an absent field.
+                //
+                // `master_id` used to be an optional trailing word, so a reader
+                // could not tell "no master, here are slots" from "this master,
+                // no slots" — the two differ by nothing but position. Adding a
+                // second optional tail would have made that ambiguity a
+                // misparse rather than a possibility.
+                let master = master_id.as_deref().unwrap_or("-");
+                let slots_str = encode_slots(slots);
+                format!(
+                    "UPDATE {} {} {} {} {} {}\n",
+                    node_id, ip, port, flags_str, master, slots_str
+                )
             }
         };
         msg.into_bytes()
@@ -199,7 +262,10 @@ impl GossipMessage {
                 ip: parts[2].to_string(),
                 port: parts[3].parse().ok()?,
                 flags: parts[4].split(',').map(|s| s.to_string()).collect(),
-                master_id: parts.get(5).map(|s| s.to_string()),
+                // `-` is the placeholder, not a node id. Reading it as one would
+                // make every masterless node claim a master called "-".
+                master_id: parts.get(5).filter(|v| **v != "-").map(|s| s.to_string()),
+                slots: parts.get(6).map(|v| decode_slots(v)).unwrap_or_default(),
             }),
             _ => None,
         }
@@ -545,6 +611,25 @@ pub async fn gossip_round(
     bus_offset: u16,
     connect_timeout: Duration,
 ) -> usize {
+    gossip_round_with_slots(state, secret, bus_offset, connect_timeout, &[]).await
+}
+
+/// A round that also announces which slots this node claims.
+///
+/// Separate entry point rather than a changed signature, because the caller that
+/// knows the slots is the server and the ones that do not are the tests — and a
+/// test passing an empty claim is saying something true about a node that owns
+/// nothing, not filling in a parameter it does not care about.
+///
+/// The `UPDATE` frame used to be decodable and never built: nothing sent one, so
+/// ownership could not propagate however correct the receiving side was.
+pub async fn gossip_round_with_slots(
+    state: &GossipState,
+    secret: &crate::auth::ClusterSecret,
+    bus_offset: u16,
+    connect_timeout: Duration,
+    my_slots: &[(u16, u16)],
+) -> usize {
     let myself = state.myself_id();
     let (my_ip, my_port) = state.myself_address();
     let mut reached = 0;
@@ -570,7 +655,28 @@ pub async fn gossip_round(
         };
         match send_frame(peer, &ping, secret, connect_timeout).await {
             Ok(()) => reached += 1,
-            Err(e) => tracing::debug!(%peer, error = %e, "gossip ping failed"),
+            Err(e) => {
+                tracing::debug!(%peer, error = %e, "gossip ping failed");
+                // No point announcing slots to a peer that did not answer a
+                // ping; the next round will try both again.
+                continue;
+            }
+        }
+
+        // Sent every round, not only on change. A peer that missed one — a
+        // restart, a dropped frame — otherwise keeps a stale ownership table
+        // until something else happens to change, and the symptom is keys
+        // redirected to the wrong node with nothing in either log.
+        let update = GossipMessage::Update {
+            node_id: myself.clone(),
+            ip: my_ip.clone(),
+            port: my_port,
+            flags: vec!["master".to_string()],
+            master_id: None,
+            slots: my_slots.to_vec(),
+        };
+        if let Err(e) = send_frame(peer, &update, secret, connect_timeout).await {
+            tracing::debug!(%peer, error = %e, "gossip slot announcement failed");
         }
     }
 
@@ -795,5 +901,111 @@ mod placeholder_race_tests {
             ],
             "peers must keep their own addresses"
         );
+    }
+}
+
+#[cfg(test)]
+mod slot_propagation_tests {
+    use super::*;
+
+    #[test]
+    fn a_slot_claim_survives_the_wire() {
+        let ranges = vec![(0u16, 5460u16), (10923, 16383)];
+        assert_eq!(encode_slots(&ranges), "0-5460,10923-16383");
+        assert_eq!(decode_slots("0-5460,10923-16383"), ranges);
+    }
+
+    #[test]
+    fn owning_nothing_is_distinguishable_from_owning_slot_zero() {
+        // `-` and `0` are one character apart and mean opposite things: a node
+        // that owns nothing, and a node that owns the slot every empty-string
+        // key hashes to.
+        assert_eq!(encode_slots(&[]), "-");
+        assert!(decode_slots("-").is_empty());
+        assert_eq!(decode_slots("0"), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn a_single_slot_is_written_as_one_number() {
+        assert_eq!(encode_slots(&[(42, 42)]), "42");
+        assert_eq!(decode_slots("42"), vec![(42, 42)]);
+    }
+
+    #[test]
+    fn a_backwards_range_is_dropped_rather_than_iterated() {
+        // `100-50` would make every reader walk an empty span and record no
+        // owner, which reads as "that peer owns nothing" — a claim it never made.
+        assert!(decode_slots("100-50").is_empty());
+        assert_eq!(decode_slots("100-50,7-9"), vec![(7, 9)]);
+    }
+
+    #[test]
+    fn a_garbled_range_does_not_discard_the_readable_ones() {
+        // The sender's membership is still worth learning. Losing the whole frame
+        // over one bad range turns a cosmetic fault into an unreachable node.
+        assert_eq!(decode_slots("abc,7-9,x-y"), vec![(7, 9)]);
+    }
+
+    #[test]
+    fn an_update_round_trips_with_a_master_and_with_slots() {
+        let msg = GossipMessage::Update {
+            node_id: "a".into(),
+            ip: "10.0.0.1".into(),
+            port: 6379,
+            flags: vec!["master".into()],
+            master_id: Some("b".into()),
+            slots: vec![(0, 100)],
+        };
+        let wire = msg.encode();
+        assert_eq!(GossipMessage::decode(&wire).unwrap(), msg);
+    }
+
+    #[test]
+    fn no_master_and_some_slots_is_not_read_as_a_master_called_dash() {
+        // The bug the fixed positions exist to prevent. `master_id` was an
+        // optional trailing word, so "no master, here are slots" and "this
+        // master, no slots" differed by position alone — and appending a second
+        // optional tail would have made that a misparse instead of a hazard.
+        let msg = GossipMessage::Update {
+            node_id: "a".into(),
+            ip: "10.0.0.1".into(),
+            port: 6379,
+            flags: vec!["master".into()],
+            master_id: None,
+            slots: vec![(0, 100)],
+        };
+        let decoded = GossipMessage::decode(&msg.encode()).unwrap();
+        assert_eq!(decoded, msg);
+        match decoded {
+            GossipMessage::Update {
+                master_id, slots, ..
+            } => {
+                assert!(master_id.is_none(), "the placeholder was read as a node id");
+                assert_eq!(slots, vec![(0, 100)]);
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_master_and_no_slots_round_trips_too() {
+        let msg = GossipMessage::Update {
+            node_id: "a".into(),
+            ip: "10.0.0.1".into(),
+            port: 6379,
+            flags: vec!["slave".into()],
+            master_id: Some("b".into()),
+            slots: Vec::new(),
+        };
+        assert_eq!(GossipMessage::decode(&msg.encode()).unwrap(), msg);
+    }
+
+    #[test]
+    fn a_full_claim_does_not_grow_the_frame_beyond_a_line() {
+        // 16384 numbers is about 80 KiB, and this rides on the failure
+        // detector's traffic. Coalescing is what keeps it a line.
+        let one_range = encode_slots(&[(0, 16383)]);
+        assert_eq!(one_range, "0-16383");
+        assert!(one_range.len() < 16, "{one_range}");
     }
 }

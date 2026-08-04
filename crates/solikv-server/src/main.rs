@@ -549,16 +549,22 @@ async fn async_main(args: Args) {
         // stop pinging everyone after it.
         let gossip_for_round = gossip_for_tasks.clone();
         let round_secret = bus_secret_for_tasks.clone();
+        let cluster_for_round = cluster.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
-                solikv_cluster::gossip::gossip_round(
+                // Read fresh each round: an operator can assign or drop slots at
+                // any moment, and a claim captured once would keep announcing
+                // ranges this node has given up.
+                let my_slots = cluster_for_round.my_slot_ranges();
+                solikv_cluster::gossip::gossip_round_with_slots(
                     &gossip_for_round,
                     &round_secret,
                     solikv_cluster::CLUSTER_BUS_PORT_OFFSET,
                     std::time::Duration::from_secs(3),
+                    &my_slots,
                 )
                 .await;
             }

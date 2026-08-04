@@ -511,22 +511,44 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                                         );
                                         continue;
                                     }
+                                    // Parsed, not `unwrap_or(0)`. That default
+                                    // made `CLUSTER ADDSLOTS abc` claim slot 0 —
+                                    // a silent wrong assignment, and slot 0 is
+                                    // where every empty-string key lands.
+                                    let mut failed = false;
                                     for slot_arg in &cmd.args[1..] {
                                         let slot_str = std::str::from_utf8(slot_arg).unwrap_or("");
-                                        if let Some((start, end)) = slot_str.split_once('-') {
-                                            let start: u16 = start.parse().unwrap_or(0);
-                                            let end: u16 = end.parse().unwrap_or(0);
-                                            if let Err(e) = cluster_mgr.add_slots(start, end) {
-                                                encode_frame(&RespFrame::error(e), &mut write_buf);
-                                                break;
+                                        let parsed = match slot_str.split_once('-') {
+                                            Some((start, end)) => {
+                                                match (start.parse::<u16>(), end.parse::<u16>()) {
+                                                    (Ok(s), Ok(e)) => Ok((s, e)),
+                                                    _ => Err(()),
+                                                }
                                             }
-                                        } else {
-                                            let slot: u16 = slot_str.parse().unwrap_or(0);
-                                            if let Err(e) = cluster_mgr.add_slots(slot, slot) {
-                                                encode_frame(&RespFrame::error(e), &mut write_buf);
-                                                break;
-                                            }
+                                            None => match slot_str.parse::<u16>() {
+                                                Ok(slot) => Ok((slot, slot)),
+                                                Err(_) => Err(()),
+                                            },
+                                        };
+                                        let Ok((start, end)) = parsed else {
+                                            encode_frame(
+                                                &RespFrame::error(format!(
+                                                    "ERR {:?} is not a slot or a slot range",
+                                                    slot_str
+                                                )),
+                                                &mut write_buf,
+                                            );
+                                            failed = true;
+                                            break;
+                                        };
+                                        if let Err(e) = cluster_mgr.add_slots(start, end) {
+                                            encode_frame(&RespFrame::error(e), &mut write_buf);
+                                            failed = true;
+                                            break;
                                         }
+                                    }
+                                    if failed {
+                                        continue;
                                     }
                                     if write_buf.is_empty()
                                         || !matches!(write_buf.last(), Some(b'*'))
@@ -983,6 +1005,20 @@ fn get_command_key<'a>(name: &'a str, args: &'a [bytes::Bytes]) -> Option<&'a [u
     }
 }
 
+/// What to say when a slot has an owner whose address cannot be read.
+///
+/// A different fault from an unassigned slot, and it gets a different sentence:
+/// somebody claimed this slot under an identifier that carries no address, so the
+/// cluster knows who owns it and cannot say where. Redirecting to a guessed
+/// address would send the client somewhere nobody chose.
+fn unroutable_owner(slot: u16, owner: &str) -> String {
+    format!(
+        "CLUSTERDOWN Hash slot {} is claimed by {:?}, which is not an address this cluster can \
+         redirect to",
+        slot, owner
+    )
+}
+
 fn check_cluster_moved(
     cluster: &Option<Arc<ClusterManager>>,
     cmd_name: &str,
@@ -997,31 +1033,28 @@ fn check_cluster_moved(
     let slot = cluster.key_slot(key);
 
     if !cluster.is_my_slot(key) {
-        let owner = match cluster.get_slot_owner_for_key(key) {
-            Some(o) => o,
-            None => {
-                return Some(RespFrame::Error(format!("MOVED {} 127.0.0.1:7000", slot)));
-            }
-        };
+        // The owner's *address*, resolved through gossip. Ownership is recorded
+        // by node id — the stable identity — so the address is looked up at
+        // redirect time rather than stored beside the claim, where it would go
+        // stale the moment a node moved.
+        if let Some((ip, port)) = cluster.get_slot_owner_address(slot) {
+            return Some(RespFrame::Error(format!("MOVED {} {}:{}", slot, ip, port)));
+        }
 
-        let owner_info: Vec<&str> = owner.split('@').collect();
-        let (ip, port) = if owner_info.len() >= 2 {
-            let addr: Vec<&str> = owner_info[1].split(':').collect();
-            if addr.len() >= 2 {
-                (addr[0], addr[1])
-            } else {
-                return Some(RespFrame::Error(format!("MOVED {} 127.0.0.1:7000", slot)));
-            }
-        } else {
-            let addr: Vec<&str> = owner.split(':').collect();
-            if addr.len() >= 2 {
-                (addr[0], addr[1])
-            } else {
-                return Some(RespFrame::Error(format!("MOVED {} 127.0.0.1:7000", slot)));
-            }
-        };
-
-        return Some(RespFrame::Error(format!("MOVED {} {}:{}", slot, ip, port)));
+        // Two different failures, two different sentences. Both used to be
+        // `MOVED <slot> 127.0.0.1:7000` — a port nothing in this cluster is
+        // required to be on. A client follows a MOVED, so it would connect
+        // there, fail, and report a connection error against an address the
+        // operator never configured.
+        return Some(RespFrame::Error(
+            match cluster.get_slot_owner_for_key(key) {
+                Some(owner) => unroutable_owner(slot, &owner),
+                None => format!(
+                    "CLUSTERDOWN Hash slot {} is not served: no node claims it",
+                    slot
+                ),
+            },
+        ));
     }
 
     None
