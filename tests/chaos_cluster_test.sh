@@ -232,54 +232,36 @@ run_replication_test() {
     master_role=$($REDIS_CLI -p $master_port ROLE | head -1)
     log_info "Master role: $master_role"
     
-    # Set replica to follow master
-    log_info "Setting replica to follow master..."
-    $REDIS_CLI -p $replica_port REPLICAOF 127.0.0.1 $master_port >/dev/null 2>&1
+    # REPLICAOF is refused until the cluster bus has HMAC/TLS (SEC-016), so this
+    # asserts the refusal rather than pretending to build a replication topology.
+    # Restore the failover assertions below once replication is actually wired.
+    log_info "Checking that REPLICAOF is refused..."
+    local replicaof_out
+    replicaof_out=$($REDIS_CLI -p $replica_port REPLICAOF 127.0.0.1 $master_port 2>&1)
+    log_info "REPLICAOF replied: $replicaof_out"
+    
+    local refused=0
+    case "$replicaof_out" in
+        *"not available"*) refused=1 ;;
+    esac
     
     sleep 1
     
-    # Check replica role
+    # The replica must stay a master: a silent "OK" that changes nothing is the
+    # regression this guards against.
     local replica_role
     replica_role=$($REDIS_CLI -p $replica_port ROLE | head -1)
-    log_info "Replica role: $replica_role"
+    log_info "Replica role after REPLICAOF: $replica_role"
     
-    # Write test data to master AFTER REPLICAOF (to test replication)
-    log_info "Writing test data to master after REPLICAOF..."
-    for i in $(seq 1 10); do
-        $REDIS_CLI -p $master_port SET "replkey:$i" "replvalue:$i" >/dev/null 2>&1
-    done
-    
-    sleep 1
-    
-    # Test failover - kill master
-    log_info "Killing master..."
-    stop_node $master_port
-    
-    sleep 1
-    
-    # Try to read from replica
-    local found=0
-    local lost=0
-    for i in $(seq 1 10); do
-        local result
-        result=$($REDIS_CLI -p $replica_port GET "replkey:$i" 2>/dev/null || echo "")
-        if [ "$result" = "replvalue:$i" ]; then
-            found=$((found + 1))
-        else
-            lost=$((lost + 1))
-        fi
-    done
-    
-    local total=10
-    local availability=0
-    if [ $total -gt 0 ]; then
-        availability=$((found * 100 / total))
+    if [ "$refused" -eq 1 ] && [ "$replica_role" = "master" ]; then
+        echo "repl|refused|2|0|1|0|100" >> "$TEST_RESULTS"
+        log_success "Replication test: REPLICAOF correctly refused, role unchanged"
+    else
+        echo "repl|refused|2|0|0|1|0" >> "$TEST_RESULTS"
+        log_error "Replication test: expected REPLICAOF to be refused and role to stay master"
     fi
     
-    echo "repl|none|2|1|$found|$lost|$availability" >> "$TEST_RESULTS"
-    
-    log_success "Replication test: $found/$total keys available after master failover ($availability%)"
-    
+    stop_node $master_port
     cleanup
     sleep 1
 }

@@ -17,6 +17,8 @@ solikv-cluster = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "service"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 serde = { workspace = true }

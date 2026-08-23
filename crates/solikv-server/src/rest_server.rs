@@ -7,49 +7,35 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
+use hyper_util::service::TowerToHyperService;
+use rustls::ServerConfig;
 use serde::Deserialize;
 #[allow(unused_imports)]
 use serde::Serialize;
+use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tokio_rustls::TlsAcceptor;
+use tower::Service;
 
 use solikv_core::CommandResponse;
 use solikv_engine::response::response_to_json;
 use solikv_engine::CommandEngine;
 
-const MAX_AUTH_FAILURES_REST: u32 = 10;
-const AUTH_COOLDOWN_SECS_REST: u64 = 30;
+use crate::auth::{constant_time_eq, AuthFailureTracker};
 
-#[derive(Default)]
-struct AuthFailureTracker {
-    failures: RwLock<std::collections::HashMap<String, (u32, std::time::Instant)>>,
-}
+/// Maximum number of concurrent REST client connections.
+const MAX_REST_CONNECTIONS: usize = 10_000;
 
-impl AuthFailureTracker {
-    fn is_blocked(&self, ip: &str) -> bool {
-        let failures = self.failures.read().unwrap();
-        if let Some((count, first_failure)) = failures.get(ip) {
-            if *count >= MAX_AUTH_FAILURES_REST {
-                let elapsed = first_failure.elapsed().as_secs();
-                return elapsed < AUTH_COOLDOWN_SECS_REST;
-            }
-        }
-        false
-    }
-
-    fn record_failure(&self, ip: &str) {
-        let mut failures = self.failures.write().unwrap();
-        let now = std::time::Instant::now();
-        let entry = failures.entry(ip.to_string()).or_insert((0, now));
-        entry.0 += 1;
-        entry.1 = now;
-    }
-
-    fn record_success(&self, ip: &str) {
-        let mut failures = self.failures.write().unwrap();
-        failures.remove(ip);
-    }
-}
+/// Cap on how long a peer may hold a connection task without completing the TLS
+/// handshake -- otherwise an unauthenticated client can pin tasks indefinitely.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct AppState {
@@ -62,6 +48,7 @@ pub async fn run(
     addr: &str,
     engine: Arc<CommandEngine>,
     password: Option<Arc<String>>,
+    tls_config: Option<ServerConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         engine,
@@ -121,14 +108,95 @@ pub async fn run(
         ))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("REST API listening on {}", addr);
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!(
+        "REST API listening on {}{}",
+        addr,
+        if tls_config.is_some() { " (TLS)" } else { "" }
+    );
+    let tls_acceptor = tls_config.map(|c| TlsAcceptor::from(Arc::new(c)));
+    let conn_semaphore = Arc::new(Semaphore::new(MAX_REST_CONNECTIONS));
+    let mut make_svc = app.into_make_service_with_connect_info::<SocketAddr>();
+
+    loop {
+        let (socket, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            // A transient accept error must not tear down the listener. Per-connection
+            // errors are dropped silently; resource exhaustion (EMFILE) is logged and
+            // retried after a pause, matching what `axum::serve` did before TLS.
+            Err(e) if is_connection_error(&e) => continue,
+            Err(e) => {
+                tracing::error!("REST accept error: {}", e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        let permit = match conn_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(
+                    "REST connection limit reached ({}), rejecting {}",
+                    MAX_REST_CONNECTIONS,
+                    peer
+                );
+                drop(socket);
+                continue;
+            }
+        };
+
+        let _ = socket.set_nodelay(true);
+        let tls_acceptor = tls_acceptor.clone();
+        let svc = make_svc.call(peer).await?;
+
+        tokio::spawn(async move {
+            match tls_acceptor {
+                Some(acceptor) => {
+                    match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(socket)).await
+                    {
+                        Ok(Ok(tls)) => serve_http(tls, svc).await,
+                        Ok(Err(e)) => {
+                            tracing::debug!("REST TLS accept error from {}: {}", peer, e)
+                        }
+                        Err(_) => tracing::debug!("REST TLS handshake timed out from {}", peer),
+                    }
+                }
+                None => serve_http(socket, svc).await,
+            }
+            drop(permit);
+        });
+    }
+}
+
+/// Accept errors that belong to a single dying connection rather than the listener.
+fn is_connection_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
     )
-    .await?;
-    Ok(())
+}
+
+async fn serve_http<I, S>(stream: I, svc: S)
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: tower::Service<
+            axum::http::Request<hyper::body::Incoming>,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let io = TokioIo::new(stream);
+    if let Err(e) = Builder::new(TokioExecutor::new())
+        .serve_connection_with_upgrades(io, TowerToHyperService::new(svc))
+        .await
+    {
+        tracing::debug!("REST connection error: {}", e);
+    }
 }
 
 async fn auth_middleware(
@@ -180,18 +248,6 @@ async fn auth_middleware(
             ))
         }
     }
-}
-
-/// Constant-time byte comparison to prevent timing side-channel attacks on password checks.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 // ---- Request/Response types ----

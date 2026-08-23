@@ -1265,7 +1265,7 @@
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-slate-400">PING / ECHO / QUIT / SELECT / DBSIZE / FLUSHDB / FLUSHALL / INFO / COMMAND / CONFIG / TIME / CLIENT / RESET / SAVE / BGSAVE / ROLE / REPLICAOF</h3>
             <div class="text-sm text-slate-400 mb-3">Server management, diagnostics, persistence, and replication.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">PING [message]<br>ECHO message<br>QUIT<br>RESET<br>SELECT db (0-15)<br>DBSIZE<br>FLUSHDB<br>FLUSHALL<br>INFO [section]<br>COMMAND [DOCS|COUNT]<br>CONFIG GET pattern<br>TIME<br>CLIENT SETNAME name<br>CLIENT GETNAME<br>CLIENT ID<br>SAVE<br>BGSAVE<br>ROLE<br>REPLICAOF host port<br>REPLICAOF NO ONE</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">PING [message]<br>ECHO message<br>QUIT<br>RESET<br>SELECT db (0-15)<br>DBSIZE<br>FLUSHDB<br>FLUSHALL<br>INFO [section]<br>COMMAND [DOCS|COUNT]<br>CONFIG GET pattern<br>TIME<br>CLIENT SETNAME name<br>CLIENT GETNAME<br>CLIENT ID<br>SAVE<br>BGSAVE<br>ROLE<br>REPLICAOF host port <span class="text-amber-400">(returns an error — replication not available)</span><br>REPLICAOF NO ONE <span class="text-amber-400">(returns an error)</span></div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">PING</span></div>
                 <div class="text-white">PONG</div>
@@ -1274,11 +1274,7 @@
                 <div class="text-white">2) "0"</div>
                 <div class="text-white">3) </div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">REPLICAOF 127.0.0.1 6379</span></div>
-                <div class="text-white">OK</div>
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ROLE</span></div>
-                <div class="text-white">1) "slave"</div>
-                <div class="text-white">2) "127.0.0.1:6379"</div>
-                <div class="text-white">3) "connect"</div>
+                <div class="text-white">(error) ERR replication is not available until cluster-bus HMAC/TLS is implemented</div>
             </div>
         </div>
 

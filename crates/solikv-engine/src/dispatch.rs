@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
@@ -157,6 +158,8 @@ pub struct CommandEngine {
     pub shards: Arc<ShardManager>,
     pub pubsub: Arc<PubSubBroker>,
     aof: Option<AofWriter>,
+    rdb_dir: PathBuf,
+    rdb_filename: String,
     start_time: Instant,
     pub(crate) script_cache: ScriptCache,
     weak_self: OnceLock<Weak<CommandEngine>>,
@@ -170,6 +173,8 @@ impl CommandEngine {
             shards,
             pubsub,
             aof: None,
+            rdb_dir: PathBuf::from("data"),
+            rdb_filename: "dump".to_string(),
             start_time: Instant::now(),
             script_cache: ScriptCache::new(),
             weak_self: OnceLock::new(),
@@ -198,6 +203,13 @@ impl CommandEngine {
 
     pub fn with_aof(mut self, aof: AofWriter) -> Self {
         self.aof = Some(aof);
+        self
+    }
+
+    /// Directory and basename used by SAVE/BGSAVE (must match `--dir` / `--dbfilename`).
+    pub fn with_rdb(mut self, dir: PathBuf, filename: impl Into<String>) -> Self {
+        self.rdb_dir = dir;
+        self.rdb_filename = filename.into();
         self
     }
 
@@ -637,7 +649,7 @@ impl CommandEngine {
             }
             "FLUSHDB" | "FLUSHALL" => {
                 // Heavy: release the async worker while we lock every shard.
-                maybe_block_in_place(|| {
+                maybe_block_in_place(self.shards.is_solo(), || {
                     let shards = self.shards.clone();
                     let num = shards.num_shards();
                     for i in 0..num {
@@ -676,10 +688,9 @@ impl CommandEngine {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("replicaof");
                 }
-                let host = std::str::from_utf8(&args[0]).unwrap_or("");
-                let port_str = std::str::from_utf8(&args[1]).unwrap_or("0");
-                let _ = (host, port_str);
-                CommandResponse::simple("OK")
+                CommandResponse::error(
+                    "ERR replication is not available until cluster-bus HMAC/TLS is implemented",
+                )
             }
             "ROLE" => CommandResponse::array(vec![
                 CommandResponse::bulk_string("master"),
@@ -1267,7 +1278,7 @@ impl CommandEngine {
                 }
                 let pattern = std::str::from_utf8(&args[0]).unwrap_or("*").to_string();
                 // Heavy full-space walk: don't pin the Tokio worker.
-                maybe_block_in_place(|| {
+                maybe_block_in_place(self.shards.is_solo(), || {
                     let shards = self.shards.clone();
                     let num = shards.num_shards();
                     let mut all_keys = Vec::new();
@@ -3187,11 +3198,12 @@ impl CommandEngine {
             // ---- Persistence commands ----
             "SAVE" | "BGSAVE" => {
                 // Disk I/O under shard locks — release the async worker while saving.
-                maybe_block_in_place(|| {
-                    let dir = std::path::Path::new("data");
+                maybe_block_in_place(self.shards.is_solo(), || {
+                    let dir = &self.rdb_dir;
+                    let filename = &self.rdb_filename;
                     let shards = self.shards.clone();
                     let num = shards.num_shards();
-                    if let Err(e) = solikv_persist::save_all_shards(dir, "dump", num, |idx, f| {
+                    if let Err(e) = solikv_persist::save_all_shards(dir, filename, num, |idx, f| {
                         shards.shard(idx).with_store(|store| f(store))
                     }) {
                         return CommandResponse::error(format!("ERR RDB save failed: {}", e));
@@ -3656,10 +3668,18 @@ impl CommandEngine {
 /// async tasks can progress while we hold shard locks / do disk I/O.
 /// On current-thread runtimes (e.g. some tests) `block_in_place` panics — run
 /// `f` directly instead.
-fn maybe_block_in_place<F, R>(f: F) -> R
+fn maybe_block_in_place<F, R>(solo: bool, f: F) -> R
 where
     F: FnOnce() -> R,
 {
+    // Solo mode's store is an unlocked `UnsafeCell` that only the single worker
+    // thread may touch. `block_in_place` hands the worker's remaining tasks to a
+    // *replacement* OS thread, so those tasks would alias `&mut ShardStore` while
+    // `f` holds it — undefined behaviour. Run inline instead: solo mode blocks the
+    // server for the duration of a KEYS/FLUSH/SAVE, which is Redis-shaped anyway.
+    if solo {
+        return f();
+    }
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(f)

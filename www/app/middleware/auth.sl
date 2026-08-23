@@ -31,9 +31,10 @@ def authenticate(req: Any) -> Any
         api_key = headers["x-api-key"]
     end
 
-    # TODO: Replace with your authentication logic
-    # For example, verify JWT token, check session, etc.
-    if api_key == ""
+    # Must be set to a non-empty secret before scoping this middleware onto routes.
+    # An empty expected key rejects every request (no "any non-empty key" bypass).
+    let expected = ""
+    if expected == "" || api_key == "" || api_key != expected
         return {
             "continue": false,
             "response": {

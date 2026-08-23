@@ -1,6 +1,6 @@
 use bytes::{Buf, Bytes, BytesMut};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -22,49 +22,10 @@ use solikv_resp::parser::ParsedCommand;
 use solikv_cluster::ClusterManager;
 use solikv_core::CommandResponse;
 
+use crate::auth::{constant_time_eq, AuthFailureTracker};
+
 /// Maximum number of concurrent client connections.
 const MAX_CONNECTIONS: usize = 10_000;
-
-const MAX_AUTH_FAILURES: u32 = 10;
-const AUTH_COOLDOWN_SECS: u64 = 30;
-
-struct AuthFailureTracker {
-    failures: RwLock<std::collections::HashMap<String, (u32, std::time::Instant)>>,
-}
-
-impl Default for AuthFailureTracker {
-    fn default() -> Self {
-        Self {
-            failures: RwLock::new(std::collections::HashMap::new()),
-        }
-    }
-}
-
-impl AuthFailureTracker {
-    fn is_blocked(&self, ip: &str) -> bool {
-        let failures = self.failures.read().unwrap();
-        if let Some((count, first_failure)) = failures.get(ip) {
-            if *count >= MAX_AUTH_FAILURES {
-                let elapsed = first_failure.elapsed().as_secs();
-                return elapsed < AUTH_COOLDOWN_SECS;
-            }
-        }
-        false
-    }
-
-    fn record_failure(&self, ip: &str) {
-        let mut failures = self.failures.write().unwrap();
-        let now = std::time::Instant::now();
-        let entry = failures.entry(ip.to_string()).or_insert((0, now));
-        entry.0 += 1;
-        entry.1 = now;
-    }
-
-    fn record_success(&self, ip: &str) {
-        let mut failures = self.failures.write().unwrap();
-        failures.remove(ip);
-    }
-}
 
 pub async fn run(
     addr: &str,
@@ -1025,18 +986,6 @@ fn check_cluster_moved(
     }
 
     None
-}
-
-/// Constant-time byte comparison to prevent timing side-channel attacks on password checks.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Convert our CommandResponse to a RESP frame for the wire.

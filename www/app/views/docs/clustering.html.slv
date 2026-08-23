@@ -181,26 +181,24 @@ MOVED 1234 127.0.0.1:7001</code></pre>
         </div>
 
         <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden mb-6">
-            <div class="px-4 py-2 border-b border-white/5 text-xs text-slate-500">Example: 1 master + 2 replicas</div>
+            <div class="px-4 py-2 border-b border-white/5 text-xs text-amber-400">Replication is not available yet</div>
             <div class="p-4 font-mono text-sm">
-                <div class="text-white"># Master on port 6379</div>
-                <div class="text-slate-500 mb-2">solikv --port 6379 --dir /data/master</div>
-                <div class="text-white"># Replica 1</div>
-                <div class="text-slate-500 mb-2">solikv --port 6380 --dir /data/replica1 --replicaof 127.0.0.1:6379</div>
-                <div class="text-white"># Replica 2</div>
-                <div class="text-slate-500">solikv --port 6381 --dir /data/replica2 --replicaof 127.0.0.1:6379</div>
+                <div class="text-slate-400">Replica sets are not wired up: there is no <span class="text-indigo-400">--replicaof</span> flag, and the</div>
+                <div class="text-slate-400"><span class="text-indigo-400">REPLICAOF</span> command returns an error. The replica-count settings above</div>
+                <div class="text-slate-400">describe the intended topology, not behaviour you can rely on today.</div>
+                <div class="text-slate-500 mt-3"># Blocked on cluster-bus HMAC + TLS (SEC-016) --- see SECURITY.md</div>
             </div>
         </div>
 
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
             <div class="p-5 rounded-xl bg-white/5 border border-white/10">
-                <h3 class="font-semibold text-white mb-3">REPLICAOF Command</h3>
-                <p class="text-sm text-slate-400 mb-3">Make a node a replica of another master:</p>
+                <h3 class="font-semibold text-white mb-3">REPLICAOF Command <span class="text-xs font-normal text-amber-400">(not available)</span></h3>
+                <p class="text-sm text-slate-400 mb-3">Runtime replication setup is disabled until the cluster bus has HMAC authentication and TLS. The command returns an error rather than silently doing nothing:</p>
                 <pre class="text-sm text-indigo-400 bg-indigo-500/10 p-3 rounded-lg overflow-x-auto"><code>REPLICAOF 127.0.0.1 6379
-# Node becomes a replica of master at 127.0.0.1:6379
+# (error) ERR replication is not available until cluster-bus HMAC/TLS is implemented
 
 REPLICAOF NO ONE
-# Node stops being a replica, becomes master</code></pre>
+# (error) ERR replication is not available until cluster-bus HMAC/TLS is implemented</code></pre>
             </div>
 
             <div class="p-5 rounded-xl bg-white/5 border border-white/10">

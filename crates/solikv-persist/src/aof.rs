@@ -3,6 +3,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 const MAX_AOF_BULK_LEN: usize = 512 * 1024 * 1024;
+const MAX_AOF_ARRAY_LEN: usize = 16_000_000;
 
 // Commands rejected during AOF replay. The on-disk AOF is trusted only as
 // far as filesystem permissions go; an attacker who can write to the data
@@ -239,6 +240,10 @@ impl AofPersistence {
     /// Replay AOF file and return commands (binary-safe).
     pub fn replay(path: &Path) -> io::Result<Vec<Vec<Bytes>>> {
         let file = std::fs::File::open(path)?;
+        // A bulk argument can never be longer than the whole file, so the on-disk size
+        // is a hard ceiling on any declared length. Without it a 20-byte header like
+        // `$536870912\r\n` forces a 512 MB allocation before `read_exact` can fail.
+        let file_len = file.metadata()?.len();
         let mut reader = BufReader::new(file);
         let mut commands = Vec::new();
 
@@ -253,11 +258,16 @@ impl AofPersistence {
                 .ok()
                 .and_then(|s| s.parse().ok())
             {
-                Some(c) => c,
+                Some(c) if c <= MAX_AOF_ARRAY_LEN => c,
+                Some(_) => {
+                    tracing::warn!("AOF replay aborted: array length exceeds maximum");
+                    break;
+                }
                 None => continue,
             };
 
-            let mut args = Vec::with_capacity(count);
+            // Grow on push rather than trusting the declared count for capacity.
+            let mut args = Vec::new();
             let mut valid = true;
             for _ in 0..count {
                 let len_line = match read_line_crlf(&mut reader) {
@@ -275,7 +285,7 @@ impl AofPersistence {
                     .ok()
                     .and_then(|s| s.parse().ok())
                 {
-                    Some(l) if l <= MAX_AOF_BULK_LEN => l,
+                    Some(l) if l <= MAX_AOF_BULK_LEN && (l as u64) <= file_len => l,
                     Some(_) => {
                         valid = false;
                         break;
@@ -450,6 +460,37 @@ mod tests {
 
         let commands = AofPersistence::replay(&path).unwrap();
         // Replay treats malformed/over-large entries as end-of-valid-stream.
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn test_aof_replay_rejects_bulk_length_larger_than_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lying_bulk_len.aof");
+
+        // A tiny file declaring a 512 MB argument must be rejected on the declared
+        // length alone, without ever allocating the buffer it asks for.
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "*1\r\n${}\r\n", MAX_AOF_BULK_LEN).unwrap();
+        drop(f);
+        assert!(std::fs::metadata(&path).unwrap().len() < 64);
+
+        let commands = AofPersistence::replay(&path).unwrap();
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn test_aof_replay_rejects_oversized_array_length() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized_array.aof");
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "*{}\r\n", MAX_AOF_ARRAY_LEN + 1).unwrap();
+        drop(f);
+
+        let commands = AofPersistence::replay(&path).unwrap();
         assert!(commands.is_empty());
     }
 }

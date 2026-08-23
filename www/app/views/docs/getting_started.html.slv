@@ -167,13 +167,18 @@
                     </tr>
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--bind</td>
-                        <td class="py-3 pr-4">0.0.0.0</td>
-                        <td class="py-3">Bind address</td>
+                        <td class="py-3 pr-4">127.0.0.1</td>
+                        <td class="py-3">Bind address. A non-loopback address requires a password (protected mode)</td>
                     </tr>
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--shards</td>
                         <td class="py-3 pr-4">0 (auto)</td>
                         <td class="py-3">Number of shards (0 = number of CPU cores)</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--solo</td>
+                        <td class="py-3 pr-4">false</td>
+                        <td class="py-3">Redis-shaped single-threaded engine (1 shard, no mutex, one Tokio worker)</td>
                     </tr>
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--dir</td>
@@ -208,12 +213,32 @@
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--requirepass</td>
                         <td class="py-3 pr-4">&mdash;</td>
-                        <td class="py-3">Require password for client authentication (RESP <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">AUTH</code> + REST <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">Bearer</code> token)</td>
+                        <td class="py-3">Require password for client authentication (RESP <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">AUTH</code> + REST <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">Bearer</code> token). An empty value is refused at startup rather than accepted as "no password"</td>
                     </tr>
                     <tr class="border-b border-white/5">
-                        <td class="py-3 pr-4 font-mono text-indigo-400">--replicaof</td>
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--requirepass-file</td>
                         <td class="py-3 pr-4">&mdash;</td>
-                        <td class="py-3">Become replica of master at <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">HOST:PORT</code></td>
+                        <td class="py-3">Read the password from a file (mode 0600 enforced). Takes precedence over <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--requirepass</code>, and keeps the secret out of <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">/proc/&lt;pid&gt;/cmdline</code></td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--protected-mode</td>
+                        <td class="py-3 pr-4">yes</td>
+                        <td class="py-3">Refuse to start when bound to a non-loopback address with no password. <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">no</code> opts out (not recommended for exposed deployments)</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--tls-cert</td>
+                        <td class="py-3 pr-4">&mdash;</td>
+                        <td class="py-3">TLS certificate (PEM). Enables TLS on <strong>both</strong> the RESP and REST ports. Must be paired with <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--tls-key</code></td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--tls-key</td>
+                        <td class="py-3 pr-4">&mdash;</td>
+                        <td class="py-3">TLS private key (PEM: PKCS#8, RSA, or SEC1)</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--tls-client-ca</td>
+                        <td class="py-3 pr-4">&mdash;</td>
+                        <td class="py-3">Client CA (PEM) requiring client certificates — mTLS on RESP and REST. Requires <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--tls-cert</code>/<code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--tls-key</code></td>
                     </tr>
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--generate-master-keyfile</td>

@@ -34,6 +34,7 @@ cargo build --release
 
 ```bash
 cargo run --release -- \
+  --bind 127.0.0.1 \
   --port 6379 \
   --rest-port 5020 \
   --shards 4 \
@@ -43,16 +44,21 @@ cargo run --release -- \
 ### Docker
 
 ```bash
-# Pull and run
-docker run -p 6379:6379 -p 5020:5020 -v ./data:/data ghcr.io/solisoft/kv:latest --dir /data
+# Pull and run (bind all interfaces; set a password — required off-loopback)
+docker run -p 6379:6379 -p 5020:5020 -v ./data:/data \
+  -e SOLIKV_REQUIREPASS=changeme \
+  ghcr.io/solisoft/kv:latest --dir /data --bind 0.0.0.0
 
 # Or with custom config
 docker run -p 6379:6379 -p 5020:5020 -v ./data:/data \
-  ghcr.io/solisoft/kv:latest --dir /data --shards 4 --appendfsync always
+  -e SOLIKV_REQUIREPASS=changeme \
+  ghcr.io/solisoft/kv:latest --dir /data --bind 0.0.0.0 --shards 4 --appendfsync always
 
 # Or build locally
 docker build -t solikv .
-docker run -p 6379:6379 -p 5020:5020 -v ./data:/data solikv --dir /data
+docker run -p 6379:6379 -p 5020:5020 -v ./data:/data \
+  -e SOLIKV_REQUIREPASS=changeme \
+  solikv --dir /data --bind 0.0.0.0
 ```
 
 ## Usage
@@ -79,13 +85,27 @@ curl -X POST -H "Content-Type: application/json" -d '{"value": "Hello"}' http://
 | `--port` | 6379 | Redis RESP protocol port |
 | `--rest-port` | 5020 | REST API port |
 | `--shards` | 0 | Number of shards (0 = auto-detect CPU cores) |
-| `--bind` | 0.0.0.0 | Bind address |
+| `--bind` | 127.0.0.1 | Bind address (a non-loopback address requires a password; see protected mode) |
 | `--log-level` | info | Log level |
 | `--dir` | data | Data directory for persistence |
 | `--dbfilename` | dump | RDB snapshot filename |
 | `--appendonly` | true | Enable AOF persistence |
 | `--appendfsync` | everysec | AOF fsync policy: always, everysec, no |
 | `--import-redis-rdb` | - | Path to a Redis `dump.rdb` file to import at startup |
+| `--solo` | false | Redis-shaped single-threaded engine (1 shard, no mutex, one Tokio worker) |
+| `--requirepass` | - | Password for RESP `AUTH` and REST `Bearer` (visible in `/proc/<pid>/cmdline`) |
+| `--requirepass-file` | - | Read the password from a 0600 file; takes precedence over `--requirepass` |
+| `--protected-mode` | yes | Refuse to start on a non-loopback bind with no password; `no` opts out |
+| `--tls-cert` | - | TLS certificate (PEM); enables TLS on **both** RESP and REST |
+| `--tls-key` | - | TLS private key (PEM: PKCS#8, RSA, or SEC1) |
+| `--tls-client-ca` | - | Client CA (PEM) requiring client certificates — mTLS on RESP and REST |
+
+The password may also be supplied as `SOLIKV_REQUIREPASS`. An empty value is
+refused at startup rather than treated as "no password". TLS does not satisfy
+protected mode: it encrypts the connection but does not authenticate the client.
+
+See [SECURITY.md](SECURITY.md) for the threat model and hardening summary, and
+[CHANGELOG.md](CHANGELOG.md) for what changed between versions.
 
 ## Migrating from Redis
 

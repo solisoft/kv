@@ -44,8 +44,8 @@ struct Args {
     #[arg(long, default_value_t = false)]
     solo: bool,
 
-    /// Bind address
-    #[arg(long, default_value = "0.0.0.0")]
+    /// Bind address (loopback by default; a non-loopback address requires a password)
+    #[arg(long, default_value = "127.0.0.1")]
     bind: String,
 
     /// Log level
@@ -92,7 +92,7 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     tls_key: Option<String>,
 
-    /// TLS client CA certificate for client certificate verification
+    /// TLS client CA certificate for mTLS (RESP and REST)
     #[arg(long, value_name = "PATH")]
     tls_client_ca: Option<String>,
 
@@ -337,6 +337,16 @@ async fn async_main(args: Args) {
         None
     };
 
+    // An empty secret is not a password: it would satisfy the protected-mode check
+    // below while accepting `AUTH ""` and a bare `Authorization: Bearer ` header.
+    if password.as_deref().is_some_and(|pw| pw.is_empty()) {
+        eprintln!("ERROR: the configured password is empty.");
+        eprintln!(
+            "Unset --requirepass/--requirepass-file/SOLIKV_REQUIREPASS, or set a real secret."
+        );
+        std::process::exit(1);
+    }
+
     let is_loopback = args.bind == "127.0.0.1" || args.bind == "::1" || args.bind == "localhost";
     if !is_loopback && password.is_none() && args.protected_mode.to_lowercase() != "no" {
         eprintln!("ERROR: SoliKV is running in protected mode because no password is set.");
@@ -347,33 +357,36 @@ async fn async_main(args: Args) {
 
     let tls_config = match (&args.tls_cert, &args.tls_key) {
         (Some(cert_path), Some(key_path)) => {
-            let cert = std::fs::read(cert_path).expect("Failed to read TLS certificate");
-            let key = std::fs::read(key_path).expect("Failed to read TLS private key");
-            let certs = pem::parse_many(&cert).expect("Failed to parse TLS certificate");
-            let keys = pem::parse_many(&key).expect("Failed to parse TLS private key");
-            let certs: Vec<rustls::pki_types::CertificateDer> = certs
-                .iter()
-                .filter(|p| p.tag() == "CERTIFICATE")
-                .map(|p| p.contents().to_vec().into())
-                .collect();
-            let key_der = keys
-                .iter()
-                .find(|p| p.tag() == "PRIVATE KEY")
-                .expect("No private key found")
-                .contents()
-                .to_vec();
-            let key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
-                .expect("Failed to create private key der");
-            let config = rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .expect("Failed to create TLS config");
-            tracing::info!("TLS enabled");
-            Some(config)
+            match solikv_server::tls::build_server_config(
+                cert_path,
+                key_path,
+                args.tls_client_ca.as_deref(),
+            ) {
+                Ok(config) => {
+                    if args.tls_client_ca.is_some() {
+                        tracing::info!("TLS enabled (RESP + REST, mTLS)");
+                    } else {
+                        tracing::info!("TLS enabled (RESP + REST)");
+                    }
+                    Some(config)
+                }
+                Err(e) => {
+                    eprintln!("ERROR: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
-        _ => {
+        (None, None) => {
+            if args.tls_client_ca.is_some() {
+                eprintln!("ERROR: --tls-client-ca requires --tls-cert and --tls-key (mTLS is built on server TLS).");
+                std::process::exit(1);
+            }
             tracing::info!("TLS disabled (no --tls-cert/--tls-key provided)");
             None
+        }
+        _ => {
+            eprintln!("ERROR: --tls-cert and --tls-key must be provided together.");
+            std::process::exit(1);
         }
     };
 
@@ -596,7 +609,8 @@ async fn async_main(args: Args) {
 
     // --- Create engine with AOF ---
     let mut engine = solikv_engine::CommandEngine::new(shards.clone(), pubsub.clone())
-        .with_notify_flags(notify_flags);
+        .with_notify_flags(notify_flags)
+        .with_rdb(args.dir.clone(), args.dbfilename.clone());
     if let Some(writer) = aof_writer {
         engine = engine.with_aof(writer);
     }
@@ -653,8 +667,11 @@ async fn async_main(args: Args) {
 
     let engine_rest = engine.clone();
     let password_rest = password.clone();
+    let tls_config_rest = tls_config.clone();
     let rest_handle = tokio::spawn(async move {
-        if let Err(e) = rest_server::run(&rest_addr, engine_rest, password_rest).await {
+        if let Err(e) =
+            rest_server::run(&rest_addr, engine_rest, password_rest, tls_config_rest).await
+        {
             tracing::error!("REST server error: {}", e);
         }
     });

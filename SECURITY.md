@@ -26,15 +26,32 @@ to the data directory after server startup.
 
 - **Protected mode (SEC-001)**: starting with `--bind` set to a non-loopback
   address while `--requirepass` is unset is refused by default. Operators must
-  either set a password or pass `--protected-mode no` to opt out.
-- **TLS for RESP (SEC-002)**: pass `--tls-cert PATH --tls-key PATH` to enable
-  TLS termination on the RESP port. REST TLS is not yet wired (planned
-  follow-up). The `--tls-client-ca` flag is reserved for mTLS.
+  either set a password or pass `--protected-mode no` to opt out. Note that TLS
+  does *not* satisfy protected mode: it provides encryption, not authentication.
+- **Empty passwords are refused**: an empty `--requirepass`,
+  `--requirepass-file`, or `SOLIKV_REQUIREPASS` exits at startup rather than
+  satisfying protected mode while accepting `AUTH ""` and a bare
+  `Authorization: Bearer ` header. An unset variable and an empty one are easy
+  to confuse in container tooling, so this fails loudly.
+- **TLS for RESP and REST (SEC-002)**: pass `--tls-cert PATH --tls-key PATH` to
+  enable TLS termination on both the RESP and REST ports. Pass
+  `--tls-client-ca PATH` to require client certificates (mTLS). Half-specified
+  combinations (one of cert/key, or a client CA with no server cert) exit at
+  startup instead of silently starting a cleartext listener.
 - **AUTH rate limiting (SEC-004)**: both the RESP server and the REST
   middleware track failed AUTH attempts per peer IP and block the IP for
   30 s after 10 failures, logging every failed attempt at `warn`. The REST
   side uses `into_make_service_with_connect_info::<SocketAddr>()` so the
-  middleware sees the real peer address.
+  middleware sees the real peer address. The tracker is bounded at 10 000 IPs;
+  when full it evicts the least valuable entries (not currently serving a
+  cooldown, then least recently active) rather than dropping new records, so
+  seeding it cannot switch the limiter off.
+- **Password comparison**: `AUTH` and `Bearer` tokens are compared with a
+  comparison whose timing depends only on the length of the configured secret,
+  never on the provided value.
+- **Connection limits**: RESP and REST each cap concurrent connections at
+  10 000, and a TLS handshake that does not complete within 10 s is dropped, so
+  an unauthenticated peer cannot pin connection tasks indefinitely.
 
 ### Command surface
 
@@ -49,7 +66,11 @@ to the data directory after server startup.
   than 512 MB (`MAX_VALUE_LEN`); collection counts are clamped to 16 M
   (`MAX_COLLECTION_LEN`) before `with_capacity`.
 - **AOF length sanitization (SEC-006)**: bulk lengths above 512 MB
-  (`MAX_AOF_BULK_LEN`) abort the replay.
+  (`MAX_AOF_BULK_LEN`) abort the replay, as do array counts above 16 M
+  (`MAX_AOF_ARRAY_LEN`). A declared length larger than the AOF file itself is
+  also rejected, so a short hostile file cannot force a large allocation from a
+  20-byte header, and argument vectors grow on push instead of reserving the
+  declared count up front.
 - **AOF replay denylist (SEC-007)**: `EVAL`, `EVALSHA`, `SCRIPT`, `DEBUG`,
   `SHUTDOWN`, `BGREWRITEAOF`, `BGSAVE`, `SLAVEOF`/`REPLICAOF`, `CLUSTER`,
   `MIGRATE`, `RESTORE`, `MODULE` are skipped (with a `warn`) on replay.
@@ -119,8 +140,8 @@ to the data directory after server startup.
 
 ## Known limitations and follow-ups
 
-- **REST TLS is not implemented** (SEC-002 follow-up): only the RESP port
-  has TLS today. Front the REST port with a TLS-terminating reverse proxy
+- **REST TLS** is enabled together with RESP when `--tls-cert`/`--tls-key` are
+  set. Without those flags, front REST with a TLS-terminating reverse proxy
   if it is exposed beyond loopback.
 - **Cluster bus / replication TLS + HMAC** (SEC-016): scaffolding only; do
   not wire these modules to a non-loopback listener until the work
@@ -132,6 +153,16 @@ to the data directory after server startup.
 - **Argv password leakage**: `--requirepass <pw>` and `--cluster-password
   <pw>` remain visible in `/proc/<pid>/cmdline` until the process exits.
   Prefer the file or env-var form.
+- **Solo mode + AOF backpressure**: `--solo` keeps its store in an unlocked
+  `UnsafeCell`, which is sound only while accesses never overlap. Command
+  dispatch no longer uses `block_in_place` in solo mode for that reason, but the
+  AOF writer still does when its 256 K-entry channel fills (`aof.rs`), and
+  `block_in_place` hands the worker's queue to a second OS thread. Fixing it
+  means giving solo mode an AOF consumer on a real OS thread (a blocking
+  channel) rather than a Tokio task, since a current-thread runtime cannot
+  apply backpressure without deadlocking. Until then, sustained write load
+  beyond AOF drain rate in solo mode is a latent aliasing hazard; the
+  debug-build borrow tracker in `shard.rs` will catch it if it triggers.
 
 ## Operating recommendations
 

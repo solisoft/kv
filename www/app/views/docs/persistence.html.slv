@@ -126,8 +126,8 @@
             <table class="w-full text-left">
                 <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Syntax</th><th class="py-3 text-slate-400 font-medium">Description</th></tr></thead>
                 <tbody class="text-slate-300">
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">SAVE</td><td class="py-3 pr-4 font-mono text-sm">SAVE</td><td class="py-3">Synchronous RDB save (blocks until complete)</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">BGSAVE</td><td class="py-3 pr-4 font-mono text-sm">BGSAVE</td><td class="py-3">Background RDB save</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">SAVE</td><td class="py-3 pr-4 font-mono text-sm">SAVE</td><td class="py-3">Synchronous RDB save (blocks until complete). Writes to <span class="font-mono text-indigo-400">--dir</span> using the <span class="font-mono text-indigo-400">--dbfilename</span> basename</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">BGSAVE</td><td class="py-3 pr-4 font-mono text-sm">BGSAVE</td><td class="py-3">Currently an alias for <span class="font-mono text-indigo-400">SAVE</span> &mdash; it completes before replying rather than forking</td></tr>
                     <tr><td class="py-3 pr-4 font-mono text-indigo-400">BGREWRITEAOF</td><td class="py-3 pr-4 font-mono text-sm">BGREWRITEAOF</td><td class="py-3">Rewrite AOF from current state (compaction)</td></tr>
                 </tbody>
             </table>

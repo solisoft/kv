@@ -1,5 +1,7 @@
 use bytes::Bytes;
 use std::cell::UnsafeCell;
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -14,11 +16,35 @@ use crate::dispatch::{NOTIFY_EXPIRED, NOTIFY_KEYEVENT, NOTIFY_KEYSPACE};
 /// Unlocked store for **solo mode** (single Tokio worker — Redis-shaped).
 ///
 /// # Safety invariant
-/// Callers must only touch the store from the solo runtime's single worker
-/// thread (`--solo` ⇒ `worker_threads(1)`). Concurrent access from another
+/// Callers must never let two accesses to the store overlap (`--solo` ⇒
+/// `worker_threads(1)`, and no `block_in_place`). Concurrent access from another
 /// OS thread is undefined behaviour.
 struct SoloStore {
     inner: UnsafeCell<ShardStore>,
+    /// Debug-only borrow state: `-1` = mutable borrow active, `n >= 0` = `n` shared
+    /// borrows. What solo mode's soundness actually rests on is that borrows never
+    /// *overlap* — not that one OS thread owns the store forever, since the store is
+    /// legitimately handed from the startup thread (RDB load) to the worker thread.
+    #[cfg(debug_assertions)]
+    borrows: AtomicIsize,
+}
+
+/// Releases the debug-only borrow recorded by [`SoloStore::track_borrow`].
+#[cfg(debug_assertions)]
+struct BorrowGuard<'a> {
+    borrows: &'a AtomicIsize,
+    exclusive: bool,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for BorrowGuard<'_> {
+    fn drop(&mut self) {
+        if self.exclusive {
+            self.borrows.store(0, Ordering::Release);
+        } else {
+            self.borrows.fetch_sub(1, Ordering::Release);
+        }
+    }
 }
 
 // SAFETY: solo mode guarantees single-threaded access.
@@ -29,17 +55,50 @@ impl SoloStore {
     fn new() -> Self {
         Self {
             inner: UnsafeCell::new(ShardStore::new()),
+            #[cfg(debug_assertions)]
+            borrows: AtomicIsize::new(0),
+        }
+    }
+
+    /// Debug-only: records a borrow and panics if it overlaps an incompatible one,
+    /// which is exactly the aliasing the `unsafe` blocks below assume cannot happen.
+    /// Compiled out of release builds, so the hot path solo mode exists to optimize
+    /// pays nothing — the field itself does not exist there either.
+    #[cfg(debug_assertions)]
+    fn track_borrow(&self, exclusive: bool) -> BorrowGuard<'_> {
+        if exclusive {
+            let prev = self.borrows.swap(-1, Ordering::Acquire);
+            assert_eq!(
+                prev, 0,
+                "SoloStore borrowed mutably while already borrowed — solo-mode store \
+                 access must never overlap"
+            );
+        } else {
+            let prev = self.borrows.fetch_add(1, Ordering::Acquire);
+            assert!(
+                prev >= 0,
+                "SoloStore borrowed while mutably borrowed — solo-mode store access \
+                 must never overlap"
+            );
+        }
+        BorrowGuard {
+            borrows: &self.borrows,
+            exclusive,
         }
     }
 
     #[inline]
     fn with_mut<R>(&self, f: impl FnOnce(&mut ShardStore) -> R) -> R {
+        #[cfg(debug_assertions)]
+        let _borrow = self.track_borrow(true);
         // SAFETY: solo invariant — only one thread mutates the store.
         f(unsafe { &mut *self.inner.get() })
     }
 
     #[inline]
     fn with_ref<R>(&self, f: impl FnOnce(&ShardStore) -> R) -> R {
+        #[cfg(debug_assertions)]
+        let _borrow = self.track_borrow(false);
         f(unsafe { &*self.inner.get() })
     }
 }

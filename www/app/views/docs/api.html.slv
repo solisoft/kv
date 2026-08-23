@@ -18,6 +18,8 @@
             Authentication
         </h2>
         <p class="text-slate-400">When the server is started with <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--requirepass &lt;PASSWORD&gt;</code>, all REST API requests must include a Bearer token in the <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">Authorization</code> header. Without the flag, no authentication is required.</p>
+        <p class="text-slate-400">Failed attempts are counted per peer IP: after 10 failures that IP is refused with <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">429 Too Many Requests</code> for 30 seconds. Tokens are compared in time that does not depend on the token you send.</p>
+        <p class="text-slate-400">Starting the server with <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--tls-cert</code> and <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--tls-key</code> serves the REST API over HTTPS on the same port (add <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--tls-client-ca</code> to require client certificates). Otherwise the API is plaintext HTTP — keep it on loopback or behind a TLS-terminating proxy.</p>
         <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
             <div class="p-4 font-mono text-sm">
                 <div class="text-slate-500"># With authentication enabled (--requirepass secret123)</div>
@@ -27,6 +29,11 @@
                 <div class="text-slate-500 mt-3"># Missing or invalid token returns 401</div>
                 <div class="text-emerald-400">curl http://localhost:5020/kv/mykey</div>
                 <div class="text-white mt-1">{"error":"Unauthorized"}</div>
+                <div class="text-slate-500 mt-3"># After 10 failures from the same IP, 429 for 30s</div>
+                <div class="text-white mt-1">{"error":"Too many failures, please wait"}</div>
+                <div class="text-slate-500 mt-3"># Over TLS (--tls-cert/--tls-key)</div>
+                <div class="text-emerald-400">curl -H "Authorization: Bearer secret123" \</div>
+                <div class="text-emerald-400 ml-4">https://localhost:5020/kv/mykey</div>
             </div>
         </div>
     </div>

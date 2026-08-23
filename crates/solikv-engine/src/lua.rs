@@ -84,6 +84,20 @@ const BLOCKED_COMMANDS: &[&str] = &[
     "EVAL",
     "EVALSHA",
     "SCRIPT",
+    "FLUSHALL",
+    "FLUSHDB",
+    "CONFIG",
+    "SAVE",
+    "BGSAVE",
+    "SHUTDOWN",
+    "DEBUG",
+    "SLAVEOF",
+    "REPLICAOF",
+    "CLUSTER",
+    "MODULE",
+    "MIGRATE",
+    "RESTORE",
+    "BGREWRITEAOF",
 ];
 
 fn is_blocked_in_script(cmd: &str) -> bool {
@@ -562,6 +576,10 @@ mod tests {
         assert!(is_blocked_in_script("eval"));
         assert!(is_blocked_in_script("MULTI"));
         assert!(is_blocked_in_script("SUBSCRIBE"));
+        assert!(is_blocked_in_script("FLUSHALL"));
+        assert!(is_blocked_in_script("CONFIG"));
+        assert!(is_blocked_in_script("SAVE"));
+        assert!(is_blocked_in_script("SHUTDOWN"));
         assert!(!is_blocked_in_script("GET"));
         assert!(!is_blocked_in_script("SET"));
     }
