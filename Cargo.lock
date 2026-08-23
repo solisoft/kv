@@ -1877,6 +1877,7 @@ dependencies = [
  "solikv-core",
  "solikv-persist",
  "solikv-pubsub",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

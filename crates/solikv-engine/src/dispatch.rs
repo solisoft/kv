@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 
@@ -154,12 +154,54 @@ use crate::lua::ScriptCache;
 use crate::shard::ShardManager;
 
 /// The central command engine that routes commands to appropriate shards.
+/// State a client needs in order to follow an asynchronous `BGSAVE`: whether one is
+/// running, and how the last one finished. Exposed through `INFO persistence` and
+/// `LASTSAVE`, the same way Redis reports it.
+#[derive(Default)]
+pub struct BgSaveState {
+    in_progress: AtomicBool,
+    last_failed: AtomicBool,
+    /// Unix seconds of the last successful save; 0 until one completes.
+    last_success_unix: AtomicU64,
+}
+
+impl BgSaveState {
+    pub fn in_progress(&self) -> bool {
+        self.in_progress.load(Ordering::Acquire)
+    }
+
+    pub fn last_save_unix(&self) -> u64 {
+        self.last_success_unix.load(Ordering::Relaxed)
+    }
+
+    pub fn last_status_ok(&self) -> bool {
+        !self.last_failed.load(Ordering::Relaxed)
+    }
+
+    fn record_success(&self) {
+        self.last_success_unix.store(unix_now(), Ordering::Relaxed);
+        self.last_failed.store(false, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self) {
+        self.last_failed.store(true, Ordering::Relaxed);
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub struct CommandEngine {
     pub shards: Arc<ShardManager>,
     pub pubsub: Arc<PubSubBroker>,
     aof: Option<AofWriter>,
     rdb_dir: PathBuf,
     rdb_filename: String,
+    bgsave: Arc<BgSaveState>,
     start_time: Instant,
     pub(crate) script_cache: ScriptCache,
     weak_self: OnceLock<Weak<CommandEngine>>,
@@ -175,6 +217,7 @@ impl CommandEngine {
             aof: None,
             rdb_dir: PathBuf::from("data"),
             rdb_filename: "dump".to_string(),
+            bgsave: Arc::new(BgSaveState::default()),
             start_time: Instant::now(),
             script_cache: ScriptCache::new(),
             weak_self: OnceLock::new(),
@@ -211,6 +254,29 @@ impl CommandEngine {
         self.rdb_dir = dir;
         self.rdb_filename = filename.into();
         self
+    }
+
+    /// Progress and outcome of the most recent `BGSAVE`.
+    pub fn bgsave_state(&self) -> &Arc<BgSaveState> {
+        &self.bgsave
+    }
+
+    /// Snapshot every shard to its RDB file, blocking until the data is on disk.
+    /// This is `SAVE`; `BGSAVE` drives the same work from a background task.
+    fn save_all_shards_blocking(&self) -> CommandResponse {
+        let shards = self.shards.clone();
+        let num = shards.num_shards();
+        if let Err(e) =
+            solikv_persist::save_all_shards(&self.rdb_dir, &self.rdb_filename, num, |idx, f| {
+                shards.shard(idx).with_store(|store| f(store))
+            })
+        {
+            self.bgsave.record_failure();
+            return CommandResponse::error(format!("ERR RDB save failed: {}", e));
+        }
+        self.bgsave.record_success();
+        tracing::info!("RDB saved {} shards to {:?}", num, self.rdb_dir);
+        CommandResponse::ok()
     }
 
     /// Execute a parsed command. Returns the response.
@@ -626,9 +692,17 @@ impl CommandEngine {
             }
             "INFO" => {
                 let uptime = self.start_time.elapsed().as_secs();
+                // The Persistence fields are how a client follows an async BGSAVE:
+                // poll rdb_bgsave_in_progress, then check rdb_last_bgsave_status.
                 let info = format!(
-                    "# Server\r\nsolikv_version:0.1.0\r\nuptime_in_seconds:{}\r\ntcp_port:6379\r\n\r\n# Keyspace\r\n",
-                    uptime
+                    "# Server\r\nsolikv_version:0.1.0\r\nuptime_in_seconds:{}\r\ntcp_port:6379\r\n\r\n\
+                     # Persistence\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\n\
+                     rdb_last_bgsave_status:{}\r\naof_enabled:{}\r\n\r\n# Keyspace\r\n",
+                    uptime,
+                    u8::from(self.bgsave.in_progress()),
+                    self.bgsave.last_save_unix(),
+                    if self.bgsave.last_status_ok() { "ok" } else { "err" },
+                    u8::from(self.aof.is_some()),
                 );
                 CommandResponse::bulk(Bytes::from(info))
             }
@@ -3196,22 +3270,89 @@ impl CommandEngine {
             }
 
             // ---- Persistence commands ----
-            "SAVE" | "BGSAVE" => {
-                // Disk I/O under shard locks — release the async worker while saving.
-                maybe_block_in_place(self.shards.is_solo(), || {
-                    let dir = &self.rdb_dir;
-                    let filename = &self.rdb_filename;
-                    let shards = self.shards.clone();
-                    let num = shards.num_shards();
-                    if let Err(e) = solikv_persist::save_all_shards(dir, filename, num, |idx, f| {
-                        shards.shard(idx).with_store(|store| f(store))
-                    }) {
-                        return CommandResponse::error(format!("ERR RDB save failed: {}", e));
-                    }
-                    tracing::info!("RDB saved {} shards to {:?}", num, dir);
-                    CommandResponse::ok()
-                })
+            "SAVE" => {
+                // Blocking by design, as in Redis. Disk I/O happens outside the shard
+                // locks, but the client waits for it — release the async worker.
+                maybe_block_in_place(self.shards.is_solo(), || self.save_all_shards_blocking())
             }
+            "BGSAVE" => {
+                // Without a runtime (unit tests, embedded use) there is nothing to
+                // spawn onto, so fall back to a blocking save.
+                let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                    return maybe_block_in_place(self.shards.is_solo(), || {
+                        self.save_all_shards_blocking()
+                    });
+                };
+                if self
+                    .bgsave
+                    .in_progress
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return CommandResponse::error("ERR Background save already in progress");
+                }
+
+                let shards = self.shards.clone();
+                let dir = self.rdb_dir.clone();
+                let filename = self.rdb_filename.clone();
+                let state = self.bgsave.clone();
+                let solo = shards.is_solo();
+
+                handle.spawn(async move {
+                    let num = shards.num_shards();
+                    let mut outcome = Ok(());
+                    for idx in 0..num {
+                        // Serializing needs store access. In solo mode that must stay on
+                        // this worker — a blocking thread would alias the unlocked store —
+                        // so `maybe_block_in_place` runs it inline there and hands it to a
+                        // blocking thread only when the shards are mutex-guarded.
+                        let serialized = maybe_block_in_place(solo, || {
+                            shards
+                                .shard(idx)
+                                .with_store(solikv_persist::serialize_shard)
+                        });
+                        let buf = match serialized {
+                            Ok(buf) => buf,
+                            Err(e) => {
+                                outcome = Err(e);
+                                break;
+                            }
+                        };
+                        // The write touches no store state, so it is safe anywhere; keeping
+                        // it off the runtime is what makes BGSAVE non-blocking in solo mode.
+                        let (d, f) = (dir.clone(), filename.clone());
+                        let written = tokio::task::spawn_blocking(move || {
+                            solikv_persist::write_shard_rdb(&d, &f, idx, &buf)
+                        })
+                        .await;
+                        match written {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                outcome = Err(e);
+                                break;
+                            }
+                            Err(e) => {
+                                outcome = Err(std::io::Error::other(e));
+                                break;
+                            }
+                        }
+                    }
+                    match outcome {
+                        Ok(()) => {
+                            state.record_success();
+                            tracing::info!("BGSAVE completed: {} shards to {:?}", num, dir);
+                        }
+                        Err(e) => {
+                            state.record_failure();
+                            tracing::error!("BGSAVE failed: {}", e);
+                        }
+                    }
+                    state.in_progress.store(false, Ordering::Release);
+                });
+
+                CommandResponse::simple("Background saving started")
+            }
+            "LASTSAVE" => CommandResponse::integer(self.bgsave.last_save_unix() as i64),
             "BGREWRITEAOF" => {
                 // Rewrite AOF: not implemented yet, return OK for compatibility
                 CommandResponse::ok()

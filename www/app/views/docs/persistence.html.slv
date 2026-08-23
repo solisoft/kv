@@ -93,6 +93,13 @@
                 </tbody>
             </table>
         </div>
+        <div class="mt-4 p-4 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-sm text-slate-300">
+            <p class="mb-2"><strong class="text-white">Following a background save.</strong> <span class="font-mono text-indigo-400">BGSAVE</span> returns before the data is on disk. Poll <span class="font-mono text-indigo-400">INFO</span> and watch the Persistence fields:</p>
+            <pre class="text-sm text-indigo-400 bg-slate-900 p-3 rounded-lg overflow-x-auto"><code>rdb_bgsave_in_progress:1   # 0 once it finishes
+rdb_last_bgsave_status:ok  # "err" if the last one failed
+rdb_last_save_time:1730000000</code></pre>
+            <p class="mt-2 text-slate-400">Each shard is serialized in turn, so a snapshot is not a single point in time across shards &mdash; writes that land mid-save may appear in later shard files but not earlier ones. There is no fork, so this applies to <span class="font-mono text-indigo-400">SAVE</span> and the periodic snapshot as well.</p>
+        </div>
     </div>
 
     <!-- Configuration -->
@@ -127,8 +134,9 @@
                 <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Syntax</th><th class="py-3 text-slate-400 font-medium">Description</th></tr></thead>
                 <tbody class="text-slate-300">
                     <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">SAVE</td><td class="py-3 pr-4 font-mono text-sm">SAVE</td><td class="py-3">Synchronous RDB save (blocks until complete). Writes to <span class="font-mono text-indigo-400">--dir</span> using the <span class="font-mono text-indigo-400">--dbfilename</span> basename</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">BGSAVE</td><td class="py-3 pr-4 font-mono text-sm">BGSAVE</td><td class="py-3">Currently an alias for <span class="font-mono text-indigo-400">SAVE</span> &mdash; it completes before replying rather than forking</td></tr>
-                    <tr><td class="py-3 pr-4 font-mono text-indigo-400">BGREWRITEAOF</td><td class="py-3 pr-4 font-mono text-sm">BGREWRITEAOF</td><td class="py-3">Rewrite AOF from current state (compaction)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">BGSAVE</td><td class="py-3 pr-4 font-mono text-sm">BGSAVE</td><td class="py-3">Replies <span class="font-mono text-indigo-400">+Background saving started</span> and snapshots in the background. Only one runs at a time &mdash; a second call returns an error while the first is in flight</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">LASTSAVE</td><td class="py-3 pr-4 font-mono text-sm">LASTSAVE</td><td class="py-3">Unix timestamp of the last successful save, or <span class="font-mono text-indigo-400">0</span> if none has completed</td></tr>
+                    <tr><td class="py-3 pr-4 font-mono text-indigo-400">BGREWRITEAOF</td><td class="py-3 pr-4 font-mono text-sm">BGREWRITEAOF</td><td class="py-3">Not implemented &mdash; replies <span class="font-mono text-indigo-400">OK</span> for client compatibility without rewriting anything</td></tr>
                 </tbody>
             </table>
         </div>

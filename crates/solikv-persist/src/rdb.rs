@@ -323,9 +323,6 @@ where
 {
     std::fs::create_dir_all(dir)?;
     for idx in 0..num_shards {
-        let final_path = rdb_path_for_shard(dir, basename, idx);
-        let tmp_path = dir.join(format!("{}-{}.rdb.tmp", basename, idx));
-
         // Serialize to memory buffer while holding the shard lock (fast, no I/O)
         let rdb_buf = std::cell::RefCell::new(Vec::new());
         with_store_fn(idx, &|store: &ShardStore| {
@@ -333,21 +330,41 @@ where
             RdbPersistence::save(store, &mut *buf)?;
             Ok(())
         })?;
-        let rdb_buf = rdb_buf.into_inner();
-
         // Write buffer to disk outside the lock (no shard blocking during I/O)
-        let file = std::fs::File::create(&tmp_path)?;
-        let mut writer = BufWriter::new(file);
-        writer.write_all(&rdb_buf)?;
-        writer.flush()?;
-        writer
-            .into_inner()
-            .map_err(|e| e.into_error())?
-            .sync_all()?;
-
-        std::fs::rename(&tmp_path, &final_path)?;
+        write_shard_rdb(dir, basename, idx, &rdb_buf.into_inner())?;
     }
     Ok(())
+}
+
+/// Serialize one shard to an in-memory RDB buffer.
+///
+/// Split out from [`save_all_shards`] so a caller can do the part that needs store
+/// access on one thread and the disk write on another — `BGSAVE` relies on this,
+/// since solo mode's unlocked store may only be touched by its own worker.
+pub fn serialize_shard(store: &ShardStore) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    RdbPersistence::save(store, &mut buf)?;
+    Ok(buf)
+}
+
+/// Atomically write one shard's already-serialized RDB bytes: write to a temporary
+/// file, fsync it, then rename over the final path. Touches no store state, so it is
+/// safe to call from a blocking thread.
+pub fn write_shard_rdb(dir: &Path, basename: &str, shard_idx: usize, rdb: &[u8]) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let final_path = rdb_path_for_shard(dir, basename, shard_idx);
+    let tmp_path = dir.join(format!("{}-{}.rdb.tmp", basename, shard_idx));
+
+    let file = std::fs::File::create(&tmp_path)?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(rdb)?;
+    writer.flush()?;
+    writer
+        .into_inner()
+        .map_err(|e| e.into_error())?
+        .sync_all()?;
+
+    std::fs::rename(&tmp_path, &final_path)
 }
 
 /// Load all shards from RDB files.

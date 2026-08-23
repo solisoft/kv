@@ -45,6 +45,26 @@ list of known limitations.
 - **Debug-build aliasing detector for solo mode**: `--solo` keeps its store in
   an unlocked `UnsafeCell`, and debug builds now panic if two accesses overlap.
   Compiled out of release builds entirely.
+- **`BGSAVE` actually runs in the background.** It was an alias for `SAVE`,
+  blocking the caller until every shard was on disk. It now replies
+  `+Background saving started` and snapshots from a background task; only one
+  runs at a time, and a second call returns
+  `ERR Background save already in progress` while the first is in flight.
+  `SAVE` stays synchronous, as in Redis.
+
+  There is no `fork`, so the work is split instead: serialization happens where
+  the store may be touched, and only the disk write is moved off-thread. In solo
+  mode that keeps the single worker free during the write — a background thread
+  touching the unlocked store would be undefined behaviour. Because shards are
+  serialized in turn there is no cross-shard point-in-time guarantee: writes
+  landing mid-save may appear in later shard files but not earlier ones. That
+  was already true of `SAVE` and the periodic snapshot; `BGSAVE` widens the
+  window.
+- **`LASTSAVE`**, returning the Unix timestamp of the last successful save
+  (`0` if none has completed).
+- **`INFO` now has a Persistence section** — `rdb_bgsave_in_progress`,
+  `rdb_last_save_time`, `rdb_last_bgsave_status`, and `aof_enabled` — which is
+  how a client follows an asynchronous `BGSAVE` to completion.
 
 ### Fixed
 
@@ -59,10 +79,11 @@ list of known limitations.
   connection aborted mid-handshake was enough. Per-connection errors are now
   skipped and resource exhaustion is logged and retried.
 - **Undefined behaviour in solo mode.** `--solo` runs one Tokio worker, but
-  `KEYS`, `FLUSHDB`/`FLUSHALL`, and `SAVE`/`BGSAVE` used `block_in_place`, which
-  hands the worker's queue to a replacement OS thread — that thread then aliased
+  `KEYS`, `FLUSHDB`/`FLUSHALL`, and `SAVE` used `block_in_place`, which hands the
+  worker's queue to a replacement OS thread — that thread then aliased
   `&mut ShardStore` while the blocking command held it. These commands now run
-  inline in solo mode.
+  inline in solo mode, and `BGSAVE` only moves the store-free disk write
+  off-thread.
 - **`SAVE` / `BGSAVE` ignored `--dir` and `--dbfilename`**, always writing
   `data/dump-*.rdb`. They now use the configured directory and basename, so a
   manual save no longer diverges from the snapshots written at startup and on
@@ -109,8 +130,10 @@ list of known limitations.
 - Docs site: corrected the `--bind` default; documented `--solo`,
   `--requirepass-file`, `--protected-mode`, and the three TLS flags; documented
   REST TLS and the 429 rate-limit response; removed the `--replicaof` flag and
-  the `REPLICAOF` examples, which described behaviour that does not exist; noted
-  that `BGSAVE` is currently an alias for `SAVE`.
+  the `REPLICAOF` examples, which described behaviour that does not exist;
+  documented `BGSAVE`/`LASTSAVE` and how to follow a background save, including
+  the cross-shard snapshot caveat; corrected `BGREWRITEAOF`, which replies `OK`
+  without rewriting anything.
 - `tests/chaos_cluster_test.sh` asserts that `REPLICAOF` is refused and the role
   stays `master`, instead of suppressing stderr and testing nothing.
 
