@@ -767,7 +767,7 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                 }
                                 "UNSUBSCRIBE" => {
                                     let channels_to_remove = if cmd.args.is_empty() {
-                                        conn.subscriptions.drain(..).collect::<Vec<_>>()
+                                        std::mem::take(&mut conn.subscriptions)
                                     } else {
                                         let mut removed = Vec::new();
                                         for ch in &cmd.args {
@@ -836,7 +836,7 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                 }
                                 "PUNSUBSCRIBE" => {
                                     let pats_to_remove = if cmd.args.is_empty() {
-                                        conn.psubscriptions.drain(..).collect::<Vec<_>>()
+                                        std::mem::take(&mut conn.psubscriptions)
                                     } else {
                                         let mut removed = Vec::new();
                                         for pat_bytes in &cmd.args {

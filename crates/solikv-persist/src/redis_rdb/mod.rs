@@ -281,7 +281,7 @@ fn read_value<R: io::Read>(
                 ));
             }
             let mut zset = ZSetValue::new();
-            for pair in entries.chunks_exact(2) {
+            for pair in entries.as_chunks::<2>().0 {
                 let member = pair[0].clone();
                 let score = parse_score_bytes(&pair[1])?;
                 zset.insert(score, member);
@@ -298,7 +298,7 @@ fn read_value<R: io::Read>(
                 ));
             }
             let mut hash = HashMap::with_capacity(entries.len() / 2);
-            for pair in entries.chunks_exact(2) {
+            for pair in entries.as_chunks::<2>().0 {
                 hash.insert(pair[0].clone(), pair[1].clone());
             }
             Ok(Some(RedisValue::Hash(hash)))
@@ -325,7 +325,7 @@ fn read_value<R: io::Read>(
                 ));
             }
             let mut hash = HashMap::with_capacity(entries.len() / 2);
-            for pair in entries.chunks_exact(2) {
+            for pair in entries.as_chunks::<2>().0 {
                 hash.insert(pair[0].clone(), pair[1].clone());
             }
             Ok(Some(RedisValue::Hash(hash)))
@@ -340,7 +340,7 @@ fn read_value<R: io::Read>(
                 ));
             }
             let mut zset = ZSetValue::new();
-            for pair in entries.chunks_exact(2) {
+            for pair in entries.as_chunks::<2>().0 {
                 let member = pair[0].clone();
                 let score = parse_score_bytes(&pair[1])?;
                 zset.insert(score, member);
