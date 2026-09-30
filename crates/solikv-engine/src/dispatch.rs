@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 
 use solikv_core::types::*;
-use solikv_core::zset_ops::Aggregate;
+use solikv_core::zset_ops::{Aggregate, LexBound, ScoreBound, ZRangeBy, ZRangeQuery};
 
 // ── Keyspace notification flags ──
 // Manual bitflags (no extra crate).
@@ -152,7 +152,19 @@ use solikv_pubsub::PubSubBroker;
 
 use crate::lua::ScriptCache;
 use crate::persistence::{PersistConfig, Persistence};
-use crate::shard::ShardManager;
+use crate::session::{ClientRegistry, ReplyMode, Session};
+use crate::shard::{current_db, DbGuard, ShardManager};
+use crate::watch::{Touch, TouchGuard, WatchFlag};
+
+thread_local! {
+    /// How many `execute` calls are running on this thread (scripts nest
+    /// them). `SELECT` outside a connection is only meaningful nested: in a
+    /// script it switches the database of the script's later calls.
+    static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Default number of logical databases (`--databases`).
+pub const DEFAULT_DATABASES: u32 = 16;
 
 /// The central command engine that routes commands to appropriate shards.
 pub struct CommandEngine {
@@ -178,6 +190,12 @@ pub struct CommandEngine {
     /// `string.rep("x", 2^31)` asks the allocator for whatever it likes, and
     /// the instruction hook cannot interrupt a C function to stop it.
     pub(crate) lua_memory_limit: usize,
+    /// Logical databases (`SELECT 0` … `SELECT databases-1`).
+    databases: u32,
+    /// Connected clients (`CLIENT LIST`, `CLIENT KILL`, `INFO clients`).
+    clients: Arc<ClientRegistry>,
+    /// Port the RESP server listens on, for `INFO`.
+    tcp_port: std::sync::atomic::AtomicU32,
 }
 
 /// Default for [`CommandEngine::with_lua_memory_limit`]: 64 MB.
@@ -196,7 +214,36 @@ impl CommandEngine {
             persistence: Arc::new(Persistence::new(PersistConfig::default())),
             shutdown_requested: Arc::new(tokio::sync::Notify::new()),
             lua_memory_limit: DEFAULT_LUA_MEMORY_LIMIT,
+            databases: DEFAULT_DATABASES,
+            clients: Arc::new(ClientRegistry::default()),
+            tcp_port: std::sync::atomic::AtomicU32::new(6379),
         }
+    }
+
+    /// Number of logical databases (at least 1).
+    pub fn with_databases(mut self, n: u32) -> Self {
+        self.databases = n.max(1);
+        self
+    }
+
+    pub fn databases(&self) -> u32 {
+        self.databases
+    }
+
+    /// The RESP port, for `INFO server`.
+    pub fn set_tcp_port(&self, port: u16) {
+        self.tcp_port.store(port as u32, Ordering::Relaxed);
+    }
+
+    /// Connected clients.
+    pub fn clients(&self) -> &Arc<ClientRegistry> {
+        &self.clients
+    }
+
+    /// State for a new connection from `addr` to `laddr`.
+    pub fn new_session(&self, addr: String, laddr: String) -> Session {
+        let info = self.clients.register(addr, laddr);
+        Session::new(info, self.clients.clone())
     }
 
     /// Cap the memory each Lua VM may use (bytes).
@@ -273,9 +320,32 @@ impl CommandEngine {
         crate::aof_log::TxGuard::begin(&self.shards)
     }
 
+    /// Execute a command in database `db` (no connection state: replay,
+    /// tools, tests).
+    pub fn execute_in_db(&self, db: u32, name: &str, args: &[Bytes]) -> CommandResponse {
+        let _db = DbGuard::enter(db);
+        self.execute(name, args)
+    }
+
     /// Execute a parsed command. Returns the response.
+    ///
+    /// Runs in the current thread's database (0, unless an enclosing
+    /// command — a connection's `execute_session`, a script — set another).
     pub fn execute(&self, name: &str, args: &[Bytes]) -> CommandResponse {
+        DEPTH.with(|d| d.set(d.get() + 1));
+        struct Depth;
+        impl Drop for Depth {
+            fn drop(&mut self) {
+                DEPTH.with(|d| d.set(d.get() - 1));
+            }
+        }
+        let _depth = Depth;
         let write = is_write_command(name);
+
+        // With someone watching keys, tell the shards what this write
+        // changes; they mark it under their lock (see `watch`).
+        let _touch = (write && self.shards.watch().is_active())
+            .then(|| TouchGuard::set(touch_for(name, args)));
 
         // With the log on, tell the shards what this command logs as; they
         // log it under their lock (see `aof_log`). The frame is set for every
@@ -312,17 +382,18 @@ impl CommandEngine {
         if flags & event_flag == 0 {
             return; // this event type not enabled
         }
-        let key_str = std::str::from_utf8(key).unwrap_or("<binary>");
+        let key_str = String::from_utf8_lossy(key);
+        let db = current_db();
 
-        // __keyspace@0__:<key> → event name as message
+        // __keyspace@<db>__:<key> → event name as message
         if flags & NOTIFY_KEYSPACE != 0 {
-            let channel = Bytes::from(format!("__keyspace@0__:{}", key_str));
+            let channel = Bytes::from(format!("__keyspace@{}__:{}", db, key_str));
             self.pubsub.publish(channel, Bytes::from(event.to_string()));
         }
 
-        // __keyevent@0__:<event> → key name as message
+        // __keyevent@<db>__:<event> → key name as message
         if flags & NOTIFY_KEYEVENT != 0 {
-            let channel = Bytes::from(format!("__keyevent@0__:{}", event));
+            let channel = Bytes::from(format!("__keyevent@{}__:{}", db, event));
             self.pubsub.publish(channel, key.clone());
         }
     }
@@ -373,14 +444,20 @@ impl CommandEngine {
                     self.notify_keyspace_event(NOTIFY_GENERIC, "del", key);
                 }
             }
-            "EXPIRE" | "PEXPIRE" => {
-                if let Some(key) = args.first() {
-                    self.notify_keyspace_event(NOTIFY_GENERIC, "expire", key);
+            "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => {
+                if !matches!(_response, CommandResponse::Integer(1)) {
+                    return;
                 }
-            }
-            "EXPIREAT" | "PEXPIREAT" => {
                 if let Some(key) = args.first() {
-                    self.notify_keyspace_event(NOTIFY_GENERIC, "expire", key);
+                    // A deadline already passed deleted the key.
+                    let amount = args.get(1).and_then(|a| parse_i64_arg(a)).unwrap_or(0);
+                    let past = match name {
+                        "EXPIRE" | "PEXPIRE" => amount <= 0,
+                        "EXPIREAT" => amount.saturating_mul(1000) <= now_millis() as i64,
+                        _ => amount <= now_millis() as i64,
+                    };
+                    let event = if past { "del" } else { "expire" };
+                    self.notify_keyspace_event(NOTIFY_GENERIC, event, key);
                 }
             }
             "PERSIST" => {
@@ -624,75 +701,16 @@ impl CommandEngine {
                 }
                 CommandResponse::bulk(args[0].clone())
             }
-            "COMMAND" => {
-                // Simplified: just return OK for compatibility
-                CommandResponse::ok()
-            }
-            "CONFIG" => {
-                if args.is_empty() {
-                    return CommandResponse::wrong_arity("config");
-                }
-                let sub = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
-                match sub.as_str() {
-                    "GET" => {
-                        // Return empty array for unknown configs
-                        if args.len() < 2 {
-                            return CommandResponse::wrong_arity("config|get");
-                        }
-                        let param = std::str::from_utf8(&args[1]).unwrap_or("");
-                        match param {
-                            "save" => CommandResponse::array(vec![
-                                CommandResponse::bulk_string("save"),
-                                CommandResponse::bulk_string(""),
-                            ]),
-                            "databases" => CommandResponse::array(vec![
-                                CommandResponse::bulk_string("databases"),
-                                CommandResponse::bulk_string("16"),
-                            ]),
-                            "notify-keyspace-events" => {
-                                let flags = self.notify_flags.load(Ordering::Relaxed);
-                                CommandResponse::array(vec![
-                                    CommandResponse::bulk_string("notify-keyspace-events"),
-                                    CommandResponse::bulk(Bytes::from(flags_to_string(flags))),
-                                ])
-                            }
-                            _ => CommandResponse::array(vec![]),
-                        }
-                    }
-                    "SET" => {
-                        if args.len() >= 3 {
-                            let param = std::str::from_utf8(&args[1]).unwrap_or("");
-                            let value = std::str::from_utf8(&args[2]).unwrap_or("");
-                            if param == "notify-keyspace-events" {
-                                let flags = parse_notify_flags(value);
-                                self.notify_flags.store(flags, Ordering::Relaxed);
-                            }
-                        }
-                        CommandResponse::ok()
-                    }
-                    "RESETSTAT" => CommandResponse::ok(),
-                    _ => CommandResponse::error(format!(
-                        "ERR Unknown subcommand or wrong number of arguments for 'config|{}'",
-                        sub.to_lowercase()
-                    )),
-                }
-            }
-            "INFO" => {
-                let uptime = self.start_time.elapsed().as_secs();
-                let info = format!(
-                    "# Server\r\nsolikv_version:0.1.0\r\nuptime_in_seconds:{}\r\ntcp_port:6379\r\n\r\n{}\r\n# Keyspace\r\n",
-                    uptime,
-                    self.persistence.stats.info_section(self.dirty()),
-                );
-                CommandResponse::bulk(Bytes::from(info))
-            }
+            "COMMAND" => self.command_command(args),
+            "CONFIG" => self.config_command(args),
+            "INFO" => self.info(args),
             "DBSIZE" => {
-                // Sum across all shards
-                let shards = self.shards.clone();
-                let num = shards.num_shards();
+                if !args.is_empty() {
+                    return CommandResponse::wrong_arity("dbsize");
+                }
+                // Sum across all shards (each counts the current database).
                 let mut total = 0i64;
-                for i in 0..num {
-                    let shard = shards.shard(i).clone();
+                for shard in self.shards.all_shards() {
                     let resp =
                         shard.execute(|store| CommandResponse::integer(store.dbsize() as i64));
                     if let CommandResponse::Integer(n) = resp {
@@ -702,53 +720,99 @@ impl CommandEngine {
                 CommandResponse::integer(total)
             }
             "FLUSHDB" | "FLUSHALL" => {
-                // Heavy: release the async worker while we lock every shard.
+                match args {
+                    [] => {}
+                    [mode]
+                        if mode.eq_ignore_ascii_case(b"ASYNC")
+                            || mode.eq_ignore_ascii_case(b"SYNC") => {}
+                    _ => return CommandResponse::syntax_error(),
+                }
+                let all = name == "FLUSHALL";
+                // Heavy: release the async worker while we lock every shard,
+                // and hold them all so no client sees a half-flushed server.
                 self.maybe_block_in_place(|| {
-                    let shards = self.shards.clone();
-                    let num = shards.num_shards();
-                    for i in 0..num {
-                        let shard = shards.shard(i).clone();
+                    let _held = self.shards.lock_all();
+                    for shard in self.shards.all_shards() {
                         shard.execute_with_effects(|store, fx| {
-                            store.flush();
-                            // Replays as "empty this shard's keys": each old
-                            // shard is replayed into its own scratch store.
-                            fx.push("FLUSHALL", &[]);
+                            // Replays per shard: each old shard is replayed
+                            // into its own scratch store.
+                            if all {
+                                store.flush_all();
+                                fx.push("FLUSHALL", &[]);
+                            } else {
+                                store.flush();
+                                fx.push("FLUSHDB", &[]);
+                            }
                             CommandResponse::ok()
                         });
                     }
                     CommandResponse::ok()
                 })
             }
+            "SWAPDB" => {
+                if args.len() != 2 {
+                    return CommandResponse::wrong_arity("swapdb");
+                }
+                let (a, b) = match (self.parse_db(&args[0]), self.parse_db(&args[1])) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    _ => return CommandResponse::error("ERR invalid first/second DB index"),
+                };
+                let _held = self.shards.lock_all();
+                let (sa, sb) = (a.to_string(), b.to_string());
+                for shard in self.shards.all_shards() {
+                    shard.execute_with_effects(|store, fx| {
+                        store.swap_db(a, b);
+                        fx.push("SWAPDB", &[sa.as_bytes(), sb.as_bytes()]);
+                        CommandResponse::ok()
+                    });
+                }
+                // Every key of both databases changed, as far as WATCH goes.
+                let watch = self.shards.watch();
+                if watch.is_active() {
+                    watch.touch_db(Some(a));
+                    watch.touch_db(Some(b));
+                }
+                CommandResponse::ok()
+            }
             "SELECT" => {
-                // We don't support multiple databases, but accept SELECT 0
+                // A connection's SELECT is handled by `execute_session`. Here
+                // only a script's: it switches the database of the script's
+                // later calls, and the caller's is restored after it.
+                if args.len() != 1 {
+                    return CommandResponse::wrong_arity("select");
+                }
+                let db = match self.parse_db(&args[0]) {
+                    Ok(db) => db,
+                    Err(e) => return e,
+                };
+                if DEPTH.with(|d| d.get()) <= 1 {
+                    return CommandResponse::error(
+                        "ERR SELECT is only supported on a RESP connection or inside a script",
+                    );
+                }
+                crate::shard::set_current_db(db);
                 CommandResponse::ok()
             }
             "QUIT" => CommandResponse::ok(),
             "RESET" => CommandResponse::simple("RESET"),
-            "CLIENT" => {
-                if args.is_empty() {
-                    return CommandResponse::wrong_arity("client");
-                }
-                let sub = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
-                match sub.as_str() {
-                    "SETNAME" => CommandResponse::ok(),
-                    "GETNAME" => CommandResponse::nil(),
-                    "ID" => CommandResponse::integer(1),
-                    "LIST" => CommandResponse::bulk_string(""),
-                    "INFO" => CommandResponse::bulk_string(""),
-                    _ => CommandResponse::ok(),
-                }
+            "CLIENT" | "MULTI" | "EXEC" | "DISCARD" | "WATCH" | "UNWATCH" => {
+                CommandResponse::error(format!(
+                    "ERR {} is only available on a RESP connection",
+                    name
+                ))
             }
 
             // ---- Replication commands ----
             "REPLICAOF" | "SLAVEOF" => {
-                if args.len() < 2 {
-                    return CommandResponse::wrong_arity("replicaof");
+                if args.len() != 2 {
+                    return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
-                let host = std::str::from_utf8(&args[0]).unwrap_or("");
-                let port_str = std::str::from_utf8(&args[1]).unwrap_or("0");
-                let _ = (host, port_str);
-                CommandResponse::simple("OK")
+                // Already a master: `NO ONE` is true as it stands. Anything
+                // else used to answer OK and replicate nothing.
+                if args[0].eq_ignore_ascii_case(b"NO") && args[1].eq_ignore_ascii_case(b"ONE") {
+                    return CommandResponse::ok();
+                }
+                CommandResponse::error("ERR replication is not supported by this server yet")
             }
             "ROLE" => CommandResponse::array(vec![
                 CommandResponse::bulk_string("master"),
@@ -781,81 +845,13 @@ impl CommandEngine {
                 }
                 let key = args[0].clone();
                 let value = args[1].clone();
-                let mut expire_ms = None;
-                let mut nx = false;
-                let mut xx = false;
-                let mut get = false;
-
-                let mut i = 2;
-                while i < args.len() {
-                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
-                    match opt.as_str() {
-                        "EX" => {
-                            i += 1;
-                            if let Some(secs) = args
-                                .get(i)
-                                .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok())
-                            {
-                                match ttl_ms(secs, true) {
-                                    Some(ms) => expire_ms = Some(ms),
-                                    None => return invalid_expire("set"),
-                                }
-                            } else {
-                                return CommandResponse::syntax_error();
-                            }
-                        }
-                        "PX" => {
-                            i += 1;
-                            if let Some(ms) = args
-                                .get(i)
-                                .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok())
-                            {
-                                match ttl_ms(ms, false) {
-                                    Some(ms) => expire_ms = Some(ms),
-                                    None => return invalid_expire("set"),
-                                }
-                            } else {
-                                return CommandResponse::syntax_error();
-                            }
-                        }
-                        "EXAT" => {
-                            i += 1;
-                            if let Some(ts) = args
-                                .get(i)
-                                .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok())
-                            {
-                                let Some(target) = ts.checked_mul(1000) else {
-                                    return invalid_expire("set");
-                                };
-                                expire_ms = Some(target.saturating_sub(now_millis()));
-                            } else {
-                                return CommandResponse::syntax_error();
-                            }
-                        }
-                        "PXAT" => {
-                            i += 1;
-                            if let Some(ts) = args
-                                .get(i)
-                                .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok())
-                            {
-                                let now = now_millis();
-                                expire_ms = Some(ts.saturating_sub(now));
-                            } else {
-                                return CommandResponse::syntax_error();
-                            }
-                        }
-                        "NX" => nx = true,
-                        "XX" => xx = true,
-                        "GET" => get = true,
-                        "KEEPTTL" => {} // TODO: implement
-                        _ => return CommandResponse::syntax_error(),
-                    }
-                    i += 1;
-                }
-
+                let opts = match parse_set_options(&args[2..]) {
+                    Ok(o) => o,
+                    Err(e) => return e,
+                };
                 self.shards
                     .shard_for_key(&key)
-                    .execute(move |store| store.string_set(key, value, expire_ms, nx, xx, get))
+                    .execute(move |store| store.string_set_opts(key, value, opts))
             }
             "SETNX" => {
                 if args.len() != 2 {
@@ -883,7 +879,7 @@ impl CommandEngine {
                         )
                     }
                 };
-                if ttl_ms(seconds, true).is_none() {
+                if seconds == 0 || ttl_ms(seconds, true).is_none() {
                     return invalid_expire("setex");
                 }
                 let value = args[2].clone();
@@ -907,7 +903,7 @@ impl CommandEngine {
                         )
                     }
                 };
-                if ttl_ms(millis, false).is_none() {
+                if millis == 0 || ttl_ms(millis, false).is_none() {
                     return invalid_expire("psetex");
                 }
                 let value = args[2].clone();
@@ -939,35 +935,36 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("getex");
                 }
                 let key = args[0].clone();
-                let mut expire_ms = None;
+                let mut expire_at = None;
                 let mut persist = false;
                 let mut i = 1;
                 while i < args.len() {
-                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                    let opt = String::from_utf8_lossy(&args[i]).to_ascii_uppercase();
                     match opt.as_str() {
-                        "EX" | "PX" => {
+                        "EX" | "PX" | "EXAT" | "PXAT" if expire_at.is_none() && !persist => {
                             i += 1;
-                            let amount = args
-                                .get(i)
-                                .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok());
-                            match amount.map(|a| ttl_ms(a, opt == "EX")) {
-                                Some(Some(ms)) => expire_ms = Some(ms),
-                                Some(None) => return invalid_expire("getex"),
-                                None => {
-                                    return CommandResponse::error(
+                            let Some(amount) = args.get(i).and_then(|b| parse_i64_arg(b)) else {
+                                return if i >= args.len() {
+                                    CommandResponse::syntax_error()
+                                } else {
+                                    CommandResponse::error(
                                         "ERR value is not an integer or out of range",
                                     )
-                                }
+                                };
+                            };
+                            match absolute_expiry(&opt, amount) {
+                                Some(at) => expire_at = Some(at),
+                                None => return invalid_expire("getex"),
                             }
                         }
-                        "PERSIST" => persist = true,
+                        "PERSIST" if expire_at.is_none() && !persist => persist = true,
                         _ => return CommandResponse::syntax_error(),
                     }
                     i += 1;
                 }
                 self.shards
                     .shard_for_key(&key)
-                    .execute(move |store| store.string_getex(&key, expire_ms, persist))
+                    .execute(move |store| store.string_getex_at(&key, expire_at, persist))
             }
             "MGET" => {
                 if args.is_empty() {
@@ -1142,62 +1139,57 @@ impl CommandEngine {
             }
 
             // ---- Generic key commands ----
-            "DEL" => {
+            "DEL" | "UNLINK" => {
                 if args.is_empty() {
-                    return CommandResponse::wrong_arity("del");
+                    return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
+                let unlink = name == "UNLINK";
+                let groups = group_by_shard(&self.shards, args);
+                // Several shards: hold them all, so no client sees some keys
+                // deleted and others not.
+                let _held = (groups.len() > 1)
+                    .then(|| self.shards.lock_shards(groups.iter().map(|(i, _)| *i)));
                 let mut total = 0i64;
-                for key in args {
-                    let k = key.clone();
-                    let resp =
-                        self.shards
-                            .shard_for_key(&k)
-                            .execute_with_effects(move |store, fx| {
-                                let deleted = store.del(&k);
-                                if deleted {
-                                    fx.push("DEL", &[&k]);
+                let mut freed: Vec<solikv_core::KeyEntry> = Vec::new();
+                for (idx, keys) in &groups {
+                    let resp = self.shards.shard(*idx).execute_with_effects(|store, fx| {
+                        let mut n = 0i64;
+                        let mut gone: Vec<&[u8]> = Vec::new();
+                        for k in keys {
+                            if let Some(entry) = store.remove_live(k) {
+                                n += 1;
+                                gone.push(k);
+                                if unlink {
+                                    freed.push(entry);
                                 }
-                                CommandResponse::integer(deleted as i64)
-                            });
+                            }
+                        }
+                        if !gone.is_empty() {
+                            fx.push("DEL", &gone);
+                        }
+                        CommandResponse::integer(n)
+                    });
                     if let CommandResponse::Integer(n) = resp {
                         total += n;
                     }
                 }
+                drop(_held);
+                // UNLINK: values are freed after the locks are released, and
+                // big ones on another thread, so a huge collection does not
+                // stall the shard (or this client) while it is dropped.
+                lazy_free(freed);
                 CommandResponse::integer(total)
             }
-            "UNLINK" => {
-                // Same as DEL for now (async deletion could be optimized later)
+            "EXISTS" | "TOUCH" => {
                 if args.is_empty() {
-                    return CommandResponse::wrong_arity("unlink");
+                    return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
                 let mut total = 0i64;
-                for key in args {
-                    let k = key.clone();
-                    let resp =
-                        self.shards
-                            .shard_for_key(&k)
-                            .execute_with_effects(move |store, fx| {
-                                let deleted = store.del(&k);
-                                if deleted {
-                                    fx.push("DEL", &[&k]);
-                                }
-                                CommandResponse::integer(deleted as i64)
-                            });
-                    if let CommandResponse::Integer(n) = resp {
-                        total += n;
-                    }
-                }
-                CommandResponse::integer(total)
-            }
-            "EXISTS" => {
-                if args.is_empty() {
-                    return CommandResponse::wrong_arity("exists");
-                }
-                let mut total = 0i64;
-                for key in args {
-                    let k = key.clone();
-                    let resp = self.shards.shard_for_key(&k).execute(move |store| {
-                        CommandResponse::integer(if store.exists(&k) { 1 } else { 0 })
+                for (idx, keys) in group_by_shard(&self.shards, args) {
+                    let resp = self.shards.shard(idx).execute(|store| {
+                        CommandResponse::integer(
+                            keys.iter().filter(|k| store.exists(k)).count() as i64
+                        )
                     });
                     if let CommandResponse::Integer(n) = resp {
                         total += n;
@@ -1205,93 +1197,95 @@ impl CommandEngine {
                 }
                 CommandResponse::integer(total)
             }
-            "EXPIRE" => {
+            "MOVE" => {
                 if args.len() != 2 {
-                    return CommandResponse::wrong_arity("expire");
+                    return CommandResponse::wrong_arity("move");
+                }
+                let to = match self.parse_db(&args[1]) {
+                    Ok(db) => db,
+                    Err(e) => return e,
+                };
+                let from = current_db();
+                if to == from {
+                    return CommandResponse::error(
+                        "ERR source and destination objects are the same",
+                    );
                 }
                 let key = args[0].clone();
-                let seconds = match std::str::from_utf8(&args[1])
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                {
-                    Some(s) => s,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR value is not an integer or out of range",
-                        )
+                let watch = self.shards.watch();
+                self.shards.shard_for_key(&key).execute(|store| {
+                    let moved = store.move_key(&key, to);
+                    if moved && watch.is_active() {
+                        watch.touch(from, &key);
+                        watch.touch(to, &key);
                     }
-                };
-                let Some(ms) = ttl_ms(seconds, true) else {
-                    return invalid_expire("expire");
-                };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    CommandResponse::integer(if store.expire(&key, ms) { 1 } else { 0 })
+                    CommandResponse::integer(moved as i64)
                 })
             }
-            "PEXPIRE" => {
-                if args.len() != 2 {
-                    return CommandResponse::wrong_arity("pexpire");
+            "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => {
+                let lname = name.to_lowercase();
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity(&lname);
                 }
                 let key = args[0].clone();
-                let millis = match std::str::from_utf8(&args[1])
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                {
-                    Some(m) => m,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR value is not an integer or out of range",
-                        )
-                    }
+                let Some(amount) = parse_i64_arg(&args[1]) else {
+                    return CommandResponse::error("ERR value is not an integer or out of range");
                 };
-                if ttl_ms(millis, false).is_none() {
-                    return invalid_expire("pexpire");
+                let mut cond = solikv_core::store::ExpireCond::default();
+                for opt in &args[2..] {
+                    match String::from_utf8_lossy(opt).to_ascii_uppercase().as_str() {
+                        "NX" => cond.nx = true,
+                        "XX" => cond.xx = true,
+                        "GT" => cond.gt = true,
+                        "LT" => cond.lt = true,
+                        other => {
+                            return CommandResponse::error(format!(
+                                "ERR Unsupported option {}",
+                                other
+                            ))
+                        }
+                    }
                 }
+                if cond.nx && (cond.xx || cond.gt || cond.lt) {
+                    return CommandResponse::error(
+                        "ERR NX and XX, GT or LT options at the same time are not compatible",
+                    );
+                }
+                if cond.gt && cond.lt {
+                    return CommandResponse::error(
+                        "ERR GT and LT options at the same time are not compatible",
+                    );
+                }
+                // Absolute deadline in ms; anything at or before now deletes.
+                let at: i128 = match name {
+                    "EXPIRE" => now_millis() as i128 + amount as i128 * 1000,
+                    "PEXPIRE" => now_millis() as i128 + amount as i128,
+                    "EXPIREAT" => amount as i128 * 1000,
+                    _ => amount as i128,
+                };
+                if at > (i64::MAX / 2) as i128 {
+                    return invalid_expire(&lname);
+                }
+                let at = at.max(0) as u64;
                 self.shards.shard_for_key(&key).execute(move |store| {
-                    CommandResponse::integer(if store.expire(&key, millis) { 1 } else { 0 })
+                    CommandResponse::integer(store.expire_cond(&key, at, cond) as i64)
                 })
             }
-            "EXPIREAT" => {
-                if args.len() != 2 {
-                    return CommandResponse::wrong_arity("expireat");
+            "EXPIRETIME" | "PEXPIRETIME" => {
+                if args.len() != 1 {
+                    return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
                 let key = args[0].clone();
-                let ts = match std::str::from_utf8(&args[1])
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                {
-                    Some(t) => t,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR value is not an integer or out of range",
-                        )
-                    }
-                };
-                let Some(at_ms) = ts.checked_mul(1000) else {
-                    return invalid_expire("expireat");
-                };
+                let ms = name == "PEXPIRETIME";
                 self.shards.shard_for_key(&key).execute(move |store| {
-                    CommandResponse::integer(if store.expire_at(&key, at_ms) { 1 } else { 0 })
-                })
-            }
-            "PEXPIREAT" => {
-                if args.len() != 2 {
-                    return CommandResponse::wrong_arity("pexpireat");
-                }
-                let key = args[0].clone();
-                let ts = match std::str::from_utf8(&args[1])
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                {
-                    Some(t) => t,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR value is not an integer or out of range",
-                        )
-                    }
-                };
-                self.shards.shard_for_key(&key).execute(move |store| {
-                    CommandResponse::integer(if store.expire_at(&key, ts) { 1 } else { 0 })
+                    CommandResponse::integer(match store.get(&key) {
+                        None => -2,
+                        Some(e) => match e.expires_at {
+                            None => -1,
+                            Some(at) if ms => at as i64,
+                            Some(at) => (at / 1000) as i64,
+                        },
+                    })
                 })
             }
             "TTL" => {
@@ -1330,35 +1324,75 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| CommandResponse::simple(store.key_type(&key)))
             }
-            "RENAME" => {
+            "RENAME" | "RENAMENX" => {
                 if args.len() != 2 {
-                    return CommandResponse::wrong_arity("rename");
+                    return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
+                let nx = name == "RENAMENX";
                 let from = args[0].clone();
                 let to = args[1].clone();
-                // Simple case: same shard
-                self.shards.shard_for_key(&from).execute(move |store| {
-                    match store.rename(&from, to) {
-                        Ok(()) => CommandResponse::ok(),
-                        Err(e) => CommandResponse::error(e),
-                    }
-                })
-            }
-            "RENAMENX" => {
-                if args.len() != 2 {
-                    return CommandResponse::wrong_arity("renamenx");
+                let fs = self.shards.shard_index_for_key(&from);
+                let ts = self.shards.shard_index_for_key(&to);
+                if fs == ts {
+                    // One shard: logged as itself.
+                    return self.shards.shard(fs).execute(move |store| {
+                        if store.get(&from).is_none() {
+                            return CommandResponse::error("ERR no such key");
+                        }
+                        // (With `from == to`, the destination exists.)
+                        if nx && store.exists(&to) {
+                            return CommandResponse::integer(0);
+                        }
+                        match store.rename(&from, to) {
+                            Ok(()) if nx => CommandResponse::integer(1),
+                            Ok(()) => CommandResponse::ok(),
+                            Err(e) => CommandResponse::error(e),
+                        }
+                    });
                 }
-                let from = args[0].clone();
-                let to = args[1].clone();
-                self.shards.shard_for_key(&from).execute(move |store| {
-                    if store.exists(&to) {
+                // Two shards, held together: the key leaves one and arrives
+                // in the other in one step. Logged as the effect on each:
+                // a DEL on the source's log, the value (TTL included) on the
+                // destination's. The checks push no record, so log nothing.
+                let _held = self.shards.lock_shards([fs, ts]);
+                let src_live = matches!(
+                    self.shards.shard(fs).execute_with_effects(|s, _| {
+                        CommandResponse::integer(s.get(&from).is_some() as i64)
+                    }),
+                    CommandResponse::Integer(1)
+                );
+                if !src_live {
+                    return CommandResponse::error("ERR no such key");
+                }
+                if nx {
+                    let dest = self.shards.shard(ts).execute_with_effects(|s, _| {
+                        CommandResponse::integer(s.get(&to).is_some() as i64)
+                    });
+                    if matches!(dest, CommandResponse::Integer(1)) {
                         return CommandResponse::integer(0);
                     }
-                    match store.rename(&from, to) {
-                        Ok(()) => CommandResponse::integer(1),
-                        Err(e) => CommandResponse::error(e),
+                }
+                let mut taken = None;
+                self.shards.shard(fs).execute_with_effects(|s, fx| {
+                    taken = s.remove_live(&from);
+                    if taken.is_some() {
+                        fx.push("DEL", &[&from]);
                     }
-                })
+                    CommandResponse::ok()
+                });
+                let Some(entry) = taken else {
+                    return CommandResponse::error("ERR no such key");
+                };
+                self.shards.shard(ts).execute_with_effects(|s, fx| {
+                    s.insert_entry(to.clone(), entry);
+                    fx.put_key(s, &to);
+                    CommandResponse::ok()
+                });
+                if nx {
+                    CommandResponse::integer(1)
+                } else {
+                    CommandResponse::ok()
+                }
             }
             "KEYS" => {
                 if args.len() != 1 {
@@ -1390,35 +1424,17 @@ impl CommandEngine {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("scan");
                 }
-                let cursor = std::str::from_utf8(&args[0])
+                let Some(cursor) = std::str::from_utf8(&args[0])
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
-                let mut pattern = None;
-                let mut count = 10usize;
-                let mut i = 1;
-                while i < args.len() {
-                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
-                    match opt.as_str() {
-                        "MATCH" => {
-                            i += 1;
-                            pattern = args
-                                .get(i)
-                                .and_then(|b| std::str::from_utf8(b).ok())
-                                .map(|s| s.to_string());
-                        }
-                        "COUNT" => {
-                            i += 1;
-                            count = args
-                                .get(i)
-                                .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok())
-                                .unwrap_or(10);
-                        }
-                        _ => {}
-                    }
-                    i += 1;
-                }
-                multi_shard_scan(&self.shards, cursor, pattern, count)
+                else {
+                    return CommandResponse::error("ERR invalid cursor");
+                };
+                let (pattern, count, type_filter) = match parse_scan_options(&args[1..], true) {
+                    Ok(o) => o,
+                    Err(e) => return e,
+                };
+                multi_shard_scan(&self.shards, cursor, pattern, count, type_filter)
             }
             "RANDOMKEY" => multi_shard_randomkey(&self.shards),
             "OBJECT" => {
@@ -1808,38 +1824,19 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("hscan");
                 }
                 let key = args[0].clone();
-                let cursor = std::str::from_utf8(&args[1])
+                let Some(cursor) = std::str::from_utf8(&args[1])
                     .ok()
                     .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let mut pattern = None;
-                let mut count = 10usize;
-                let mut i = 2;
-                while i < args.len() {
-                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
-                    match opt.as_str() {
-                        "MATCH" => {
-                            i += 1;
-                            pattern = args
-                                .get(i)
-                                .and_then(|b| std::str::from_utf8(b).ok())
-                                .map(|s| s.to_string());
-                        }
-                        "COUNT" => {
-                            i += 1;
-                            count = args
-                                .get(i)
-                                .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok())
-                                .unwrap_or(10);
-                        }
-                        _ => {}
-                    }
-                    i += 1;
-                }
-                let pat = pattern.clone();
+                else {
+                    return CommandResponse::error("ERR invalid cursor");
+                };
+                let (pattern, count, _) = match parse_scan_options(&args[2..], false) {
+                    Ok(o) => o,
+                    Err(e) => return e,
+                };
                 self.shards
                     .shard_for_key(&key)
-                    .execute(move |store| store.hash_hscan(&key, cursor, pat.as_deref(), count))
+                    .execute(move |store| store.hash_hscan(&key, cursor, pattern.as_deref(), count))
             }
 
             // ---- Set commands ----
@@ -1891,29 +1888,18 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.set_scard(&key))
             }
-            "SINTER" => {
+            "SINTER" | "SUNION" | "SDIFF" => {
                 if args.is_empty() {
-                    return CommandResponse::wrong_arity("sinter");
+                    return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
-                let keys: Vec<Bytes> = args.to_vec();
-                let shard = self.shards.shard_for_key(&keys[0]).clone();
-                shard.execute(move |store| store.set_sinter(&keys))
+                self.set_algebra(name, args, None)
             }
-            "SUNION" => {
-                if args.is_empty() {
-                    return CommandResponse::wrong_arity("sunion");
+            "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" => {
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
-                let keys: Vec<Bytes> = args.to_vec();
-                let shard = self.shards.shard_for_key(&keys[0]).clone();
-                shard.execute(move |store| store.set_sunion(&keys))
-            }
-            "SDIFF" => {
-                if args.is_empty() {
-                    return CommandResponse::wrong_arity("sdiff");
-                }
-                let keys: Vec<Bytes> = args.to_vec();
-                let shard = self.shards.shard_for_key(&keys[0]).clone();
-                shard.execute(move |store| store.set_sdiff(&keys))
+                let op = &name[..name.len() - "STORE".len()];
+                self.set_algebra(op, &args[1..], Some(&args[0]))
             }
             "SPOP" => {
                 if args.is_empty() {
@@ -1947,9 +1933,42 @@ impl CommandEngine {
                 let src = args[0].clone();
                 let dst = args[1].clone();
                 let member = args[2].clone();
-                self.shards
-                    .shard_for_key(&src)
-                    .execute(move |store| store.set_smove(&src, dst, member))
+                let ss = self.shards.shard_index_for_key(&src);
+                let ds = self.shards.shard_index_for_key(&dst);
+                if ss == ds {
+                    return self
+                        .shards
+                        .shard(ss)
+                        .execute(move |store| store.set_smove(&src, dst, member));
+                }
+                // Across shards: both held; logged as the SREM and the SADD.
+                let _held = self.shards.lock_shards([ss, ds]);
+                let dst_ok =
+                    self.shards
+                        .shard(ds)
+                        .execute_with_effects(|s, _| match s.set_clone(&dst) {
+                            Err(e) => e,
+                            Ok(_) => CommandResponse::ok(),
+                        });
+                if dst_ok.is_error() {
+                    return dst_ok;
+                }
+                let removed = self.shards.shard(ss).execute_with_effects(|s, fx| {
+                    let r = s.set_srem(&src, std::slice::from_ref(&member));
+                    if matches!(r, CommandResponse::Integer(1)) {
+                        fx.push("SREM", &[&src, &member]);
+                    }
+                    r
+                });
+                if !matches!(removed, CommandResponse::Integer(1)) {
+                    return removed;
+                }
+                self.shards.shard(ds).execute_with_effects(|s, fx| {
+                    s.set_sadd(&dst, vec![member.clone()]);
+                    fx.push("SADD", &[&dst, &member]);
+                    CommandResponse::ok()
+                });
+                CommandResponse::integer(1)
             }
 
             // ---- Sorted Set commands ----
@@ -1958,58 +1977,59 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("zadd");
                 }
                 let key = args[0].clone();
-                let mut nx = false;
-                let mut xx = false;
-                let mut gt = false;
-                let mut lt = false;
-                let mut ch = false;
+                let (mut nx, mut xx, mut gt, mut lt, mut ch, mut incr) =
+                    (false, false, false, false, false, false);
                 let mut i = 1;
-
-                // Parse flags
                 while i < args.len() {
-                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
-                    match opt.as_str() {
-                        "NX" => {
-                            nx = true;
-                            i += 1;
-                        }
-                        "XX" => {
-                            xx = true;
-                            i += 1;
-                        }
-                        "GT" => {
-                            gt = true;
-                            i += 1;
-                        }
-                        "LT" => {
-                            lt = true;
-                            i += 1;
-                        }
-                        "CH" => {
-                            ch = true;
-                            i += 1;
-                        }
+                    match String::from_utf8_lossy(&args[i])
+                        .to_ascii_uppercase()
+                        .as_str()
+                    {
+                        "NX" => nx = true,
+                        "XX" => xx = true,
+                        "GT" => gt = true,
+                        "LT" => lt = true,
+                        "CH" => ch = true,
+                        "INCR" => incr = true,
                         _ => break, // Start of score-member pairs
                     }
+                    i += 1;
                 }
-
                 let remaining = &args[i..];
-                if remaining.len() < 2 || !remaining.len().is_multiple_of(2) {
-                    return CommandResponse::wrong_arity("zadd");
+                if remaining.is_empty() || !remaining.len().is_multiple_of(2) {
+                    return CommandResponse::syntax_error();
                 }
-
-                let pairs: Vec<(f64, Bytes)> = remaining
-                    .chunks(2)
-                    .filter_map(|c| {
-                        let score = std::str::from_utf8(&c[0]).ok()?.parse::<f64>().ok()?;
-                        Some((score, c[1].clone()))
-                    })
-                    .collect();
-
-                if pairs.is_empty() {
-                    return CommandResponse::error("ERR value is not a valid float");
+                if nx && xx {
+                    return CommandResponse::error(
+                        "ERR XX and NX options at the same time are not compatible",
+                    );
                 }
-
+                if (gt && lt) || (nx && (gt || lt)) {
+                    return CommandResponse::error(
+                        "ERR GT, LT, and/or NX options at the same time are not compatible",
+                    );
+                }
+                if incr && remaining.len() != 2 {
+                    return CommandResponse::error(
+                        "ERR INCR option supports a single increment-element pair",
+                    );
+                }
+                let mut pairs = Vec::with_capacity(remaining.len() / 2);
+                for c in remaining.chunks(2) {
+                    let Some(score) = std::str::from_utf8(&c[0])
+                        .ok()
+                        .and_then(solikv_core::zset_ops::parse_float)
+                    else {
+                        return CommandResponse::error("ERR value is not a valid float");
+                    };
+                    pairs.push((score, c[1].clone()));
+                }
+                if incr {
+                    let (delta, member) = pairs.pop().expect("one pair");
+                    return self.shards.shard_for_key(&key).execute(move |store| {
+                        store.zset_zadd_incr(&key, delta, member, (nx, xx, gt, lt))
+                    });
+                }
                 self.shards
                     .shard_for_key(&key)
                     .execute(move |store| store.zset_zadd(&key, pairs, nx, xx, gt, lt, ch))
@@ -2068,132 +2088,86 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("zincrby");
                 }
                 let key = args[0].clone();
-                let delta = match std::str::from_utf8(&args[1])
+                let Some(delta) = std::str::from_utf8(&args[1])
                     .ok()
-                    .and_then(|s| s.parse::<f64>().ok())
-                {
-                    Some(d) => d,
-                    None => return CommandResponse::error("ERR value is not a valid float"),
+                    .and_then(solikv_core::zset_ops::parse_float)
+                else {
+                    return CommandResponse::error("ERR value is not a valid float");
                 };
                 let member = args[2].clone();
                 self.shards
                     .shard_for_key(&key)
                     .execute(move |store| store.zset_zincrby(&key, delta, member))
             }
-            "ZCOUNT" => {
+            "ZCOUNT" | "ZLEXCOUNT" => {
                 if args.len() != 3 {
-                    return CommandResponse::wrong_arity("zcount");
+                    return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
-                let key = args[0].clone();
-                let min = parse_score_bound(&args[1], f64::NEG_INFINITY);
-                let max = parse_score_bound(&args[2], f64::INFINITY);
-                self.shards
-                    .shard_for_key(&key)
-                    .execute(move |store| store.zset_zcount(&key, min, max))
-            }
-            "ZRANGE" => {
-                if args.len() < 3 {
-                    return CommandResponse::wrong_arity("zrange");
-                }
-                let key = args[0].clone();
-                let start = match std::str::from_utf8(&args[1])
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                {
-                    Some(s) => s,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR value is not an integer or out of range",
-                        )
-                    }
+                let by = match if name == "ZCOUNT" {
+                    parse_score_range(&args[1], &args[2])
+                } else {
+                    parse_lex_range(&args[1], &args[2])
+                } {
+                    Ok(by) => by,
+                    Err(e) => return e,
                 };
-                let stop = match std::str::from_utf8(&args[2])
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                {
-                    Some(s) => s,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR value is not an integer or out of range",
-                        )
-                    }
-                };
-                let withscores = args
-                    .get(3)
-                    .map(|b| std::str::from_utf8(b).unwrap_or("").to_uppercase() == "WITHSCORES")
-                    .unwrap_or(false);
-                self.shards
-                    .shard_for_key(&key)
-                    .execute(move |store| store.zset_zrange(&key, start, stop, withscores))
-            }
-            "ZREVRANGE" => {
-                if args.len() < 3 {
-                    return CommandResponse::wrong_arity("zrevrange");
-                }
                 let key = args[0].clone();
-                let start = match std::str::from_utf8(&args[1])
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                {
-                    Some(s) => s,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR value is not an integer or out of range",
-                        )
-                    }
+                let q = ZRangeQuery {
+                    by,
+                    rev: false,
+                    limit: None,
                 };
-                let stop = match std::str::from_utf8(&args[2])
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                {
-                    Some(s) => s,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR value is not an integer or out of range",
-                        )
-                    }
-                };
-                let withscores = args
-                    .get(3)
-                    .map(|b| std::str::from_utf8(b).unwrap_or("").to_uppercase() == "WITHSCORES")
-                    .unwrap_or(false);
-                self.shards
-                    .shard_for_key(&key)
-                    .execute(move |store| store.zset_zrevrange(&key, start, stop, withscores))
-            }
-            "ZRANGEBYSCORE" => {
-                if args.len() < 3 {
-                    return CommandResponse::wrong_arity("zrangebyscore");
-                }
-                let key = args[0].clone();
-                let min = parse_score_bound(&args[1], f64::NEG_INFINITY);
-                let max = parse_score_bound(&args[2], f64::INFINITY);
-                let mut withscores = false;
-                let mut offset = 0;
-                let mut count = None;
-                let mut i = 3;
-                while i < args.len() {
-                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
-                    match opt.as_str() {
-                        "WITHSCORES" => withscores = true,
-                        "LIMIT" => {
-                            i += 1;
-                            offset = args
-                                .get(i)
-                                .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok())
-                                .unwrap_or(0);
-                            i += 1;
-                            count = args
-                                .get(i)
-                                .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok());
-                        }
-                        _ => {}
-                    }
-                    i += 1;
-                }
                 self.shards.shard_for_key(&key).execute(move |store| {
-                    store.zset_zrangebyscore(&key, min, max, withscores, offset, count)
+                    match store.zset_range_query(&key, &q) {
+                        Ok(v) => CommandResponse::integer(v.len() as i64),
+                        Err(e) => e,
+                    }
                 })
+            }
+            "ZRANGE" | "ZREVRANGE" | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" | "ZRANGEBYLEX"
+            | "ZREVRANGEBYLEX" => {
+                if args.len() < 3 {
+                    return CommandResponse::wrong_arity(&name.to_lowercase());
+                }
+                let (q, withscores) = match parse_zrange(name, args) {
+                    Ok(q) => q,
+                    Err(e) => return e,
+                };
+                let key = args[0].clone();
+                self.shards.shard_for_key(&key).execute(move |store| {
+                    match store.zset_range_query(&key, &q) {
+                        Ok(items) => solikv_core::zset_ops::zrange_reply(items, withscores),
+                        Err(e) => e,
+                    }
+                })
+            }
+            "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" | "ZREMRANGEBYLEX" => {
+                if args.len() != 3 {
+                    return CommandResponse::wrong_arity(&name.to_lowercase());
+                }
+                let by = match name {
+                    "ZREMRANGEBYSCORE" => parse_score_range(&args[1], &args[2]),
+                    "ZREMRANGEBYLEX" => parse_lex_range(&args[1], &args[2]),
+                    _ => match (parse_i64_arg(&args[1]), parse_i64_arg(&args[2])) {
+                        (Some(a), Some(b)) => Ok(ZRangeBy::Rank(a, b)),
+                        _ => Err(CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )),
+                    },
+                };
+                let by = match by {
+                    Ok(by) => by,
+                    Err(e) => return e,
+                };
+                let key = args[0].clone();
+                let q = ZRangeQuery {
+                    by,
+                    rev: false,
+                    limit: None,
+                };
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.zset_remove_range(&key, &q))
             }
             "ZPOPMIN" => {
                 if args.is_empty() {
@@ -2221,161 +2195,25 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.zset_zpopmax(&key, count))
             }
-            "ZUNIONSTORE" => {
-                if args.len() < 3 {
-                    return CommandResponse::wrong_arity("zunionstore");
-                }
-                let dest = args[0].clone();
-                let numkeys = match std::str::from_utf8(&args[1])
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                {
-                    Some(n) => n,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR value is not an integer or out of range",
-                        )
-                    }
-                };
-                let keys_end = match numkeys.checked_add(2) {
-                    Some(end) => end,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR Number of keys can't be greater than number of args",
-                        )
-                    }
-                };
-                if args.len() < keys_end {
-                    return CommandResponse::wrong_arity("zunionstore");
-                }
-                let keys: Vec<Bytes> = args[2..keys_end].to_vec();
-                let mut weights = Vec::new();
-                let mut aggregate = Aggregate::Sum;
-                let mut i = keys_end;
-                while i < args.len() {
-                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
-                    match opt.as_str() {
-                        "WEIGHTS" => {
-                            i += 1;
-                            while i < args.len() {
-                                if let Some(w) = std::str::from_utf8(&args[i])
-                                    .ok()
-                                    .and_then(|s| s.parse::<f64>().ok())
-                                {
-                                    weights.push(w);
-                                    i += 1;
-                                } else {
-                                    break;
-                                }
-                            }
-                            continue;
-                        }
-                        "AGGREGATE" => {
-                            i += 1;
-                            if let Some(agg) = args.get(i).and_then(|b| std::str::from_utf8(b).ok())
-                            {
-                                aggregate = match agg.to_uppercase().as_str() {
-                                    "MIN" => Aggregate::Min,
-                                    "MAX" => Aggregate::Max,
-                                    _ => Aggregate::Sum,
-                                };
-                            }
-                        }
-                        _ => {}
-                    }
-                    i += 1;
-                }
-                let shard = self.shards.shard_for_key(&dest).clone();
-                shard.execute_with_effects(move |store, fx| {
-                    let r = store.zset_zunionstore(&dest, &keys, &weights, aggregate);
-                    fx.put_key(store, &dest);
-                    r
-                })
-            }
-            "ZINTERSTORE" => {
-                if args.len() < 3 {
-                    return CommandResponse::wrong_arity("zinterstore");
-                }
-                let dest = args[0].clone();
-                let numkeys = match std::str::from_utf8(&args[1])
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                {
-                    Some(n) => n,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR value is not an integer or out of range",
-                        )
-                    }
-                };
-                let keys_end = match numkeys.checked_add(2) {
-                    Some(end) => end,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR Number of keys can't be greater than number of args",
-                        )
-                    }
-                };
-                if args.len() < keys_end {
-                    return CommandResponse::wrong_arity("zinterstore");
-                }
-                let keys: Vec<Bytes> = args[2..keys_end].to_vec();
-                let mut weights = Vec::new();
-                let mut aggregate = Aggregate::Sum;
-                let mut i = keys_end;
-                while i < args.len() {
-                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
-                    match opt.as_str() {
-                        "WEIGHTS" => {
-                            i += 1;
-                            while i < args.len() {
-                                if let Some(w) = std::str::from_utf8(&args[i])
-                                    .ok()
-                                    .and_then(|s| s.parse::<f64>().ok())
-                                {
-                                    weights.push(w);
-                                    i += 1;
-                                } else {
-                                    break;
-                                }
-                            }
-                            continue;
-                        }
-                        "AGGREGATE" => {
-                            i += 1;
-                            if let Some(agg) = args.get(i).and_then(|b| std::str::from_utf8(b).ok())
-                            {
-                                aggregate = match agg.to_uppercase().as_str() {
-                                    "MIN" => Aggregate::Min,
-                                    "MAX" => Aggregate::Max,
-                                    _ => Aggregate::Sum,
-                                };
-                            }
-                        }
-                        _ => {}
-                    }
-                    i += 1;
-                }
-                let shard = self.shards.shard_for_key(&dest).clone();
-                shard.execute_with_effects(move |store, fx| {
-                    let r = store.zset_zinterstore(&dest, &keys, &weights, aggregate);
-                    fx.put_key(store, &dest);
-                    r
-                })
-            }
+            "ZUNIONSTORE" | "ZINTERSTORE" => self.zstore(name, args),
             "ZSCAN" => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("zscan");
                 }
                 let key = args[0].clone();
-                let cursor = std::str::from_utf8(&args[1])
+                let Some(cursor) = std::str::from_utf8(&args[1])
                     .ok()
                     .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let count = 10;
+                else {
+                    return CommandResponse::error("ERR invalid cursor");
+                };
+                let (pattern, count, _) = match parse_scan_options(&args[2..], false) {
+                    Ok(o) => o,
+                    Err(e) => return e,
+                };
                 self.shards
                     .shard_for_key(&key)
-                    .execute(move |store| store.zset_zscan(&key, cursor, None, count))
+                    .execute(move |store| store.zset_zscan(&key, cursor, pattern.as_deref(), count))
             }
 
             // ---- Geospatial commands ----
@@ -2630,6 +2468,9 @@ impl CommandEngine {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("geosearchstore");
                 }
+                // Source and destination held together: read and store in
+                // one step.
+                let _held = self.shards.lock_keys([args[0].as_ref(), args[1].as_ref()]);
                 let dest = args[0].clone();
                 let src = args[1].clone();
                 let mut i = 2usize;
@@ -3114,6 +2955,7 @@ impl CommandEngine {
                 i += 1;
 
                 let mut count = None;
+                let mut noack = false;
 
                 while i < args.len() {
                     let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
@@ -3127,6 +2969,10 @@ impl CommandEngine {
                         }
                         "BLOCK" => {
                             i += 2; // parse and ignore for v1
+                        }
+                        "NOACK" => {
+                            noack = true;
+                            i += 1;
                         }
                         "STREAMS" => {
                             i += 1;
@@ -3169,7 +3015,8 @@ impl CommandEngine {
                         self.shards
                             .shard_for_key(&k)
                             .execute_with_effects(move |store, fx| {
-                                let r = store.stream_xreadgroup_single(&k, &g, &c, id_input, count);
+                                let r = store
+                                    .stream_xreadgroup_opts(&k, &g, &c, id_input, count, noack);
                                 if !r.is_error() && fx.enabled() {
                                     // This stream's part only: the others are on
                                     // their own shards' logs.
@@ -3177,6 +3024,9 @@ impl CommandEngine {
                                     if let Some(n) = &count_arg {
                                         a.push(b"COUNT");
                                         a.push(n.as_bytes());
+                                    }
+                                    if noack {
+                                        a.push(b"NOACK");
                                     }
                                     a.extend_from_slice(&[b"STREAMS", &k, &id_arg]);
                                     fx.push("XREADGROUP", &a);
@@ -3293,21 +3143,58 @@ impl CommandEngine {
                 let sub = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
                 match sub.as_str() {
                     "CHANNELS" => {
-                        let channels = self.pubsub.channels();
-                        CommandResponse::array(
-                            channels.into_iter().map(CommandResponse::bulk).collect(),
-                        )
+                        if args.len() > 2 {
+                            return CommandResponse::wrong_arity("pubsub|channels");
+                        }
+                        let pattern = args.get(1).map(|p| String::from_utf8_lossy(p).to_string());
+                        // Only channels someone is subscribed to, as Redis
+                        // lists them (the broker keeps a sender per channel
+                        // that ever had one).
+                        let channels = self
+                            .pubsub
+                            .numsub()
+                            .into_iter()
+                            .filter(|(ch, n)| {
+                                *n > 0
+                                    && pattern.as_ref().is_none_or(|p| {
+                                        solikv_core::store::glob_match_pub(
+                                            p,
+                                            &String::from_utf8_lossy(ch),
+                                        )
+                                    })
+                            })
+                            .map(|(ch, _)| CommandResponse::bulk(ch))
+                            .collect();
+                        CommandResponse::array(channels)
                     }
                     "NUMSUB" => {
-                        let subs = self.pubsub.numsub();
-                        let mut result = Vec::new();
-                        for (ch, count) in subs {
-                            result.push(CommandResponse::bulk(ch));
-                            result.push(CommandResponse::integer(count as i64));
+                        // Exactly the channels asked for, in order, 0 when
+                        // nobody listens.
+                        let mut result = Vec::with_capacity((args.len() - 1) * 2);
+                        for ch in &args[1..] {
+                            result.push(CommandResponse::bulk(ch.clone()));
+                            result.push(CommandResponse::integer(
+                                self.pubsub.subscriber_count(ch) as i64
+                            ));
                         }
                         CommandResponse::array(result)
                     }
-                    _ => CommandResponse::error("ERR Unknown PUBSUB subcommand"),
+                    "NUMPAT" => {
+                        if args.len() != 1 {
+                            return CommandResponse::wrong_arity("pubsub|numpat");
+                        }
+                        let n = self
+                            .pubsub
+                            .pattern_numsub()
+                            .into_iter()
+                            .filter(|(_, n)| *n > 0)
+                            .count();
+                        CommandResponse::integer(n as i64)
+                    }
+                    _ => CommandResponse::error(format!(
+                        "ERR unknown subcommand '{}'. Try PUBSUB HELP.",
+                        sub.to_lowercase()
+                    )),
                 }
             }
 
@@ -3412,13 +3299,7 @@ impl CommandEngine {
 
                 // Cache the script
                 self.script_cache.load(script);
-
-                match self.get_self_arc() {
-                    Some(arc) => crate::lua::execute_script(&arc, script, keys, argv),
-                    None => {
-                        CommandResponse::error("ERR scripting not initialized (call init_self_ref)")
-                    }
-                }
+                self.run_script(script, keys, argv)
             }
             "EVALSHA" => {
                 // EVALSHA sha1 numkeys [key ...] [arg ...]
@@ -3461,13 +3342,7 @@ impl CommandEngine {
                 }
                 let keys: Vec<Bytes> = args[2..keys_start].to_vec();
                 let argv: Vec<Bytes> = args[keys_start..].to_vec();
-
-                match self.get_self_arc() {
-                    Some(arc) => crate::lua::execute_script(&arc, &script, keys, argv),
-                    None => {
-                        CommandResponse::error("ERR scripting not initialized (call init_self_ref)")
-                    }
-                }
+                self.run_script(&script, keys, argv)
             }
             "SCRIPT" => {
                 if args.is_empty() {
@@ -3509,12 +3384,6 @@ impl CommandEngine {
                     }
                     _ => CommandResponse::error(format!("ERR Unknown SCRIPT subcommand '{}'", sub)),
                 }
-            }
-
-            // ---- Transaction commands (basic support) ----
-            "MULTI" | "EXEC" | "DISCARD" | "WATCH" | "UNWATCH" => {
-                // These are handled at the connection level in the server
-                CommandResponse::error("ERR transactions are handled at connection level")
             }
 
             // ---- HyperLogLog commands ----
@@ -3564,9 +3433,10 @@ impl CommandEngine {
                 }
             }
             "PFMERGE" => {
-                if args.len() < 2 {
+                if args.is_empty() {
                     return CommandResponse::wrong_arity("pfmerge");
                 }
+                let _held = self.shards.lock_keys(args.iter().map(|k| k.as_ref()));
                 // Cross-shard merge: collect registers from dest + all sources
                 let mut merged_registers = vec![0u8; 16384];
                 let dest = args[0].clone();
@@ -3785,6 +3655,7 @@ impl CommandEngine {
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity("bitop");
                 }
+                let _held = self.shards.lock_keys(args[1..].iter().map(|k| k.as_ref()));
                 let op = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
                 let dest = args[1].clone();
                 let src_keys = &args[2..];
@@ -3831,6 +3702,1088 @@ impl CommandEngine {
             // ---- Catch-all ----
             _ => CommandResponse::error(format!("ERR unknown command '{}'", name)),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connections: databases, transactions, watches, CLIENT
+// ---------------------------------------------------------------------------
+
+/// Commands that name no key and touch no key: a transaction made only of
+/// these (and keyed commands) needs no shard it does not name.
+fn keyless_and_keyspace_free(name: &str) -> bool {
+    matches!(
+        name,
+        "PING" | "ECHO" | "PUBLISH" | "COMMAND" | "LASTSAVE" | "SELECT" | "TIME" | "ROLE"
+    )
+}
+
+/// What a write changes, for watch marking.
+fn touch_for(name: &str, args: &[Bytes]) -> Option<Touch> {
+    match name {
+        // Scripts: each `redis.call` marks for itself.
+        "EVAL" | "EVALSHA" => None,
+        "FLUSHDB" => Some(Touch::Db(current_db())),
+        "FLUSHALL" => Some(Touch::All),
+        // Marked by the arm, which knows both databases.
+        "SWAPDB" | "MOVE" => None,
+        _ => crate::commands::keys_of(name, args).map(|k| Touch::Keys(current_db(), k)),
+    }
+}
+
+impl CommandEngine {
+    /// Execute a command for a connection: connection-level commands
+    /// (`SELECT`, `MULTI`/`EXEC`, `WATCH`, `CLIENT`, `RESET`) here, the rest
+    /// in the session's database.
+    pub fn execute_session(
+        &self,
+        session: &mut Session,
+        name: &str,
+        args: &[Bytes],
+    ) -> CommandResponse {
+        // Inside MULTI, everything but the transaction's own commands queues.
+        if session.multi.is_some()
+            && !matches!(
+                name,
+                "EXEC" | "DISCARD" | "MULTI" | "WATCH" | "UNWATCH" | "QUIT" | "RESET"
+            )
+        {
+            return self.queue(session, name, args);
+        }
+        match name {
+            "SELECT" => {
+                if args.len() != 1 {
+                    return CommandResponse::wrong_arity("select");
+                }
+                match self.parse_db(&args[0]) {
+                    Ok(db) => {
+                        session.set_db(db);
+                        CommandResponse::ok()
+                    }
+                    Err(e) => e,
+                }
+            }
+            "MULTI" => {
+                if !args.is_empty() {
+                    return CommandResponse::wrong_arity("multi");
+                }
+                if session.multi.is_some() {
+                    return CommandResponse::error("ERR MULTI calls can not be nested");
+                }
+                session.multi = Some(Vec::new());
+                session.multi_failed = false;
+                session.set_multi_len(Some(0));
+                CommandResponse::ok()
+            }
+            "DISCARD" => {
+                if session.multi.take().is_none() {
+                    return CommandResponse::error("ERR DISCARD without MULTI");
+                }
+                session.set_multi_len(None);
+                session.unwatch_all();
+                CommandResponse::ok()
+            }
+            "EXEC" => self.exec(session),
+            "WATCH" => {
+                if session.multi.is_some() {
+                    return CommandResponse::error("ERR WATCH inside MULTI is not allowed");
+                }
+                if args.is_empty() {
+                    return CommandResponse::wrong_arity("watch");
+                }
+                let flag = session
+                    .watch_flag
+                    .get_or_insert_with(|| Arc::new(WatchFlag::default()))
+                    .clone();
+                session.watch_owner = Some(self.shards.clone());
+                for k in args {
+                    let entry = (session.db, k.clone());
+                    if !session.watched.contains(&entry) {
+                        self.shards.watch().watch(session.db, k.clone(), &flag);
+                        session.watched.push(entry);
+                    }
+                }
+                CommandResponse::ok()
+            }
+            "UNWATCH" => {
+                session.unwatch_all();
+                CommandResponse::ok()
+            }
+            "RESET" => {
+                session.multi = None;
+                session.set_multi_len(None);
+                session.unwatch_all();
+                session.set_db(0);
+                session.set_name(None);
+                session.reply = ReplyMode::On;
+                CommandResponse::simple("RESET")
+            }
+            "CLIENT" => self.client_command(session, args),
+            _ => {
+                let _db = DbGuard::enter(session.db);
+                self.execute(name, args)
+            }
+        }
+    }
+
+    fn parse_db(&self, arg: &Bytes) -> Result<u32, CommandResponse> {
+        let n = std::str::from_utf8(arg)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .ok_or_else(|| CommandResponse::error("ERR value is not an integer or out of range"))?;
+        if n < 0 || n >= self.databases as i64 {
+            return Err(CommandResponse::error("ERR DB index is out of range"));
+        }
+        Ok(n as u32)
+    }
+
+    /// Queue a command inside `MULTI`, validating what Redis validates at
+    /// queue time (a bad one aborts the whole transaction at `EXEC`).
+    fn queue(&self, session: &mut Session, name: &str, args: &[Bytes]) -> CommandResponse {
+        let Some(spec) = crate::commands::lookup(name) else {
+            session.multi_failed = true;
+            return CommandResponse::error(format!(
+                "ERR unknown command '{}', with args beginning with: {}",
+                name.to_lowercase(),
+                args_preview(args)
+            ));
+        };
+        if !spec.arity_ok(args.len()) {
+            session.multi_failed = true;
+            return CommandResponse::wrong_arity(&name.to_lowercase());
+        }
+        if spec.flags.contains(&"pubsub") && name != "PUBLISH" && name != "PUBSUB" {
+            session.multi_failed = true;
+            return CommandResponse::error(format!(
+                "ERR Command not allowed inside a transaction: '{}'",
+                name.to_lowercase()
+            ));
+        }
+        let q = session.multi.as_mut().expect("in MULTI");
+        q.push((name.to_string(), args.to_vec()));
+        let n = q.len();
+        session.set_multi_len(Some(n));
+        crate::session::queued()
+    }
+
+    /// `EXEC`: run the queue as one step. Every shard its commands (and
+    /// watched keys) live on is locked first, so no other client's command
+    /// runs in between — and a watched key changed before this point has
+    /// flagged the session by then (see `watch`).
+    fn exec(&self, session: &mut Session) -> CommandResponse {
+        let Some(queue) = session.multi.take() else {
+            return CommandResponse::error("ERR EXEC without MULTI");
+        };
+        session.set_multi_len(None);
+        if std::mem::take(&mut session.multi_failed) {
+            session.unwatch_all();
+            return CommandResponse::error(
+                "EXECABORT Transaction discarded because of previous errors.",
+            );
+        }
+
+        // Which shards to hold: those of every key named, or all of them
+        // when a command's keys are not known up front (scripts, KEYS,
+        // FLUSHDB, …).
+        let mut all = false;
+        let mut idx: Vec<usize> = Vec::new();
+        for (name, args) in &queue {
+            if name == "EVAL" || name == "EVALSHA" {
+                all = true;
+                break;
+            }
+            let keys = crate::commands::keys_of(name, args).unwrap_or_default();
+            if keys.is_empty() && !keyless_and_keyspace_free(name) {
+                all = true;
+                break;
+            }
+            idx.extend(keys.iter().map(|k| self.shards.shard_index_for_key(k)));
+        }
+        idx.extend(
+            session
+                .watched
+                .iter()
+                .map(|(_, k)| self.shards.shard_index_for_key(k)),
+        );
+        let _held = if all {
+            self.shards.lock_all()
+        } else {
+            self.shards.lock_shards(idx)
+        };
+
+        if session.watch_flag.as_ref().is_some_and(|f| f.is_dirty()) {
+            session.unwatch_all();
+            return CommandResponse::Nil;
+        }
+        // Watches end with the EXEC; unregister before running so the
+        // transaction's own writes do not bother marking them.
+        session.unwatch_all();
+
+        let tx = self.aof_transaction();
+        let mut results = Vec::with_capacity(queue.len());
+        for (name, args) in queue {
+            let resp = if name == "SELECT" {
+                match self.parse_db(&args[0]) {
+                    Ok(db) => {
+                        session.set_db(db);
+                        CommandResponse::ok()
+                    }
+                    Err(e) => e,
+                }
+            } else if name == "CLIENT" {
+                self.client_command(session, &args)
+            } else {
+                let _db = DbGuard::enter(session.db);
+                self.execute(&name, &args)
+            };
+            results.push(resp);
+        }
+        drop(tx);
+        CommandResponse::Array(results)
+    }
+
+    fn client_command(&self, session: &mut Session, args: &[Bytes]) -> CommandResponse {
+        let Some(sub) = args.first() else {
+            return CommandResponse::wrong_arity("client");
+        };
+        let sub = String::from_utf8_lossy(sub).to_ascii_uppercase();
+        let rest = &args[1..];
+        match sub.as_str() {
+            "ID" => CommandResponse::integer(session.info.id as i64),
+            "SETNAME" => {
+                let [name] = rest else {
+                    return CommandResponse::wrong_arity("client|setname");
+                };
+                if name.iter().any(|&b| b <= b' ' || b > b'~') {
+                    return CommandResponse::error(
+                        "ERR Client names cannot contain spaces, newlines or special characters.",
+                    );
+                }
+                session.set_name((!name.is_empty()).then(|| name.clone()));
+                CommandResponse::ok()
+            }
+            "GETNAME" => match session.info.name() {
+                Some(n) => CommandResponse::bulk(n),
+                None => CommandResponse::nil(),
+            },
+            "SETINFO" => {
+                let [attr, value] = rest else {
+                    return CommandResponse::wrong_arity("client|setinfo");
+                };
+                match String::from_utf8_lossy(attr).to_ascii_uppercase().as_str() {
+                    "LIB-NAME" => session.set_lib(Some(value.clone()), None),
+                    "LIB-VER" => session.set_lib(None, Some(value.clone())),
+                    other => {
+                        return CommandResponse::error(format!(
+                            "ERR Unrecognized option '{}'",
+                            other
+                        ))
+                    }
+                }
+                CommandResponse::ok()
+            }
+            "INFO" => {
+                let mut line = session.info.describe();
+                line.push('\n');
+                CommandResponse::bulk(Bytes::from(line))
+            }
+            "LIST" => {
+                let mut ids: Option<Vec<u64>> = None;
+                let mut i = 0;
+                while i < rest.len() {
+                    let opt = String::from_utf8_lossy(&rest[i]).to_ascii_uppercase();
+                    match opt.as_str() {
+                        "TYPE" if i + 1 < rest.len() => i += 2,
+                        "ID" => {
+                            let mut v = Vec::new();
+                            for a in &rest[i + 1..] {
+                                match std::str::from_utf8(a).ok().and_then(|s| s.parse().ok()) {
+                                    Some(id) => v.push(id),
+                                    None => return CommandResponse::error("ERR Invalid client ID"),
+                                }
+                            }
+                            ids = Some(v);
+                            i = rest.len();
+                        }
+                        _ => return CommandResponse::syntax_error(),
+                    }
+                }
+                let mut out = String::new();
+                for c in session.registry().list() {
+                    if ids.as_ref().is_some_and(|ids| !ids.contains(&c.id)) {
+                        continue;
+                    }
+                    out.push_str(&c.describe());
+                    out.push('\n');
+                }
+                CommandResponse::bulk(Bytes::from(out))
+            }
+            "KILL" => self.client_kill(session, rest),
+            "REPLY" => {
+                let [mode] = rest else {
+                    return CommandResponse::wrong_arity("client|reply");
+                };
+                match String::from_utf8_lossy(mode).to_ascii_uppercase().as_str() {
+                    "ON" => {
+                        session.reply = ReplyMode::On;
+                        CommandResponse::ok()
+                    }
+                    "OFF" => {
+                        session.reply = ReplyMode::Off;
+                        session.suppress_current = true;
+                        CommandResponse::ok()
+                    }
+                    "SKIP" => {
+                        session.reply = ReplyMode::Skip;
+                        session.suppress_current = true;
+                        CommandResponse::ok()
+                    }
+                    _ => CommandResponse::syntax_error(),
+                }
+            }
+            // Accepted, meaningless here (no eviction, no LRU clock yet).
+            "NO-EVICT" | "NO-TOUCH" => match rest {
+                [v] if v.eq_ignore_ascii_case(b"ON") || v.eq_ignore_ascii_case(b"OFF") => {
+                    CommandResponse::ok()
+                }
+                _ => CommandResponse::syntax_error(),
+            },
+            // Client-side caching is not implemented. Saying OK here made
+            // clients serve stale cached values forever.
+            "TRACKING" | "CACHING" | "GETREDIR" | "TRACKINGINFO" => CommandResponse::error(
+                "ERR client-side caching (CLIENT TRACKING) is not supported by this server",
+            ),
+            "PAUSE" | "UNPAUSE" | "UNBLOCK" => CommandResponse::error(format!(
+                "ERR CLIENT {} is not supported by this server",
+                sub
+            )),
+            "HELP" => CommandResponse::array(
+                [
+                    "CLIENT <subcommand> [<arg> ...]. Subcommands are:",
+                    "ID, GETNAME, SETNAME <name>, SETINFO <attr> <value>, INFO,",
+                    "LIST [TYPE type] [ID id ...], KILL <filter> <value> ...,",
+                    "REPLY ON|OFF|SKIP, NO-EVICT ON|OFF, NO-TOUCH ON|OFF",
+                ]
+                .iter()
+                .map(|l| CommandResponse::simple(l))
+                .collect(),
+            ),
+            _ => CommandResponse::error(format!(
+                "ERR unknown subcommand '{}'. Try CLIENT HELP.",
+                sub.to_lowercase()
+            )),
+        }
+    }
+
+    fn client_kill(&self, session: &Session, rest: &[Bytes]) -> CommandResponse {
+        // Old form: CLIENT KILL addr:port
+        if rest.len() == 1 {
+            let addr = String::from_utf8_lossy(&rest[0]).to_string();
+            let n = session.kill_matching(|c| c.addr == addr, false);
+            return if n == 0 {
+                CommandResponse::error("ERR No such client")
+            } else {
+                CommandResponse::ok()
+            };
+        }
+        if rest.is_empty() || !rest.len().is_multiple_of(2) {
+            return CommandResponse::syntax_error();
+        }
+        let mut id: Option<u64> = None;
+        let mut addr: Option<String> = None;
+        let mut laddr: Option<String> = None;
+        let mut skip_me = true;
+        for pair in rest.chunks(2) {
+            let opt = String::from_utf8_lossy(&pair[0]).to_ascii_uppercase();
+            let val = String::from_utf8_lossy(&pair[1]).to_string();
+            match opt.as_str() {
+                "ID" => match val.parse() {
+                    Ok(v) => id = Some(v),
+                    Err(_) => {
+                        return CommandResponse::error("ERR client-id should be greater than 0")
+                    }
+                },
+                "ADDR" => addr = Some(val),
+                "LADDR" => laddr = Some(val),
+                "SKIPME" => match val.to_ascii_lowercase().as_str() {
+                    "yes" => skip_me = true,
+                    "no" => skip_me = false,
+                    _ => return CommandResponse::syntax_error(),
+                },
+                // Every client is a normal client of the default user here.
+                "TYPE" | "USER" | "MAXAGE" => {}
+                _ => return CommandResponse::syntax_error(),
+            }
+        }
+        let n = session.kill_matching(
+            |c| {
+                id.is_none_or(|id| c.id == id)
+                    && addr.as_ref().is_none_or(|a| &c.addr == a)
+                    && laddr.as_ref().is_none_or(|a| &c.laddr == a)
+            },
+            skip_me,
+        );
+        CommandResponse::integer(n)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commands whose keys may span shards
+// ---------------------------------------------------------------------------
+
+impl CommandEngine {
+    /// `SINTER`/`SUNION`/`SDIFF` over `keys`, stored into `dest` when given.
+    /// Keys on one shard (hash tags) are computed in place; otherwise the
+    /// shards involved are held together and the sets combined here.
+    fn set_algebra(&self, op: &str, keys: &[Bytes], dest: Option<&Bytes>) -> CommandResponse {
+        let mut idx: Vec<usize> = keys
+            .iter()
+            .map(|k| self.shards.shard_index_for_key(k))
+            .collect();
+        if let Some(d) = dest {
+            idx.push(self.shards.shard_index_for_key(d));
+        }
+        let one_shard = idx.iter().all(|&i| i == idx[0]);
+        if one_shard && dest.is_none() {
+            let keys = keys.to_vec();
+            return self.shards.shard(idx[0]).execute(move |store| match op {
+                "SINTER" => store.set_sinter(&keys),
+                "SUNION" => store.set_sunion(&keys),
+                _ => store.set_sdiff(&keys),
+            });
+        }
+        // Held even on one shard when storing: read and write in one step.
+        let _held = self.shards.lock_shards(idx.iter().copied());
+        let mut sets: Vec<Option<std::collections::HashSet<Bytes>>> = Vec::new();
+        for k in keys {
+            let mut got = None;
+            let r =
+                self.shards
+                    .shard_for_key(k)
+                    .execute_with_effects(|s, _| match s.set_clone(k) {
+                        Ok(set) => {
+                            got = Some(set);
+                            CommandResponse::ok()
+                        }
+                        Err(e) => e,
+                    });
+            if r.is_error() {
+                return r;
+            }
+            sets.push(got.flatten());
+        }
+        let result: std::collections::HashSet<Bytes> = match op {
+            "SINTER" => {
+                if sets.iter().any(|s| s.is_none()) {
+                    Default::default()
+                } else {
+                    let mut sets: Vec<_> = sets.into_iter().flatten().collect();
+                    sets.sort_by_key(|s| s.len());
+                    let (first, rest) = sets.split_first().expect("keys is not empty");
+                    first
+                        .iter()
+                        .filter(|m| rest.iter().all(|s| s.contains(*m)))
+                        .cloned()
+                        .collect()
+                }
+            }
+            "SUNION" => sets.into_iter().flatten().flatten().collect(),
+            _ => {
+                let mut it = sets.into_iter();
+                let mut first = it.next().flatten().unwrap_or_default();
+                for s in it.flatten() {
+                    first.retain(|m| !s.contains(m));
+                }
+                first
+            }
+        };
+        match dest {
+            None => CommandResponse::array(result.into_iter().map(CommandResponse::bulk).collect()),
+            Some(d) => self.shards.shard_for_key(d).execute_with_effects(|s, fx| {
+                let n = s.set_store(d, result);
+                fx.put_key(s, d);
+                CommandResponse::integer(n)
+            }),
+        }
+    }
+}
+
+impl CommandEngine {
+    /// `ZUNIONSTORE`/`ZINTERSTORE dest numkeys key… [WEIGHTS w…]
+    /// [AGGREGATE SUM|MIN|MAX]`, over sources on any shards (sets count as
+    /// sorted sets scored 1, as in Redis). The shards involved are held
+    /// together; the result is logged as the destination's value.
+    fn zstore(&self, name: &str, args: &[Bytes]) -> CommandResponse {
+        let lname = name.to_lowercase();
+        if args.len() < 3 {
+            return CommandResponse::wrong_arity(&lname);
+        }
+        let dest = args[0].clone();
+        let numkeys = match std::str::from_utf8(&args[1]).ok().map(|s| s.parse::<u64>()) {
+            Some(Ok(n)) => n,
+            _ => return CommandResponse::error("ERR value is not an integer or out of range"),
+        };
+        if numkeys < 1 {
+            return CommandResponse::error(format!(
+                "ERR at least 1 input key is needed for '{}' command",
+                lname
+            ));
+        }
+        let Some(keys_end) = usize::try_from(numkeys)
+            .ok()
+            .and_then(|n| n.checked_add(2))
+            .filter(|&e| e <= args.len())
+        else {
+            return CommandResponse::error(
+                "ERR Number of keys can't be greater than number of args",
+            );
+        };
+        let numkeys = keys_end - 2;
+        let keys = &args[2..keys_end];
+        let mut weights = vec![1.0f64; numkeys];
+        let mut aggregate = Aggregate::Sum;
+        let mut i = keys_end;
+        while i < args.len() {
+            match String::from_utf8_lossy(&args[i])
+                .to_ascii_uppercase()
+                .as_str()
+            {
+                "WEIGHTS" if i + numkeys < args.len() => {
+                    for (w, a) in weights.iter_mut().zip(&args[i + 1..=i + numkeys]) {
+                        match std::str::from_utf8(a)
+                            .ok()
+                            .and_then(solikv_core::zset_ops::parse_float)
+                        {
+                            Some(v) => *w = v,
+                            None => {
+                                return CommandResponse::error("ERR weight value is not a float")
+                            }
+                        }
+                    }
+                    i += numkeys + 1;
+                }
+                "AGGREGATE" if i + 1 < args.len() => {
+                    aggregate = match String::from_utf8_lossy(&args[i + 1])
+                        .to_ascii_uppercase()
+                        .as_str()
+                    {
+                        "SUM" => Aggregate::Sum,
+                        "MIN" => Aggregate::Min,
+                        "MAX" => Aggregate::Max,
+                        _ => return CommandResponse::syntax_error(),
+                    };
+                    i += 2;
+                }
+                _ => return CommandResponse::syntax_error(),
+            }
+        }
+
+        let idx: Vec<usize> = std::iter::once(&dest)
+            .chain(keys)
+            .map(|k| self.shards.shard_index_for_key(k))
+            .collect();
+        let _held = self.shards.lock_shards(idx);
+        let mut sources = Vec::with_capacity(numkeys);
+        for k in keys {
+            let mut got = None;
+            let r =
+                self.shards
+                    .shard_for_key(k)
+                    .execute_with_effects(|s, _| match s.zset_source(k) {
+                        Ok(v) => {
+                            got = v;
+                            CommandResponse::ok()
+                        }
+                        Err(e) => e,
+                    });
+            if r.is_error() {
+                return r;
+            }
+            sources.push(got);
+        }
+        let combine = |a: f64, b: f64| match aggregate {
+            // +inf + -inf is NaN; Redis makes it 0.
+            Aggregate::Sum => {
+                let s = a + b;
+                if s.is_nan() {
+                    0.0
+                } else {
+                    s
+                }
+            }
+            Aggregate::Min => a.min(b),
+            Aggregate::Max => a.max(b),
+        };
+        let weighted = |score: f64, w: f64| {
+            let v = score * w;
+            if v.is_nan() {
+                0.0
+            } else {
+                v
+            }
+        };
+        let mut acc: std::collections::HashMap<Bytes, f64> = std::collections::HashMap::new();
+        if name == "ZUNIONSTORE" {
+            for (src, w) in sources.into_iter().zip(&weights) {
+                for (m, sc) in src.unwrap_or_default() {
+                    let v = weighted(sc, *w);
+                    acc.entry(m)
+                        .and_modify(|cur| *cur = combine(*cur, v))
+                        .or_insert(v);
+                }
+            }
+        } else if sources.iter().all(|s| s.is_some()) {
+            let mut srcs: Vec<(std::collections::HashMap<Bytes, f64>, f64)> = sources
+                .into_iter()
+                .zip(&weights)
+                .map(|(s, w)| (s.unwrap_or_default().into_iter().collect(), *w))
+                .collect();
+            let (first, w0) = srcs.remove(0);
+            'member: for (m, sc) in first {
+                let mut v = weighted(sc, w0);
+                for (other, w) in &srcs {
+                    match other.get(&m) {
+                        Some(o) => v = combine(v, weighted(*o, *w)),
+                        None => continue 'member,
+                    }
+                }
+                acc.insert(m, v);
+            }
+        }
+        self.shards
+            .shard_for_key(&dest)
+            .execute_with_effects(|s, fx| {
+                let n = s.zset_store(&dest, acc.into_iter().collect());
+                fx.put_key(s, &dest);
+                CommandResponse::integer(n)
+            })
+    }
+}
+
+impl CommandEngine {
+    /// Run a script as one step: every shard is held for its duration (a
+    /// script may touch keys it did not declare, as Redis allows outside
+    /// cluster mode), and its writes are bracketed in the log so replay
+    /// applies all of them or none.
+    fn run_script(&self, script: &str, keys: Vec<Bytes>, argv: Vec<Bytes>) -> CommandResponse {
+        let Some(arc) = self.get_self_arc() else {
+            return CommandResponse::error("ERR scripting not initialized (call init_self_ref)");
+        };
+        let _held = self.shards.lock_all();
+        let _tx = self.aof_transaction();
+        crate::lua::execute_script(&arc, script, keys, argv)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// COMMAND, CONFIG, INFO
+// ---------------------------------------------------------------------------
+
+fn command_info(spec: &crate::commands::CommandSpec) -> CommandResponse {
+    let (first, last, step) = spec.key_range();
+    CommandResponse::array(vec![
+        CommandResponse::bulk(Bytes::from(spec.name.to_lowercase())),
+        CommandResponse::integer(spec.arity as i64),
+        CommandResponse::array(
+            spec.flags
+                .iter()
+                .map(|f| CommandResponse::simple(f))
+                .collect(),
+        ),
+        CommandResponse::integer(first as i64),
+        CommandResponse::integer(last as i64),
+        CommandResponse::integer(step as i64),
+        CommandResponse::array(vec![]), // ACL categories
+        CommandResponse::array(vec![]), // tips
+        CommandResponse::array(vec![]), // key specifications
+        CommandResponse::array(vec![]), // subcommands
+    ])
+}
+
+/// Redis-style glob match on a config parameter name.
+fn config_glob(pattern: &str, name: &str) -> bool {
+    solikv_core::store::glob_match_pub(&pattern.to_ascii_lowercase(), name)
+}
+
+impl CommandEngine {
+    fn command_command(&self, args: &[Bytes]) -> CommandResponse {
+        let Some(sub) = args.first() else {
+            return CommandResponse::array(
+                crate::commands::all().iter().map(command_info).collect(),
+            );
+        };
+        match String::from_utf8_lossy(sub).to_ascii_uppercase().as_str() {
+            "COUNT" => CommandResponse::integer(crate::commands::all().len() as i64),
+            "INFO" => {
+                if args.len() == 1 {
+                    return CommandResponse::array(
+                        crate::commands::all().iter().map(command_info).collect(),
+                    );
+                }
+                CommandResponse::array(
+                    args[1..]
+                        .iter()
+                        .map(|n| {
+                            let n = String::from_utf8_lossy(n).to_ascii_uppercase();
+                            crate::commands::lookup(&n)
+                                .map(command_info)
+                                .unwrap_or(CommandResponse::Nil)
+                        })
+                        .collect(),
+                )
+            }
+            // Documentation is not shipped; an empty map is a valid answer.
+            "DOCS" => CommandResponse::array(vec![]),
+            "LIST" => CommandResponse::array(
+                crate::commands::all()
+                    .iter()
+                    .map(|s| CommandResponse::bulk(Bytes::from(s.name.to_lowercase())))
+                    .collect(),
+            ),
+            "GETKEYS" => {
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("command|getkeys");
+                }
+                let name = String::from_utf8_lossy(&args[1]).to_ascii_uppercase();
+                let Some(spec) = crate::commands::lookup(&name) else {
+                    return CommandResponse::error("ERR Invalid command specified");
+                };
+                if !spec.arity_ok(args.len() - 2) {
+                    return CommandResponse::error(
+                        "ERR Invalid number of arguments specified for command",
+                    );
+                }
+                let keys = spec.keys_of(&args[2..]);
+                if keys.is_empty() {
+                    return CommandResponse::error("ERR The command has no key arguments");
+                }
+                CommandResponse::array(keys.into_iter().map(CommandResponse::bulk).collect())
+            }
+            other => CommandResponse::error(format!(
+                "ERR unknown subcommand '{}'. Try COMMAND HELP.",
+                other.to_lowercase()
+            )),
+        }
+    }
+
+    /// Every parameter `CONFIG GET` reports, with its current value.
+    fn config_params(&self) -> Vec<(&'static str, String)> {
+        let cfg = self.persistence.config();
+        let yes_no = |b: bool| if b { "yes" } else { "no" }.to_string();
+        vec![
+            ("databases", self.databases.to_string()),
+            (
+                "save",
+                if cfg.save_interval > 0 {
+                    format!("{} 1", cfg.save_interval)
+                } else {
+                    String::new()
+                },
+            ),
+            ("appendonly", yes_no(cfg.appendonly)),
+            (
+                "appendfsync",
+                match cfg.fsync {
+                    solikv_persist::FsyncPolicy::Always => "always",
+                    solikv_persist::FsyncPolicy::Everysec => "everysec",
+                    solikv_persist::FsyncPolicy::No => "no",
+                }
+                .to_string(),
+            ),
+            ("dir", cfg.dir.display().to_string()),
+            ("dbfilename", format!("{}.rdb", cfg.dbfilename)),
+            (
+                "appenddirname",
+                solikv_persist::aof::AOF_DIRNAME.to_string(),
+            ),
+            (
+                "auto-aof-rewrite-percentage",
+                cfg.auto_rewrite_percentage.to_string(),
+            ),
+            (
+                "auto-aof-rewrite-min-size",
+                cfg.auto_rewrite_min_size.to_string(),
+            ),
+            (
+                "notify-keyspace-events",
+                flags_to_string(self.notify_flags.load(Ordering::Relaxed)),
+            ),
+            ("port", self.tcp_port.load(Ordering::Relaxed).to_string()),
+            // No memory limit or eviction yet: report what is true.
+            ("maxmemory", "0".to_string()),
+            ("maxmemory-policy", "noeviction".to_string()),
+        ]
+    }
+
+    fn config_command(&self, args: &[Bytes]) -> CommandResponse {
+        let Some(sub) = args.first() else {
+            return CommandResponse::wrong_arity("config");
+        };
+        let sub = String::from_utf8_lossy(sub).to_ascii_uppercase();
+        match sub.as_str() {
+            "GET" => {
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("config|get");
+                }
+                let params = self.config_params();
+                let mut out = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for pat in &args[1..] {
+                    let pat = String::from_utf8_lossy(pat);
+                    for (name, value) in &params {
+                        if config_glob(&pat, name) && seen.insert(*name) {
+                            out.push(CommandResponse::bulk_string(name));
+                            out.push(CommandResponse::bulk(Bytes::from(value.clone())));
+                        }
+                    }
+                }
+                CommandResponse::array(out)
+            }
+            "SET" => {
+                if args.len() < 3 || args.len().is_multiple_of(2) {
+                    return CommandResponse::wrong_arity("config|set");
+                }
+                let known: Vec<&str> = self.config_params().iter().map(|(n, _)| *n).collect();
+                // Validate all first: Redis applies all or none.
+                for pair in args[1..].chunks(2) {
+                    let param = String::from_utf8_lossy(&pair[0]).to_ascii_lowercase();
+                    if param == "notify-keyspace-events" {
+                        continue;
+                    }
+                    if known.contains(&param.as_str()) {
+                        return CommandResponse::error(format!(
+                            "ERR CONFIG SET failed (possibly related to argument '{}') - \
+                             can't set immutable config",
+                            param
+                        ));
+                    }
+                    return CommandResponse::error(format!(
+                        "ERR Unknown option or number of arguments for CONFIG SET - '{}'",
+                        param
+                    ));
+                }
+                for pair in args[1..].chunks(2) {
+                    let value = String::from_utf8_lossy(&pair[1]);
+                    self.notify_flags
+                        .store(parse_notify_flags(&value), Ordering::Relaxed);
+                }
+                CommandResponse::ok()
+            }
+            "RESETSTAT" => {
+                self.clients.reset_stats();
+                CommandResponse::ok()
+            }
+            "REWRITE" => CommandResponse::error("ERR The server is running without a config file"),
+            _ => CommandResponse::error(format!(
+                "ERR unknown subcommand '{}'. Try CONFIG HELP.",
+                sub.to_lowercase()
+            )),
+        }
+    }
+
+    fn info(&self, args: &[Bytes]) -> CommandResponse {
+        const DEFAULT: &[&str] = &[
+            "server",
+            "clients",
+            "memory",
+            "persistence",
+            "stats",
+            "replication",
+            "cpu",
+            "keyspace",
+        ];
+        let mut wanted: Vec<String> = args
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).to_ascii_lowercase())
+            .collect();
+        if wanted.is_empty()
+            || wanted
+                .iter()
+                .any(|w| w == "all" || w == "everything" || w == "default")
+        {
+            wanted = DEFAULT.iter().map(|s| s.to_string()).collect();
+        }
+        let mut out = String::new();
+        for section in DEFAULT {
+            if !wanted.iter().any(|w| w == section) {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push_str("\r\n");
+            }
+            out.push_str(&self.info_section(section));
+        }
+        CommandResponse::bulk(Bytes::from(out))
+    }
+
+    fn info_section(&self, section: &str) -> String {
+        let uptime = self.start_time.elapsed().as_secs();
+        match section {
+            "server" => format!(
+                "# Server\r\n\
+                 redis_version:7.2.0\r\n\
+                 solikv_version:{}\r\n\
+                 redis_mode:standalone\r\n\
+                 os:{} {}\r\n\
+                 arch_bits:{}\r\n\
+                 process_id:{}\r\n\
+                 tcp_port:{}\r\n\
+                 uptime_in_seconds:{}\r\n\
+                 uptime_in_days:{}\r\n\
+                 executable:solikv\r\n",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                usize::BITS,
+                std::process::id(),
+                self.tcp_port.load(Ordering::Relaxed),
+                uptime,
+                uptime / 86400,
+            ),
+            "clients" => format!(
+                "# Clients\r\nconnected_clients:{}\r\nblocked_clients:0\r\n",
+                self.clients.count()
+            ),
+            // No allocator statistics are collected yet.
+            "memory" => "# Memory\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\n".to_string(),
+            "persistence" => self.persistence.stats.info_section(self.dirty()),
+            "stats" => format!(
+                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n",
+                self.clients.connections_received(),
+                self.clients.commands_processed()
+            ),
+            "replication" => format!(
+                "# Replication\r\nrole:master\r\nconnected_slaves:0\r\nmaster_repl_offset:{}\r\n",
+                self.replication_offset.load(Ordering::Relaxed)
+            ),
+            "cpu" => "# CPU\r\n".to_string(),
+            "keyspace" => {
+                let mut out = String::from("# Keyspace\r\n");
+                for db in 0..self.databases {
+                    let (mut keys, mut expires) = (0usize, 0usize);
+                    for shard in self.shards.all_shards() {
+                        let (k, e) = shard.with_store(|s| (s.dbsize_of(db), s.expires_of(db)));
+                        keys += k;
+                        expires += e;
+                    }
+                    if keys > 0 {
+                        out.push_str(&format!(
+                            "db{}:keys={},expires={},avg_ttl=0\r\n",
+                            db, keys, expires
+                        ));
+                    }
+                }
+                out
+            }
+            _ => String::new(),
+        }
+    }
+}
+
+fn args_preview(args: &[Bytes]) -> String {
+    args.iter()
+        .take(3)
+        .map(|a| format!("'{}'", String::from_utf8_lossy(a)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_i64_arg(b: &[u8]) -> Option<i64> {
+    std::str::from_utf8(b).ok()?.parse::<i64>().ok()
+}
+
+/// Absolute expiry (ms) for `EX|PX|EXAT|PXAT amount`, or `None` when it is
+/// not a positive, representable time (Redis: "invalid expire time").
+fn absolute_expiry(opt: &str, amount: i64) -> Option<u64> {
+    if amount <= 0 {
+        return None;
+    }
+    let amount = amount as u64;
+    match opt {
+        "EX" => now_millis().checked_add(ttl_ms(amount, true)?),
+        "PX" => now_millis().checked_add(ttl_ms(amount, false)?),
+        "EXAT" => amount
+            .checked_mul(1000)
+            .filter(|&ms| ms <= (i64::MAX as u64) / 2),
+        "PXAT" => Some(amount).filter(|&ms| ms <= (i64::MAX as u64) / 2),
+        _ => None,
+    }
+}
+
+/// `SET` options after `key value`, with Redis 7's validation.
+fn parse_set_options(
+    opts: &[Bytes],
+) -> Result<solikv_core::string_ops::SetOptions, CommandResponse> {
+    let mut o = solikv_core::string_ops::SetOptions::default();
+    let mut expiry_given = false;
+    let mut i = 0;
+    while i < opts.len() {
+        let opt = String::from_utf8_lossy(&opts[i]).to_ascii_uppercase();
+        match opt.as_str() {
+            "NX" if !o.xx => o.nx = true,
+            "XX" if !o.nx => o.xx = true,
+            "GET" => o.get = true,
+            "KEEPTTL" if !expiry_given => {
+                o.keep_ttl = true;
+                expiry_given = true;
+            }
+            "EX" | "PX" | "EXAT" | "PXAT" if !expiry_given => {
+                i += 1;
+                let Some(arg) = opts.get(i) else {
+                    return Err(CommandResponse::syntax_error());
+                };
+                let Some(amount) = parse_i64_arg(arg) else {
+                    return Err(CommandResponse::error(
+                        "ERR value is not an integer or out of range",
+                    ));
+                };
+                match absolute_expiry(&opt, amount) {
+                    Some(at) => o.expire_at = Some(at),
+                    None => return Err(invalid_expire("set")),
+                }
+                expiry_given = true;
+            }
+            _ => return Err(CommandResponse::syntax_error()),
+        }
+        i += 1;
+    }
+    Ok(o)
+}
+
+/// `keys` grouped by owning shard, in first-seen shard order (duplicates
+/// kept: `EXISTS k k` counts twice).
+fn group_by_shard(shards: &ShardManager, keys: &[Bytes]) -> Vec<(usize, Vec<Bytes>)> {
+    let mut groups: Vec<(usize, Vec<Bytes>)> = Vec::new();
+    for k in keys {
+        let i = shards.shard_index_for_key(k);
+        match groups.iter_mut().find(|(g, _)| *g == i) {
+            Some((_, v)) => v.push(k.clone()),
+            None => groups.push((i, vec![k.clone()])),
+        }
+    }
+    groups
+}
+
+/// Elements past which dropping a value is worth a thread of its own.
+const LAZY_FREE_THRESHOLD: usize = 64 * 1024;
+
+/// Drop values removed by `UNLINK`: big ones on a background thread.
+fn lazy_free(entries: Vec<solikv_core::KeyEntry>) {
+    let weight: usize = entries
+        .iter()
+        .map(|e| match &e.value {
+            RedisValue::List(l) => l.len(),
+            RedisValue::Hash(h) => h.len(),
+            RedisValue::Set(s) => s.len(),
+            RedisValue::ZSet(z) => z.len(),
+            RedisValue::Stream(s) => s.len(),
+            _ => 1,
+        })
+        .sum();
+    if weight >= LAZY_FREE_THRESHOLD {
+        let _ = std::thread::Builder::new()
+            .name("solikv-lazyfree".into())
+            .spawn(move || drop(entries));
     }
 }
 
@@ -3903,6 +4856,9 @@ fn multi_shard_mget(shards: &crate::shard::ShardManager, keys: &[Bytes]) -> Comm
     }
 
     let mut results = vec![CommandResponse::Nil; keys.len()];
+    // One consistent read across shards (an MSET is all-or-nothing too).
+    let involved: Vec<usize> = (0..num).filter(|&i| !by_shard[i].is_empty()).collect();
+    let _held = (involved.len() > 1).then(|| shards.lock_shards(involved));
     for (shard_idx, group) in by_shard.into_iter().enumerate() {
         if group.is_empty() {
             continue;
@@ -3942,6 +4898,9 @@ fn multi_shard_mset(
         let slot = shards.shard_index_for_key(&key);
         by_shard[slot].push((key, value));
     }
+    // Atomic like Redis' MSET: nobody reads some keys new and others old.
+    let involved: Vec<usize> = (0..num).filter(|&i| !by_shard[i].is_empty()).collect();
+    let _held = (involved.len() > 1).then(|| shards.lock_shards(involved));
     for (shard_idx, group) in by_shard.into_iter().enumerate() {
         if group.is_empty() {
             continue;
@@ -3966,8 +4925,17 @@ fn multi_shard_msetnx(
         let slot = shards.shard_index_for_key(&key);
         by_shard[slot].push((key, value));
     }
+    // All-or-nothing: every shard involved is held from the check to the
+    // last write, so no key can appear in between.
+    let _held = shards.lock_shards(
+        by_shard
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| !g.is_empty())
+            .map(|(i, _)| i),
+    );
 
-    // Phase 1: all keys must be absent (best-effort; not cross-shard atomic).
+    // Phase 1: all keys must be absent.
     for (shard_idx, group) in by_shard.iter().enumerate() {
         if group.is_empty() {
             continue;
@@ -4001,11 +4969,52 @@ fn multi_shard_msetnx(
     CommandResponse::integer(1)
 }
 
+/// `[MATCH pattern] [COUNT n] [TYPE t]` of the SCAN family (`TYPE` only for
+/// `SCAN` itself).
+#[allow(clippy::type_complexity)]
+fn parse_scan_options(
+    opts: &[Bytes],
+    allow_type: bool,
+) -> Result<(Option<String>, usize, Option<String>), CommandResponse> {
+    let mut pattern = None;
+    let mut count = 10usize;
+    let mut type_filter = None;
+    let mut i = 0;
+    while i < opts.len() {
+        let opt = String::from_utf8_lossy(&opts[i]).to_ascii_uppercase();
+        let Some(val) = opts.get(i + 1) else {
+            return Err(CommandResponse::syntax_error());
+        };
+        match opt.as_str() {
+            "MATCH" => pattern = Some(String::from_utf8_lossy(val).to_string()),
+            "COUNT" => {
+                // Only a hint: a huge one is clamped, never allocated.
+                count = match std::str::from_utf8(val).ok().map(|v| v.parse::<i128>()) {
+                    Some(Ok(n)) if n >= 1 => usize::try_from(n).unwrap_or(usize::MAX),
+                    Some(Ok(_)) => return Err(CommandResponse::syntax_error()),
+                    _ => {
+                        return Err(CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        ))
+                    }
+                }
+            }
+            "TYPE" if allow_type => {
+                type_filter = Some(String::from_utf8_lossy(val).to_ascii_lowercase())
+            }
+            _ => return Err(CommandResponse::syntax_error()),
+        }
+        i += 2;
+    }
+    Ok((pattern, count, type_filter))
+}
+
 fn multi_shard_scan(
     shards: &crate::shard::ShardManager,
     cursor: u64,
     pattern: Option<String>,
     count: usize,
+    type_filter: Option<String>,
 ) -> CommandResponse {
     let num = shards.num_shards();
     if num == 0 {
@@ -4031,7 +5040,8 @@ fn multi_shard_scan(
     // Scan the current shard; if it finishes, advance to the next shard (or 0 = done).
     let pat = pattern.clone();
     let resp = shards.shard(shard_idx).execute(move |store| {
-        let (next_local, keys) = store.scan(local, pat.as_deref(), count);
+        let (next_local, keys) =
+            store.scan_typed(local, pat.as_deref(), type_filter.as_deref(), count);
         // Pack next_local into a temporary Integer so we can unwrap outside.
         // We return Array [next_local_as_int, ...keys as bulk]
         let mut items = Vec::with_capacity(1 + keys.len());
@@ -4154,6 +5164,7 @@ fn is_write_command(name: &str) -> bool {
             | "XREADGROUP"
             | "XACK"
             | "EVAL"
+            | "EVALSHA"
             | "PFADD"
             | "PFMERGE"
             | "BF.RESERVE"
@@ -4163,21 +5174,113 @@ fn is_write_command(name: &str) -> bool {
             | "BITOP"
             | "GEOADD"
             | "GEOSEARCHSTORE"
+            | "MOVE"
+            | "SWAPDB"
+            | "SINTERSTORE"
+            | "SUNIONSTORE"
+            | "SDIFFSTORE"
+            | "ZREMRANGEBYSCORE"
+            | "ZREMRANGEBYRANK"
+            | "ZREMRANGEBYLEX"
     )
 }
 
-fn parse_score_bound(arg: &Bytes, default: f64) -> f64 {
-    let s = std::str::from_utf8(arg).unwrap_or("");
-    if s == "-inf" {
-        f64::NEG_INFINITY
-    } else if s == "+inf" || s == "inf" {
-        f64::INFINITY
-    } else if let Some(stripped) = s.strip_prefix('(') {
-        // Exclusive bound: for simplicity, we treat as inclusive with tiny offset
-        stripped.parse::<f64>().unwrap_or(default)
-    } else {
-        s.parse::<f64>().unwrap_or(default)
+fn parse_score_range(min: &Bytes, max: &Bytes) -> Result<ZRangeBy, CommandResponse> {
+    match (ScoreBound::parse(min), ScoreBound::parse(max)) {
+        (Some(a), Some(b)) => Ok(ZRangeBy::Score(a, b)),
+        _ => Err(CommandResponse::error("ERR min or max is not a float")),
     }
+}
+
+fn parse_lex_range(min: &Bytes, max: &Bytes) -> Result<ZRangeBy, CommandResponse> {
+    match (LexBound::parse(min), LexBound::parse(max)) {
+        (Some(a), Some(b)) => Ok(ZRangeBy::Lex(a, b)),
+        _ => Err(CommandResponse::error(
+            "ERR min or max not valid string range item",
+        )),
+    }
+}
+
+/// Every `ZRANGE`-family form, as one query:
+/// `ZRANGE key start stop [BYSCORE|BYLEX] [REV] [LIMIT offset count]
+/// [WITHSCORES]` (Redis 6.2), and the older `ZREVRANGE`,
+/// `Z[REV]RANGEBYSCORE key min max [WITHSCORES] [LIMIT o c]` and
+/// `Z[REV]RANGEBYLEX key min max [LIMIT o c]`.
+fn parse_zrange(name: &str, args: &[Bytes]) -> Result<(ZRangeQuery, bool), CommandResponse> {
+    #[derive(PartialEq)]
+    enum By {
+        Rank,
+        Score,
+        Lex,
+    }
+    let (mut by, mut rev) = match name {
+        "ZRANGE" => (By::Rank, false),
+        "ZREVRANGE" => (By::Rank, true),
+        "ZRANGEBYSCORE" => (By::Score, false),
+        "ZREVRANGEBYSCORE" => (By::Score, true),
+        "ZRANGEBYLEX" => (By::Lex, false),
+        _ => (By::Lex, true),
+    };
+    let unified = name == "ZRANGE";
+    let mut withscores = false;
+    let mut limit = None;
+    let mut i = 3;
+    while i < args.len() {
+        match String::from_utf8_lossy(&args[i])
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "WITHSCORES" if name != "ZRANGEBYLEX" && name != "ZREVRANGEBYLEX" => withscores = true,
+            "BYSCORE" if unified && by == By::Rank => by = By::Score,
+            "BYLEX" if unified && by == By::Rank => by = By::Lex,
+            "REV" if unified => rev = true,
+            "LIMIT" if name != "ZREVRANGE" => {
+                let (Some(o), Some(c)) = (
+                    args.get(i + 1).and_then(|a| parse_i64_arg(a)),
+                    args.get(i + 2).and_then(|a| parse_i64_arg(a)),
+                ) else {
+                    return Err(if i + 2 >= args.len() {
+                        CommandResponse::syntax_error()
+                    } else {
+                        CommandResponse::error("ERR value is not an integer or out of range")
+                    });
+                };
+                limit = Some((o, c));
+                i += 2;
+            }
+            _ => return Err(CommandResponse::syntax_error()),
+        }
+        i += 1;
+    }
+    if limit.is_some() && by == By::Rank {
+        return Err(CommandResponse::error(
+            "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
+        ));
+    }
+    if withscores && by == By::Lex {
+        return Err(CommandResponse::error(
+            "ERR syntax error, WITHSCORES not supported in combination with BYLEX",
+        ));
+    }
+    // Reverse score/lex forms take the range as `max min`.
+    let (lo, hi) = if rev && by != By::Rank {
+        (&args[2], &args[1])
+    } else {
+        (&args[1], &args[2])
+    };
+    let by = match by {
+        By::Rank => match (parse_i64_arg(&args[1]), parse_i64_arg(&args[2])) {
+            (Some(a), Some(b)) => ZRangeBy::Rank(a, b),
+            _ => {
+                return Err(CommandResponse::error(
+                    "ERR value is not an integer or out of range",
+                ))
+            }
+        },
+        By::Score => parse_score_range(lo, hi)?,
+        By::Lex => parse_lex_range(lo, hi)?,
+    };
+    Ok((ZRangeQuery { by, rev, limit }, withscores))
 }
 
 #[cfg(test)]
@@ -4382,15 +5485,26 @@ mod sec_tests {
             ("PSETEX", vec![b("k"), b(huge), b("v")]),
             ("GETEX", vec![b("k"), b("EX"), b(huge)]),
         ];
+        // Beyond i64 the argument is not an integer (Redis' wording); within
+        // it but past the representable range, an invalid expire time.
+        let refused = |r: &CommandResponse| {
+            let m = err_string(r);
+            m.contains("invalid expire time") || m.contains("not an integer")
+        };
         for (cmd, args) in cases {
             let r = e.execute(cmd, &args);
-            assert!(
-                err_string(&r).contains("invalid expire time"),
-                "{cmd} {args:?}"
-            );
+            assert!(refused(&r), "{cmd} {args:?}");
         }
+        assert!(
+            err_string(&e.execute("SET", &[b("k"), b("v"), b("EX"), b(secs)]))
+                .contains("invalid expire time")
+        );
         e.execute("SET", &[b("k"), b("v")]);
         for (cmd, arg) in [("EXPIRE", huge), ("PEXPIRE", huge), ("EXPIREAT", huge)] {
+            let r = e.execute(cmd, &[b("k"), b(arg)]);
+            assert!(refused(&r), "{cmd}");
+        }
+        for (cmd, arg) in [("EXPIRE", secs), ("EXPIREAT", secs)] {
             let r = e.execute(cmd, &[b("k"), b(arg)]);
             assert!(err_string(&r).contains("invalid expire time"), "{cmd}");
         }

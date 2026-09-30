@@ -86,6 +86,10 @@ impl ShardStore {
             }
         }
 
+        if zset.is_empty() {
+            // `XX` on a missing key created nothing.
+            self.del(key);
+        }
         CommandResponse::integer(if ch { changed } else { added })
     }
 
@@ -165,6 +169,10 @@ impl ShardStore {
             Ok(z) => z,
             Err(e) => return e,
         };
+        let old = zset.score(&member).unwrap_or(0.0);
+        if (old + delta).is_nan() {
+            return CommandResponse::error("ERR resulting score is not a number (NaN)");
+        }
         let new_score = zset.incr(member, delta);
         CommandResponse::bulk(Bytes::from(format_score(new_score)))
     }
@@ -354,7 +362,7 @@ impl ShardStore {
         &mut self,
         key: &Bytes,
         cursor: usize,
-        _pattern: Option<&str>,
+        pattern: Option<&str>,
         count: usize,
     ) -> CommandResponse {
         match self.get_zset(key) {
@@ -377,8 +385,13 @@ impl ShardStore {
 
                 while checked < count && i < total {
                     let (ref member, score) = pairs[i];
-                    result.push(CommandResponse::bulk(member.clone()));
-                    result.push(CommandResponse::bulk(Bytes::from(format_score(score))));
+                    let matches = pattern.is_none_or(|p| {
+                        crate::store::glob_match_pub(p, &String::from_utf8_lossy(member))
+                    });
+                    if matches {
+                        result.push(CommandResponse::bulk(member.clone()));
+                        result.push(CommandResponse::bulk(Bytes::from(format_score(score))));
+                    }
                     i += 1;
                     checked += 1;
                 }
@@ -498,6 +511,312 @@ impl ShardStore {
         let len = result.len() as i64;
         self.set(dest.clone(), RedisValue::ZSet(result), None);
         CommandResponse::integer(len)
+    }
+}
+
+/// One end of a score range: `(5` is exclusive, `5`/`-inf`/`+inf` inclusive.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScoreBound {
+    Incl(f64),
+    Excl(f64),
+}
+
+impl ScoreBound {
+    /// Parse `-inf`, `+inf`, `(1.5`, `1.5` … `None` for anything else.
+    pub fn parse(arg: &[u8]) -> Option<Self> {
+        let s = std::str::from_utf8(arg).ok()?;
+        let (excl, num) = match s.strip_prefix('(') {
+            Some(rest) => (true, rest),
+            None => (false, s),
+        };
+        let v = parse_float(num)?;
+        Some(if excl {
+            ScoreBound::Excl(v)
+        } else {
+            ScoreBound::Incl(v)
+        })
+    }
+
+    fn above_min(&self, v: f64) -> bool {
+        match *self {
+            ScoreBound::Incl(m) => v >= m,
+            ScoreBound::Excl(m) => v > m,
+        }
+    }
+
+    fn below_max(&self, v: f64) -> bool {
+        match *self {
+            ScoreBound::Incl(m) => v <= m,
+            ScoreBound::Excl(m) => v < m,
+        }
+    }
+
+    fn value(&self) -> f64 {
+        match *self {
+            ScoreBound::Incl(v) | ScoreBound::Excl(v) => v,
+        }
+    }
+}
+
+/// One end of a lexicographic range: `-`, `+`, `[a` (inclusive), `(a`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LexBound {
+    Min,
+    Max,
+    Incl(Bytes),
+    Excl(Bytes),
+}
+
+impl LexBound {
+    pub fn parse(arg: &Bytes) -> Option<Self> {
+        match arg.first()? {
+            b'-' if arg.len() == 1 => Some(LexBound::Min),
+            b'+' if arg.len() == 1 => Some(LexBound::Max),
+            b'[' => Some(LexBound::Incl(arg.slice(1..))),
+            b'(' => Some(LexBound::Excl(arg.slice(1..))),
+            _ => None,
+        }
+    }
+
+    fn above_min(&self, m: &[u8]) -> bool {
+        match self {
+            LexBound::Min => true,
+            LexBound::Max => false,
+            LexBound::Incl(b) => m >= b.as_ref(),
+            LexBound::Excl(b) => m > b.as_ref(),
+        }
+    }
+
+    fn below_max(&self, m: &[u8]) -> bool {
+        match self {
+            LexBound::Min => false,
+            LexBound::Max => true,
+            LexBound::Incl(b) => m <= b.as_ref(),
+            LexBound::Excl(b) => m < b.as_ref(),
+        }
+    }
+}
+
+/// Parse a score argument (`inf`, `-inf`, `+inf` included, NaN refused).
+pub fn parse_float(s: &str) -> Option<f64> {
+    let v = match s.to_ascii_lowercase().as_str() {
+        "inf" | "+inf" => f64::INFINITY,
+        "-inf" => f64::NEG_INFINITY,
+        other => other.parse::<f64>().ok()?,
+    };
+    (!v.is_nan()).then_some(v)
+}
+
+/// Which members a range query selects.
+#[derive(Debug, Clone)]
+pub enum ZRangeBy {
+    /// Ranks `start..=stop` (negative from the end), in the query's order.
+    Rank(i64, i64),
+    Score(ScoreBound, ScoreBound),
+    Lex(LexBound, LexBound),
+}
+
+/// A `ZRANGE`-family query. For `Score`/`Lex` the bounds are always
+/// `(min, max)`, whatever order the command took them in.
+#[derive(Debug, Clone)]
+pub struct ZRangeQuery {
+    pub by: ZRangeBy,
+    pub rev: bool,
+    /// `LIMIT offset count` (negative count = all).
+    pub limit: Option<(i64, i64)>,
+}
+
+impl ZRangeQuery {
+    /// The selected `(member, score)` pairs, in order.
+    pub fn collect(&self, zset: &ZSetValue) -> Vec<(Bytes, f64)> {
+        let (offset, count) = match self.limit {
+            Some((o, _)) if o < 0 => return Vec::new(),
+            Some((o, c)) => (o as usize, if c < 0 { usize::MAX } else { c as usize }),
+            None => (0, usize::MAX),
+        };
+        let pair = |((s, m), _): (&(OrderedFloat<f64>, Bytes), &())| (m.clone(), s.into_inner());
+        match &self.by {
+            ZRangeBy::Rank(start, stop) => {
+                let len = zset.len() as i64;
+                let s = normalize_index(*start, len);
+                let e = normalize_index(*stop, len);
+                if len == 0 || s > e || s >= len as usize {
+                    return Vec::new();
+                }
+                let e = e.min(len as usize - 1);
+                let take = e - s + 1;
+                if self.rev {
+                    zset.scores
+                        .iter()
+                        .rev()
+                        .skip(s)
+                        .take(take)
+                        .map(pair)
+                        .collect()
+                } else {
+                    zset.scores.iter().skip(s).take(take).map(pair).collect()
+                }
+            }
+            ZRangeBy::Score(min, max) => {
+                let lo = (OrderedFloat(min.value()), Bytes::new());
+                let range = zset.scores.range(lo..);
+                if self.rev {
+                    // Start at the top of the range: one-sided, so no
+                    // start > end panic whatever the bounds.
+                    use std::ops::Bound;
+                    let hi = match *max {
+                        ScoreBound::Incl(v) if v == f64::INFINITY => Bound::Unbounded,
+                        ScoreBound::Incl(v) => {
+                            Bound::Excluded((OrderedFloat(v.next_up()), Bytes::new()))
+                        }
+                        ScoreBound::Excl(v) => Bound::Excluded((OrderedFloat(v), Bytes::new())),
+                    };
+                    zset.scores
+                        .range((Bound::Unbounded, hi))
+                        .rev()
+                        .skip_while(|((s, _), _)| !max.below_max(s.into_inner()))
+                        .take_while(|((s, _), _)| min.above_min(s.into_inner()))
+                        .skip(offset)
+                        .take(count)
+                        .map(pair)
+                        .collect()
+                } else {
+                    range
+                        .skip_while(|((s, _), _)| !min.above_min(s.into_inner()))
+                        .take_while(|((s, _), _)| max.below_max(s.into_inner()))
+                        .skip(offset)
+                        .take(count)
+                        .map(pair)
+                        .collect()
+                }
+            }
+            ZRangeBy::Lex(min, max) => {
+                let inside = |((_, m), _): &(&(OrderedFloat<f64>, Bytes), &())| {
+                    min.above_min(m) && max.below_max(m)
+                };
+                if self.rev {
+                    zset.scores
+                        .iter()
+                        .rev()
+                        .filter(inside)
+                        .skip(offset)
+                        .take(count)
+                        .map(pair)
+                        .collect()
+                } else {
+                    zset.scores
+                        .iter()
+                        .filter(inside)
+                        .skip(offset)
+                        .take(count)
+                        .map(pair)
+                        .collect()
+                }
+            }
+        }
+    }
+}
+
+/// Reply for a range: members, or member/score pairs `WITHSCORES`.
+pub fn zrange_reply(items: Vec<(Bytes, f64)>, withscores: bool) -> CommandResponse {
+    format_zrange_result(items.into_iter().map(|(m, s)| (s, m)).collect(), withscores)
+}
+
+impl ShardStore {
+    /// Run a range query against the sorted set at `key`.
+    pub fn zset_range_query(
+        &mut self,
+        key: &Bytes,
+        q: &ZRangeQuery,
+    ) -> Result<Vec<(Bytes, f64)>, CommandResponse> {
+        Ok(match self.get_zset(key)? {
+            None => Vec::new(),
+            Some(z) => q.collect(z),
+        })
+    }
+
+    /// Remove what `q` selects (`ZREMRANGEBY*`); returns how many.
+    pub fn zset_remove_range(&mut self, key: &Bytes, q: &ZRangeQuery) -> CommandResponse {
+        let victims = match self.zset_range_query(key, q) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if victims.is_empty() {
+            return CommandResponse::integer(0);
+        }
+        let members: Vec<Bytes> = victims.into_iter().map(|(m, _)| m).collect();
+        self.zset_zrem(key, &members)
+    }
+
+    /// Members and scores of a sorted set — or of a set, each scored 1 —
+    /// for `ZUNIONSTORE`/`ZINTERSTORE` over several shards.
+    pub fn zset_source(
+        &mut self,
+        key: &Bytes,
+    ) -> Result<Option<Vec<(Bytes, f64)>>, CommandResponse> {
+        match self.get(key) {
+            None => Ok(None),
+            Some(entry) => match &entry.value {
+                RedisValue::ZSet(z) => Ok(Some(
+                    z.members
+                        .iter()
+                        .map(|(m, s)| (m.clone(), s.into_inner()))
+                        .collect(),
+                )),
+                RedisValue::Set(s) => Ok(Some(s.iter().map(|m| (m.clone(), 1.0)).collect())),
+                _ => Err(CommandResponse::wrong_type()),
+            },
+        }
+    }
+
+    /// Replace `dest` with these members (deleting it when empty); returns
+    /// the cardinality.
+    pub fn zset_store(&mut self, dest: &Bytes, members: Vec<(Bytes, f64)>) -> i64 {
+        if members.is_empty() {
+            self.del(dest);
+            return 0;
+        }
+        let mut z = ZSetValue::new();
+        for (m, s) in members {
+            z.insert(s, m);
+        }
+        let n = z.len() as i64;
+        self.set(dest.clone(), RedisValue::ZSet(z), None);
+        n
+    }
+
+    /// `ZADD … INCR delta member` with NX/XX/GT/LT: the new score, or nil
+    /// when a condition stopped it.
+    pub fn zset_zadd_incr(
+        &mut self,
+        key: &Bytes,
+        delta: f64,
+        member: Bytes,
+        cond: (bool, bool, bool, bool),
+    ) -> CommandResponse {
+        let (nx, xx, gt, lt) = cond;
+        let existing = match self.get_zset(key) {
+            Err(e) => return e,
+            Ok(z) => z.and_then(|z| z.score(&member)),
+        };
+        if (nx && existing.is_some()) || (xx && existing.is_none()) {
+            return CommandResponse::nil();
+        }
+        let new = existing.unwrap_or(0.0) + delta;
+        if new.is_nan() {
+            return CommandResponse::error("ERR resulting score is not a number (NaN)");
+        }
+        if let Some(old) = existing {
+            if (gt && new <= old) || (lt && new >= old) {
+                return CommandResponse::nil();
+            }
+        }
+        let zset = match self.get_or_create_zset(key) {
+            Ok(z) => z,
+            Err(e) => return e,
+        };
+        zset.insert(new, member);
+        CommandResponse::bulk(Bytes::from(format_score(new)))
     }
 }
 

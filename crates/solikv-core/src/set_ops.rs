@@ -45,6 +45,24 @@ impl ShardStore {
         }
     }
 
+    /// A copy of the set at `key` (`None` when missing), for operations that
+    /// combine sets living on several shards.
+    pub fn set_clone(&mut self, key: &Bytes) -> Result<Option<HashSet<Bytes>>, CommandResponse> {
+        self.get_set(key).map(|s| s.cloned())
+    }
+
+    /// Replace `dest` with `members` (deleting it when empty); returns the
+    /// cardinality (`S*STORE`).
+    pub fn set_store(&mut self, dest: &Bytes, members: HashSet<Bytes>) -> i64 {
+        let n = members.len() as i64;
+        if members.is_empty() {
+            self.del(dest);
+        } else {
+            self.set(dest.clone(), RedisValue::Set(members), None);
+        }
+        n
+    }
+
     pub fn set_sadd(&mut self, key: &Bytes, members: Vec<Bytes>) -> CommandResponse {
         let set = match self.get_or_create_set(key) {
             Ok(s) => s,
@@ -231,6 +249,17 @@ impl ShardStore {
     }
 
     pub fn set_smove(&mut self, src: &Bytes, dst: Bytes, member: Bytes) -> CommandResponse {
+        // Both types first: a wrong-typed destination must not cost the
+        // source its member.
+        if let Err(e) = self.get_set(&dst) {
+            return e;
+        }
+        if src == &dst {
+            return match self.get_set(src) {
+                Err(e) => e,
+                Ok(s) => CommandResponse::integer(s.is_some_and(|s| s.contains(&member)) as i64),
+            };
+        }
         // Remove from source
         let entry = match self.get_mut(src) {
             None => return CommandResponse::integer(0),

@@ -63,6 +63,10 @@ const EXPLICIT: &[&str] = &[
     "FLUSHALL",
     "ZUNIONSTORE",
     "ZINTERSTORE",
+    "SINTERSTORE",
+    "SUNIONSTORE",
+    "SDIFFSTORE",
+    "SWAPDB",
     "GEOSEARCHSTORE",
     "PFMERGE",
     "BITOP",
@@ -226,22 +230,24 @@ impl Effects {
     }
 }
 
-/// Called by `ShardHandle` with the shard lock held, after a command ran.
+/// Called by `ShardHandle` with the shard lock held, after a command ran in
+/// database `db`. Expired keys carry the database each was in.
 pub(crate) fn log_under_lock(
     w: &AofWriter,
     shard: u32,
+    db: u32,
     resp: &CommandResponse,
-    lazy_expired: &[Bytes],
+    lazy_expired: &[(u32, Bytes)],
     explicit: Option<&mut Effects>,
-    active_expired: &[Bytes],
+    active_expired: &[(u32, Bytes)],
 ) {
-    for k in lazy_expired {
-        emit(w, shard, |buf| encode_into(buf, b"DEL", &[k]));
+    for (d, k) in lazy_expired {
+        emit(w, shard, *d, |buf| encode_into(buf, b"DEL", &[k]));
     }
     match explicit {
         Some(fx) => {
             for rec in fx.records.drain(..) {
-                emit(w, shard, |buf| buf.extend_from_slice(&rec));
+                emit(w, shard, db, |buf| buf.extend_from_slice(&rec));
             }
         }
         None => {
@@ -251,20 +257,20 @@ pub(crate) fn log_under_lock(
                 if !cmd.logged.get() && !resp.is_error() {
                     cmd.logged.set(true);
                     if let Some(pre) = &cmd.pre {
-                        emit(w, shard, |buf| buf.extend_from_slice(pre));
+                        emit(w, shard, db, |buf| buf.extend_from_slice(pre));
                     } else if let Some(rec) = aof_form(cmd.name, cmd.args, resp) {
-                        emit(w, shard, |buf| rec.write(buf));
+                        emit(w, shard, db, |buf| rec.write(buf));
                     }
                 }
             }
         }
     }
-    for k in active_expired {
-        emit(w, shard, |buf| encode_into(buf, b"DEL", &[k]));
+    for (d, k) in active_expired {
+        emit(w, shard, *d, |buf| encode_into(buf, b"DEL", &[k]));
     }
 }
 
-fn emit(w: &AofWriter, shard: u32, write: impl FnOnce(&mut Vec<u8>)) {
+fn emit(w: &AofWriter, shard: u32, db: u32, write: impl FnOnce(&mut Vec<u8>)) {
     TX.with(|tx| {
         if let Some(opened) = tx.borrow_mut().as_mut() {
             if !opened.contains(&shard) {
@@ -273,7 +279,7 @@ fn emit(w: &AofWriter, shard: u32, write: impl FnOnce(&mut Vec<u8>)) {
             }
         }
     });
-    w.append(shard, write);
+    w.append_db(shard, db, write);
 }
 
 /// Brackets a transaction's records in each shard log with `MULTI`/`EXEC`,
@@ -284,7 +290,8 @@ pub struct TxGuard {
 
 impl TxGuard {
     pub(crate) fn begin(shards: &Arc<ShardManager>) -> Self {
-        if shards.aof().is_none() {
+        // Nested (a script inside EXEC): the outer bracket covers it.
+        if shards.aof().is_none() || TX.with(|tx| tx.borrow().is_some()) {
             return Self { shards: None };
         }
         TX.with(|tx| *tx.borrow_mut() = Some(Vec::new()));
@@ -438,7 +445,7 @@ pub(crate) fn aof_form<'a>(
                 return None;
             }
             let at = abs_ms(&args[1], name == "EXPIRE")?;
-            Some(enc("PEXPIREAT", &[args[0].to_vec(), at]))
+            Some(expire_record(args[0].to_vec(), at))
         }
         "EXPIREAT" | "PEXPIREAT" if args.len() >= 2 => {
             if !is_one {
@@ -449,10 +456,7 @@ pub(crate) fn aof_form<'a>(
             } else {
                 parse_i64(&args[1])?.max(0)
             };
-            Some(enc(
-                "PEXPIREAT",
-                &[args[0].to_vec(), at.to_string().into_bytes()],
-            ))
+            Some(expire_record(args[0].to_vec(), at.to_string().into_bytes()))
         }
         "PERSIST" if !is_one => None,
         "GETEX" => {
@@ -464,13 +468,13 @@ pub(crate) fn aof_form<'a>(
             match opt.as_str() {
                 "EX" | "PX" => {
                     let at = abs_ms(args.get(2)?, opt == "EX")?;
-                    Some(enc("PEXPIREAT", &[key, at]))
+                    Some(expire_record(key, at))
                 }
                 "EXAT" => {
                     let at = parse_u64(args.get(2)?)?.checked_mul(1000)?;
-                    Some(enc("PEXPIREAT", &[key, at.to_string().into_bytes()]))
+                    Some(expire_record(key, at.to_string().into_bytes()))
                 }
-                "PXAT" => Some(enc("PEXPIREAT", &[key, args.get(2)?.to_vec()])),
+                "PXAT" => Some(expire_record(key, args.get(2)?.to_vec())),
                 "PERSIST" => Some(enc("PERSIST", &[key])),
                 _ => None,
             }
@@ -500,6 +504,20 @@ pub(crate) fn aof_form<'a>(
             Some(enc("XADD", &out))
         }
         _ => Some(Record::Verbatim(name, args)),
+    }
+}
+
+/// `PEXPIREAT key at`, or `DEL key` when `at` has passed: an expiry set in
+/// the past deletes the key there and then (Redis does the same).
+fn expire_record(key: Vec<u8>, at: Vec<u8>) -> Record<'static> {
+    let past = std::str::from_utf8(&at)
+        .ok()
+        .and_then(|a| a.parse::<u64>().ok())
+        .is_some_and(|a| a <= now_millis());
+    if past {
+        enc("DEL", &[key])
+    } else {
+        enc("PEXPIREAT", &[key, at])
     }
 }
 

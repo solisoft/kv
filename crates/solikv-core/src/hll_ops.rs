@@ -89,7 +89,7 @@ impl ShardStore {
     /// Set HLL registers directly (for cross-shard merge).
     pub fn pfset_registers(&mut self, key: &Bytes, registers: Vec<u8>) -> CommandResponse {
         let hll = HyperLogLogValue { registers };
-        self.set(key.clone(), RedisValue::HyperLogLog(hll), None);
+        self.set_keep_ttl(key, RedisValue::HyperLogLog(hll));
         CommandResponse::ok()
     }
 

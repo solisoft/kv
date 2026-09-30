@@ -303,6 +303,10 @@ struct Pending {
     data: Vec<u8>,
     /// `(offset, generation)`: from `offset` on, records go to `generation`.
     rotations: Vec<(usize, u64)>,
+    /// Database the shard's log is in at the end of `data`: replay starts
+    /// every file in database 0, and a `SELECT` is written whenever a record
+    /// belongs to another one (see [`AofWriter::append_db`]).
+    db: u32,
 }
 
 struct Inner {
@@ -378,6 +382,10 @@ impl AofWriter {
     /// Encode a record straight into `shard`'s buffer. Call with the shard's
     /// lock held.
     pub fn append(&self, shard: u32, write: impl FnOnce(&mut Vec<u8>)) {
+        self.append_inner(shard, None, write)
+    }
+
+    fn append_inner(&self, shard: u32, db: Option<u32>, write: impl FnOnce(&mut Vec<u8>)) {
         let Some(slot) = self.inner.shards.get(shard as usize) else {
             tracing::error!("AOF record for unknown shard {}", shard);
             return;
@@ -388,6 +396,13 @@ impl AofWriter {
             self.wait_for_room(slot);
             p = slot.lock();
         }
+        if let Some(db) = db {
+            if p.db != db {
+                let n = db.to_string();
+                encode_into(&mut p.data, b"SELECT", &[n.as_bytes()]);
+                p.db = db;
+            }
+        }
         write(&mut p.data);
         drop(p);
         if self.inner.policy == FsyncPolicy::Always {
@@ -395,6 +410,13 @@ impl AofWriter {
                 t.unpark();
             }
         }
+    }
+
+    /// [`append`](Self::append) for a record that applies to database `db`:
+    /// preceded by `SELECT db` when the shard's log is in another one, as
+    /// Redis writes its AOF. Call with the shard's lock held.
+    pub fn append_db(&self, shard: u32, db: u32, write: impl FnOnce(&mut Vec<u8>)) {
+        self.append_inner(shard, Some(db), write)
     }
 
     /// Backpressure: the disk is behind; wait for the writer to catch up.
@@ -430,6 +452,8 @@ impl AofWriter {
             let mut p = slot.lock();
             let at = p.data.len();
             p.rotations.push((at, gen));
+            // The new file replays from database 0.
+            p.db = 0;
         }
     }
 
@@ -485,7 +509,16 @@ pub fn spawn_aof_writer(
     }
     let dir = aof_dir.to_path_buf();
     let inner = Arc::new(Inner {
-        shards: (0..shards).map(|_| parking_lot::Mutex::default()).collect(),
+        // Appending may continue a file that ended in any database: the first
+        // record of each shard always states its own.
+        shards: (0..shards)
+            .map(|_| {
+                parking_lot::Mutex::new(Pending {
+                    db: u32::MAX,
+                    ..Pending::default()
+                })
+            })
+            .collect(),
         policy,
         syncs: parking_lot::Mutex::new(Vec::new()),
         thread: std::sync::OnceLock::new(),
@@ -546,7 +579,9 @@ fn writer_loop(inner: Arc<Inner>, mut logs: Vec<ShardLog>, dir: PathBuf, stats: 
                 if p.data.is_empty() && p.rotations.is_empty() {
                     continue;
                 }
-                std::mem::swap(&mut *p, &mut spare);
+                // The buffers only: `db` describes the log, not the batch.
+                std::mem::swap(&mut p.data, &mut spare.data);
+                std::mem::swap(&mut p.rotations, &mut spare.rotations);
             }
             let log = &mut logs[s];
             let mut from = 0;

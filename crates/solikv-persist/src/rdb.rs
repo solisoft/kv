@@ -3,11 +3,15 @@
 //! A snapshot is one file holding every shard, each in its own *section*:
 //!
 //! ```text
-//! "SOLIKV" | version (u8 = 3)
-//! ( 0xFE | section index (u32 LE) | entry* | 0xFF )*
+//! "SOLIKV" | version (u8 = 4)
+//! ( 0xFE | section index (u32 LE) | ( [ 0xFB | database (u32 LE) ] entry* )* | 0xFF )*
 //! 0xFD | CRC-32 (u32 LE) of every byte before it
 //! entry = [ 0xFC | expires-at ms (u64 LE) ] type (u8) | key | value
 //! ```
+//!
+//! Entries belong to database 0 until a `0xFB` marker names another one
+//! (`SELECT n`); version 3 files, written before logical databases, have no
+//! markers and load entirely into database 0.
 //!
 //! Sections keep the shard a key was saved from. `dump.rdb` does not need
 //! that — loading re-hashes every key to the shard that owns it under the
@@ -28,8 +32,10 @@ use std::path::{Path, PathBuf};
 const RDB_MAGIC: &[u8] = b"SOLIKV";
 /// Per-shard files without sections or checksum.
 const RDB_VERSION_LEGACY: u8 = 2;
-/// Sectioned, checksummed, with streams.
-const RDB_VERSION: u8 = 3;
+/// Sectioned, checksummed, with streams; no database markers.
+const RDB_VERSION_V3: u8 = 3;
+/// Version 3 plus database markers.
+const RDB_VERSION: u8 = 4;
 
 const MAX_VALUE_LEN: usize = 512 * 1024 * 1024;
 /// Bounds a declared element count. Nothing is allocated from it (capacity is
@@ -65,6 +71,7 @@ const TYPE_BLOOM: u8 = 6;
 const TYPE_STREAM: u8 = 7;
 
 // Framing
+const SELECT_DB: u8 = 0xFB;
 const EXPIRY: u8 = 0xFC;
 const CHECKSUM: u8 = 0xFD;
 const SECTION: u8 = 0xFE;
@@ -88,19 +95,27 @@ impl RdbPersistence {
 
     /// Load every section of a snapshot into one store.
     pub fn load<R: Read>(reader: &mut R, store: &mut ShardStore) -> io::Result<()> {
-        read_snapshot(reader, |_, key, entry| {
-            store.insert_entry(key, entry);
+        read_snapshot(reader, |_, db, key, entry| {
+            store.insert_entry_in(db, key, entry);
             Ok(())
         })?;
+        store.select(0);
         Ok(())
     }
 }
 
-/// Serialize every live entry of `store` (section body: entries only).
+/// Serialize every live entry of `store`, all databases (section body).
 pub fn serialize_store(store: &ShardStore, out: &mut Vec<u8>) -> io::Result<()> {
-    for (key, entry) in store.iter() {
+    // `iter_all` yields each database's entries together.
+    let mut current = 0u32;
+    for (db, key, entry) in store.iter_all() {
         if entry.is_expired() {
             continue;
+        }
+        if db != current {
+            out.push(SELECT_DB);
+            out.extend_from_slice(&db.to_le_bytes());
+            current = db;
         }
         write_entry(out, key, entry)?;
     }
@@ -403,15 +418,20 @@ fn read_value<R: Read>(r: &mut R, type_byte: u8) -> io::Result<RedisValue> {
     })
 }
 
+/// Called for each key of a snapshot: `(section, database, key, entry)`.
+pub type OnEntry<'a> = dyn FnMut(u32, u32, Bytes, KeyEntry) -> io::Result<()> + 'a;
+
 /// Read one section's entries up to its end marker.
 fn read_entries<R: Read>(
     r: &mut R,
     section: u32,
-    on_entry: &mut dyn FnMut(u32, Bytes, KeyEntry) -> io::Result<()>,
+    on_entry: &mut OnEntry<'_>,
     legacy: bool,
+    with_dbs: bool,
 ) -> io::Result<u64> {
     let mut count = 0u64;
     let mut current_expiry: Option<u64> = None;
+    let mut db = 0u32;
     loop {
         let mut t = [0u8; 1];
         match r.read_exact(&mut t) {
@@ -425,11 +445,16 @@ fn read_entries<R: Read>(
             EXPIRY => {
                 current_expiry = Some(read_u64(r)?);
             }
+            SELECT_DB if with_dbs => {
+                let mut buf = [0u8; 4];
+                r.read_exact(&mut buf)?;
+                db = u32::from_le_bytes(buf);
+            }
             TYPE_STREAM if legacy => return Err(invalid("unknown type byte: 7")),
             ty => {
                 let key = read_bytes(r)?;
                 let value = read_value(r, ty)?;
-                on_entry(section, key, make_entry(value, current_expiry.take()))?;
+                on_entry(section, db, key, make_entry(value, current_expiry.take()))?;
                 count += 1;
             }
         }
@@ -444,13 +469,14 @@ pub struct SnapshotInfo {
     pub keys: u64,
 }
 
-/// Stream a snapshot, calling `on_entry(section, key, entry)` for each key.
+/// Stream a snapshot, calling `on_entry(section, database, key, entry)` for
+/// each key.
 ///
 /// The checksum is verified at the end, so a caller that must not act on a
 /// damaged file loads into scratch storage first; the startup path does.
 pub fn read_snapshot<R: Read>(
     reader: R,
-    mut on_entry: impl FnMut(u32, Bytes, KeyEntry) -> io::Result<()>,
+    mut on_entry: impl FnMut(u32, u32, Bytes, KeyEntry) -> io::Result<()>,
 ) -> io::Result<SnapshotInfo> {
     let mut r = CrcReader::new(reader);
     let mut magic = [0u8; 6];
@@ -467,10 +493,10 @@ pub fn read_snapshot<R: Read>(
     match version[0] {
         RDB_VERSION_LEGACY => {
             info.sections = 1;
-            info.keys = read_entries(&mut r, 0, &mut on_entry, true)?;
+            info.keys = read_entries(&mut r, 0, &mut on_entry, true, false)?;
             Ok(info)
         }
-        RDB_VERSION => loop {
+        v @ (RDB_VERSION_V3 | RDB_VERSION) => loop {
             let mut t = [0u8; 1];
             r.read_exact(&mut t)?;
             match t[0] {
@@ -478,7 +504,7 @@ pub fn read_snapshot<R: Read>(
                     let mut idx = [0u8; 4];
                     r.read_exact(&mut idx)?;
                     let idx = u32::from_le_bytes(idx);
-                    info.keys += read_entries(&mut r, idx, &mut on_entry, false)?;
+                    info.keys += read_entries(&mut r, idx, &mut on_entry, false, v == RDB_VERSION)?;
                     info.sections += 1;
                 }
                 CHECKSUM => {
@@ -500,7 +526,7 @@ pub fn read_snapshot<R: Read>(
 /// Load a snapshot file from disk.
 pub fn load_snapshot_file(
     path: &Path,
-    on_entry: impl FnMut(u32, Bytes, KeyEntry) -> io::Result<()>,
+    on_entry: impl FnMut(u32, u32, Bytes, KeyEntry) -> io::Result<()>,
 ) -> io::Result<SnapshotInfo> {
     let file = std::fs::File::open(path)?;
     read_snapshot(BufReader::with_capacity(1 << 20, file), on_entry)
@@ -666,20 +692,20 @@ pub fn legacy_shard_files(dir: &Path, basename: &str) -> Vec<PathBuf> {
 pub fn load_rdb(
     dir: &Path,
     basename: &str,
-    mut on_entry: impl FnMut(Bytes, KeyEntry),
+    mut on_entry: impl FnMut(u32, Bytes, KeyEntry),
 ) -> io::Result<Vec<PathBuf>> {
     let single = rdb_path(dir, basename);
     if single.exists() {
-        load_snapshot_file(&single, |_, k, e| {
-            on_entry(k, e);
+        load_snapshot_file(&single, |_, db, k, e| {
+            on_entry(db, k, e);
             Ok(())
         })?;
         return Ok(vec![single]);
     }
     let legacy = legacy_shard_files(dir, basename);
     for path in &legacy {
-        load_snapshot_file(path, |_, k, e| {
-            on_entry(k, e);
+        load_snapshot_file(path, |_, db, k, e| {
+            on_entry(db, k, e);
             Ok(())
         })?;
     }
@@ -982,7 +1008,7 @@ mod tests {
         w.finish().unwrap();
 
         let mut seen = Vec::new();
-        let info = read_snapshot(Cursor::new(&out), |sec, k, _| {
+        let info = read_snapshot(Cursor::new(&out), |sec, _, k, _| {
             seen.push((sec, k));
             Ok(())
         })
@@ -993,7 +1019,63 @@ mod tests {
         let mut bad = out.clone();
         let n = bad.len();
         bad[n - 8] ^= 0x40;
-        assert!(read_snapshot(Cursor::new(&bad), |_, _, _| Ok(())).is_err());
+        assert!(read_snapshot(Cursor::new(&bad), |_, _, _, _| Ok(())).is_err());
+    }
+
+    #[test]
+    fn databases_round_trip_and_a_version_3_file_loads_into_db_0() {
+        let mut store = ShardStore::new();
+        store.set(Bytes::from("a"), RedisValue::String(Bytes::from("0")), None);
+        store.select(3);
+        store.set(Bytes::from("a"), RedisValue::String(Bytes::from("3")), None);
+        store.set(Bytes::from("b"), RedisValue::String(Bytes::from("3")), None);
+        store.select(1);
+        store.set(Bytes::from("c"), RedisValue::String(Bytes::from("1")), None);
+
+        let mut buf = Vec::new();
+        RdbPersistence::save(&store, &mut buf).unwrap();
+        let mut seen = Vec::new();
+        read_snapshot(Cursor::new(&buf), |_, db, k, _| {
+            seen.push((db, k));
+            Ok(())
+        })
+        .unwrap();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                (0, Bytes::from("a")),
+                (1, Bytes::from("c")),
+                (3, Bytes::from("a")),
+                (3, Bytes::from("b")),
+            ]
+        );
+        let mut loaded = ShardStore::new();
+        RdbPersistence::load(&mut Cursor::new(&buf), &mut loaded).unwrap();
+        assert_eq!(loaded.dbsize_of(0), 1);
+        assert_eq!(loaded.dbsize_of(1), 1);
+        assert_eq!(loaded.dbsize_of(3), 2);
+
+        // A version 3 body is the same bytes without markers.
+        let mut v3 = Vec::new();
+        let mut w = SnapshotWriter::new(&mut v3).unwrap();
+        let mut body = Vec::new();
+        write_entry(
+            &mut body,
+            b"k",
+            &KeyEntry::new(RedisValue::String(Bytes::from("v"))),
+        )
+        .unwrap();
+        w.write_section(0, &body).unwrap();
+        w.finish().unwrap();
+        v3[RDB_MAGIC.len()] = RDB_VERSION_V3;
+        // The version byte is covered by the checksum: recompute it.
+        let n = v3.len();
+        let crc = crc32_update(0, &v3[..n - 4]);
+        v3[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        let mut old = ShardStore::new();
+        RdbPersistence::load(&mut Cursor::new(&v3), &mut old).unwrap();
+        assert_eq!(old.dbsize_of(0), 1);
     }
 
     #[test]

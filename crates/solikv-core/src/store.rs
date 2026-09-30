@@ -4,16 +4,47 @@ use indexmap::IndexMap;
 use crate::expiry::{ExpiryHeap, MAX_EXPIRE_PER_TICK};
 use crate::types::*;
 
+/// `EXPIRE … NX|XX|GT|LT`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExpireCond {
+    pub nx: bool,
+    pub xx: bool,
+    pub gt: bool,
+    pub lt: bool,
+}
+
+/// One logical database's keys (`SELECT n`).
+#[derive(Debug, Default)]
+struct Keyspace {
+    data: IndexMap<Bytes, KeyEntry>,
+    expiry_heap: ExpiryHeap,
+}
+
 /// Per-shard key-value store. Owned by a single thread — no locking needed.
 ///
 /// Uses [`IndexMap`] so SCAN/RANDOMKEY can address keys by stable index in O(1)
 /// without cloning the full key set on every call.
+///
+/// # Logical databases
+///
+/// Every shard holds its part of every database. The *selected* one lives in
+/// `data`/`expiry_heap`, where every command method finds it; the others wait
+/// in `parked`. [`select`](Self::select) swaps two keyspaces' headers — a few
+/// pointers, no rehash — and is a no-op for the database already selected,
+/// so a server whose clients never `SELECT` pays one compare per command.
 #[derive(Debug)]
 pub struct ShardStore {
     data: IndexMap<Bytes, KeyEntry>,
     expiry_heap: ExpiryHeap,
-    /// Buffer of keys that were lazily expired during get/get_mut. Drained by ShardHandle.
-    pub expired_buffer: Vec<Bytes>,
+    /// Which database `data` is.
+    db: u32,
+    /// Every other database, by index; `parked[db]` is an empty placeholder
+    /// for the selected one. Grows on demand to the highest database used.
+    parked: Vec<Keyspace>,
+    /// Keys expired lazily (during get/get_mut) since the owner last drained
+    /// this, with the database each was in. Drained by `ShardHandle`, which
+    /// logs and announces them.
+    pub expired_buffer: Vec<(u32, Bytes)>,
 }
 
 impl ShardStore {
@@ -21,8 +52,138 @@ impl ShardStore {
         Self {
             data: IndexMap::new(),
             expiry_heap: ExpiryHeap::new(),
+            db: 0,
+            parked: Vec::new(),
             expired_buffer: Vec::new(),
         }
+    }
+
+    // ---- Logical databases ----
+
+    /// The selected database.
+    #[inline]
+    pub fn db(&self) -> u32 {
+        self.db
+    }
+
+    /// Make `db` the database every command method works on.
+    #[inline]
+    pub fn select(&mut self, db: u32) {
+        if db != self.db {
+            self.select_slow(db);
+        }
+    }
+
+    #[cold]
+    fn select_slow(&mut self, db: u32) {
+        let cur = self.db as usize;
+        let want = db as usize;
+        self.ensure_parked(cur.max(want));
+        // Park the selected keyspace in its placeholder slot, then take the
+        // wanted one out of its slot (which becomes the new placeholder).
+        std::mem::swap(&mut self.data, &mut self.parked[cur].data);
+        std::mem::swap(&mut self.expiry_heap, &mut self.parked[cur].expiry_heap);
+        std::mem::swap(&mut self.data, &mut self.parked[want].data);
+        std::mem::swap(&mut self.expiry_heap, &mut self.parked[want].expiry_heap);
+        self.db = db;
+    }
+
+    fn ensure_parked(&mut self, idx: usize) {
+        if self.parked.len() <= idx {
+            self.parked.resize_with(idx + 1, Keyspace::default);
+        }
+    }
+
+    /// Highest database index this shard has ever held keys in, plus one.
+    pub fn db_span(&self) -> u32 {
+        (self.parked.len() as u32).max(self.db + 1)
+    }
+
+    fn keyspace(&self, db: u32) -> Option<&IndexMap<Bytes, KeyEntry>> {
+        if db == self.db {
+            Some(&self.data)
+        } else {
+            self.parked.get(db as usize).map(|k| &k.data)
+        }
+    }
+
+    /// Keys in `db` (expired ones not yet reclaimed included, like `DBSIZE`).
+    pub fn dbsize_of(&self, db: u32) -> usize {
+        self.keyspace(db).map_or(0, |d| d.len())
+    }
+
+    /// Keys in `db` that carry a TTL (`INFO keyspace`'s `expires`).
+    pub fn expires_of(&self, db: u32) -> usize {
+        self.keyspace(db)
+            .map_or(0, |d| d.values().filter(|e| e.expires_at.is_some()).count())
+    }
+
+    /// Swap the contents of two databases (`SWAPDB`).
+    pub fn swap_db(&mut self, a: u32, b: u32) {
+        if a == b {
+            return;
+        }
+        let cur = self.db;
+        let hi = a.max(b).max(cur) as usize;
+        self.ensure_parked(hi);
+        // Park the selected database so all three live in `parked`, swap,
+        // and select the same index again.
+        let c = cur as usize;
+        std::mem::swap(&mut self.data, &mut self.parked[c].data);
+        std::mem::swap(&mut self.expiry_heap, &mut self.parked[c].expiry_heap);
+        self.parked.swap(a as usize, b as usize);
+        std::mem::swap(&mut self.data, &mut self.parked[c].data);
+        std::mem::swap(&mut self.expiry_heap, &mut self.parked[c].expiry_heap);
+    }
+
+    /// Move `key` from the selected database to `to` (`MOVE`). False when
+    /// the key is missing or `to` already has it.
+    pub fn move_key(&mut self, key: &Bytes, to: u32) -> bool {
+        if to == self.db || self.get(key).is_none() {
+            return false;
+        }
+        self.ensure_parked(to as usize);
+        let target = &mut self.parked[to as usize];
+        if let Some(existing) = target.data.get(key) {
+            if !existing.is_expired() {
+                return false;
+            }
+            target.data.swap_remove(key);
+        }
+        let Some((k, entry)) = self.data.swap_remove_entry(key) else {
+            return false;
+        };
+        if let Some(exp) = entry.expires_at {
+            target.expiry_heap.push(k.clone(), exp);
+        }
+        target.data.insert(k, entry);
+        true
+    }
+
+    /// Every live entry of every database, with the database it is in.
+    pub fn iter_all(&self) -> impl Iterator<Item = (u32, &Bytes, &KeyEntry)> {
+        let active = self.db;
+        let parked = self
+            .parked
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| *i as u32 != active)
+            .flat_map(|(i, ks)| ks.data.iter().map(move |(k, e)| (i as u32, k, e)));
+        self.data
+            .iter()
+            .map(move |(k, e)| (active, k, e))
+            .chain(parked)
+    }
+
+    /// Insert an entry into database `db` (loading).
+    pub fn insert_entry_in(&mut self, db: u32, key: Bytes, entry: KeyEntry) {
+        self.select(db);
+        self.insert_entry(key, entry);
+    }
+
+    #[inline]
+    fn note_expired(&mut self, key: Bytes) {
+        self.expired_buffer.push((self.db, key));
     }
 
     /// Get a reference to an entry, performing lazy expiry check.
@@ -32,7 +193,7 @@ impl ShardStore {
         let idx = self.data.get_index_of(key)?;
         if self.data[idx].is_expired() {
             if let Some((k, _)) = self.data.swap_remove_index(idx) {
-                self.expired_buffer.push(k);
+                self.note_expired(k);
             }
             return None;
         }
@@ -45,7 +206,7 @@ impl ShardStore {
         let idx = self.data.get_index_of(key)?;
         if self.data[idx].is_expired() {
             if let Some((k, _)) = self.data.swap_remove_index(idx) {
-                self.expired_buffer.push(k);
+                self.note_expired(k);
             }
             return None;
         }
@@ -69,6 +230,17 @@ impl ShardStore {
         self.expiry_heap.push(key.clone(), expires_at);
         self.data
             .insert(key, KeyEntry::with_expiry(value, expires_at));
+    }
+
+    /// Replace `key`'s value, keeping its TTL if it has a live one (what
+    /// every in-place modification — `APPEND`, `INCR`, `SETRANGE`, `SETBIT`
+    /// … — must do; re-inserting with no expiry made them drop it).
+    pub fn set_keep_ttl(&mut self, key: &Bytes, value: RedisValue) {
+        if let Some(entry) = self.get_mut(key) {
+            entry.value = value;
+        } else {
+            self.data.insert(key.clone(), KeyEntry::new(value));
+        }
     }
 
     /// Insert a KeyEntry directly.
@@ -118,6 +290,32 @@ impl ShardStore {
         } else {
             false
         }
+    }
+
+    /// `EXPIRE`-family: give `key` the absolute deadline `at` (ms) if the
+    /// condition allows. A deadline already passed deletes the key. For
+    /// GT/LT a key without a TTL counts as an infinite one, as in Redis.
+    /// True when the key existed and the condition held.
+    pub fn expire_cond(&mut self, key: &Bytes, at: u64, c: ExpireCond) -> bool {
+        let current = match self.get(key) {
+            None => return false,
+            Some(e) => e.expires_at,
+        };
+        if (c.nx && current.is_some()) || (c.xx && current.is_none()) {
+            return false;
+        }
+        if c.gt && current.is_none_or(|cur| at <= cur) {
+            return false;
+        }
+        if c.lt && current.is_some_and(|cur| at >= cur) {
+            return false;
+        }
+        if at <= now_millis() {
+            self.data.swap_remove(key);
+        } else {
+            self.expire_at(key, at);
+        }
+        true
     }
 
     /// Remove the expiry from a key. Returns true if key exists.
@@ -208,6 +406,18 @@ impl ShardStore {
         pattern: Option<&str>,
         count: usize,
     ) -> (usize, Vec<Bytes>) {
+        self.scan_typed(cursor, pattern, None, count)
+    }
+
+    /// [`scan`](Self::scan) with `SCAN … TYPE t`: only keys of that type
+    /// (`string`, `list`, …) are returned; the others still consume `count`.
+    pub fn scan_typed(
+        &mut self,
+        cursor: usize,
+        pattern: Option<&str>,
+        type_filter: Option<&str>,
+        count: usize,
+    ) -> (usize, Vec<Bytes>) {
         let count = count.max(1);
         let len = self.data.len();
         if len == 0 {
@@ -221,13 +431,14 @@ impl ShardStore {
         let mut deferred_expire: Vec<Bytes> = Vec::new();
 
         while idx < end {
-            let (key, expired) = {
+            let (key, expired, type_ok) = {
                 let (k, entry) = self.data.get_index(idx).expect("idx in range");
-                (k.clone(), entry.is_expired())
+                let type_ok = type_filter.is_none_or(|t| t.eq_ignore_ascii_case(entry.type_name()));
+                (k.clone(), entry.is_expired(), type_ok)
             };
             if expired {
                 deferred_expire.push(key);
-            } else {
+            } else if type_ok {
                 let matches = pattern
                     .map(|p| {
                         let key_str = std::str::from_utf8(&key).unwrap_or("");
@@ -248,7 +459,7 @@ impl ShardStore {
         // Drop expired keys after the window walk so this call's indices stayed stable.
         for key in deferred_expire {
             if self.data.swap_remove(&key).is_some() {
-                self.expired_buffer.push(key);
+                self.note_expired(key);
             }
         }
 
@@ -261,19 +472,37 @@ impl ShardStore {
     /// records each expiry as a `DEL` so replay reproduces it.
     fn expire_now(&mut self, key: &Bytes) {
         if let Some((k, _)) = self.data.swap_remove_entry(key) {
-            self.expired_buffer.push(k);
+            self.note_expired(k);
         }
     }
 
-    /// Flush all keys.
+    /// Delete `key` if it is (still) there, reporting whether it was live.
+    /// An expired key counts as absent but is reported through
+    /// `expired_buffer`, like any other lazy expiry.
+    pub fn remove_live(&mut self, key: &Bytes) -> Option<KeyEntry> {
+        let (k, entry) = self.data.swap_remove_entry(key)?;
+        if entry.is_expired() {
+            self.note_expired(k);
+            return None;
+        }
+        Some(entry)
+    }
+
+    /// Empty the selected database (`FLUSHDB`).
     pub fn flush(&mut self) {
         self.data.clear();
         self.expiry_heap = ExpiryHeap::new();
     }
 
-    /// Run active expiry: remove up to [`MAX_EXPIRE_PER_TICK`] expired keys.
-    /// Returns the expired key names that were actually removed from the map.
-    pub fn run_active_expiry(&mut self) -> Vec<Bytes> {
+    /// Empty every database (`FLUSHALL`).
+    pub fn flush_all(&mut self) {
+        self.flush();
+        self.parked.clear();
+    }
+
+    /// Run active expiry: remove up to [`MAX_EXPIRE_PER_TICK`] expired keys,
+    /// across every database. Returns them with the database each was in.
+    pub fn run_active_expiry(&mut self) -> Vec<(u32, Bytes)> {
         // Loading: nothing expires (see `LoadingGuard`). Returning before the
         // heap is drained matters: a drained entry whose key then reads as
         // live would be gone from the heap for good.
@@ -281,34 +510,25 @@ impl ShardStore {
             return Vec::new();
         }
         let now = now_millis();
-        let expired_keys = self.expiry_heap.drain_expired(now, MAX_EXPIRE_PER_TICK);
         let mut removed = Vec::new();
-        for key in expired_keys {
-            if let Some(entry) = self.data.get(&key) {
-                if entry.is_expired() {
-                    self.data.swap_remove(&key);
-                    removed.push(key);
-                }
+        let db = self.db;
+        expire_keyspace(&mut self.data, &mut self.expiry_heap, db, now, &mut removed);
+        for (i, ks) in self.parked.iter_mut().enumerate() {
+            if removed.len() >= MAX_EXPIRE_PER_TICK {
+                break;
             }
+            if i as u32 == db || ks.expiry_heap.is_empty() {
+                continue;
+            }
+            expire_keyspace(
+                &mut ks.data,
+                &mut ks.expiry_heap,
+                i as u32,
+                now,
+                &mut removed,
+            );
         }
-
-        // Compact the expiry heap if it has grown much larger than the data set.
-        // This prevents unbounded heap growth from repeated EXPIRE updates.
-        if self.expiry_heap.len() > self.data.len() * 4 + 1024 {
-            self.rebuild_expiry_heap();
-        }
-
         removed
-    }
-
-    /// Rebuild the expiry heap from scratch, removing stale entries.
-    fn rebuild_expiry_heap(&mut self) {
-        self.expiry_heap = ExpiryHeap::new();
-        for (key, entry) in &self.data {
-            if let Some(exp) = entry.expires_at {
-                self.expiry_heap.push(key.clone(), exp);
-            }
-        }
     }
 
     /// Rename a key. Returns error message if source doesn't exist.
@@ -318,7 +538,7 @@ impl ShardStore {
             return Err("ERR no such key");
         }
         let entry = self.data.swap_remove(from).unwrap();
-        self.data.insert(to, entry);
+        self.insert_entry(to, entry);
         Ok(())
     }
 
@@ -343,11 +563,18 @@ impl ShardStore {
         self.data.get(key).filter(|e| !e.is_expired())
     }
 
-    /// Remove and return every entry, leaving the store empty. Used to move a
-    /// dataset replayed into a scratch store over to the shards that own it.
-    pub fn drain_entries(&mut self) -> Vec<(Bytes, KeyEntry)> {
+    /// Remove and return every entry of every database, with its database,
+    /// leaving the store empty. Used to move a dataset replayed into a
+    /// scratch store over to the shards that own it.
+    pub fn drain_entries(&mut self) -> Vec<(u32, Bytes, KeyEntry)> {
         self.expiry_heap = ExpiryHeap::new();
-        self.data.drain(..).collect()
+        let db = self.db;
+        let mut out: Vec<(u32, Bytes, KeyEntry)> =
+            self.data.drain(..).map(|(k, e)| (db, k, e)).collect();
+        for (i, ks) in self.parked.drain(..).enumerate() {
+            out.extend(ks.data.into_iter().map(|(k, e)| (i as u32, k, e)));
+        }
+        out
     }
 
     /// Get all data for persistence/snapshotting.
@@ -364,6 +591,36 @@ impl ShardStore {
 impl Default for ShardStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Remove expired keys of one keyspace from its heap, up to the tick budget.
+fn expire_keyspace(
+    data: &mut IndexMap<Bytes, KeyEntry>,
+    heap: &mut ExpiryHeap,
+    db: u32,
+    now: u64,
+    removed: &mut Vec<(u32, Bytes)>,
+) {
+    let budget = MAX_EXPIRE_PER_TICK.saturating_sub(removed.len());
+    for key in heap.drain_expired(now, budget) {
+        if let Some(entry) = data.get(&key) {
+            if entry.is_expired() {
+                data.swap_remove(&key);
+                removed.push((db, key));
+            }
+        }
+    }
+    // Compact the heap if it has grown much larger than the data set: every
+    // EXPIRE on a key pushes a fresh entry and leaves the old one behind.
+    if heap.len() > data.len() * 4 + 1024 {
+        let mut fresh = ExpiryHeap::new();
+        for (key, entry) in data.iter() {
+            if let Some(exp) = entry.expires_at {
+                fresh.push(key.clone(), exp);
+            }
+        }
+        *heap = fresh;
     }
 }
 

@@ -1,9 +1,9 @@
 use bytes::Bytes;
-use std::cell::UnsafeCell;
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use solikv_core::ShardStore;
 use solikv_pubsub::PubSubBroker;
 
@@ -12,6 +12,7 @@ use solikv_persist::AofWriter;
 
 use crate::aof_log::Effects;
 use crate::dispatch::{NOTIFY_EXPIRED, NOTIFY_KEYEVENT, NOTIFY_KEYSPACE};
+use crate::watch::WatchRegistry;
 
 /// Reply to every command once the server has started shutting down.
 pub const SHUTTING_DOWN: &str = "ERR server is shutting down";
@@ -25,6 +26,119 @@ struct Shared {
     /// Shutdown barrier: no command touches a store once this is set (see
     /// `ShardManager::freeze`).
     frozen: AtomicBool,
+    /// Keys clients `WATCH` (marked by writes under the shard lock).
+    watch: WatchRegistry,
+}
+
+// ---------------------------------------------------------------------------
+// The database a command runs in
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Database of the command this thread is executing (`SELECT`). Set by
+    /// the engine for the length of one command (scripts' `redis.call`
+    /// inherit it); every shard visit selects it in its store.
+    static CURRENT_DB: Cell<u32> = const { Cell::new(0) };
+}
+
+/// The database the running command works in.
+#[inline]
+pub fn current_db() -> u32 {
+    CURRENT_DB.with(|c| c.get())
+}
+
+/// Switch the running command's database until the enclosing [`DbGuard`]
+/// restores it (a script's `SELECT`).
+pub(crate) fn set_current_db(db: u32) {
+    CURRENT_DB.with(|c| c.set(db));
+}
+
+/// Runs the commands issued while it lives in database `db`; restores the
+/// previous one on drop.
+pub struct DbGuard {
+    prev: u32,
+}
+
+impl DbGuard {
+    #[inline]
+    pub fn enter(db: u32) -> Self {
+        Self {
+            prev: CURRENT_DB.with(|c| c.replace(db)),
+        }
+    }
+}
+
+impl Drop for DbGuard {
+    #[inline]
+    fn drop(&mut self) {
+        let prev = self.prev;
+        CURRENT_DB.with(|c| c.set(prev));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Holding several shards at once
+// ---------------------------------------------------------------------------
+
+/// Shards this thread holds locked for an atomic multi-shard operation
+/// (`ShardManager::lock_shards`): commands run meanwhile use the held store
+/// instead of locking it again, which with a non-reentrant mutex would
+/// deadlock — and would let another client in between two of them.
+#[derive(Default)]
+struct Held {
+    /// Identity of the `Shared` the stores belong to (0 = none held).
+    owner: usize,
+    stores: Vec<*mut ShardStore>,
+}
+
+thread_local! {
+    static HELD_OWNER: Cell<usize> = const { Cell::new(0) };
+    static HELD: RefCell<Held> = RefCell::new(Held::default());
+}
+
+/// The store of shard `idx`, if this thread holds it.
+#[inline]
+fn held_store(shared: &Arc<Shared>, idx: u32) -> Option<*mut ShardStore> {
+    let owner = HELD_OWNER.with(|o| o.get());
+    if owner == 0 || owner != Arc::as_ptr(shared) as usize {
+        return None;
+    }
+    HELD.with(|h| {
+        h.borrow()
+            .stores
+            .get(idx as usize)
+            .copied()
+            .filter(|p| !p.is_null())
+    })
+}
+
+/// Shards locked by [`ShardManager::lock_shards`]; released on drop.
+pub struct HeldShards<'a> {
+    guards: Vec<(u32, MutexGuard<'a, ShardStore>)>,
+    /// Whether this guard made this thread an owner (outermost guard).
+    outermost: bool,
+}
+
+impl Drop for HeldShards<'_> {
+    fn drop(&mut self) {
+        HELD.with(|h| {
+            let mut h = h.borrow_mut();
+            for (i, _) in &self.guards {
+                if let Some(p) = h.stores.get_mut(*i as usize) {
+                    *p = std::ptr::null_mut();
+                }
+            }
+            if self.outermost {
+                h.owner = 0;
+                h.stores.clear();
+            }
+        });
+        if self.outermost {
+            HELD_OWNER.with(|o| o.set(0));
+        }
+        // The guards unlock as the Vec drops, after the pointers are gone.
+        self.guards.clear();
+    }
 }
 
 /// Unlocked store for **solo mode** (single Tokio worker — Redis-shaped).
@@ -139,6 +253,12 @@ impl ShardHandle {
     fn locked<T>(&self, f: impl FnOnce(&mut ShardStore, &AtomicU64) -> T) -> T {
         match self.backend.as_ref() {
             StoreBackend::Locked { store, tick } => {
+                if let Some(p) = held_store(&self.shared, self.index) {
+                    // SAFETY: this thread holds the shard's lock (a guard in
+                    // a live `HeldShards`), and nothing else uses the store
+                    // through that guard while the pointer is registered.
+                    return f(unsafe { &mut *p }, tick);
+                }
                 let mut guard = store.lock();
                 f(&mut guard, tick)
             }
@@ -175,6 +295,7 @@ impl ShardHandle {
         F: FnOnce(&mut ShardStore, &mut Effects) -> CommandResponse,
     {
         let aof = self.shared.aof.get();
+        let db = current_db();
         let (result, lazy_expired, active_expired) = self.locked(|store, tick| {
             // Checked under the lock: once `freeze` has taken and released
             // this lock, nothing changes the store again.
@@ -185,6 +306,7 @@ impl ShardHandle {
                     Vec::new(),
                 );
             }
+            store.select(db);
             let mut effects = Effects::new(aof.is_some());
             let result = f(store, &mut effects);
             let lazy_expired = std::mem::take(&mut store.expired_buffer);
@@ -200,11 +322,22 @@ impl ShardHandle {
                 crate::aof_log::log_under_lock(
                     w,
                     self.index,
+                    db,
                     &result,
                     &lazy_expired,
                     explicit.then_some(&mut effects),
                     &active_expired,
                 );
+            }
+            // Still under the lock: see `watch` for why that matters.
+            let watch = &self.shared.watch;
+            if watch.is_active() {
+                if !result.is_error() {
+                    crate::watch::mark_running(watch);
+                }
+                for (d, k) in lazy_expired.iter().chain(active_expired.iter()) {
+                    watch.touch(*d, k);
+                }
             }
             (result, lazy_expired, active_expired)
         });
@@ -229,7 +362,7 @@ impl ShardHandle {
         self.index
     }
 
-    fn emit_expired_notifications(&self, keys: &[Bytes]) {
+    fn emit_expired_notifications(&self, keys: &[(u32, Bytes)]) {
         if keys.is_empty() {
             return;
         }
@@ -240,14 +373,14 @@ impl ShardHandle {
         if flags == 0 || flags & NOTIFY_EXPIRED == 0 {
             return;
         }
-        for key in keys {
-            let key_str = std::str::from_utf8(key).unwrap_or("<binary>");
+        for (db, key) in keys {
+            let key_str = String::from_utf8_lossy(key);
             if flags & NOTIFY_KEYSPACE != 0 {
-                let channel = Bytes::from(format!("__keyspace@0__:{}", key_str));
+                let channel = Bytes::from(format!("__keyspace@{}__:{}", db, key_str));
                 pubsub.publish(channel, Bytes::from("expired"));
             }
             if flags & NOTIFY_KEYEVENT != 0 {
-                let channel = Bytes::from("__keyevent@0__:expired");
+                let channel = Bytes::from(format!("__keyevent@{}__:expired", db));
                 pubsub.publish(channel, key.clone());
             }
         }
@@ -259,6 +392,10 @@ impl ShardHandle {
     {
         match self.backend.as_ref() {
             StoreBackend::Locked { store, .. } => {
+                if let Some(p) = held_store(&self.shared, self.index) {
+                    // SAFETY: see `locked`.
+                    return f(unsafe { &*p });
+                }
                 let guard = store.lock();
                 f(&guard)
             }
@@ -293,7 +430,13 @@ impl ShardManager {
     /// Names the key → shard function below. Persisted with the append-only
     /// log, whose per-shard files are only valid for a server that routes
     /// keys the same way: change it whenever `shard_index_for_key` changes.
-    pub const HASH_SCHEME: &'static str = "fnv1a-64";
+    ///
+    /// A key goes to the shard of its Redis Cluster slot (CRC16 of the key,
+    /// or of its `{hash tag}`, mod 16384), slot mod shard count. Keys that
+    /// share a tag therefore share a shard, as they share a slot — clients
+    /// use tags to keep multi-key commands on one node, and here that also
+    /// keeps them on one lock.
+    pub const HASH_SCHEME: &'static str = "crc16-slot-mod";
 
     pub fn new(num_shards: usize) -> Self {
         Self::with_notifications_inner(num_shards, None, None, false)
@@ -398,7 +541,81 @@ impl ShardManager {
         if self.solo || self.num_shards == 1 {
             return 0;
         }
-        (fast_shard_hash(key) as usize) % self.num_shards
+        solikv_core::keyspace::hash_slot(key) as usize % self.num_shards
+    }
+
+    /// The watch registry (`WATCH`).
+    pub fn watch(&self) -> &WatchRegistry {
+        &self.shared.watch
+    }
+
+    /// Lock the shards at `indices` (any order, duplicates allowed) until
+    /// the returned guard drops. Meanwhile, commands this thread runs against
+    /// those shards use the held locks: an operation spanning several shards
+    /// runs as one step no other client can see half of.
+    ///
+    /// Locks are always taken in ascending shard order, and a thread already
+    /// holding shards only adds the missing ones — so two lockers cannot
+    /// deadlock as long as every multi-lock goes through here. Solo mode has
+    /// nothing to lock: its single thread runs one command at a time.
+    pub fn lock_shards(&self, indices: impl IntoIterator<Item = usize>) -> HeldShards<'_> {
+        let mut idx: Vec<usize> = indices
+            .into_iter()
+            .filter(|&i| i < self.num_shards)
+            .collect();
+        if self.solo {
+            idx.clear();
+        }
+        idx.sort_unstable();
+        idx.dedup();
+
+        let me = Arc::as_ptr(&self.shared) as usize;
+        let owner = HELD_OWNER.with(|o| o.get());
+        let outermost = owner == 0;
+        if !outermost && owner != me {
+            // Another manager's shards are held (a scratch engine inside a
+            // replay): unrelated locks, never nested in practice.
+            tracing::error!("lock_shards: this thread already holds another manager's shards");
+        }
+        let mut guards = Vec::with_capacity(idx.len());
+        for i in idx {
+            if !outermost && held_store(&self.shared, i as u32).is_some() {
+                continue;
+            }
+            let StoreBackend::Locked { store, .. } = self.shards[i].backend.as_ref() else {
+                continue;
+            };
+            guards.push((i as u32, store.lock()));
+        }
+        HELD.with(|h| {
+            let mut h = h.borrow_mut();
+            if outermost {
+                h.owner = me;
+                h.stores.clear();
+                h.stores.resize(self.num_shards, std::ptr::null_mut());
+            }
+            for (i, g) in guards.iter_mut() {
+                h.stores[*i as usize] = &mut **g as *mut ShardStore;
+            }
+        });
+        if outermost {
+            HELD_OWNER.with(|o| o.set(me));
+        }
+        HeldShards { guards, outermost }
+    }
+
+    /// [`lock_shards`](Self::lock_shards) for the shards owning `keys`.
+    pub fn lock_keys<'k>(&self, keys: impl IntoIterator<Item = &'k [u8]>) -> HeldShards<'_> {
+        let idx: Vec<usize> = keys
+            .into_iter()
+            .map(|k| self.shard_index_for_key(k))
+            .collect();
+        self.lock_shards(idx)
+    }
+
+    /// [`lock_shards`](Self::lock_shards) for every shard.
+    pub fn lock_all(&self) -> HeldShards<'_> {
+        self.lock_shards(0..self.num_shards)
     }
 
     #[inline]
@@ -418,12 +635,15 @@ impl ShardManager {
         self.num_shards
     }
 
+    /// Every key of database 0 (the cluster dump; clusters have only 0).
     pub fn scan_all(&self) -> Vec<(bytes::Bytes, String, Option<u64>)> {
         let mut results = Vec::new();
         for shard in &self.shards {
             let shard_data = shard.with_store(|store| {
                 store
-                    .iter()
+                    .iter_all()
+                    .filter(|(db, _, _)| *db == 0)
+                    .map(|(_, k, e)| (k, e))
                     .map(|(key, entry)| {
                         let r#type = match &entry.value {
                             solikv_core::types::RedisValue::String(_) => "string",
@@ -445,15 +665,71 @@ impl ShardManager {
     }
 }
 
-/// FNV-1a 64-bit — cheap, well-distributed for short Redis keys.
-#[inline]
-fn fast_shard_hash(key: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-    let mut h = FNV_OFFSET;
-    for &b in key {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_sharing_a_hash_tag_share_a_shard() {
+        let m = ShardManager::new(16);
+        let a = m.shard_index_for_key(b"{user:1}:name");
+        let b = m.shard_index_for_key(b"{user:1}:email");
+        assert_eq!(a, b);
+        assert_eq!(
+            m.shard_index_for_key(b"foo"),
+            solikv_core::keyspace::hash_slot(b"foo") as usize % 16
+        );
     }
-    h
+
+    #[test]
+    fn held_shards_are_reentrant_and_released() {
+        let m = ShardManager::new(4);
+        {
+            let _outer = m.lock_shards([2, 0, 2]);
+            // A command against a held shard does not deadlock.
+            let r = m
+                .shard(0)
+                .execute(|s| CommandResponse::integer(s.dbsize() as i64));
+            assert!(matches!(r, CommandResponse::Integer(0)));
+            // Nested: adds shard 3, keeps 0 and 2.
+            {
+                let _inner = m.lock_shards([0, 3]);
+                m.shard(3).execute(|_| CommandResponse::ok());
+            }
+            m.shard(2).execute(|_| CommandResponse::ok());
+        }
+        // Every lock is free again: another thread can take them.
+        let m = Arc::new(m);
+        let m2 = m.clone();
+        std::thread::spawn(move || {
+            let _all = m2.lock_all();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn commands_run_in_the_current_database() {
+        let m = ShardManager::new(1);
+        {
+            let _db = DbGuard::enter(5);
+            m.shard(0).execute(|s| {
+                s.set(
+                    Bytes::from("k"),
+                    solikv_core::RedisValue::String(Bytes::from("v")),
+                    None,
+                );
+                CommandResponse::ok()
+            });
+        }
+        let n0 = m
+            .shard(0)
+            .execute(|s| CommandResponse::integer(s.dbsize() as i64));
+        assert!(matches!(n0, CommandResponse::Integer(0)));
+        let _db = DbGuard::enter(5);
+        let n5 = m
+            .shard(0)
+            .execute(|s| CommandResponse::integer(s.dbsize() as i64));
+        assert!(matches!(n5, CommandResponse::Integer(1)));
+    }
 }

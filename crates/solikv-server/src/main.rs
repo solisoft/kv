@@ -75,6 +75,11 @@ struct Args {
     #[arg(long, default_value = "67108864", value_name = "BYTES")]
     lua_memory_limit: usize,
 
+    /// Number of logical databases (SELECT 0 … n-1). Cluster mode uses
+    /// database 0 only.
+    #[arg(long, default_value_t = solikv_engine::dispatch::DEFAULT_DATABASES)]
+    databases: u32,
+
     /// Daemon mode log file (default: <dir>/solikv.log)
     #[arg(long, value_name = "PATH")]
     logfile: Option<PathBuf>,
@@ -755,9 +760,11 @@ async fn async_main(args: Args) {
     let engine = solikv_engine::CommandEngine::new(shards.clone(), pubsub.clone())
         .with_notify_flags(notify_flags)
         .with_lua_memory_limit(args.lua_memory_limit)
+        .with_databases(args.databases)
         .with_persistence(persistence.clone());
     let engine = Arc::new(engine);
     engine.init_self_ref(Arc::downgrade(&engine));
+    engine.set_tcp_port(args.port);
 
     // --- Import Redis RDB if requested ---
     if let Some(ref redis_rdb_path) = args.import_redis_rdb {

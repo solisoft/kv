@@ -452,6 +452,20 @@ impl ShardStore {
         id_input: StreamIdInput,
         count: Option<usize>,
     ) -> CommandResponse {
+        self.stream_xreadgroup_opts(key, group, consumer_name, id_input, count, false)
+    }
+
+    /// `XREADGROUP` on one stream; with `noack`, new entries are delivered
+    /// without entering the pending list (Redis' `NOACK`).
+    pub fn stream_xreadgroup_opts(
+        &mut self,
+        key: &Bytes,
+        group: &Bytes,
+        consumer_name: &Bytes,
+        id_input: StreamIdInput,
+        count: Option<usize>,
+        noack: bool,
+    ) -> CommandResponse {
         match self.get_stream_mut(key) {
             Err(e) => e,
             Ok(None) => {
@@ -506,6 +520,12 @@ impl ShardStore {
                         grp.last_delivered_id = last_delivered;
 
                         for (id, _) in &entries_data {
+                            if noack {
+                                if let Some(c) = grp.consumers.get_mut(consumer_name) {
+                                    c.seen_time = now;
+                                }
+                                continue;
+                            }
                             grp.pending.insert(
                                 *id,
                                 PendingEntry {

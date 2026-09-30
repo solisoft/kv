@@ -166,6 +166,10 @@ pub async fn run_with_limits(
         // TCP_NODELAY: disable Nagle's algorithm for lower latency. Set on
         // the underlying TcpStream before any TLS wrap.
         let _ = socket.set_nodelay(true);
+        let local_addr = socket
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
 
         let engine = engine.clone();
         let pubsub = pubsub.clone();
@@ -204,6 +208,7 @@ pub async fn run_with_limits(
                 engine,
                 pubsub,
                 peer_addr,
+                local_addr,
                 password,
                 cluster,
                 auth_tracker,
@@ -225,6 +230,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     engine: Arc<CommandEngine>,
     pubsub: Arc<PubSubBroker>,
     peer_addr: std::net::SocketAddr,
+    local_addr: String,
     password: Option<Arc<String>>,
     cluster: Option<Arc<ClusterManager>>,
     auth_tracker: Arc<AuthFailureTracker>,
@@ -236,6 +242,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     let mut read_buf = BytesMut::with_capacity(65536);
     let mut write_buf = BytesMut::with_capacity(65536);
     let mut conn = ClientConnection::new(peer_addr, password.is_some());
+    // Database, MULTI queue, watches, CLIENT metadata: engine-side state.
+    let mut session = engine.new_session(peer_addr.to_string(), local_addr);
+    let info = session.info.clone();
 
     loop {
         // ── Phase 1: Decode all complete frames from buffer ──
@@ -274,24 +283,38 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 let _ = socket.write_all(&write_buf).await;
                 return Err("read buffer exceeded maximum size".into());
             }
-            let read = socket.read_buf(&mut read_buf);
+            if info.is_killed() {
+                return Ok(());
+            }
+            let read = async {
+                // `CLIENT KILL` from another connection ends this one even
+                // while it waits for input.
+                tokio::select! {
+                    r = socket.read_buf(&mut read_buf) => Some(r),
+                    _ = info.killed() => None,
+                }
+            };
             let n = match (conn.authenticated, auth_deadline, limits.idle_timeout) {
                 // Not yet authenticated: the whole connection has until the
                 // deadline, not each read — a byte every few seconds must not
                 // keep a slot forever.
                 (false, Some(deadline), _) => match tokio::time::timeout_at(deadline, read).await {
-                    Ok(n) => n?,
+                    Ok(n) => n,
                     Err(_) => {
                         tracing::debug!("{} did not authenticate in time", peer_addr);
                         return Ok(());
                     }
                 },
                 (true, _, Some(idle)) => match tokio::time::timeout(idle, read).await {
-                    Ok(n) => n?,
+                    Ok(n) => n,
                     Err(_) => return Ok(()),
                 },
-                _ => read.await?,
+                _ => read.await,
             };
+            let Some(n) = n else {
+                return Ok(()); // killed
+            };
+            let n = n?;
             if n == 0 {
                 return Ok(()); // EOF
             }
@@ -315,21 +338,25 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         // ── Phase 3: Execute commands ──
         // Fast path: all commands are pure engine commands (no MULTI/EXEC/SUBSCRIBE/AUTH)
         // This is the common case for pipelined benchmarks
+        if let Some(last) = commands.last() {
+            info.touch(&last.name, commands.len());
+        }
         let fast_path = conn.authenticated
-            && !conn.in_transaction
+            && !session.in_multi()
             && commands.iter().all(|cmd| {
                 !matches!(
                     cmd.name.as_str(),
                     "MULTI"
-                        | "EXEC"
-                        | "DISCARD"
                         | "SUBSCRIBE"
                         | "UNSUBSCRIBE"
                         | "PSUBSCRIBE"
                         | "PUNSUBSCRIBE"
                         | "QUIT"
                         | "AUTH"
+                        | "HELLO"
                         | "CLUSTER"
+                        | "SELECT"
+                        | "RESET"
                 )
             });
 
@@ -342,13 +369,15 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     encode_frame(&moved_frame, &mut write_buf);
                     continue;
                 }
-                let resp = engine.execute(&cmd.name, &cmd.args);
-                encode_frame(&command_response_to_frame(resp), &mut write_buf);
+                let resp = engine.execute_session(&mut session, &cmd.name, &cmd.args);
+                if session.reply_allowed() {
+                    encode_frame(&command_response_to_frame(resp), &mut write_buf);
+                }
             }
         } else {
             // Slow path: sequential processing with connection state
             for cmd in commands {
-                // Handle AUTH command
+                // AUTH [username] password
                 if cmd.name == "AUTH" {
                     let ip = peer_addr.ip().to_string();
                     if auth_tracker.is_blocked(&ip) {
@@ -360,35 +389,51 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         socket.write_all(&write_buf).await?;
                         return Ok(());
                     }
-                    match &password {
-                        None => {
-                            encode_frame(
-                                &RespFrame::error("ERR Client sent AUTH, but no password is set"),
-                                &mut write_buf,
-                            );
+                    let frame = match check_auth(&password, &cmd.args) {
+                        Ok(()) => {
+                            conn.authenticated = true;
+                            auth_tracker.record_success(&ip);
+                            RespFrame::ok()
                         }
-                        Some(pass) => {
-                            if cmd.args.len() != 1 {
-                                encode_frame(
-                                    &RespFrame::error(
-                                        "ERR wrong number of arguments for 'auth' command",
-                                    ),
-                                    &mut write_buf,
-                                );
-                            } else if constant_time_eq(&cmd.args[0], pass.as_bytes()) {
-                                conn.authenticated = true;
-                                auth_tracker.record_success(&ip);
-                                encode_frame(&RespFrame::ok(), &mut write_buf);
-                            } else {
-                                auth_tracker.record_failure(&ip);
-                                tracing::warn!("Failed AUTH attempt from {}", ip);
-                                encode_frame(
-                                    &RespFrame::error("ERR invalid password"),
-                                    &mut write_buf,
-                                );
-                            }
+                        Err(AuthError::Arity) => {
+                            RespFrame::error("ERR wrong number of arguments for 'auth' command")
                         }
+                        Err(AuthError::NoPassword) => RespFrame::error(
+                            "ERR AUTH <password> called without any password configured for \
+                             the default user. Are you sure your configuration is correct?",
+                        ),
+                        Err(AuthError::Wrong) => {
+                            auth_tracker.record_failure(&ip);
+                            tracing::warn!("Failed AUTH attempt from {}", ip);
+                            RespFrame::error(WRONGPASS)
+                        }
+                    };
+                    encode_frame(&frame, &mut write_buf);
+                    continue;
+                }
+
+                // HELLO [protover [AUTH user pass] [SETNAME name]]
+                if cmd.name == "HELLO" {
+                    let ip = peer_addr.ip().to_string();
+                    if auth_tracker.is_blocked(&ip) {
+                        encode_frame(
+                            &RespFrame::error("ERR too many failures, please wait"),
+                            &mut write_buf,
+                        );
+                        socket.write_all(&write_buf).await?;
+                        return Ok(());
                     }
+                    let frame = hello(
+                        &cmd.args,
+                        &password,
+                        &mut conn.authenticated,
+                        &auth_tracker,
+                        &ip,
+                        &engine,
+                        &mut session,
+                        cluster.is_some(),
+                    );
+                    encode_frame(&frame, &mut write_buf);
                     continue;
                 }
 
@@ -402,7 +447,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 }
 
                 match cmd.name.as_str() {
-                    "SUBSCRIBE" => {
+                    "SUBSCRIBE" if !session.in_multi() => {
                         // Enter pubsub mode — send confirmations, then enter delivery loop
                         for channel in &cmd.args {
                             conn.subscriptions.push(channel.clone());
@@ -430,10 +475,11 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                             &mut conn,
                             &mut read_buf,
                             &password,
+                            &info,
                         )
                         .await;
                     }
-                    "PSUBSCRIBE" => {
+                    "PSUBSCRIBE" if !session.in_multi() => {
                         for pattern_bytes in &cmd.args {
                             let pattern =
                                 std::str::from_utf8(pattern_bytes).unwrap_or("").to_string();
@@ -461,10 +507,11 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                             &mut conn,
                             &mut read_buf,
                             &password,
+                            &info,
                         )
                         .await;
                     }
-                    "UNSUBSCRIBE" => {
+                    "UNSUBSCRIBE" if !session.in_multi() => {
                         if cmd.args.is_empty() {
                             conn.subscriptions.clear();
                         } else {
@@ -484,7 +531,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         );
                         continue;
                     }
-                    "PUNSUBSCRIBE" => {
+                    "PUNSUBSCRIBE" if !session.in_multi() => {
                         if cmd.args.is_empty() {
                             conn.psubscriptions.clear();
                         } else {
@@ -503,48 +550,6 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                             ]),
                             &mut write_buf,
                         );
-                        continue;
-                    }
-                    "MULTI" => {
-                        conn.in_transaction = true;
-                        conn.tx_queue.clear();
-                        encode_frame(&RespFrame::ok(), &mut write_buf);
-                        continue;
-                    }
-                    "EXEC" => {
-                        if !conn.in_transaction {
-                            encode_frame(
-                                &RespFrame::error("ERR EXEC without MULTI"),
-                                &mut write_buf,
-                            );
-                            continue;
-                        }
-                        let queue = std::mem::take(&mut conn.tx_queue);
-                        conn.in_transaction = false;
-
-                        let mut results = Vec::new();
-                        // Bracket the batch in the log (no `.await` inside).
-                        let tx = engine.aof_transaction();
-                        for args in queue {
-                            let name = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
-                            let cmd_args: Vec<Bytes> = args[1..].to_vec();
-                            let resp = engine.execute(&name, &cmd_args);
-                            results.push(command_response_to_frame(resp));
-                        }
-                        drop(tx);
-                        encode_frame(&RespFrame::Array(results), &mut write_buf);
-                        continue;
-                    }
-                    "DISCARD" => {
-                        if !conn.in_transaction {
-                            encode_frame(
-                                &RespFrame::error("ERR DISCARD without MULTI"),
-                                &mut write_buf,
-                            );
-                        } else {
-                            conn.reset_transaction();
-                            encode_frame(&RespFrame::ok(), &mut write_buf);
-                        }
                         continue;
                     }
                     "QUIT" => {
@@ -744,23 +749,32 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     _ => {}
                 }
 
-                // Queue in transaction or execute
-                if conn.in_transaction {
-                    let mut full_args = vec![Bytes::from(cmd.name.clone())];
-                    full_args.extend(cmd.args.clone());
-                    conn.tx_queue.push(full_args);
+                // Cluster mode has database 0 only, as in Redis.
+                if cmd.name == "SELECT"
+                    && cluster.is_some()
+                    && cmd.args.first().is_some_and(|a| a.as_ref() != b"0")
+                {
                     encode_frame(
-                        &RespFrame::SimpleString(Bytes::from("QUEUED")),
+                        &RespFrame::error("ERR SELECT is not allowed in cluster mode"),
                         &mut write_buf,
                     );
-                } else {
-                    // Check for MOVED redirect in cluster mode
+                    continue;
+                }
+                // Queued inside MULTI (the engine queues), or run now.
+                if !session.in_multi() {
                     if let Some(moved_frame) = check_cluster_moved(&cluster, &cmd.name, &cmd.args) {
                         encode_frame(&moved_frame, &mut write_buf);
-                    } else {
-                        let response = engine.execute(&cmd.name, &cmd.args);
-                        encode_frame(&command_response_to_frame(response), &mut write_buf);
+                        continue;
                     }
+                }
+                let response = engine.execute_session(&mut session, &cmd.name, &cmd.args);
+                if cmd.name == "RESET" {
+                    // Back to the default user: with a password, that is
+                    // unauthenticated.
+                    conn.authenticated = password.is_none();
+                }
+                if session.reply_allowed() {
+                    encode_frame(&command_response_to_frame(response), &mut write_buf);
                 }
             }
         }
@@ -788,7 +802,28 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut ClientConnection,
     read_buf: &mut BytesMut,
     _password: &Option<Arc<String>>,
+    info: &Arc<solikv_engine::session::ClientInfo>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // `CLIENT LIST` shows the subscription counts; zeroed when this returns.
+    struct SubCounts<'a>(&'a solikv_engine::session::ClientInfo);
+    impl Drop for SubCounts<'_> {
+        fn drop(&mut self) {
+            self.0.subs.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.0.psubs.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _counts = SubCounts(info);
+    let publish_counts = |conn: &ClientConnection| {
+        info.subs.store(
+            conn.subscriptions.len() as u32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        info.psubs.store(
+            conn.psubscriptions.len() as u32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    };
+    publish_counts(conn);
     let (fan_tx, mut fan_rx) = mpsc::unbounded_channel::<PubSubMessage>();
     let mut write_buf = BytesMut::with_capacity(65536);
 
@@ -812,6 +847,12 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
 
     loop {
         tokio::select! {
+            // Ended by `CLIENT KILL`.
+            _ = info.killed() => {
+                for (_, h) in channel_tasks.drain() { h.abort(); }
+                for (_, h) in pattern_tasks.drain() { h.abort(); }
+                return Ok(());
+            }
             // Branch 1: incoming message from any subscription
             msg = fan_rx.recv() => {
                 let Some(msg) = msg else { break; };
@@ -1065,6 +1106,7 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                         }
                     }
                 }
+                publish_counts(conn);
 
                 if !write_buf.is_empty() {
                     socket.write_all(&write_buf).await?;
@@ -1211,6 +1253,128 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Convert our CommandResponse to a RESP frame for the wire.
+/// Redis 6+'s reply to a failed AUTH.
+const WRONGPASS: &str = "WRONGPASS invalid username-password pair or user is disabled.";
+
+enum AuthError {
+    Arity,
+    NoPassword,
+    Wrong,
+}
+
+/// `AUTH password` or `AUTH username password`. There is one user,
+/// `default` (ACLs are not implemented): any other name is refused like a
+/// wrong password, so URLs of the form `redis://default:pw@host` work.
+fn check_auth(password: &Option<Arc<String>>, args: &[Bytes]) -> Result<(), AuthError> {
+    let (user, pass) = match args {
+        [pass] => (None, pass),
+        [user, pass] => (Some(user), pass),
+        _ => return Err(AuthError::Arity),
+    };
+    if user.is_some_and(|u| u.as_ref() != b"default") {
+        return Err(AuthError::Wrong);
+    }
+    match password {
+        // No password: `AUTH pw` is an error; `AUTH default <anything>`
+        // succeeds, as for Redis' passwordless default user.
+        None if user.is_none() => Err(AuthError::NoPassword),
+        None => Ok(()),
+        Some(expected) if constant_time_eq(pass, expected.as_bytes()) => Ok(()),
+        Some(_) => Err(AuthError::Wrong),
+    }
+}
+
+/// `HELLO [protover [AUTH username password] [SETNAME clientname]]`.
+/// Only RESP2 is spoken: `HELLO 3` gets `NOPROTO`, which clients take as
+/// "fall back to RESP2".
+#[allow(clippy::too_many_arguments)]
+fn hello(
+    args: &[Bytes],
+    password: &Option<Arc<String>>,
+    authenticated: &mut bool,
+    tracker: &AuthFailureTracker,
+    ip: &str,
+    engine: &CommandEngine,
+    session: &mut solikv_engine::Session,
+    cluster: bool,
+) -> RespFrame {
+    let mut i = 0;
+    if let Some(v) = args.first() {
+        match std::str::from_utf8(v)
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+        {
+            Some(2) => {}
+            Some(_) => return RespFrame::error("NOPROTO unsupported protocol version"),
+            None => {
+                return RespFrame::error("ERR Protocol version is not an integer or out of range")
+            }
+        }
+        i = 1;
+    }
+    let mut setname: Option<Bytes> = None;
+    while i < args.len() {
+        let opt = String::from_utf8_lossy(&args[i]).to_ascii_uppercase();
+        match opt.as_str() {
+            "AUTH" if i + 2 < args.len() => {
+                match check_auth(password, &args[i + 1..i + 3]) {
+                    Ok(()) => {
+                        *authenticated = true;
+                        tracker.record_success(ip);
+                    }
+                    Err(AuthError::Wrong) => {
+                        tracker.record_failure(ip);
+                        tracing::warn!("Failed AUTH attempt from {}", ip);
+                        return RespFrame::error(WRONGPASS);
+                    }
+                    Err(_) => return RespFrame::error(WRONGPASS),
+                }
+                i += 3;
+            }
+            "SETNAME" if i + 1 < args.len() => {
+                setname = Some(args[i + 1].clone());
+                i += 2;
+            }
+            _ => {
+                return RespFrame::error(format!(
+                    "ERR Syntax error in HELLO option '{}'",
+                    opt.to_lowercase()
+                ))
+            }
+        }
+    }
+    if !*authenticated {
+        return RespFrame::error(
+            "NOAUTH HELLO must be called with the client already authenticated, otherwise the \
+             HELLO <proto> AUTH <user> <pass> option can be used to authenticate the client and \
+             select the RESP protocol version at the same time",
+        );
+    }
+    if let Some(name) = setname {
+        let r = engine.execute_session(session, "CLIENT", &[Bytes::from_static(b"SETNAME"), name]);
+        if let CommandResponse::Error(e) = r {
+            return RespFrame::Error(e);
+        }
+    }
+    let bulk = |s: &str| RespFrame::BulkString(Bytes::from(s.to_string()));
+    RespFrame::Array(vec![
+        bulk("server"),
+        bulk("redis"),
+        bulk("version"),
+        bulk("7.2.0"),
+        bulk("proto"),
+        RespFrame::Integer(2),
+        bulk("id"),
+        RespFrame::Integer(session.info.id as i64),
+        bulk("mode"),
+        bulk(if cluster { "cluster" } else { "standalone" }),
+        bulk("role"),
+        bulk("master"),
+        bulk("modules"),
+        RespFrame::Array(vec![]),
+    ])
+}
+
 fn command_response_to_frame(resp: CommandResponse) -> RespFrame {
     match resp {
         CommandResponse::Ok => RespFrame::ok(),

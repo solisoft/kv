@@ -3,6 +3,18 @@ use bytes::{Bytes, BytesMut};
 use crate::store::ShardStore;
 use crate::types::*;
 
+/// Options of `SET key value [NX|XX] [GET] [EX|PX|EXAT|PXAT|KEEPTTL]`,
+/// already validated.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SetOptions {
+    /// Absolute expiry in ms (any of EX/PX/EXAT/PXAT, resolved by the caller).
+    pub expire_at: Option<u64>,
+    pub keep_ttl: bool,
+    pub nx: bool,
+    pub xx: bool,
+    pub get: bool,
+}
+
 impl ShardStore {
     // ---- GET ----
     #[inline]
@@ -54,6 +66,36 @@ impl ShardStore {
 
         self.set(key, RedisValue::String(value), expire_ms);
 
+        old.unwrap_or(CommandResponse::ok())
+    }
+
+    /// SET with every option (see [`SetOptions`]).
+    pub fn string_set_opts(&mut self, key: Bytes, value: Bytes, o: SetOptions) -> CommandResponse {
+        let old = if o.get {
+            match self.get(&key) {
+                Some(entry) => match &entry.value {
+                    RedisValue::String(v) => Some(CommandResponse::bulk(v.clone())),
+                    _ => return CommandResponse::wrong_type(),
+                },
+                None => Some(CommandResponse::nil()),
+            }
+        } else {
+            None
+        };
+        if o.nx || o.xx {
+            let exists = match &old {
+                Some(prev) => !matches!(prev, CommandResponse::Nil),
+                None => self.exists(&key),
+            };
+            if (o.nx && exists) || (o.xx && !exists) {
+                return old.unwrap_or(CommandResponse::nil());
+            }
+        }
+        match (o.expire_at, o.keep_ttl) {
+            (Some(at), _) => self.set_with_absolute_expiry(key, RedisValue::String(value), at),
+            (None, true) => self.set_keep_ttl(&key, RedisValue::String(value)),
+            (None, false) => self.set(key, RedisValue::String(value), None),
+        }
         old.unwrap_or(CommandResponse::ok())
     }
 
@@ -135,6 +177,33 @@ impl ShardStore {
         }
     }
 
+    /// GETEX with an absolute expiry (`expire_at`, ms) or `persist`. An
+    /// expiry already in the past deletes the key, as in Redis.
+    pub fn string_getex_at(
+        &mut self,
+        key: &Bytes,
+        expire_at: Option<u64>,
+        persist: bool,
+    ) -> CommandResponse {
+        let result = match self.get(key) {
+            None => return CommandResponse::nil(),
+            Some(entry) => match &entry.value {
+                RedisValue::String(v) => CommandResponse::bulk(v.clone()),
+                _ => return CommandResponse::wrong_type(),
+            },
+        };
+        if persist {
+            self.persist(key);
+        } else if let Some(at) = expire_at {
+            if at <= now_millis() {
+                self.del(key);
+            } else {
+                self.expire_at(key, at);
+            }
+        }
+        result
+    }
+
     // ---- MGET ----
     pub fn string_mget(&mut self, keys: &[Bytes]) -> CommandResponse {
         let results: Vec<CommandResponse> = keys.iter().map(|k| self.string_get(k)).collect();
@@ -199,11 +268,7 @@ impl ShardStore {
 
         match current.checked_add(delta) {
             Some(new_val) => {
-                self.set(
-                    key.clone(),
-                    RedisValue::String(Bytes::from(new_val.to_string())),
-                    None,
-                );
+                self.set_keep_ttl(key, RedisValue::String(Bytes::from(new_val.to_string())));
                 CommandResponse::integer(new_val)
             }
             None => CommandResponse::error("ERR increment or decrement would overflow"),
@@ -232,16 +297,15 @@ impl ShardStore {
         };
 
         let new_val = current + delta;
-        let formatted = if new_val == new_val.trunc() {
+        if !new_val.is_finite() {
+            return CommandResponse::error("ERR increment would produce NaN or Infinity");
+        }
+        let formatted = if new_val == new_val.trunc() && new_val.abs() < 1e17 {
             format!("{}", new_val as i64)
         } else {
             format!("{}", new_val)
         };
-        self.set(
-            key.clone(),
-            RedisValue::String(Bytes::from(formatted.clone())),
-            None,
-        );
+        self.set_keep_ttl(key, RedisValue::String(Bytes::from(formatted.clone())));
         CommandResponse::bulk(Bytes::from(formatted))
     }
 
@@ -259,7 +323,7 @@ impl ShardStore {
                     new_val.extend_from_slice(value);
                     let new_bytes = new_val.freeze();
                     let len = new_bytes.len() as i64;
-                    self.set(key.clone(), RedisValue::String(new_bytes), None);
+                    self.set_keep_ttl(key, RedisValue::String(new_bytes));
                     CommandResponse::integer(len)
                 }
                 _ => CommandResponse::wrong_type(),
@@ -323,6 +387,10 @@ impl ShardStore {
                 _ => return CommandResponse::wrong_type(),
             },
         };
+        // Redis: an empty value changes nothing (and creates no key).
+        if value.is_empty() {
+            return CommandResponse::integer(current.len() as i64);
+        }
 
         // Checked, and capped like Redis' proto-max-bulk-len: `offset` comes
         // from the client, and `usize::MAX + len` used to wrap to a small
@@ -351,7 +419,7 @@ impl ShardStore {
         }
 
         let new_len = buf.len() as i64;
-        self.set(key.clone(), RedisValue::String(buf.freeze()), None);
+        self.set_keep_ttl(key, RedisValue::String(buf.freeze()));
         CommandResponse::integer(new_len)
     }
     // ---- SETBIT ----
@@ -384,7 +452,7 @@ impl ShardStore {
             buf[byte_offset] &= !(1 << bit_pos);
         }
 
-        self.set(key.clone(), RedisValue::String(buf.freeze()), None);
+        self.set_keep_ttl(key, RedisValue::String(buf.freeze()));
         CommandResponse::integer(old_bit as i64)
     }
 

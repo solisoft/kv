@@ -189,9 +189,9 @@ impl Persistence {
         }
         let mut keys = 0u64;
         let mut batch = Router::new(shards);
-        let files = rdb::load_rdb(&self.cfg.dir, &self.cfg.dbfilename, |k, e| {
+        let files = rdb::load_rdb(&self.cfg.dir, &self.cfg.dbfilename, |db, k, e| {
             keys += 1;
-            batch.push(k, e);
+            batch.push(db, k, e);
         })?;
         batch.flush();
         report.keys = keys;
@@ -208,7 +208,7 @@ impl Persistence {
     ) -> io::Result<(u64, u64)> {
         let mut scratch: Vec<Scratch> = (0..m.shards).map(|_| Scratch::new()).collect();
         if let Some(b) = m.base {
-            rdb::load_snapshot_file(&aof::base_path(aof_dir, b), |section, k, e| {
+            rdb::load_snapshot_file(&aof::base_path(aof_dir, b), |section, db, k, e| {
                 let s = scratch.get_mut(section as usize).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -218,7 +218,7 @@ impl Persistence {
                         ),
                     )
                 })?;
-                s.insert(k, e);
+                s.insert(db, k, e);
                 Ok(())
             })?;
         }
@@ -229,6 +229,7 @@ impl Persistence {
                 if !path.exists() {
                     continue;
                 }
+                store.next_file();
                 let outcome = aof::replay_log(&path, |args| store.apply(args))?;
                 records += outcome.commands;
                 if let Some(len) = outcome.truncated_at {
@@ -643,6 +644,9 @@ fn unix_now() -> u64 {
 /// One old shard's data, replayed in isolation.
 struct Scratch {
     engine: Arc<CommandEngine>,
+    /// Database the log being replayed is in (its `SELECT` records). Every
+    /// file starts in database 0.
+    db: u32,
 }
 
 impl Scratch {
@@ -652,31 +656,46 @@ impl Scratch {
             Arc::new(PubSubBroker::new()),
         ));
         engine.init_self_ref(Arc::downgrade(&engine));
-        Self { engine }
+        Self { engine, db: 0 }
     }
 
-    fn insert(&mut self, key: Bytes, entry: KeyEntry) {
+    fn insert(&mut self, db: u32, key: Bytes, entry: KeyEntry) {
         self.engine
             .shards
             .shard(0)
-            .with_store_mut_unlogged(|s| s.insert_entry(key, entry));
+            .with_store_mut_unlogged(|s| s.insert_entry_in(db, key, entry));
     }
 
     fn apply(&mut self, args: Vec<Bytes>) {
         if args[0].as_ref() == PUT_RECORD.as_bytes() {
             if args.len() == 3 {
                 match rdb::decode_entry(&args[2]) {
-                    Ok(entry) => self.insert(args[1].clone(), entry),
+                    Ok(entry) => self.insert(self.db, args[1].clone(), entry),
                     Err(e) => tracing::error!("Skipping undecodable {} record: {}", PUT_RECORD, e),
                 }
             }
             return;
         }
         let name = String::from_utf8_lossy(&args[0]).to_uppercase();
-        let resp = self.engine.execute(&name, &args[1..]);
+        if name == "SELECT" {
+            match args
+                .get(1)
+                .and_then(|a| std::str::from_utf8(a).ok()?.parse::<u32>().ok())
+            {
+                Some(db) => self.db = db,
+                None => tracing::warn!("Replayed SELECT without a valid database"),
+            }
+            return;
+        }
+        let resp = self.engine.execute_in_db(self.db, &name, &args[1..]);
         if resp.is_error() {
             tracing::warn!("Replayed {} failed: {:?}", name, resp);
         }
+    }
+
+    /// Next file: logs start in database 0.
+    fn next_file(&mut self) {
+        self.db = 0;
     }
 
     /// Move every key to the shard that owns it in `shards`.
@@ -688,8 +707,8 @@ impl Scratch {
             .with_store_mut_unlogged(|s| s.drain_entries());
         let n = entries.len() as u64;
         let mut router = Router::new(shards);
-        for (k, e) in entries {
-            router.push(k, e);
+        for (db, k, e) in entries {
+            router.push(db, k, e);
         }
         router.flush();
         n
@@ -700,7 +719,7 @@ impl Scratch {
 /// per batch rather than once per key.
 struct Router<'a> {
     shards: &'a ShardManager,
-    pending: Vec<Vec<(Bytes, KeyEntry)>>,
+    pending: Vec<Vec<(u32, Bytes, KeyEntry)>>,
 }
 
 impl<'a> Router<'a> {
@@ -713,9 +732,9 @@ impl<'a> Router<'a> {
         }
     }
 
-    fn push(&mut self, key: Bytes, entry: KeyEntry) {
+    fn push(&mut self, db: u32, key: Bytes, entry: KeyEntry) {
         let i = self.shards.shard_index_for_key(&key);
-        self.pending[i].push((key, entry));
+        self.pending[i].push((db, key, entry));
         if self.pending[i].len() >= Self::BATCH {
             self.flush_one(i);
         }
@@ -724,9 +743,10 @@ impl<'a> Router<'a> {
     fn flush_one(&mut self, i: usize) {
         let batch = std::mem::take(&mut self.pending[i]);
         self.shards.shard(i).with_store_mut_unlogged(|s| {
-            for (k, e) in batch {
-                s.insert_entry(k, e);
+            for (db, k, e) in batch {
+                s.insert_entry_in(db, k, e);
             }
+            s.select(0);
         });
     }
 
@@ -748,7 +768,7 @@ pub fn insert_routed(
     let mut router = Router::new(shards);
     let mut n = 0;
     for (k, e) in entries {
-        router.push(k, e);
+        router.push(0, k, e);
         n += 1;
     }
     router.flush();
@@ -860,6 +880,97 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("rewrite did not finish");
+    }
+
+    fn in_db(e: &CommandEngine, db: u32, cmd: &[&str]) -> CommandResponse {
+        let args: Vec<Bytes> = cmd[1..].iter().map(|s| b(s)).collect();
+        e.execute_in_db(db, &cmd[0].to_uppercase(), &args)
+    }
+
+    fn get_in(e: &CommandEngine, db: u32, key: &str) -> Option<String> {
+        match in_db(e, db, &["GET", key]) {
+            CommandResponse::BulkString(v) => Some(String::from_utf8_lossy(&v).to_string()),
+            CommandResponse::Nil => None,
+            other => panic!("GET {key}: {other:?}"),
+        }
+    }
+
+    /// Keys in several databases come back in their databases, from the log
+    /// (SELECT records), from its rewrite (database markers in the base) and
+    /// from a snapshot; MOVE, SWAPDB and FLUSHDB replay per database.
+    #[test]
+    fn databases_survive_the_log_its_rewrite_and_snapshots() {
+        for appendonly in [true, false] {
+            let dir = TmpDir::new(if appendonly { "dbs-aof" } else { "dbs-rdb" });
+            let e = start(&dir.0, ShardManager::new(4), appendonly);
+            in_db(&e, 0, &["SET", "k", "zero"]);
+            in_db(&e, 3, &["SET", "k", "three"]);
+            in_db(&e, 3, &["RPUSH", "l", "a", "b"]);
+            in_db(&e, 7, &["SET", "gone", "x"]);
+            in_db(&e, 7, &["FLUSHDB"]);
+            in_db(&e, 3, &["SET", "mv", "m"]);
+            assert_eq!(int(in_db(&e, 3, &["MOVE", "mv", "4"])), 1);
+            if appendonly {
+                assert!(!run(&e, &["BGREWRITEAOF"]).is_error());
+                wait_rewrite(&e);
+            }
+            in_db(&e, 5, &["SET", "five", "5"]);
+            in_db(&e, 0, &["SWAPDB", "5", "6"]);
+            in_db(&e, 3, &["INCR", "n"]);
+            if !appendonly {
+                assert!(!run(&e, &["SAVE"]).is_error());
+            }
+            stop(&e);
+
+            // A different shard count, too.
+            let e = start(&dir.0, ShardManager::new(3), appendonly);
+            assert_eq!(get_in(&e, 0, "k").as_deref(), Some("zero"));
+            assert_eq!(get_in(&e, 3, "k").as_deref(), Some("three"));
+            assert_eq!(get_in(&e, 3, "n").as_deref(), Some("1"));
+            assert_eq!(get_in(&e, 4, "mv").as_deref(), Some("m"));
+            assert_eq!(get_in(&e, 3, "mv"), None);
+            assert_eq!(get_in(&e, 7, "gone"), None);
+            assert_eq!(get_in(&e, 5, "five"), None);
+            assert_eq!(get_in(&e, 6, "five").as_deref(), Some("5"));
+            assert_eq!(int(in_db(&e, 3, &["LLEN", "l"])), 2);
+            stop(&e);
+        }
+    }
+
+    /// RENAME, SMOVE and the STORE commands across shards are logged as
+    /// their effect on each shard and replay to the same state.
+    #[test]
+    fn cross_shard_writes_replay_exactly() {
+        let dir = TmpDir::new("xshard");
+        let m = ShardManager::new(4);
+        let a = "key:a";
+        let other = (0..)
+            .map(|i| format!("key:b{i}"))
+            .find(|k| m.shard_index_for_key(k.as_bytes()) != m.shard_index_for_key(a.as_bytes()))
+            .unwrap();
+        let e = start(&dir.0, m, true);
+        run(&e, &["SET", a, "v", "EX", "1000"]);
+        assert!(!run(&e, &["RENAME", a, &other]).is_error());
+        run(&e, &["SADD", "s1", "x", "y"]);
+        run(&e, &["SADD", "s2", "y"]);
+        assert_eq!(int(run(&e, &["SINTERSTORE", "si", "s1", "s2"])), 1);
+        assert_eq!(int(run(&e, &["SMOVE", "s1", "s3", "x"])), 1);
+        run(&e, &["ZADD", "z1", "1", "a"]);
+        run(&e, &["ZADD", "z2", "2", "a"]);
+        assert_eq!(int(run(&e, &["ZUNIONSTORE", "zu", "2", "z1", "z2"])), 1);
+        stop(&e);
+
+        let e = start(&dir.0, ShardManager::new(4), true);
+        assert_eq!(get(&e, a), None);
+        assert_eq!(get(&e, &other).as_deref(), Some("v"));
+        assert!(int(run(&e, &["TTL", &other])) > 900);
+        assert_eq!(int(run(&e, &["SCARD", "si"])), 1);
+        assert_eq!(int(run(&e, &["SISMEMBER", "s3", "x"])), 1);
+        assert_eq!(int(run(&e, &["SISMEMBER", "s1", "x"])), 0);
+        match run(&e, &["ZSCORE", "zu", "a"]) {
+            CommandResponse::BulkString(v) => assert_eq!(v, "3"),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The bug this module exists for: a snapshot plus the whole log replayed
