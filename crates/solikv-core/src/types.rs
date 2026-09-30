@@ -105,22 +105,42 @@ impl ZSetValue {
 
     /// Insert or update a member. Returns true if the member is new.
     pub fn insert(&mut self, score: f64, member: Bytes) -> bool {
-        let score = OrderedFloat(score);
-        match self.members.get_mut(&member) {
-            Some(old) => {
-                if *old == score {
-                    return false;
+        self.upsert(member, |_| Some(score)).0.is_none()
+    }
+
+    /// One hash lookup for `ZADD`'s read-decide-write: `decide` gets the
+    /// member's current score (if any) and returns the new one, or `None`
+    /// to leave it. Returns `(previous score, whether it changed)`.
+    pub fn upsert(
+        &mut self,
+        member: Bytes,
+        decide: impl FnOnce(Option<f64>) -> Option<f64>,
+    ) -> (Option<f64>, bool) {
+        match self.members.entry(member) {
+            indexmap::map::Entry::Occupied(mut e) => {
+                let old = *e.get();
+                match decide(Some(old.into_inner())) {
+                    Some(new) if OrderedFloat(new) != old => {
+                        let new = OrderedFloat(new);
+                        *e.get_mut() = new;
+                        let m = e.key().clone();
+                        self.scores.remove(&(old, m.clone()));
+                        self.scores.insert((new, m));
+                        (Some(old.into_inner()), true)
+                    }
+                    _ => (Some(old.into_inner()), false),
                 }
-                let prev = std::mem::replace(old, score);
-                self.scores.remove(&(prev, member.clone()));
-                self.scores.insert((score, member));
-                false
             }
-            None => {
-                self.members.insert(member.clone(), score);
-                self.scores.insert((score, member));
-                true
-            }
+            indexmap::map::Entry::Vacant(e) => match decide(None) {
+                Some(new) => {
+                    let new = OrderedFloat(new);
+                    let m = e.key().clone();
+                    e.insert(new);
+                    self.scores.insert((new, m));
+                    (None, true)
+                }
+                None => (None, false),
+            },
         }
     }
 

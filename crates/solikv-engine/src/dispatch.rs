@@ -111,7 +111,7 @@ fn parse_stream_trim(
     if i >= args.len() {
         return Ok(None);
     }
-    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+    let opt = Upper::new(&args[i]);
     match opt.as_str() {
         "MAXLEN" | "MINID" => {
             *start = i + 1;
@@ -1047,7 +1047,7 @@ impl CommandEngine {
                 let mut persist = false;
                 let mut i = 1;
                 while i < args.len() {
-                    let opt = String::from_utf8_lossy(&args[i]).to_ascii_uppercase();
+                    let opt = Upper::new(&args[i]);
                     match opt.as_str() {
                         "EX" | "PX" | "EXAT" | "PXAT" if expire_at.is_none() && !persist => {
                             i += 1;
@@ -1341,7 +1341,7 @@ impl CommandEngine {
                 };
                 let mut cond = solikv_core::store::ExpireCond::default();
                 for opt in &args[2..] {
-                    match String::from_utf8_lossy(opt).to_ascii_uppercase().as_str() {
+                    match Upper::new(opt).as_str() {
                         "NX" => cond.nx = true,
                         "XX" => cond.xx = true,
                         "GT" => cond.gt = true,
@@ -1549,7 +1549,7 @@ impl CommandEngine {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("object");
                 }
-                let sub = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
+                let sub = Upper::new(&args[0]);
                 match sub.as_str() {
                     "ENCODING" => {
                         if args.len() < 2 {
@@ -1754,7 +1754,7 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("linsert");
                 }
                 let key = args[0].clone();
-                let pos = std::str::from_utf8(&args[1]).unwrap_or("").to_uppercase();
+                let pos = Upper::new(&args[1]);
                 let before = match pos.as_str() {
                     "BEFORE" => true,
                     "AFTER" => false,
@@ -2407,7 +2407,7 @@ impl CommandEngine {
 
                 // Parse optional flags
                 while i < args.len() {
-                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                    let opt = Upper::new(&args[i]);
                     match opt.as_str() {
                         "NX" => {
                             nx = true;
@@ -2517,7 +2517,7 @@ impl CommandEngine {
                 let mut withhash = false;
 
                 while i < args.len() {
-                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                    let opt = Upper::new(&args[i]);
                     match opt.as_str() {
                         "FROMMEMBER" => {
                             i += 1;
@@ -2658,7 +2658,7 @@ impl CommandEngine {
                 let mut store_dist = false;
 
                 while i < args.len() {
-                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                    let opt = Upper::new(&args[i]);
                     match opt.as_str() {
                         "FROMMEMBER" => {
                             i += 1;
@@ -2792,7 +2792,7 @@ impl CommandEngine {
 
                 // Parse optional NOMKSTREAM
                 if i < args.len() {
-                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                    let opt = Upper::new(&args[i]);
                     if opt == "NOMKSTREAM" {
                         nomkstream = true;
                         i += 1;
@@ -2869,7 +2869,7 @@ impl CommandEngine {
                 };
                 let mut count = None;
                 if args.len() >= 5 {
-                    let opt = std::str::from_utf8(&args[3]).unwrap_or("").to_uppercase();
+                    let opt = Upper::new(&args[3]);
                     if opt == "COUNT" {
                         count = args
                             .get(4)
@@ -2908,7 +2908,7 @@ impl CommandEngine {
                 };
                 let mut count = None;
                 if args.len() >= 5 {
-                    let opt = std::str::from_utf8(&args[3]).unwrap_or("").to_uppercase();
+                    let opt = Upper::new(&args[3]);
                     if opt == "COUNT" {
                         count = args
                             .get(4)
@@ -2929,7 +2929,7 @@ impl CommandEngine {
 
                 // Parse options
                 while i < args.len() {
-                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                    let opt = Upper::new(&args[i]);
                     match opt.as_str() {
                         "COUNT" => {
                             i += 1;
@@ -3043,7 +3043,7 @@ impl CommandEngine {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("xinfo");
                 }
-                let sub = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
+                let sub = Upper::new(&args[0]);
                 match sub.as_str() {
                     "STREAM" => {
                         let key = args[1].clone();
@@ -3058,7 +3058,7 @@ impl CommandEngine {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("xgroup");
                 }
-                let sub = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
+                let sub = Upper::new(&args[0]);
                 match sub.as_str() {
                     "CREATE" => {
                         // XGROUP CREATE key group id|$ [MKSTREAM]
@@ -3080,9 +3080,7 @@ impl CommandEngine {
                         };
                         let mkstream = args
                             .get(4)
-                            .map(|a| {
-                                std::str::from_utf8(a).unwrap_or("").to_uppercase() == "MKSTREAM"
-                            })
+                            .map(|a| Upper::new(a) == "MKSTREAM")
                             .unwrap_or(false);
                         self.shards.shard_for_key(&key).execute(move |store| {
                             store.stream_xgroup_create(&key, group, id, mkstream)
@@ -3121,7 +3119,7 @@ impl CommandEngine {
                 }
                 let mut i = 0;
                 // Expect GROUP keyword
-                let kw = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                let kw = Upper::new(&args[i]);
                 if kw != "GROUP" {
                     return CommandResponse::syntax_error();
                 }
@@ -3135,7 +3133,7 @@ impl CommandEngine {
                 let mut noack = false;
 
                 while i < args.len() {
-                    let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
+                    let opt = Upper::new(&args[i]);
                     match opt.as_str() {
                         "COUNT" => {
                             i += 1;
@@ -3317,7 +3315,7 @@ impl CommandEngine {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("pubsub");
                 }
-                let sub = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
+                let sub = Upper::new(&args[0]);
                 match sub.as_str() {
                     "CHANNELS" => {
                         if args.len() > 2 {
@@ -3416,7 +3414,7 @@ impl CommandEngine {
                 // SHUTDOWN [NOSAVE|SAVE] [NOW] [FORCE] [ABORT]
                 let mut save = None;
                 for a in args {
-                    match std::str::from_utf8(a).unwrap_or("").to_uppercase().as_str() {
+                    match Upper::new(a).as_str() {
                         "NOSAVE" => save = Some(false),
                         "SAVE" => save = Some(true),
                         "NOW" | "FORCE" => {}
@@ -3525,7 +3523,7 @@ impl CommandEngine {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("script");
                 }
-                let sub = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
+                let sub = Upper::new(&args[0]);
                 match sub.as_str() {
                     "LOAD" => {
                         if args.len() != 2 {
@@ -3833,7 +3831,7 @@ impl CommandEngine {
                     return CommandResponse::wrong_arity("bitop");
                 }
                 let _held = self.shards.lock_keys(args[1..].iter().map(|k| k.as_ref()));
-                let op = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
+                let op = Upper::new(&args[0]);
                 let dest = args[1].clone();
                 let src_keys = &args[2..];
 
@@ -4123,7 +4121,7 @@ impl CommandEngine {
         let Some(sub) = args.first() else {
             return CommandResponse::wrong_arity("client");
         };
-        let sub = String::from_utf8_lossy(sub).to_ascii_uppercase();
+        let sub = Upper::new(sub);
         let rest = &args[1..];
         match sub.as_str() {
             "ID" => CommandResponse::integer(session.info.id as i64),
@@ -4147,7 +4145,7 @@ impl CommandEngine {
                 let [attr, value] = rest else {
                     return CommandResponse::wrong_arity("client|setinfo");
                 };
-                match String::from_utf8_lossy(attr).to_ascii_uppercase().as_str() {
+                match Upper::new(attr).as_str() {
                     "LIB-NAME" => session.set_lib(Some(value.clone()), None),
                     "LIB-VER" => session.set_lib(None, Some(value.clone())),
                     other => {
@@ -4168,7 +4166,7 @@ impl CommandEngine {
                 let mut ids: Option<Vec<u64>> = None;
                 let mut i = 0;
                 while i < rest.len() {
-                    let opt = String::from_utf8_lossy(&rest[i]).to_ascii_uppercase();
+                    let opt = Upper::new(&rest[i]);
                     match opt.as_str() {
                         "TYPE" if i + 1 < rest.len() => i += 2,
                         "ID" => {
@@ -4200,7 +4198,7 @@ impl CommandEngine {
                 let [mode] = rest else {
                     return CommandResponse::wrong_arity("client|reply");
                 };
-                match String::from_utf8_lossy(mode).to_ascii_uppercase().as_str() {
+                match Upper::new(mode).as_str() {
                     "ON" => {
                         session.reply = ReplyMode::On;
                         CommandResponse::ok()
@@ -4271,7 +4269,7 @@ impl CommandEngine {
         let mut laddr: Option<String> = None;
         let mut skip_me = true;
         for pair in rest.chunks(2) {
-            let opt = String::from_utf8_lossy(&pair[0]).to_ascii_uppercase();
+            let opt = Upper::new(&pair[0]);
             let val = String::from_utf8_lossy(&pair[1]).to_string();
             match opt.as_str() {
                 "ID" => match val.parse() {
@@ -4578,7 +4576,7 @@ impl CommandEngine {
                 crate::commands::all().iter().map(command_info).collect(),
             );
         };
-        match String::from_utf8_lossy(sub).to_ascii_uppercase().as_str() {
+        match Upper::new(sub).as_str() {
             "COUNT" => CommandResponse::integer(crate::commands::all().len() as i64),
             "INFO" => {
                 if args.len() == 1 {
@@ -4590,7 +4588,7 @@ impl CommandEngine {
                     args[1..]
                         .iter()
                         .map(|n| {
-                            let n = String::from_utf8_lossy(n).to_ascii_uppercase();
+                            let n = Upper::new(n);
                             crate::commands::lookup(&n)
                                 .map(command_info)
                                 .unwrap_or(CommandResponse::Nil)
@@ -4610,7 +4608,7 @@ impl CommandEngine {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("command|getkeys");
                 }
-                let name = String::from_utf8_lossy(&args[1]).to_ascii_uppercase();
+                let name = Upper::new(&args[1]);
                 let Some(spec) = crate::commands::lookup(&name) else {
                     return CommandResponse::error("ERR Invalid command specified");
                 };
@@ -4694,7 +4692,7 @@ impl CommandEngine {
         let Some(sub) = args.first() else {
             return CommandResponse::wrong_arity("config");
         };
-        let sub = String::from_utf8_lossy(sub).to_ascii_uppercase();
+        let sub = Upper::new(sub);
         match sub.as_str() {
             "GET" => {
                 if args.len() < 2 {
@@ -4905,6 +4903,55 @@ impl CommandEngine {
     }
 }
 
+/// An argument upper-cased for matching an option or subcommand name,
+/// without a heap allocation when it is short (they all are).
+#[derive(Clone)]
+pub(crate) enum Upper {
+    Stack([u8; 32], u8),
+    Heap(String),
+}
+
+impl Upper {
+    pub(crate) fn new(b: &[u8]) -> Self {
+        if b.len() <= 32 && b.is_ascii() {
+            let mut buf = [0u8; 32];
+            for (d, s) in buf.iter_mut().zip(b) {
+                *d = s.to_ascii_uppercase();
+            }
+            Upper::Stack(buf, b.len() as u8)
+        } else {
+            Upper::Heap(String::from_utf8_lossy(b).to_uppercase())
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            // ASCII by construction.
+            Upper::Stack(buf, n) => std::str::from_utf8(&buf[..*n as usize]).unwrap_or(""),
+            Upper::Heap(s) => s,
+        }
+    }
+}
+
+impl std::ops::Deref for Upper {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<&str> for Upper {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl std::fmt::Display for Upper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 fn args_preview(args: &[Bytes]) -> String {
     args.iter()
         .take(3)
@@ -4943,7 +4990,7 @@ fn parse_set_options(
     let mut expiry_given = false;
     let mut i = 0;
     while i < opts.len() {
-        let opt = String::from_utf8_lossy(&opts[i]).to_ascii_uppercase();
+        let opt = Upper::new(&opts[i]);
         match opt.as_str() {
             "NX" if !o.xx => o.nx = true,
             "XX" if !o.nx => o.xx = true,
@@ -5073,6 +5120,18 @@ fn unpack_scan_cursor(cursor: u64) -> (usize, usize) {
 
 fn multi_shard_mget(shards: &crate::shard::ShardManager, keys: &[Bytes]) -> CommandResponse {
     let num = shards.num_shards();
+    // All on one shard (one shard, or keys sharing a hash tag): the reply
+    // is built in place, in one lock hold.
+    let first = shards.shard_index_for_key(&keys[0]);
+    if num == 1
+        || keys[1..]
+            .iter()
+            .all(|k| shards.shard_index_for_key(k) == first)
+    {
+        return shards.shard(first).execute(|store| {
+            CommandResponse::Array(keys.iter().map(|k| store.string_get(k)).collect())
+        });
+    }
     // Group (original_index, key) by shard so we lock each shard once.
     let mut by_shard: Vec<Vec<(usize, Bytes)>> = vec![Vec::new(); num];
     for (i, key) in keys.iter().enumerate() {
@@ -5212,7 +5271,7 @@ fn parse_scan_options(
     let mut type_filter = None;
     let mut i = 0;
     while i < opts.len() {
-        let opt = String::from_utf8_lossy(&opts[i]).to_ascii_uppercase();
+        let opt = Upper::new(&opts[i]);
         let Some(val) = opts.get(i + 1) else {
             return Err(CommandResponse::syntax_error());
         };

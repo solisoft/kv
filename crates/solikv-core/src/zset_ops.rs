@@ -56,34 +56,28 @@ impl ShardStore {
         let mut changed = 0i64;
 
         for (score, member) in pairs {
-            let existing_score = zset.members.get(&member).copied();
-
-            if nx && existing_score.is_some() {
-                continue;
-            }
-            if xx && existing_score.is_none() {
-                continue;
-            }
-
-            if let Some(old) = existing_score {
-                let old_f = old.into_inner();
-                let update = if gt && lt {
-                    score != old_f
-                } else if gt {
-                    score > old_f
-                } else if lt {
-                    score < old_f
-                } else {
-                    true
-                };
-                if update && score != old_f {
-                    zset.insert(score, member);
-                    changed += 1;
+            let (old, did) = zset.upsert(member, |existing| match existing {
+                Some(_) if nx => None,
+                None if xx => None,
+                None => Some(score),
+                Some(old) => {
+                    let update = if gt && lt {
+                        score != old
+                    } else if gt {
+                        score > old
+                    } else if lt {
+                        score < old
+                    } else {
+                        true
+                    };
+                    (update && score != old).then_some(score)
                 }
-            } else {
-                zset.insert(score, member);
-                added += 1;
+            });
+            if did {
                 changed += 1;
+                if old.is_none() {
+                    added += 1;
+                }
             }
         }
 

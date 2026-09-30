@@ -309,8 +309,22 @@ struct Pending {
     db: u32,
 }
 
+/// One shard's buffer, on its own cache lines: the slots sit side by side
+/// in a `Vec`, and each is written by whichever core runs its shard, so
+/// unpadded neighbours would bounce a shared line between cores on every
+/// record.
+#[repr(align(128))]
+struct Slot(parking_lot::Mutex<Pending>);
+
+impl std::ops::Deref for Slot {
+    type Target = parking_lot::Mutex<Pending>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 struct Inner {
-    shards: Vec<parking_lot::Mutex<Pending>>,
+    shards: Vec<Slot>,
     policy: FsyncPolicy,
     /// `sync()` requests waiting for the next fsync.
     syncs: parking_lot::Mutex<Vec<std::sync::mpsc::SyncSender<io::Result<()>>>>,
@@ -513,10 +527,10 @@ pub fn spawn_aof_writer(
         // record of each shard always states its own.
         shards: (0..shards)
             .map(|_| {
-                parking_lot::Mutex::new(Pending {
+                Slot(parking_lot::Mutex::new(Pending {
                     db: u32::MAX,
                     ..Pending::default()
-                })
+                }))
             })
             .collect(),
         policy,

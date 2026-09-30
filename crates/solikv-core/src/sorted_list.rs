@@ -1,38 +1,47 @@
-//! An ordered sequence with O(log n) positional access: the score index of
-//! a sorted set.
+//! An ordered sequence with O(log n) search and positional access: the
+//! score index of a sorted set.
 //!
-//! Elements live in a list of sorted chunks of at most `2 * LOAD` elements
-//! (the layout of Python's `sortedcontainers`), with a Fenwick tree over the
-//! chunk lengths. Finding an element or a rank is a binary search over the
+//! Elements live in a list of sorted chunks (the layout of Python's
+//! `sortedcontainers`), with a Fenwick tree over the chunk lengths. Finding an element or a rank is a binary search over the
 //! chunks' last elements, one inside a chunk, and a prefix sum; inserting or
 //! removing shifts at most one chunk (a `memmove` of a few KB) and updates the
 //! tree. `ZRANK`, `ZRANGE start stop`, `ZCOUNT` and every `LIMIT offset` are
 //! therefore logarithmic instead of a walk from the first element, which is
 //! what a `BTreeMap` without subtree counts gave.
 //!
-//! Chunk splits and merges rebuild the Fenwick tree (O(n / LOAD)); they happen
-//! once per `LOAD` updates at most, so the rebuild is amortised to O(1).
+//! Chunks are sized to about √n / 2 (see [`SortedList::load`]): a split or
+//! merge rebuilds the Fenwick tree, O(number of chunks) = O(√n), and happens
+//! about once per chunk-length updates, so the rebuild amortises to O(1)
+//! per update at any size, while the memmove per update stays O(√n)
+//! elements — a few KB at a million members.
 
-const LOAD: usize = 256;
+/// Bounds of the target chunk length (see [`SortedList::load`]).
+const MIN_LOAD: usize = 32;
+const MAX_LOAD: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct SortedList<T> {
     chunks: Vec<Vec<T>>,
+    /// `maxes[i]` is a copy of `chunks[i]`'s last element: the chunk search
+    /// runs over this one contiguous array instead of dereferencing every
+    /// chunk it probes (a cache miss each).
+    maxes: Vec<T>,
     /// Fenwick tree (1-based, stored 0-based) over `chunks[i].len()`.
     fen: Vec<usize>,
     len: usize,
 }
 
-impl<T: Ord> Default for SortedList<T> {
+impl<T: Ord + Clone> Default for SortedList<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Ord> SortedList<T> {
+impl<T: Ord + Clone> SortedList<T> {
     pub fn new() -> Self {
         Self {
             chunks: Vec::new(),
+            maxes: Vec::new(),
             fen: Vec::new(),
             len: 0,
         }
@@ -41,13 +50,15 @@ impl<T: Ord> SortedList<T> {
     /// Build from elements already in ascending order (no duplicates).
     pub fn from_sorted(items: Vec<T>) -> Self {
         let len = items.len();
-        let mut chunks = Vec::with_capacity(len.div_ceil(LOAD));
+        let load = (len.isqrt() / 2).clamp(MIN_LOAD, MAX_LOAD);
+        let mut chunks = Vec::with_capacity(len.div_ceil(load));
         let mut it = items.into_iter().peekable();
         while it.peek().is_some() {
-            chunks.push(it.by_ref().take(LOAD).collect::<Vec<T>>());
+            chunks.push(it.by_ref().take(load).collect::<Vec<T>>());
         }
         let mut s = Self {
             chunks,
+            maxes: Vec::new(),
             fen: Vec::new(),
             len,
         };
@@ -60,6 +71,13 @@ impl<T: Ord> SortedList<T> {
         self.len
     }
 
+    /// Target chunk length at the current size: √n / 2, clamped. A chunk
+    /// splits past twice this and merges below a quarter.
+    #[inline]
+    fn load(&self) -> usize {
+        (self.len.isqrt() / 2).clamp(MIN_LOAD, MAX_LOAD)
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -67,11 +85,17 @@ impl<T: Ord> SortedList<T> {
 
     pub fn clear(&mut self) {
         self.chunks.clear();
+        self.maxes.clear();
         self.fen.clear();
         self.len = 0;
     }
 
+    /// Recompute `maxes` and the Fenwick tree (after chunks were split,
+    /// merged or removed).
     fn rebuild_index(&mut self) {
+        self.maxes.clear();
+        self.maxes
+            .extend(self.chunks.iter().filter_map(|c| c.last().cloned()));
         let n = self.chunks.len();
         self.fen.clear();
         self.fen.extend(self.chunks.iter().map(|c| c.len()));
@@ -124,7 +148,16 @@ impl<T: Ord> SortedList<T> {
     /// Index of the first chunk whose last element does not satisfy `pred`
     /// (`pred` must be true for a prefix of the sequence).
     fn chunk_partition(&self, pred: &impl Fn(&T) -> bool) -> usize {
-        self.chunks.partition_point(|c| c.last().is_some_and(pred))
+        self.maxes.partition_point(pred)
+    }
+
+    #[inline]
+    fn fix_max(&mut self, ci: usize) {
+        if let Some(last) = self.chunks[ci].last() {
+            if self.maxes[ci] != *last {
+                self.maxes[ci] = last.clone();
+            }
+        }
     }
 
     /// Number of leading elements for which `pred` holds; `pred` must be
@@ -150,6 +183,7 @@ impl<T: Ord> SortedList<T> {
     /// Insert `x`; false (and nothing changes) if an equal element exists.
     pub fn insert(&mut self, x: T) -> bool {
         if self.chunks.is_empty() {
+            self.maxes.push(x.clone());
             self.chunks.push(vec![x]);
             self.fen.push(1);
             self.len = 1;
@@ -160,13 +194,21 @@ impl<T: Ord> SortedList<T> {
             ci -= 1; // after every element: append to the last chunk
         }
         let chunk = &mut self.chunks[ci];
-        match chunk.binary_search(&x) {
+        let at_end = match chunk.binary_search(&x) {
             Ok(_) => return false,
-            Err(off) => chunk.insert(off, x),
+            Err(off) => {
+                let at_end = off == chunk.len();
+                chunk.insert(off, x);
+                at_end
+            }
+        };
+        if at_end {
+            self.fix_max(ci);
         }
         self.len += 1;
-        if self.chunks[ci].len() > 2 * LOAD {
-            let tail = self.chunks[ci].split_off(LOAD);
+        let load = self.load();
+        if self.chunks[ci].len() > 2 * load {
+            let tail = self.chunks[ci].split_off(load);
             self.chunks.insert(ci + 1, tail);
             self.rebuild_index();
         } else {
@@ -184,7 +226,7 @@ impl<T: Ord> SortedList<T> {
         match chunk.binary_search(x) {
             Ok(off) => {
                 chunk.remove(off);
-                self.after_remove(ci);
+                self.after_remove(ci, off);
                 true
             }
             Err(_) => false,
@@ -198,17 +240,22 @@ impl<T: Ord> SortedList<T> {
         }
         let (ci, off) = self.locate(pos);
         let x = self.chunks[ci].remove(off);
-        self.after_remove(ci);
+        self.after_remove(ci, off);
         Some(x)
     }
 
-    fn after_remove(&mut self, ci: usize) {
+    /// After removing the element at `off` of chunk `ci`.
+    fn after_remove(&mut self, ci: usize, off: usize) {
         self.len -= 1;
         let n = self.chunks[ci].len();
+        if n > 0 && off == n {
+            // The chunk's last element went.
+            self.fix_max(ci);
+        }
         if n == 0 {
             self.chunks.remove(ci);
             self.rebuild_index();
-        } else if n < LOAD / 4 && self.chunks.len() > 1 {
+        } else if n < self.load() / 4 && self.chunks.len() > 1 {
             // Merge a small chunk into a neighbour so chunks stay dense.
             let (a, b) = if ci + 1 < self.chunks.len() {
                 (ci, ci + 1)
@@ -217,7 +264,7 @@ impl<T: Ord> SortedList<T> {
             };
             let tail = self.chunks.remove(b);
             self.chunks[a].extend(tail);
-            if self.chunks[a].len() > 2 * LOAD {
+            if self.chunks[a].len() > 2 * self.load() {
                 let half = self.chunks[a].len() / 2;
                 let t = self.chunks[a].split_off(half);
                 self.chunks.insert(a + 1, t);
@@ -285,7 +332,7 @@ impl<T: Ord> SortedList<T> {
     }
 }
 
-impl<T: Ord> FromIterator<T> for SortedList<T> {
+impl<T: Ord + Clone> FromIterator<T> for SortedList<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let mut v: Vec<T> = iter.into_iter().collect();
         v.sort();
