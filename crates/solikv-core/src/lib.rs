@@ -9,6 +9,7 @@ pub mod memory;
 pub mod set_ops;
 pub mod sorted_list;
 pub mod store;
+pub mod stream_ext;
 pub mod stream_ops;
 pub mod string_ops;
 pub mod types;

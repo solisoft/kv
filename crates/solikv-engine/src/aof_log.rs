@@ -75,6 +75,8 @@ const EXPLICIT: &[&str] = &[
     "RPOPLPUSH",
     "ZDIFFSTORE",
     "ZRANGESTORE",
+    "XCLAIM",
+    "XAUTOCLAIM",
 ];
 
 /// Write commands that are never records themselves: each runs the plain

@@ -622,3 +622,239 @@ fn set_and_hash_additions() {
         .cmd(&["HRANDFIELD", "h", "1", "WITHSCORES"])
         .starts_with("-ERR syntax"));
 }
+
+// ---------------------------------------------------------------------------
+// Streams
+// ---------------------------------------------------------------------------
+
+#[test]
+fn consumer_group_recovery_commands() {
+    let s = Server::new("xclaim");
+    let mut c = s.client();
+    for i in 1..=4 {
+        c.cmd(&["XADD", "st", &format!("{i}-0"), "n", &i.to_string()]);
+    }
+    c.cmd(&["XGROUP", "CREATE", "st", "g", "0"]);
+    c.cmd(&[
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "alice",
+        "COUNT",
+        "3",
+        "STREAMS",
+        "st",
+        ">",
+    ]);
+    thread::sleep(Duration::from_millis(30));
+
+    // Too recent for a 10 s min-idle: nothing claimed.
+    assert_eq!(c.cmd(&["XCLAIM", "st", "g", "bob", "10000", "1-0"]), "[]");
+    assert_eq!(
+        c.cmd(&["XCLAIM", "st", "g", "bob", "10", "1-0"]),
+        "[[$1-0,[$n,$1]]]"
+    );
+    // JUSTID: ids only, delivery count untouched.
+    assert_eq!(
+        c.cmd(&["XCLAIM", "st", "g", "bob", "0", "2-0", "JUSTID"]),
+        "[$2-0]"
+    );
+    let pel = c.cmd(&["XPENDING", "st", "g", "-", "+", "10"]);
+    assert!(pel.contains("[$1-0,$bob,"), "{pel}");
+    // 2-0 was claimed with JUSTID: still delivered once.
+    assert!(pel.contains(",:1],[$3-0,$alice,"), "{pel}");
+    // FORCE takes an entry nobody had; RETRYCOUNT and IDLE set its state.
+    assert_eq!(
+        c.cmd(&[
+            "XCLAIM",
+            "st",
+            "g",
+            "bob",
+            "0",
+            "4-0",
+            "FORCE",
+            "JUSTID",
+            "RETRYCOUNT",
+            "7",
+            "IDLE",
+            "5000"
+        ]),
+        "[$4-0]"
+    );
+    let four = c.cmd(&["XPENDING", "st", "g", "4-0", "4-0", "1"]);
+    assert!(
+        four.starts_with("[[$4-0,$bob,:") && four.ends_with(",:7]]"),
+        "{four}"
+    );
+    let idle: i64 = four.split(",:").nth(1).unwrap().parse().unwrap();
+    assert!(idle >= 5000, "{four}");
+    assert!(c
+        .cmd(&["XCLAIM", "st", "g", "bob", "x", "1-0"])
+        .starts_with("-ERR Invalid min-idle-time"));
+    assert!(c
+        .cmd(&["XCLAIM", "st", "nope", "bob", "0", "1-0"])
+        .starts_with("-NOGROUP"));
+
+    // XPENDING filters: IDLE and consumer.
+    assert_eq!(
+        c.cmd(&["XPENDING", "st", "g", "IDLE", "4000", "-", "+", "10"])
+            .matches("$bob")
+            .count(),
+        1
+    );
+    assert_eq!(
+        c.cmd(&["XPENDING", "st", "g", "-", "+", "10", "alice"])
+            .matches("$alice")
+            .count(),
+        1
+    );
+
+    // XAUTOCLAIM: an entry deleted from the stream leaves the PEL.
+    c.cmd(&["XDEL", "st", "3-0"]);
+    let r = c.cmd(&["XAUTOCLAIM", "st", "g", "carol", "0", "0-0", "COUNT", "10"]);
+    assert!(r.starts_with("[$0-0,[[$1-0,"), "{r}");
+    assert!(r.ends_with(",[$3-0]]"), "{r}");
+    let r = c.cmd(&[
+        "XAUTOCLAIM",
+        "st",
+        "g",
+        "carol",
+        "0",
+        "0-0",
+        "COUNT",
+        "1",
+        "JUSTID",
+    ]);
+    assert_eq!(r, "[$2-0,[$1-0],[]]");
+    assert!(c
+        .cmd(&["XAUTOCLAIM", "st", "g", "carol", "0", "0", "COUNT", "0"])
+        .starts_with("-ERR COUNT must be > 0"));
+}
+
+#[test]
+fn stream_metadata_and_introspection() {
+    let s = Server::new("xinfo");
+    let mut c = s.client();
+    assert!(c
+        .cmd(&["XADD", "fresh", "0-0", "f", "v"])
+        .contains("greater than 0-0"));
+    assert_eq!(c.cmd(&["EXISTS", "fresh"]), ":0");
+
+    for i in 1..=5 {
+        c.cmd(&["XADD", "st", &format!("{i}-1"), "f", "v"]);
+    }
+    c.cmd(&["XDEL", "st", "2-1"]);
+    let info = c.cmd(&["XINFO", "STREAM", "st"]);
+    assert!(info.contains("$entries-added,:5"), "{info}");
+    assert!(info.contains("$max-deleted-entry-id,$2-1"), "{info}");
+    assert!(info.contains("$last-generated-id,$5-1"), "{info}");
+
+    c.cmd(&["XGROUP", "CREATE", "st", "g1", "$"]);
+    c.cmd(&["XGROUP", "CREATE", "st", "g0", "0", "ENTRIESREAD", "0"]);
+    assert_eq!(
+        c.cmd(&["XGROUP", "CREATECONSUMER", "st", "g0", "zed"]),
+        ":1"
+    );
+    assert_eq!(
+        c.cmd(&["XGROUP", "CREATECONSUMER", "st", "g0", "zed"]),
+        ":0"
+    );
+    c.cmd(&[
+        "XREADGROUP",
+        "GROUP",
+        "g0",
+        "amy",
+        "COUNT",
+        "2",
+        "STREAMS",
+        "st",
+        ">",
+    ]);
+    let groups = c.cmd(&["XINFO", "GROUPS", "st"]);
+    assert!(
+        groups.starts_with("[[$name,$g0,$consumers,:2,$pending,:2,$last-delivered-id,$3-1,"),
+        "{groups}"
+    );
+    assert!(groups.contains("[$name,$g1,$consumers,:0,$pending,:0,$last-delivered-id,$5-1,$entries-read,:5,$lag,:0]"), "{groups}");
+    let cons = c.cmd(&["XINFO", "CONSUMERS", "st", "g0"]);
+    assert!(
+        cons.starts_with("[[$name,$amy,$pending,:2,$idle,:"),
+        "{cons}"
+    );
+    assert!(cons.contains("[$name,$zed,$pending,:0,$idle,:"), "{cons}");
+    assert!(cons.ends_with("$inactive,:-1]]"), "{cons}");
+    let full = c.cmd(&["XINFO", "STREAM", "st", "FULL", "COUNT", "1"]);
+    assert!(full.contains("$entries,[[$1-1,[$f,$v]]]"), "{full}");
+    assert!(full.contains("$pel-count,:2"), "{full}");
+
+    assert_eq!(
+        c.cmd(&["XGROUP", "SETID", "st", "g0", "0", "ENTRIESREAD", "0"]),
+        "+OK"
+    );
+    assert!(c
+        .cmd(&["XINFO", "GROUPS", "st"])
+        .contains("$last-delivered-id,$0-0,$entries-read,:0"));
+
+    // XSETID and its checks.
+    assert!(c
+        .cmd(&["XSETID", "st", "1-0"])
+        .contains("smaller than the target stream top item"));
+    assert!(c
+        .cmd(&["XSETID", "st", "9-0", "ENTRIESADDED", "1"])
+        .contains("smaller than the target stream length"));
+    assert!(c
+        .cmd(&["XSETID", "st", "9-0", "MAXDELETEDID", "10-0"])
+        .contains("max_deleted_entry_id"));
+    assert_eq!(c.cmd(&["XSETID", "st", "9-0", "ENTRIESADDED", "50"]), "+OK");
+    assert!(c.cmd(&["XADD", "st", "8-0", "f", "v"]).starts_with("-ERR"));
+    assert!(c
+        .cmd(&["XINFO", "STREAM", "st"])
+        .contains("$entries-added,:50"));
+    assert!(c
+        .cmd(&["XSETID", "none", "1-0"])
+        .starts_with("-ERR no such key"));
+
+    // Trimming options.
+    assert!(c
+        .cmd(&["XADD", "st", "MAXLEN", "2", "LIMIT", "10", "*", "f", "v"])
+        .contains("LIMIT cannot be used without"));
+    assert!(c
+        .cmd(&["XADD", "st", "MAXLEN", "~", "2", "LIMIT", "10", "*", "f", "v"])
+        .starts_with('$'));
+    assert!(c
+        .cmd(&["XTRIM", "st", "MAXLEN", "-1"])
+        .contains("MAXLEN argument must be >= 0"));
+    assert!(c
+        .cmd(&["XTRIM", "st", "MAXLEN", "1", "junk"])
+        .starts_with("-ERR syntax"));
+}
+
+#[test]
+fn consumer_group_state_replays_with_its_delivery_times() {
+    let dir = TmpDir::new("xreplay");
+    let s = Server::start(&dir.0, &["--shards", "8"]);
+    {
+        let mut c = s.client();
+        c.cmd(&["XADD", "st", "1-0", "f", "a"]);
+        c.cmd(&["XADD", "st", "2-0", "f", "b"]);
+        c.cmd(&["XGROUP", "CREATE", "st", "g", "0"]);
+        c.cmd(&["XREADGROUP", "GROUP", "g", "alice", "STREAMS", "st", ">"]);
+        c.cmd(&["XCLAIM", "st", "g", "bob", "0", "2-0"]);
+    }
+    thread::sleep(Duration::from_millis(400));
+    s.sigterm();
+    let s = Server::start(&dir.0, &["--shards", "8"]);
+    let mut c = s.client();
+    let pel = c.cmd(&["XPENDING", "st", "g", "-", "+", "10"]);
+    // Owners and counts as they were; idle times kept counting.
+    assert!(pel.starts_with("[[$1-0,$alice,:"), "{pel}");
+    assert!(pel.contains(",:1],[$2-0,$bob,:"), "{pel}");
+    assert!(pel.ends_with(",:2]]"), "{pel}");
+    let idle: i64 = pel.split(",:").nth(1).unwrap().parse().unwrap();
+    assert!(idle >= 400, "idle reset by replay: {pel}");
+    // The group's position survived: nothing new to read.
+    assert_eq!(
+        c.cmd(&["XREADGROUP", "GROUP", "g", "carol", "STREAMS", "st", ">"]),
+        "nilarr"
+    );
+}

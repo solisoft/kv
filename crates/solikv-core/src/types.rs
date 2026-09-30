@@ -263,8 +263,22 @@ pub struct PendingEntry {
 #[derive(Debug, Clone)]
 pub struct StreamConsumer {
     pub name: Bytes,
+    /// Last time the consumer did anything (`XINFO CONSUMERS` idle).
     pub seen_time: u64,
+    /// Last time it read or claimed something; 0 = never (`inactive` -1).
+    pub active_time: u64,
     pub pending: BTreeMap<StreamId, ()>,
+}
+
+impl StreamConsumer {
+    pub fn new(name: Bytes, now: u64) -> Self {
+        Self {
+            name,
+            seen_time: now,
+            active_time: 0,
+            pending: BTreeMap::new(),
+        }
+    }
 }
 
 /// A consumer group on a stream.
@@ -274,6 +288,21 @@ pub struct ConsumerGroup {
     pub last_delivered_id: StreamId,
     pub pending: BTreeMap<StreamId, PendingEntry>,
     pub consumers: HashMap<Bytes, StreamConsumer>,
+    /// Entries the group has read, counted from the stream's first ever
+    /// entry (`XINFO GROUPS` entries-read / lag); `None` when unknown.
+    pub entries_read: Option<u64>,
+}
+
+impl ConsumerGroup {
+    pub fn new(name: Bytes, last_delivered_id: StreamId, entries_read: Option<u64>) -> Self {
+        Self {
+            name,
+            last_delivered_id,
+            pending: BTreeMap::new(),
+            consumers: HashMap::new(),
+            entries_read,
+        }
+    }
 }
 
 /// Redis Stream: append-only log of field-value entries.
@@ -282,6 +311,10 @@ pub struct StreamValue {
     pub entries: BTreeMap<StreamId, Vec<(Bytes, Bytes)>>,
     pub last_id: StreamId,
     pub groups: HashMap<Bytes, ConsumerGroup>,
+    /// Entries ever added (`XINFO STREAM` entries-added, `XSETID`).
+    pub entries_added: u64,
+    /// Highest ID ever deleted (`XDEL`, trimming), for lag computation.
+    pub max_deleted_id: StreamId,
 }
 
 impl StreamValue {
@@ -290,6 +323,8 @@ impl StreamValue {
             entries: BTreeMap::new(),
             last_id: StreamId::MIN,
             groups: HashMap::new(),
+            entries_added: 0,
+            max_deleted_id: StreamId::MIN,
         }
     }
 

@@ -896,3 +896,559 @@ impl CommandEngine {
             .execute(move |s| s.hash_hstrlen(&key, &field))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Streams
+// ---------------------------------------------------------------------------
+
+/// An exact ID argument (`ms-seq` or `ms`), `-`/`+` allowed as the bounds.
+fn stream_id_arg(arg: &Bytes, high: bool) -> Result<StreamId, CommandResponse> {
+    use solikv_core::types::StreamIdInput;
+    match super::parse_stream_id(arg) {
+        Some(StreamIdInput::Explicit(id)) => Ok(id),
+        Some(StreamIdInput::Partial(ms)) => Ok(StreamId::new(ms, if high { u64::MAX } else { 0 })),
+        Some(StreamIdInput::Min) => Ok(StreamId::MIN),
+        Some(StreamIdInput::Max) => Ok(StreamId::MAX),
+        _ => Err(CommandResponse::error(
+            "ERR Invalid stream ID specified as stream command argument",
+        )),
+    }
+}
+
+fn u64_arg(arg: &[u8], err: &str) -> Result<u64, CommandResponse> {
+    std::str::from_utf8(arg)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n >= 0)
+        .map(|n| n as u64)
+        .ok_or_else(|| CommandResponse::error(err.to_string()))
+}
+
+/// The entry IDs in a stream-entries reply (`[[id, fields], …]` or, with
+/// JUSTID, `[id, …]`).
+fn reply_ids(r: &CommandResponse) -> Vec<StreamId> {
+    let CommandResponse::Array(items) = r else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|it| {
+            let id = match it {
+                CommandResponse::Array(e) => e.first()?,
+                other => other,
+            };
+            let CommandResponse::BulkString(b) = id else {
+                return None;
+            };
+            let (a, s) = std::str::from_utf8(b).ok()?.split_once('-')?;
+            Some(StreamId::new(a.parse().ok()?, s.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Log what a claim did, as records that replay exactly: the consumer's
+/// creation, each claimed entry with its delivery time and count, and the
+/// entries that left the PEL because the stream no longer had them.
+fn push_claim_effects(
+    fx: &mut crate::aof_log::Effects,
+    key: &Bytes,
+    group: &Bytes,
+    consumer: &Bytes,
+    claimed: &[solikv_core::stream_ext::Claimed],
+) {
+    if !fx.enabled() {
+        return;
+    }
+    fx.push("XGROUP", &[b"CREATECONSUMER", key, group, consumer]);
+    for c in claimed {
+        let id = c.id.to_string();
+        match c.delivery {
+            Some((t, n)) => {
+                let (t, n) = (t.to_string(), n.to_string());
+                fx.push(
+                    "XCLAIM",
+                    &[
+                        key,
+                        group,
+                        consumer,
+                        b"0",
+                        id.as_bytes(),
+                        b"TIME",
+                        t.as_bytes(),
+                        b"RETRYCOUNT",
+                        n.as_bytes(),
+                        b"FORCE",
+                        b"JUSTID",
+                    ],
+                );
+            }
+            None => fx.push("XACK", &[key, group, id.as_bytes()]),
+        }
+    }
+}
+
+/// `XGROUP SETID` for a group's current position, logged after reads.
+fn push_group_position(
+    fx: &mut crate::aof_log::Effects,
+    store: &mut solikv_core::ShardStore,
+    key: &Bytes,
+    group: &Bytes,
+) {
+    if !fx.enabled() {
+        return;
+    }
+    if let Some((last, read)) = store.stream_group_state(key, group) {
+        let last = last.to_string();
+        match read {
+            Some(n) => {
+                let n = n.to_string();
+                fx.push(
+                    "XGROUP",
+                    &[
+                        b"SETID",
+                        key,
+                        group,
+                        last.as_bytes(),
+                        b"ENTRIESREAD",
+                        n.as_bytes(),
+                    ],
+                );
+            }
+            None => fx.push("XGROUP", &[b"SETID", key, group, last.as_bytes()]),
+        }
+    }
+}
+
+impl CommandEngine {
+    /// The per-shard `XREADGROUP` of one stream, logged as its effects (see
+    /// `push_claim_effects`): replaying the read itself would redeliver at
+    /// replay time and reset every idle time.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn xreadgroup_one(
+        &self,
+        key: &Bytes,
+        group: &Bytes,
+        consumer: &Bytes,
+        id_input: solikv_core::types::StreamIdInput,
+        count: Option<usize>,
+        noack: bool,
+    ) -> CommandResponse {
+        let (k, g, c) = (key.clone(), group.clone(), consumer.clone());
+        self.shards
+            .shard_for_key(key)
+            .execute_with_effects(move |store, fx| {
+                let r = store.stream_xreadgroup_opts(&k, &g, &c, id_input, count, noack);
+                if !r.is_error() && fx.enabled() {
+                    let ids = reply_ids(&r);
+                    let claimed: Vec<_> = store
+                        .stream_pel_of(&k, &g, &ids)
+                        .into_iter()
+                        .filter(|x| x.delivery.is_some())
+                        .collect();
+                    push_claim_effects(fx, &k, &g, &c, &claimed);
+                    if matches!(id_input, solikv_core::types::StreamIdInput::Max) {
+                        push_group_position(fx, store, &k, &g);
+                    }
+                }
+                r
+            })
+    }
+
+    /// `XCLAIM key group consumer min-idle-time id… [IDLE ms] [TIME ms]
+    /// [RETRYCOUNT n] [FORCE] [JUSTID] [LASTID id]`.
+    pub(super) fn xclaim(&self, args: &[Bytes]) -> CommandResponse {
+        if args.len() < 5 {
+            return CommandResponse::wrong_arity("xclaim");
+        }
+        let min_idle = match u64_arg(&args[3], "ERR Invalid min-idle-time argument for XCLAIM") {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let mut ids = Vec::new();
+        let mut i = 4;
+        while i < args.len() {
+            match super::parse_stream_id(&args[i]) {
+                Some(solikv_core::types::StreamIdInput::Explicit(id)) => ids.push(id),
+                Some(solikv_core::types::StreamIdInput::Partial(ms)) => {
+                    ids.push(StreamId::new(ms, 0))
+                }
+                _ => break,
+            }
+            i += 1;
+        }
+        if ids.is_empty() {
+            return CommandResponse::error(
+                "ERR Invalid stream ID specified as stream command argument",
+            );
+        }
+        let mut opts = solikv_core::stream_ext::XClaimOpts::default();
+        while i < args.len() {
+            let opt = Upper::new(&args[i]);
+            let val = args.get(i + 1);
+            match opt.as_str() {
+                "FORCE" => opts.force = true,
+                "JUSTID" => opts.justid = true,
+                "IDLE" | "TIME" | "RETRYCOUNT" | "LASTID" => {
+                    let Some(v) = val else {
+                        return CommandResponse::syntax_error();
+                    };
+                    let err = format!("ERR Invalid {} option argument for XCLAIM", opt.as_str());
+                    match opt.as_str() {
+                        "IDLE" => match u64_arg(v, &err) {
+                            Ok(n) => opts.idle = Some(n),
+                            Err(e) => return e,
+                        },
+                        "TIME" => match u64_arg(v, &err) {
+                            Ok(n) => opts.time = Some(n),
+                            Err(e) => return e,
+                        },
+                        "RETRYCOUNT" => match u64_arg(v, &err) {
+                            Ok(n) => opts.retrycount = Some(n),
+                            Err(e) => return e,
+                        },
+                        _ => match stream_id_arg(v, false) {
+                            Ok(id) => opts.lastid = Some(id),
+                            Err(e) => return e,
+                        },
+                    }
+                    i += 1;
+                }
+                _ => {
+                    return CommandResponse::error(format!(
+                        "ERR Unrecognized XCLAIM option '{}'",
+                        String::from_utf8_lossy(&args[i])
+                    ))
+                }
+            }
+            i += 1;
+        }
+        let (k, g, c) = (args[0].clone(), args[1].clone(), args[2].clone());
+        let lastid = opts.lastid.is_some();
+        self.shards
+            .shard_for_key(&k)
+            .execute_with_effects(move |store, fx| {
+                let mut claimed = Vec::new();
+                let r = store.stream_xclaim(&k, &g, &c, min_idle, &ids, &opts, &mut claimed);
+                if !r.is_error() {
+                    push_claim_effects(fx, &k, &g, &c, &claimed);
+                    if lastid {
+                        push_group_position(fx, store, &k, &g);
+                    }
+                }
+                r
+            })
+    }
+
+    /// `XAUTOCLAIM key group consumer min-idle-time start [COUNT n]
+    /// [JUSTID]`.
+    pub(super) fn xautoclaim(&self, args: &[Bytes]) -> CommandResponse {
+        if args.len() < 5 {
+            return CommandResponse::wrong_arity("xautoclaim");
+        }
+        let min_idle = match u64_arg(
+            &args[3],
+            "ERR Invalid min-idle-time argument for XAUTOCLAIM",
+        ) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let start = match stream_id_arg(&args[4], false) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let mut count = 100usize;
+        let mut justid = false;
+        let mut i = 5;
+        while i < args.len() {
+            match Upper::new(&args[i]).as_str() {
+                "COUNT" => {
+                    match args.get(i + 1).map(|v| int_arg(v)) {
+                        Some(Ok(n)) if n > 0 && n <= (i64::MAX / 10) => count = n as usize,
+                        Some(Ok(_)) => return CommandResponse::error("ERR COUNT must be > 0"),
+                        Some(Err(e)) => return e,
+                        None => return CommandResponse::syntax_error(),
+                    }
+                    i += 2;
+                }
+                "JUSTID" => {
+                    justid = true;
+                    i += 1;
+                }
+                _ => return CommandResponse::syntax_error(),
+            }
+        }
+        let (k, g, c) = (args[0].clone(), args[1].clone(), args[2].clone());
+        self.shards
+            .shard_for_key(&k)
+            .execute_with_effects(move |store, fx| {
+                let mut claimed = Vec::new();
+                let r = store.stream_xautoclaim(
+                    &k,
+                    &g,
+                    &c,
+                    min_idle,
+                    start,
+                    count,
+                    justid,
+                    &mut claimed,
+                );
+                if !r.is_error() {
+                    push_claim_effects(fx, &k, &g, &c, &claimed);
+                }
+                r
+            })
+    }
+
+    /// `XSETID key last-id [ENTRIESADDED n] [MAXDELETEDID id]`.
+    pub(super) fn xsetid(&self, args: &[Bytes]) -> CommandResponse {
+        if args.len() < 2 {
+            return CommandResponse::wrong_arity("xsetid");
+        }
+        let last = match stream_id_arg(&args[1], false) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let mut added = None;
+        let mut maxdel = None;
+        let mut i = 2;
+        while i < args.len() {
+            let Some(v) = args.get(i + 1) else {
+                return CommandResponse::syntax_error();
+            };
+            match Upper::new(&args[i]).as_str() {
+                "ENTRIESADDED" => match u64_arg(v, "ERR entries_added must be positive") {
+                    Ok(n) => added = Some(n),
+                    Err(e) => return e,
+                },
+                "MAXDELETEDID" => match stream_id_arg(v, false) {
+                    Ok(id) => maxdel = Some(id),
+                    Err(e) => return e,
+                },
+                _ => return CommandResponse::syntax_error(),
+            }
+            i += 2;
+        }
+        let k = args[0].clone();
+        self.shards
+            .shard_for_key(&k)
+            .execute(move |s| s.stream_xsetid(&k, last, added, maxdel))
+    }
+
+    /// `XINFO STREAM key [FULL [COUNT n]] | GROUPS key | CONSUMERS key
+    /// group | HELP`.
+    pub(super) fn xinfo(&self, args: &[Bytes]) -> CommandResponse {
+        let Some(sub) = args.first() else {
+            return CommandResponse::wrong_arity("xinfo");
+        };
+        let sub = Upper::new(sub);
+        let key = args.get(1).cloned();
+        match (sub.as_str(), key) {
+            ("HELP", _) => CommandResponse::array(
+                [
+                    "XINFO <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                    "CONSUMERS <key> <groupname>",
+                    "GROUPS <key>",
+                    "STREAM <key> [FULL [COUNT <count>]]",
+                ]
+                .iter()
+                .map(|s| CommandResponse::bulk_string(s))
+                .collect(),
+            ),
+            ("STREAM", Some(k)) => {
+                let full = match &args[2..] {
+                    [] => None,
+                    [f] if Upper::new(f).as_str() == "FULL" => Some(10),
+                    [f, c, n]
+                        if Upper::new(f).as_str() == "FULL"
+                            && Upper::new(c).as_str() == "COUNT" =>
+                    {
+                        match int_arg(n) {
+                            Ok(n) if n >= 0 => Some(n as usize),
+                            Ok(_) => Some(0),
+                            Err(e) => return e,
+                        }
+                    }
+                    _ => return CommandResponse::syntax_error(),
+                };
+                self.shards
+                    .shard_for_key(&k)
+                    .execute(move |s| s.stream_xinfo_full(&k, full))
+            }
+            ("GROUPS", Some(k)) if args.len() == 2 => self
+                .shards
+                .shard_for_key(&k)
+                .execute(move |s| s.stream_xinfo_groups(&k)),
+            ("CONSUMERS", Some(k)) if args.len() == 3 => {
+                let g = args[2].clone();
+                self.shards
+                    .shard_for_key(&k)
+                    .execute(move |s| s.stream_xinfo_consumers(&k, &g))
+            }
+            ("STREAM" | "GROUPS" | "CONSUMERS", _) => {
+                CommandResponse::wrong_arity(&format!("xinfo|{}", sub.to_ascii_lowercase()))
+            }
+            _ => CommandResponse::error(format!(
+                "ERR unknown subcommand '{}'. Try XINFO HELP.",
+                String::from_utf8_lossy(&args[0])
+            )),
+        }
+    }
+
+    /// `XGROUP CREATE key group id|$ [MKSTREAM] [ENTRIESREAD n] | SETID key
+    /// group id|$ [ENTRIESREAD n] | CREATECONSUMER key group consumer |
+    /// DELCONSUMER key group consumer | DESTROY key group | HELP`.
+    pub(super) fn xgroup(&self, args: &[Bytes]) -> CommandResponse {
+        let Some(sub) = args.first() else {
+            return CommandResponse::wrong_arity("xgroup");
+        };
+        let sub = Upper::new(sub);
+        let arity = |n: usize, exact: bool| {
+            let ok = if exact {
+                args.len() == n
+            } else {
+                args.len() >= n
+            };
+            (!ok).then(|| {
+                CommandResponse::wrong_arity(&format!("xgroup|{}", sub.to_ascii_lowercase()))
+            })
+        };
+        match sub.as_str() {
+            "HELP" => CommandResponse::array(
+                [
+                    "XGROUP <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                    "CREATE <key> <groupname> <id|$> [option]",
+                    "CREATECONSUMER <key> <groupname> <consumer>",
+                    "DELCONSUMER <key> <groupname> <consumername>",
+                    "DESTROY <key> <groupname>",
+                    "SETID <key> <groupname> <id|$> [ENTRIESREAD entries_read]",
+                ]
+                .iter()
+                .map(|s| CommandResponse::bulk_string(s))
+                .collect(),
+            ),
+            "CREATE" | "SETID" => {
+                if let Some(e) = arity(4, false) {
+                    return e;
+                }
+                let (k, g) = (args[1].clone(), args[2].clone());
+                let id = if args[3].as_ref() == b"$" {
+                    None
+                } else {
+                    match stream_id_arg(&args[3], false) {
+                        Ok(id) => Some(id),
+                        Err(e) => return e,
+                    }
+                };
+                let mut mkstream = false;
+                let mut entries_read = None;
+                let mut i = 4;
+                while i < args.len() {
+                    match Upper::new(&args[i]).as_str() {
+                        "MKSTREAM" if sub.as_str() == "CREATE" => {
+                            mkstream = true;
+                            i += 1;
+                        }
+                        "ENTRIESREAD" if i + 1 < args.len() => {
+                            match int_arg(&args[i + 1]) {
+                                Ok(n) if n >= 0 => entries_read = Some(n as u64),
+                                Ok(-1) => entries_read = None,
+                                Ok(_) => {
+                                    return CommandResponse::error(
+                                        "ERR value for ENTRIESREAD must be positive or -1",
+                                    )
+                                }
+                                Err(e) => return e,
+                            }
+                            i += 2;
+                        }
+                        _ => return CommandResponse::syntax_error(),
+                    }
+                }
+                if sub.as_str() == "SETID" {
+                    return self
+                        .shards
+                        .shard_for_key(&k)
+                        .execute(move |s| s.stream_xgroup_setid(&k, &g, id, entries_read));
+                }
+                let input = match id {
+                    None => solikv_core::types::StreamIdInput::Max,
+                    Some(id) => solikv_core::types::StreamIdInput::Explicit(id),
+                };
+                self.shards.shard_for_key(&k).execute(move |s| {
+                    s.stream_xgroup_create_opts(&k, g, input, mkstream, entries_read)
+                })
+            }
+            "CREATECONSUMER" | "DELCONSUMER" => {
+                if let Some(e) = arity(4, true) {
+                    return e;
+                }
+                let (k, g, c) = (args[1].clone(), args[2].clone(), args[3].clone());
+                let create = sub.as_str() == "CREATECONSUMER";
+                self.shards.shard_for_key(&k).execute(move |s| {
+                    if create {
+                        s.stream_xgroup_createconsumer(&k, &g, &c)
+                    } else {
+                        s.stream_xgroup_delconsumer(&k, &g, &c)
+                    }
+                })
+            }
+            "DESTROY" => {
+                if let Some(e) = arity(3, true) {
+                    return e;
+                }
+                let (k, g) = (args[1].clone(), args[2].clone());
+                self.shards
+                    .shard_for_key(&k)
+                    .execute(move |s| s.stream_xgroup_destroy(&k, &g))
+            }
+            _ => CommandResponse::error(format!(
+                "ERR unknown subcommand '{}'. Try XGROUP HELP.",
+                String::from_utf8_lossy(&args[0])
+            )),
+        }
+    }
+
+    /// `XPENDING key group [[IDLE min-idle] start end count [consumer]]`.
+    pub(super) fn xpending(&self, args: &[Bytes]) -> CommandResponse {
+        if args.len() < 2 {
+            return CommandResponse::wrong_arity("xpending");
+        }
+        let (k, g) = (args[0].clone(), args[1].clone());
+        if args.len() == 2 {
+            return self
+                .shards
+                .shard_for_key(&k)
+                .execute(move |s| s.stream_xpending(&k, &g, None, None, None, None));
+        }
+        let mut i = 2;
+        let mut min_idle = None;
+        if Upper::new(&args[2]).as_str() == "IDLE" {
+            match args.get(3).map(|v| int_arg(v)) {
+                Some(Ok(n)) => min_idle = Some(n.max(0) as u64),
+                Some(Err(e)) => return e,
+                None => return CommandResponse::syntax_error(),
+            }
+            i = 4;
+        }
+        let rest = &args[i..];
+        if rest.len() < 3 || rest.len() > 4 {
+            return CommandResponse::syntax_error();
+        }
+        let start = match stream_id_arg(&rest[0], false) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let end = match stream_id_arg(&rest[1], true) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let count = match int_arg(&rest[2]) {
+            Ok(n) => n.max(0) as usize,
+            Err(e) => return e,
+        };
+        let consumer = rest.get(3).cloned();
+        self.shards.shard_for_key(&k).execute(move |s| {
+            s.stream_xpending_range(&k, &g, min_idle, start, end, count, consumer.as_ref())
+        })
+    }
+}

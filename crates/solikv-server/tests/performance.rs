@@ -108,7 +108,8 @@ async fn keys_expire_on_an_idle_server() {
     let mut batch = Vec::new();
     for i in 0..20_000 {
         let k = format!("e{i}");
-        batch.extend(cmd(&[b"SET", k.as_bytes(), b"v", b"PX", b"50"]));
+        // Long enough to outlast the load itself on a busy test machine.
+        batch.extend(cmd(&[b"SET", k.as_bytes(), b"v", b"PX", b"600"]));
     }
     s.write_all(&batch).await.unwrap();
     // Drain the 20k +OK replies.

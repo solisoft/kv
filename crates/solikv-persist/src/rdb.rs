@@ -69,6 +69,8 @@ const TYPE_ZSET: u8 = 4;
 const TYPE_HLL: u8 = 5;
 const TYPE_BLOOM: u8 = 6;
 const TYPE_STREAM: u8 = 7;
+/// A stream followed by the Redis 7 metadata ([`write_stream_meta`]).
+const TYPE_STREAM2: u8 = 8;
 
 // Framing
 const SELECT_DB: u8 = 0xFB;
@@ -197,7 +199,7 @@ fn type_byte(value: &RedisValue) -> u8 {
         RedisValue::ZSet(_) => TYPE_ZSET,
         RedisValue::HyperLogLog(_) => TYPE_HLL,
         RedisValue::BloomFilter(_) => TYPE_BLOOM,
-        RedisValue::Stream(_) => TYPE_STREAM,
+        RedisValue::Stream(_) => TYPE_STREAM2,
     }
 }
 
@@ -243,7 +245,10 @@ fn write_value<W: Write>(w: &mut W, value: &RedisValue) -> io::Result<()> {
             w.write_all(&bf.error_rate.to_le_bytes())?;
             write_bytes(w, &bf.bits)
         }
-        RedisValue::Stream(stream) => write_stream(w, stream),
+        RedisValue::Stream(stream) => {
+            write_stream(w, stream)?;
+            write_stream_meta(w, stream)
+        }
     }
 }
 
@@ -281,6 +286,50 @@ fn write_stream<W: Write>(w: &mut W, s: &StreamValue) -> io::Result<()> {
             write_len(w, c.pending.len())?;
             for id in c.pending.keys() {
                 write_id(w, id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What `write_stream` predates: entries added, the highest deleted ID,
+/// each group's entries-read and each consumer's active time — by name, as
+/// the groups are read back into hash maps.
+fn write_stream_meta<W: Write>(w: &mut W, s: &StreamValue) -> io::Result<()> {
+    w.write_all(&s.entries_added.to_le_bytes())?;
+    write_id(w, &s.max_deleted_id)?;
+    write_len(w, s.groups.len())?;
+    for g in s.groups.values() {
+        write_bytes(w, &g.name)?;
+        w.write_all(&g.entries_read.unwrap_or(u64::MAX).to_le_bytes())?;
+        write_len(w, g.consumers.len())?;
+        for c in g.consumers.values() {
+            write_bytes(w, &c.name)?;
+            w.write_all(&c.active_time.to_le_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn read_stream_meta<R: Read>(r: &mut R, s: &mut StreamValue) -> io::Result<()> {
+    s.entries_added = read_u64(r)?;
+    s.max_deleted_id = read_id(r)?;
+    let ngroups = sanitize_collection_len(read_len(r)?)?;
+    for _ in 0..ngroups {
+        let name = read_bytes(r)?;
+        let entries_read = read_u64(r)?;
+        let nconsumers = sanitize_collection_len(read_len(r)?)?;
+        let mut active = Vec::with_capacity(nconsumers.min(PREALLOC_CAP));
+        for _ in 0..nconsumers {
+            let cname = read_bytes(r)?;
+            active.push((cname, read_u64(r)?));
+        }
+        if let Some(g) = s.groups.get_mut(&name) {
+            g.entries_read = (entries_read != u64::MAX).then_some(entries_read);
+            for (cname, t) in active {
+                if let Some(c) = g.consumers.get_mut(&cname) {
+                    c.active_time = t;
+                }
             }
         }
     }
@@ -345,25 +394,17 @@ fn read_stream<R: Read>(r: &mut R) -> io::Result<StreamValue> {
             for _ in 0..nids {
                 cp.insert(read_id(r)?, ());
             }
-            consumers.insert(
-                cname.clone(),
-                StreamConsumer {
-                    name: cname,
-                    seen_time,
-                    pending: cp,
-                },
-            );
+            let mut c = StreamConsumer::new(cname.clone(), seen_time);
+            c.pending = cp;
+            consumers.insert(cname, c);
         }
-        s.groups.insert(
-            name.clone(),
-            ConsumerGroup {
-                name,
-                last_delivered_id,
-                pending,
-                consumers,
-            },
-        );
+        let mut g = ConsumerGroup::new(name.clone(), last_delivered_id, None);
+        g.pending = pending;
+        g.consumers = consumers;
+        s.groups.insert(name, g);
     }
+    // Written before this metadata existed: estimate what can be.
+    s.entries_added = s.entries.len() as u64;
     Ok(s)
 }
 
@@ -438,6 +479,11 @@ fn read_value<R: Read>(r: &mut R, type_byte: u8) -> io::Result<RedisValue> {
             })
         }
         TYPE_STREAM => RedisValue::stream(read_stream(r)?),
+        TYPE_STREAM2 => {
+            let mut st = read_stream(r)?;
+            read_stream_meta(r, &mut st)?;
+            RedisValue::stream(st)
+        }
         b => return Err(invalid(format!("unknown type byte: {}", b))),
     })
 }
@@ -984,23 +1030,16 @@ mod tests {
         let mut cp = BTreeMap::new();
         cp.insert(StreamId::new(5, 0), ());
         let mut consumers = HashMap::new();
-        consumers.insert(
-            Bytes::from("c1"),
-            StreamConsumer {
-                name: Bytes::from("c1"),
-                seen_time: 41,
-                pending: cp,
-            },
-        );
-        s.groups.insert(
-            Bytes::from("g1"),
-            ConsumerGroup {
-                name: Bytes::from("g1"),
-                last_delivered_id: StreamId::new(5, 0),
-                pending,
-                consumers,
-            },
-        );
+        let mut c1 = StreamConsumer::new(Bytes::from("c1"), 41);
+        c1.pending = cp;
+        c1.active_time = 40;
+        consumers.insert(Bytes::from("c1"), c1);
+        let mut g1 = ConsumerGroup::new(Bytes::from("g1"), StreamId::new(5, 0), Some(1));
+        g1.pending = pending;
+        g1.consumers = consumers;
+        s.groups.insert(Bytes::from("g1"), g1);
+        s.entries_added = 7;
+        s.max_deleted_id = StreamId::new(4, 9);
         let mut store = ShardStore::new();
         store.insert_entry(Bytes::from("st"), KeyEntry::new(RedisValue::stream(s)));
         let loaded = roundtrip(&store);
@@ -1011,6 +1050,10 @@ mod tests {
                 let g = &s.groups[&Bytes::from("g1")];
                 assert_eq!(g.pending[&StreamId::new(5, 0)].delivery_count, 2);
                 assert_eq!(g.consumers[&Bytes::from("c1")].pending.len(), 1);
+                assert_eq!(g.consumers[&Bytes::from("c1")].active_time, 40);
+                assert_eq!(g.entries_read, Some(1));
+                assert_eq!(s.entries_added, 7);
+                assert_eq!(s.max_deleted_id, StreamId::new(4, 9));
             }
             _ => panic!("expected a stream"),
         }

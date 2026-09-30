@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use std::collections::{BTreeMap, HashMap};
 
 use crate::store::ShardStore;
 use crate::types::*;
@@ -23,7 +22,11 @@ fn generate_stream_id(
             Ok(StreamId::new(ms, seq))
         }
         StreamIdInput::Explicit(id) => {
-            if id <= stream.last_id {
+            if id == StreamId::MIN {
+                Err(CommandResponse::error(
+                    "ERR The ID specified in XADD must be greater than 0-0",
+                ))
+            } else if id <= stream.last_id {
                 Err(CommandResponse::error(
                     "ERR The ID specified in XADD is equal or smaller than the target stream top item",
                 ))
@@ -54,8 +57,8 @@ fn apply_trim(stream: &mut StreamValue, trim: &StreamTrim) -> i64 {
     match trim {
         StreamTrim::MaxLen { threshold, .. } => {
             while stream.entries.len() > *threshold {
-                if let Some((&id, _)) = stream.entries.iter().next() {
-                    stream.entries.remove(&id);
+                if let Some((id, _)) = stream.entries.pop_first() {
+                    stream.max_deleted_id = stream.max_deleted_id.max(id);
                     trimmed += 1;
                 } else {
                     break;
@@ -70,6 +73,7 @@ fn apply_trim(stream: &mut StreamValue, trim: &StreamTrim) -> i64 {
                 .collect();
             for id in to_remove {
                 stream.entries.remove(&id);
+                stream.max_deleted_id = stream.max_deleted_id.max(id);
                 trimmed += 1;
             }
         }
@@ -85,7 +89,7 @@ fn format_stream_entries(entries: &[(&StreamId, &Vec<(Bytes, Bytes)>)]) -> Comma
     CommandResponse::array(result)
 }
 
-fn format_single_entry(id: &StreamId, fields: &[(Bytes, Bytes)]) -> CommandResponse {
+pub(crate) fn format_single_entry(id: &StreamId, fields: &[(Bytes, Bytes)]) -> CommandResponse {
     let field_items: Vec<CommandResponse> = fields
         .iter()
         .flat_map(|(k, v)| {
@@ -167,6 +171,10 @@ impl ShardStore {
             }
         }
 
+        let existed = match self.get_stream(key) {
+            Err(e) => return e,
+            Ok(s) => s.is_some(),
+        };
         let stream = match self.get_or_create_stream(key) {
             Ok(s) => s,
             Err(e) => return e,
@@ -174,11 +182,18 @@ impl ShardStore {
 
         let id = match generate_stream_id(stream, id_input) {
             Ok(id) => id,
-            Err(e) => return e,
+            Err(e) => {
+                // A refused XADD must not leave an empty stream behind.
+                if !existed {
+                    self.del(key);
+                }
+                return e;
+            }
         };
 
         stream.entries.insert(id, fields);
         stream.last_id = id;
+        stream.entries_added += 1;
 
         if let Some(ref t) = trim {
             apply_trim(stream, t);
@@ -284,6 +299,9 @@ impl ShardStore {
                 for id in ids {
                     if sv.entries.remove(id).is_some() {
                         deleted += 1;
+                        if *id > sv.max_deleted_id {
+                            sv.max_deleted_id = *id;
+                        }
                     }
                 }
                 // Note: unlike sets/lists, empty streams keep the key alive
@@ -349,6 +367,18 @@ impl ShardStore {
         id: StreamIdInput,
         mkstream: bool,
     ) -> CommandResponse {
+        self.stream_xgroup_create_opts(key, group, id, mkstream, None)
+    }
+
+    /// `XGROUP CREATE … [MKSTREAM] [ENTRIESREAD n]`.
+    pub fn stream_xgroup_create_opts(
+        &mut self,
+        key: &Bytes,
+        group: Bytes,
+        id: StreamIdInput,
+        mkstream: bool,
+        entries_read: Option<u64>,
+    ) -> CommandResponse {
         // Check if stream exists
         match self.get_stream(key) {
             Err(e) => return e,
@@ -383,14 +413,15 @@ impl ShardStore {
             StreamIdInput::Partial(ms) => StreamId::new(ms, 0),
         };
 
+        let entries_read = match entries_read {
+            Some(n) => Some(n),
+            None if last_delivered_id >= stream.last_id => Some(stream.entries_added),
+            None if last_delivered_id == StreamId::MIN => Some(0),
+            None => None,
+        };
         stream.groups.insert(
             group.clone(),
-            ConsumerGroup {
-                name: group,
-                last_delivered_id,
-                pending: BTreeMap::new(),
-                consumers: HashMap::new(),
-            },
+            ConsumerGroup::new(group, last_delivered_id, entries_read),
         );
 
         CommandResponse::ok()
@@ -486,12 +517,11 @@ impl ShardStore {
                 if !grp.consumers.contains_key(consumer_name) {
                     grp.consumers.insert(
                         consumer_name.clone(),
-                        StreamConsumer {
-                            name: consumer_name.clone(),
-                            seen_time: now_millis(),
-                            pending: BTreeMap::new(),
-                        },
+                        StreamConsumer::new(consumer_name.clone(), now_millis()),
                     );
+                }
+                if let Some(c) = grp.consumers.get_mut(consumer_name) {
+                    c.seen_time = now_millis();
                 }
 
                 match id_input {
@@ -521,6 +551,14 @@ impl ShardStore {
                         let now = now_millis();
                         let last_delivered = entries_data.last().unwrap().0;
                         grp.last_delivered_id = last_delivered;
+                        grp.entries_read = if last_delivered == sv.last_id {
+                            Some(sv.entries_added)
+                        } else {
+                            grp.entries_read.map(|n| n + entries_data.len() as u64)
+                        };
+                        if let Some(c) = grp.consumers.get_mut(consumer_name) {
+                            c.active_time = now;
+                        }
 
                         for (id, _) in &entries_data {
                             if noack {

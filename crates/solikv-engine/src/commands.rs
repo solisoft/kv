@@ -481,6 +481,9 @@ commands! {
     XGROUP = "XGROUP", -2, W, Keys::Movable(second_arg_key);
     XACK = "XACK", -4, WF, K1;
     XPENDING = "XPENDING", -3, RO, K1;
+    XCLAIM = "XCLAIM", -6, WF, K1;
+    XAUTOCLAIM = "XAUTOCLAIM", -6, WF, K1;
+    XSETID = "XSETID", -3, WDF, K1;
     // HyperLogLog
     PFADD = "PFADD", -2, WDF, K1;
     PFCOUNT = "PFCOUNT", -2, RO, ALL;

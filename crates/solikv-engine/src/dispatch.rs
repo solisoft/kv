@@ -128,12 +128,51 @@ fn parse_stream_trim(
             if *start >= args.len() {
                 return Err(CommandResponse::syntax_error());
             }
+            // `LIMIT n` bounds how much one call trims; only with `~`, where
+            // trimming more exactly than asked is allowed, so it is accepted
+            // and the trim stays exact.
+            let limit = |start: &mut usize| -> Result<(), CommandResponse> {
+                if args
+                    .get(*start)
+                    .is_some_and(|a| a.eq_ignore_ascii_case(b"LIMIT"))
+                {
+                    if exact {
+                        return Err(CommandResponse::error(
+                            "ERR syntax error, LIMIT cannot be used without the special ~ option",
+                        ));
+                    }
+                    let ok = args
+                        .get(*start + 1)
+                        .and_then(|a| std::str::from_utf8(a).ok()?.parse::<i64>().ok())
+                        .is_some_and(|n| n >= 0);
+                    if !ok {
+                        return Err(CommandResponse::error(
+                            "ERR The LIMIT argument must be >= 0.",
+                        ));
+                    }
+                    *start += 2;
+                }
+                Ok(())
+            };
             if opt == "MAXLEN" {
-                let threshold = std::str::from_utf8(&args[*start])
+                let threshold = match std::str::from_utf8(&args[*start])
                     .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .ok_or_else(CommandResponse::syntax_error)?;
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    Some(n) if n >= 0 => n as usize,
+                    Some(_) => {
+                        return Err(CommandResponse::error(
+                            "ERR The MAXLEN argument must be >= 0.",
+                        ))
+                    }
+                    None => {
+                        return Err(CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        ))
+                    }
+                };
                 *start += 1;
+                limit(start)?;
                 Ok(Some(StreamTrim::MaxLen { exact, threshold }))
             } else {
                 let id_input =
@@ -144,6 +183,7 @@ fn parse_stream_trim(
                     _ => return Err(CommandResponse::syntax_error()),
                 };
                 *start += 1;
+                limit(start)?;
                 Ok(Some(StreamTrim::MinId { exact, threshold }))
             }
         }
@@ -3089,82 +3129,18 @@ impl CommandEngine {
                     Ok(None) => return CommandResponse::syntax_error(),
                     Err(e) => return e,
                 };
+                if i != args.len() {
+                    return CommandResponse::syntax_error();
+                }
                 self.shards
                     .shard_for_key(&key)
                     .execute(move |store| store.stream_xtrim(&key, trim))
             }
-            Cmd::XINFO => {
-                // XINFO STREAM key
-                if args.len() < 2 {
-                    return CommandResponse::wrong_arity("xinfo");
-                }
-                let sub = Upper::new(&args[0]);
-                match sub.as_str() {
-                    "STREAM" => {
-                        let key = args[1].clone();
-                        self.shards
-                            .shard_for_key(&key)
-                            .execute(move |store| store.stream_xinfo(&key))
-                    }
-                    _ => CommandResponse::error(format!("ERR Unknown XINFO subcommand '{}'", sub)),
-                }
-            }
-            Cmd::XGROUP => {
-                if args.is_empty() {
-                    return CommandResponse::wrong_arity("xgroup");
-                }
-                let sub = Upper::new(&args[0]);
-                match sub.as_str() {
-                    "CREATE" => {
-                        // XGROUP CREATE key group id|$ [MKSTREAM]
-                        if args.len() < 4 {
-                            return CommandResponse::wrong_arity("xgroup|create");
-                        }
-                        let key = args[1].clone();
-                        let group = args[2].clone();
-                        let id_str = std::str::from_utf8(&args[3]).unwrap_or("0");
-                        let id = if id_str == "$" {
-                            StreamIdInput::Max
-                        } else {
-                            match StreamId::parse(id_str) {
-                                Some(id) => id,
-                                None => return CommandResponse::error(
-                                    "ERR Invalid stream ID specified as stream command argument",
-                                ),
-                            }
-                        };
-                        let mkstream = args
-                            .get(4)
-                            .map(|a| Upper::new(a) == "MKSTREAM")
-                            .unwrap_or(false);
-                        self.shards.shard_for_key(&key).execute(move |store| {
-                            store.stream_xgroup_create(&key, group, id, mkstream)
-                        })
-                    }
-                    "DESTROY" => {
-                        if args.len() < 3 {
-                            return CommandResponse::wrong_arity("xgroup|destroy");
-                        }
-                        let key = args[1].clone();
-                        let group = args[2].clone();
-                        self.shards
-                            .shard_for_key(&key)
-                            .execute(move |store| store.stream_xgroup_destroy(&key, &group))
-                    }
-                    "DELCONSUMER" => {
-                        if args.len() < 4 {
-                            return CommandResponse::wrong_arity("xgroup|delconsumer");
-                        }
-                        let key = args[1].clone();
-                        let group = args[2].clone();
-                        let consumer = args[3].clone();
-                        self.shards.shard_for_key(&key).execute(move |store| {
-                            store.stream_xgroup_delconsumer(&key, &group, &consumer)
-                        })
-                    }
-                    _ => CommandResponse::error(format!("ERR Unknown XGROUP subcommand '{}'", sub)),
-                }
-            }
+            Cmd::XINFO => self.xinfo(args),
+            Cmd::XCLAIM => self.xclaim(args),
+            Cmd::XAUTOCLAIM => self.xautoclaim(args),
+            Cmd::XSETID => self.xsetid(args),
+            Cmd::XGROUP => self.xgroup(args),
             Cmd::XREADGROUP => {
                 // XREADGROUP GROUP group consumer [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]
                 // Six arguments at least: GROUP g c STREAMS key id (the
@@ -3236,33 +3212,7 @@ impl CommandEngine {
                             }
                         };
 
-                    let k = key.clone();
-                    let g = group.clone();
-                    let c = consumer.clone();
-                    let count_arg = count.map(|n| n.to_string());
-                    let id_arg = id_arg.clone();
-                    let resp =
-                        self.shards
-                            .shard_for_key(&k)
-                            .execute_with_effects(move |store, fx| {
-                                let r = store
-                                    .stream_xreadgroup_opts(&k, &g, &c, id_input, count, noack);
-                                if !r.is_error() && fx.enabled() {
-                                    // This stream's part only: the others are on
-                                    // their own shards' logs.
-                                    let mut a: Vec<&[u8]> = vec![b"GROUP", &g, &c];
-                                    if let Some(n) = &count_arg {
-                                        a.push(b"COUNT");
-                                        a.push(n.as_bytes());
-                                    }
-                                    if noack {
-                                        a.push(b"NOACK");
-                                    }
-                                    a.extend_from_slice(&[b"STREAMS", &k, &id_arg]);
-                                    fx.push("XREADGROUP", &a);
-                                }
-                                r
-                            });
+                    let resp = self.xreadgroup_one(key, &group, &consumer, id_input, count, noack);
 
                     if resp.is_error() {
                         return resp;
@@ -3304,60 +3254,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.stream_xack(&key, &group, &ids))
             }
-            Cmd::XPENDING => {
-                // XPENDING key group [start end count [consumer]]
-                if args.len() < 2 {
-                    return CommandResponse::wrong_arity("xpending");
-                }
-                let key = args[0].clone();
-                let group = args[1].clone();
-
-                if args.len() == 2 {
-                    // Summary form
-                    self.shards.shard_for_key(&key).execute(move |store| {
-                        store.stream_xpending(&key, &group, None, None, None, None)
-                    })
-                } else if args.len() >= 5 {
-                    // Detail form: start end count [consumer]
-                    let start = match parse_stream_id(&args[2]) {
-                        Some(StreamIdInput::Min) => StreamId::MIN,
-                        Some(StreamIdInput::Explicit(id)) => id,
-                        Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, 0),
-                        _ => {
-                            return CommandResponse::error(
-                                "ERR Invalid stream ID specified as stream command argument",
-                            )
-                        }
-                    };
-                    let end = match parse_stream_id(&args[3]) {
-                        Some(StreamIdInput::Max) => StreamId::MAX,
-                        Some(StreamIdInput::Explicit(id)) => id,
-                        Some(StreamIdInput::Partial(ms)) => StreamId::new(ms, u64::MAX),
-                        _ => {
-                            return CommandResponse::error(
-                                "ERR Invalid stream ID specified as stream command argument",
-                            )
-                        }
-                    };
-                    let count = std::str::from_utf8(&args[4])
-                        .ok()
-                        .and_then(|s| s.parse::<usize>().ok())
-                        .unwrap_or(10);
-                    let consumer_filter = args.get(5).cloned();
-                    self.shards.shard_for_key(&key).execute(move |store| {
-                        store.stream_xpending(
-                            &key,
-                            &group,
-                            Some(start),
-                            Some(end),
-                            Some(count),
-                            consumer_filter.as_ref(),
-                        )
-                    })
-                } else {
-                    CommandResponse::syntax_error()
-                }
-            }
+            Cmd::XPENDING => self.xpending(args),
 
             // ---- Pub/Sub commands ----
             Cmd::PUBLISH => {
