@@ -235,6 +235,19 @@ fn sort_keys(args: &[Bytes]) -> Vec<usize> {
     v
 }
 
+/// `GEORADIUS key … [STORE dest] [STOREDIST dest]`.
+fn georadius_keys(args: &[Bytes]) -> Vec<usize> {
+    let mut v = vec![0];
+    for (i, a) in args.iter().enumerate() {
+        if (a.eq_ignore_ascii_case(b"STORE") || a.eq_ignore_ascii_case(b"STOREDIST"))
+            && i + 1 < args.len()
+        {
+            v.push(i + 1);
+        }
+    }
+    v
+}
+
 /// `OBJECT sub key` / `MEMORY USAGE key`: the key is the second argument.
 fn second_arg_key(args: &[Bytes]) -> Vec<usize> {
     if args.len() >= 2 {
@@ -340,7 +353,10 @@ commands! {
     OBJECT = "OBJECT", -2, RO, Keys::Movable(second_arg_key);
     DUMP = "DUMP", 2, RO, K1;
     RESTORE = "RESTORE", -4, WD, K1;
-    SORT = "SORT", -2, WD, Keys::Movable(sort_keys);
+    SORT = "SORT", -2, &["write", "denyoom", "movablekeys"], Keys::Movable(sort_keys);
+    SORT_RO = "SORT_RO", -2, RO, K1;
+    COPY = "COPY", -3, WD, r(1, 2, 1);
+    TIME = "TIME", 1, &["loading", "stale", "fast"], NONE;
     // Strings
     GET = "GET", 2, ROF, K1;
     SET = "SET", -3, WD, K1;
@@ -367,6 +383,10 @@ commands! {
     GETBIT = "GETBIT", 3, ROF, K1;
     BITCOUNT = "BITCOUNT", -2, RO, K1;
     BITOP = "BITOP", -4, WD, r(2, -1, 1);
+    BITPOS = "BITPOS", -3, RO, K1;
+    BITFIELD = "BITFIELD", -2, WD, K1;
+    BITFIELD_RO = "BITFIELD_RO", -2, ROF, K1;
+    LCS = "LCS", -3, RO, r(1, 2, 1);
     // Lists
     LPUSH = "LPUSH", -3, WDF, K1;
     RPUSH = "RPUSH", -3, WDF, K1;
@@ -468,6 +488,10 @@ commands! {
     GEODIST = "GEODIST", -4, RO, K1;
     GEOSEARCH = "GEOSEARCH", -7, RO, K1;
     GEOSEARCHSTORE = "GEOSEARCHSTORE", -8, WD, r(1, 2, 1);
+    GEORADIUS = "GEORADIUS", -6, &["write", "denyoom", "movablekeys"], Keys::Movable(georadius_keys);
+    GEORADIUSBYMEMBER = "GEORADIUSBYMEMBER", -5, &["write", "denyoom", "movablekeys"], Keys::Movable(georadius_keys);
+    GEORADIUS_RO = "GEORADIUS_RO", -6, RO, K1;
+    GEORADIUSBYMEMBER_RO = "GEORADIUSBYMEMBER_RO", -5, RO, K1;
     // Streams
     XADD = "XADD", -5, WDF, K1;
     XLEN = "XLEN", 2, ROF, K1;

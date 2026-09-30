@@ -727,6 +727,38 @@ impl CommandEngine {
                     self.notify_keyspace_event(NOTIFY_ZSET, ev, key);
                 }
             }
+            "COPY" if args.len() >= 2 => {
+                if matches!(_response, CommandResponse::Integer(1)) {
+                    self.notify_keyspace_event(NOTIFY_GENERIC, "copy_to", &args[1]);
+                }
+            }
+            "RESTORE" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_GENERIC, "restore", key);
+                }
+            }
+            "SORT" => {
+                if let Some(p) = args.iter().position(|a| a.eq_ignore_ascii_case(b"STORE")) {
+                    if let Some(dest) = args.get(p + 1) {
+                        let ev = if matches!(_response, CommandResponse::Integer(0)) {
+                            "del"
+                        } else {
+                            "sortstore"
+                        };
+                        self.notify_keyspace_event(NOTIFY_LIST, ev, dest);
+                    }
+                }
+            }
+            "BITFIELD" => {
+                let writes = args
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(b"SET") || a.eq_ignore_ascii_case(b"INCRBY"));
+                if writes {
+                    if let Some(key) = args.first() {
+                        self.notify_keyspace_event(NOTIFY_STRING, "setbit", key);
+                    }
+                }
+            }
             "SMOVE" if args.len() >= 2 => {
                 self.notify_keyspace_event(NOTIFY_SET, "srem", &args[0]);
                 self.notify_keyspace_event(NOTIFY_SET, "sadd", &args[1]);
@@ -1647,17 +1679,9 @@ impl CommandEngine {
                             return CommandResponse::wrong_arity("object|encoding");
                         }
                         let key = args[1].clone();
-                        self.shards.shard_for_key(&key).execute(move |store| {
-                            match store.key_type(&key) {
-                                "string" => CommandResponse::bulk_string("embstr"),
-                                "list" => CommandResponse::bulk_string("listpack"),
-                                "hash" => CommandResponse::bulk_string("listpack"),
-                                "set" => CommandResponse::bulk_string("listpack"),
-                                "zset" => CommandResponse::bulk_string("skiplist"),
-                                "stream" => CommandResponse::bulk_string("stream"),
-                                _ => CommandResponse::nil(),
-                            }
-                        })
+                        self.shards
+                            .shard_for_key(&key)
+                            .execute(move |store| store.object_encoding_of(&key))
                     }
                     "IDLETIME" | "FREQ" | "REFCOUNT" => {
                         if args.len() != 2 {
@@ -1709,7 +1733,20 @@ impl CommandEngine {
                     _ => CommandResponse::error("ERR Unknown subcommand"),
                 }
             }
-            Cmd::DUMP | Cmd::RESTORE => CommandResponse::error("ERR not implemented"),
+            Cmd::DUMP => self.dump(args),
+            Cmd::RESTORE => self.restore(args),
+            Cmd::COPY => self.copy(args),
+            Cmd::SORT => self.sort(false, args),
+            Cmd::SORT_RO => self.sort(true, args),
+            Cmd::TIME => self.time(),
+            Cmd::LCS => self.lcs(args),
+            Cmd::BITPOS => self.bitpos(args),
+            Cmd::BITFIELD => self.bitfield(false, args),
+            Cmd::BITFIELD_RO => self.bitfield(true, args),
+            Cmd::GEORADIUS => self.georadius(false, false, args),
+            Cmd::GEORADIUS_RO => self.georadius(false, true, args),
+            Cmd::GEORADIUSBYMEMBER => self.georadius(true, false, args),
+            Cmd::GEORADIUSBYMEMBER_RO => self.georadius(true, true, args),
             Cmd::WAIT => CommandResponse::integer(0),
 
             // ---- List commands ----
@@ -2865,14 +2902,52 @@ impl CommandEngine {
                     None => return CommandResponse::syntax_error(),
                 };
 
-                // GEOSEARCHSTORE operates on two keys (src + dest), route to dest shard
-                let shard = self.shards.shard_for_key(&dest).clone();
-                shard.execute_with_effects(move |store, fx| {
-                    let r = store
-                        .geo_search_store(&dest, &src, &from, &by, sort_asc, count, store_dist);
-                    fx.put_key(store, &dest);
-                    r
-                })
+                let si = self.shards.shard_index_for_key(&src);
+                let di = self.shards.shard_index_for_key(&dest);
+                if si == di {
+                    return self
+                        .shards
+                        .shard(di)
+                        .execute_with_effects(move |store, fx| {
+                            let r = store.geo_search_store(
+                                &dest, &src, &from, &by, sort_asc, count, store_dist,
+                            );
+                            fx.put_key(store, &dest);
+                            r
+                        });
+                }
+                // Different shards: the source used to be looked up in the
+                // destination's store, where it is not, so the result was
+                // always empty. Search a copy of it, store what is found.
+                let mut src_value = None;
+                self.shards.shard(si).execute(|s| {
+                    if let Some(e) = s.get(&src) {
+                        src_value = Some(e.value.clone());
+                    }
+                    CommandResponse::ok()
+                });
+                let mut scratch = solikv_core::ShardStore::new();
+                if let Some(v) = src_value {
+                    scratch.set(src.clone(), v, None);
+                }
+                let r =
+                    scratch.geo_search_store(&dest, &src, &from, &by, sort_asc, count, store_dist);
+                if r.is_error() {
+                    return r;
+                }
+                let found = scratch.peek(&dest).map(|e| e.value.clone());
+                self.shards
+                    .shard(di)
+                    .execute_with_effects(move |store, fx| {
+                        match found {
+                            Some(v) => store.set(dest.clone(), v, None),
+                            None => {
+                                store.del(&dest);
+                            }
+                        }
+                        fx.put_key(store, &dest);
+                        r
+                    })
             }
 
             // ---- Stream commands ----
@@ -3745,42 +3820,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_getbit(&key, offset))
             }
-            Cmd::BITCOUNT => {
-                if args.is_empty() || args.len() == 2 || args.len() > 3 {
-                    return CommandResponse::wrong_arity("bitcount");
-                }
-                let key = args[0].clone();
-                let (start, end) = if args.len() == 3 {
-                    let s = match std::str::from_utf8(&args[1])
-                        .ok()
-                        .and_then(|s| s.parse::<i64>().ok())
-                    {
-                        Some(v) => v,
-                        None => {
-                            return CommandResponse::error(
-                                "ERR value is not an integer or out of range",
-                            )
-                        }
-                    };
-                    let e = match std::str::from_utf8(&args[2])
-                        .ok()
-                        .and_then(|s| s.parse::<i64>().ok())
-                    {
-                        Some(v) => v,
-                        None => {
-                            return CommandResponse::error(
-                                "ERR value is not an integer or out of range",
-                            )
-                        }
-                    };
-                    (Some(s), Some(e))
-                } else {
-                    (None, None)
-                };
-                self.shards
-                    .shard_for_key(&key)
-                    .execute(move |store| store.string_bitcount(&key, start, end))
-            }
+            Cmd::BITCOUNT => self.bitcount(args),
             Cmd::BITOP => {
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity("bitop");

@@ -150,6 +150,33 @@ impl Client {
         self.reply()
     }
 
+    /// Send a command with binary arguments.
+    fn cmd_b(&mut self, args: &[&[u8]]) -> String {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            out.extend_from_slice(a);
+            out.extend_from_slice(b"\r\n");
+        }
+        self.w.write_all(&out).unwrap();
+        self.reply()
+    }
+
+    /// A bulk reply's raw bytes (`None` for nil).
+    fn bulk_raw(&mut self, args: &[&str]) -> Option<Vec<u8>> {
+        self.send(args);
+        let mut line = String::new();
+        self.r.read_line(&mut line).unwrap();
+        let n: i64 = line.trim_end()[1..].parse().unwrap();
+        if n < 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; n as usize + 2];
+        self.r.read_exact(&mut buf).unwrap();
+        buf.truncate(n as usize);
+        Some(buf)
+    }
+
     fn reply(&mut self) -> String {
         let mut line = String::new();
         self.r.read_line(&mut line).unwrap();
@@ -857,4 +884,344 @@ fn consumer_group_state_replays_with_its_delivery_times() {
         c.cmd(&["XREADGROUP", "GROUP", "g", "carol", "STREAMS", "st", ">"]),
         "nilarr"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Keys, strings, geo
+// ---------------------------------------------------------------------------
+
+#[test]
+fn copy_sort_time() {
+    let s = Server::new("keys");
+    let mut c = s.client();
+    let (a, b) = keys_on_different_shards("cp");
+    c.cmd(&["RPUSH", &a, "3", "1", "2"]);
+    c.cmd(&["PEXPIRE", &a, "100000"]);
+    assert_eq!(c.cmd(&["COPY", &a, &b]), ":1");
+    assert_eq!(c.cmd(&["LRANGE", &b, "0", "-1"]), "[$3,$1,$2]");
+    let ttl: i64 = c.cmd(&["PTTL", &b])[1..].parse().unwrap();
+    assert!(ttl > 90_000, "{ttl}");
+    assert_eq!(c.cmd(&["COPY", &a, &b]), ":0");
+    c.cmd(&["SET", "str", "x"]);
+    assert_eq!(c.cmd(&["COPY", "str", &b, "REPLACE"]), ":1");
+    assert_eq!(c.cmd(&["GET", &b]), "$x");
+    assert_eq!(c.cmd(&["COPY", "str", "str", "DB", "3"]), ":1");
+    assert_eq!(c.cmd(&["SELECT", "3"]), "+OK");
+    assert_eq!(c.cmd(&["GET", "str"]), "$x");
+    c.cmd(&["SELECT", "0"]);
+    assert!(c
+        .cmd(&["COPY", "str", "str"])
+        .contains("source and destination objects are the same"));
+    assert!(c
+        .cmd(&["COPY", "str", "y", "DB", "99"])
+        .contains("out of range"));
+    assert_eq!(c.cmd(&["COPY", "missing", "y"]), ":0");
+
+    // SORT: numeric, alpha, limit, desc, BY/GET patterns across shards.
+    assert_eq!(c.cmd(&["SORT", &a]), "[$1,$2,$3]");
+    assert_eq!(c.cmd(&["SORT", &a, "DESC", "LIMIT", "0", "2"]), "[$3,$2]");
+    c.cmd(&["RPUSH", "names", "bob", "al", "cy"]);
+    assert_eq!(c.cmd(&["SORT", "names", "ALPHA"]), "[$al,$bob,$cy]");
+    assert!(c
+        .cmd(&["SORT", "names"])
+        .contains("can't be converted into double"));
+    for (n, w) in [("bob", "3"), ("al", "9"), ("cy", "1")] {
+        c.cmd(&["SET", &format!("weight_{n}"), w]);
+        c.cmd(&[
+            "HSET",
+            &format!("user:{n}"),
+            "age",
+            w,
+            "name",
+            &n.to_uppercase(),
+        ]);
+    }
+    assert_eq!(
+        c.cmd(&["SORT", "names", "BY", "weight_*"]),
+        "[$cy,$bob,$al]"
+    );
+    assert_eq!(
+        c.cmd(&[
+            "SORT",
+            "names",
+            "BY",
+            "user:*->age",
+            "DESC",
+            "GET",
+            "#",
+            "GET",
+            "user:*->name"
+        ]),
+        "[$al,$AL,$bob,$BOB,$cy,$CY]"
+    );
+    assert_eq!(
+        c.cmd(&["SORT", "names", "BY", "nosort", "GET", "nothing:*"]),
+        "[nil,nil,nil]"
+    );
+    assert_eq!(c.cmd(&["SORT", "names", "ALPHA", "STORE", "sorted"]), ":3");
+    assert_eq!(c.cmd(&["LRANGE", "sorted", "0", "-1"]), "[$al,$bob,$cy]");
+    assert!(c
+        .cmd(&["SORT_RO", "names", "STORE", "x"])
+        .starts_with("-ERR syntax"));
+    assert_eq!(
+        c.cmd(&["SORT_RO", "names", "ALPHA", "LIMIT", "1", "-1"]),
+        "[$bob,$cy]"
+    );
+    c.cmd(&["ZADD", "zs", "1", "z", "2", "a"]);
+    assert_eq!(c.cmd(&["SORT", "zs", "BY", "nosort"]), "[$z,$a]");
+
+    let t = c.cmd(&["TIME"]);
+    let parts: Vec<&str> = t
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(',')
+        .collect();
+    assert_eq!(parts.len(), 2);
+    assert!(parts[0][1..].parse::<u64>().unwrap() > 1_600_000_000);
+    assert!(parts[1][1..].parse::<u64>().unwrap() < 1_000_000);
+}
+
+#[test]
+fn dump_restore_round_trips_every_type() {
+    let s = Server::new("dump");
+    let mut c = s.client();
+    c.cmd(&["SET", "s", "hello"]);
+    c.cmd(&["RPUSH", "l", "a", "b"]);
+    c.cmd(&["SADD", "set", "x", "y"]);
+    c.cmd(&["HSET", "h", "f", "v"]);
+    c.cmd(&["ZADD", "z", "1.5", "m", "-3", "n"]);
+    c.cmd(&["XADD", "st", "1-1", "f", "v"]);
+    c.cmd(&["PFADD", "hll", "a", "b", "c"]);
+    for k in ["s", "l", "set", "h", "z", "st", "hll"] {
+        let payload = c.bulk_raw(&["DUMP", k]).expect(k);
+        let copy = format!("{k}:copy");
+        assert_eq!(
+            c.cmd_b(&[b"RESTORE", copy.as_bytes(), b"0", &payload]),
+            "+OK",
+            "{k}"
+        );
+        assert!(c
+            .cmd_b(&[b"RESTORE", copy.as_bytes(), b"0", &payload])
+            .starts_with("-BUSYKEY"));
+        assert_eq!(
+            c.cmd_b(&[b"RESTORE", copy.as_bytes(), b"0", &payload, b"REPLACE"]),
+            "+OK"
+        );
+        assert_eq!(c.cmd(&["TYPE", &copy]), c.cmd(&["TYPE", k]), "{k}");
+    }
+    assert_eq!(c.cmd(&["GET", "s:copy"]), "$hello");
+    assert_eq!(c.cmd(&["LRANGE", "l:copy", "0", "-1"]), "[$a,$b]");
+    assert_eq!(
+        c.cmd(&["ZRANGE", "z:copy", "0", "-1", "WITHSCORES"]),
+        "[$n,$-3,$m,$1.5]"
+    );
+    assert_eq!(c.cmd(&["HGET", "h:copy", "f"]), "$v");
+    assert_eq!(c.cmd(&["XLEN", "st:copy"]), ":1");
+    assert_eq!(c.cmd(&["PFCOUNT", "hll:copy"]), ":3");
+    assert_eq!(c.cmd(&["DUMP", "nothing"]), "nil");
+
+    // A payload produced by Redis itself (its documentation's example).
+    let redis: &[u8] = b"\x00\xc0\n\n\x00n\x9fWE\x0e\xaec\xbb";
+    assert_eq!(c.cmd_b(&[b"RESTORE", b"fromredis", b"5000", redis]), "+OK");
+    assert_eq!(c.cmd(&["GET", "fromredis"]), "$10");
+    let pttl: i64 = c.cmd(&["PTTL", "fromredis"])[1..].parse().unwrap();
+    assert!(pttl > 4000 && pttl <= 5000, "{pttl}");
+    // Already past with ABSTTL: nothing is created.
+    assert_eq!(
+        c.cmd_b(&[b"RESTORE", b"past", b"1000", redis, b"ABSTTL"]),
+        "+OK"
+    );
+    assert_eq!(c.cmd(&["EXISTS", "past"]), ":0");
+    let mut bad = redis.to_vec();
+    bad[1] ^= 1;
+    assert!(c
+        .cmd_b(&[b"RESTORE", b"bad", b"0", &bad])
+        .contains("DUMP payload version or checksum are wrong"));
+    assert!(c
+        .cmd_b(&[b"RESTORE", b"bad", b"-1", redis])
+        .contains("Invalid TTL"));
+}
+
+#[test]
+fn copy_and_restore_replay_with_absolute_ttls() {
+    let dir = TmpDir::new("krep");
+    let s = Server::start(&dir.0, &["--shards", "8"]);
+    let (a, b) = keys_on_different_shards("kr");
+    {
+        let mut c = s.client();
+        c.cmd(&["SET", &a, "v", "EX", "1000"]);
+        c.cmd(&["COPY", &a, &b]);
+        let p = c.bulk_raw(&["DUMP", &a]).unwrap();
+        c.cmd_b(&[b"RESTORE", b"r", b"2000", &p]);
+        c.cmd(&["RPUSH", "names", "b", "a"]);
+        c.cmd(&["SORT", "names", "ALPHA", "STORE", "out"]);
+    }
+    thread::sleep(Duration::from_millis(1100));
+    s.sigterm();
+    let s = Server::start(&dir.0, &["--shards", "8"]);
+    let mut c = s.client();
+    assert_eq!(c.cmd(&["GET", &b]), "$v");
+    let ttl: i64 = c.cmd(&["PTTL", "r"])[1..].parse().unwrap();
+    // The deadline was absolute: time spent down counts.
+    assert!(ttl < 1000, "restarted TTL: {ttl}");
+    assert_eq!(c.cmd(&["LRANGE", "out", "0", "-1"]), "[$a,$b]");
+}
+
+#[test]
+fn lcs_and_bit_commands() {
+    let s = Server::new("bits");
+    let mut c = s.client();
+    let (a, b) = keys_on_different_shards("lcs");
+    c.cmd(&["SET", &a, "ohmytext"]);
+    c.cmd(&["SET", &b, "mynewtext"]);
+    assert_eq!(c.cmd(&["LCS", &a, &b]), "$mytext");
+    assert_eq!(c.cmd(&["LCS", &a, &b, "LEN"]), ":6");
+    assert_eq!(
+        c.cmd(&["LCS", &a, &b, "IDX"]),
+        "[$matches,[[[:4,:7],[:5,:8]],[[:2,:3],[:0,:1]]],$len,:6]"
+    );
+    assert_eq!(
+        c.cmd(&["LCS", &a, &b, "IDX", "MINMATCHLEN", "4", "WITHMATCHLEN"]),
+        "[$matches,[[[:4,:7],[:5,:8],:4]],$len,:6]"
+    );
+    assert_eq!(c.cmd(&["LCS", &a, "missing"]), "$");
+    c.cmd(&["RPUSH", "list", "x"]);
+    assert!(c
+        .cmd(&["LCS", &a, "list"])
+        .contains("must contain string values"));
+
+    // BITPOS / BITCOUNT, the examples of Redis' documentation.
+    c.cmd_b(&[b"SET", b"bp", b"\xff\xf0\x00"]);
+    assert_eq!(c.cmd(&["BITPOS", "bp", "0"]), ":12");
+    c.cmd_b(&[b"SET", b"bp", b"\x00\xff\xf0"]);
+    assert_eq!(c.cmd(&["BITPOS", "bp", "1", "0"]), ":8");
+    assert_eq!(c.cmd(&["BITPOS", "bp", "1", "2"]), ":16");
+    assert_eq!(c.cmd(&["BITPOS", "bp", "1", "2", "-1", "BYTE"]), ":16");
+    assert_eq!(c.cmd(&["BITPOS", "bp", "1", "7", "15", "BIT"]), ":8");
+    c.cmd_b(&[b"SET", b"bp", b"\x00\x00\x00"]);
+    assert_eq!(c.cmd(&["BITPOS", "bp", "1"]), ":-1");
+    assert_eq!(c.cmd(&["BITPOS", "nokey", "0"]), ":0");
+    assert!(c.cmd(&["BITPOS", "bp", "2"]).contains("must be 1 or 0"));
+    c.cmd(&["SET", "fb", "foobar"]);
+    assert_eq!(c.cmd(&["BITCOUNT", "fb"]), ":26");
+    assert_eq!(c.cmd(&["BITCOUNT", "fb", "0", "0"]), ":4");
+    assert_eq!(c.cmd(&["BITCOUNT", "fb", "1", "1", "BYTE"]), ":6");
+    assert_eq!(c.cmd(&["BITCOUNT", "fb", "5", "30", "BIT"]), ":17");
+
+    // BITFIELD.
+    assert_eq!(
+        c.cmd(&["BITFIELD", "bf", "INCRBY", "i5", "100", "1", "GET", "u4", "0"]),
+        "[:1,:0]"
+    );
+    for want in ["[:1,:1]", "[:2,:2]", "[:3,:3]", "[:0,:3]"] {
+        assert_eq!(
+            c.cmd(&[
+                "BITFIELD", "ov", "INCRBY", "u2", "100", "1", "OVERFLOW", "SAT", "INCRBY", "u2",
+                "102", "1"
+            ]),
+            want
+        );
+    }
+    assert_eq!(
+        c.cmd(&["BITFIELD", "f", "SET", "i8", "#1", "-100", "GET", "i8", "8"]),
+        "[:0,:-100]"
+    );
+    assert_eq!(
+        c.cmd(&["BITFIELD", "f", "OVERFLOW", "FAIL", "INCRBY", "i8", "#1", "-100"]),
+        "[nil]"
+    );
+    assert_eq!(c.cmd(&["BITFIELD_RO", "f", "GET", "u8", "8"]), "[:156]");
+    assert!(c
+        .cmd(&["BITFIELD_RO", "f", "SET", "u8", "0", "1"])
+        .contains("only supports the GET"));
+    assert!(c
+        .cmd(&["BITFIELD", "f", "GET", "u64", "0"])
+        .contains("Invalid bitfield type"));
+    assert!(c
+        .cmd(&["BITFIELD", "f", "GET", "u8", "4294967295"])
+        .contains("bit offset"));
+    assert_eq!(c.cmd(&["BITFIELD", "none", "GET", "u8", "0"]), "[:0]");
+    assert_eq!(c.cmd(&["EXISTS", "none"]), ":0");
+}
+
+#[test]
+fn georadius_and_object_encoding() {
+    let s = Server::new("geo");
+    let mut c = s.client();
+    c.cmd(&[
+        "GEOADD",
+        "Sicily",
+        "13.361389",
+        "38.115556",
+        "Palermo",
+        "15.087269",
+        "37.502669",
+        "Catania",
+    ]);
+    assert_eq!(
+        c.cmd(&["GEORADIUS", "Sicily", "15", "37", "200", "km", "ASC"]),
+        "[$Catania,$Palermo]"
+    );
+    assert_eq!(
+        c.cmd(&["GEORADIUS", "Sicily", "15", "37", "100", "km", "WITHDIST"]),
+        "[[$Catania,$56.4413]]"
+    );
+    assert_eq!(
+        c.cmd(&["GEORADIUSBYMEMBER_RO", "Sicily", "Palermo", "10", "km"]),
+        "[$Palermo]"
+    );
+    assert_eq!(
+        c.cmd(&[
+            "GEORADIUS",
+            "Sicily",
+            "15",
+            "37",
+            "200",
+            "km",
+            "STORE",
+            "near"
+        ]),
+        ":2"
+    );
+    assert_eq!(c.cmd(&["ZCARD", "near"]), ":2");
+    assert!(c
+        .cmd(&[
+            "GEORADIUS",
+            "Sicily",
+            "15",
+            "37",
+            "200",
+            "km",
+            "WITHDIST",
+            "STORE",
+            "x"
+        ])
+        .contains("not compatible"));
+    assert!(c
+        .cmd(&[
+            "GEORADIUS_RO",
+            "Sicily",
+            "15",
+            "37",
+            "200",
+            "km",
+            "STORE",
+            "x"
+        ])
+        .starts_with("-ERR syntax"));
+
+    c.cmd(&["SET", "n", "12345"]);
+    c.cmd(&["SET", "e", "hello"]);
+    c.cmd(&["SET", "r", &"x".repeat(50)]);
+    c.cmd(&["SADD", "is", "1", "2"]);
+    c.cmd(&["SADD", "ls", "a"]);
+    for (k, enc) in [
+        ("n", "int"),
+        ("e", "embstr"),
+        ("r", "raw"),
+        ("is", "intset"),
+        ("ls", "listpack"),
+        ("Sicily", "listpack"),
+    ] {
+        assert_eq!(c.cmd(&["OBJECT", "ENCODING", k]), format!("${enc}"), "{k}");
+    }
 }

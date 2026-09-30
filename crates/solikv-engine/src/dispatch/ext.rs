@@ -1452,3 +1452,773 @@ impl CommandEngine {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Keys, strings, geo
+// ---------------------------------------------------------------------------
+
+/// Parse `i8`/`u16`… for `BITFIELD`.
+fn bit_type(arg: &[u8]) -> Result<solikv_core::string_ops::BitType, CommandResponse> {
+    let err = || {
+        CommandResponse::error(
+            "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not \
+             supported but i64 is.",
+        )
+    };
+    let (&sign, rest) = arg.split_first().ok_or_else(err)?;
+    let signed = match sign {
+        b'i' | b'I' => true,
+        b'u' | b'U' => false,
+        _ => return Err(err()),
+    };
+    let bits: u32 = std::str::from_utf8(rest)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(err)?;
+    if bits == 0 || (signed && bits > 64) || (!signed && bits > 63) {
+        return Err(err());
+    }
+    Ok(solikv_core::string_ops::BitType { signed, bits })
+}
+
+/// A `BITFIELD` offset: bits, or `#n` fields of the type's width.
+fn bit_offset(arg: &[u8], bits: u32) -> Result<u64, CommandResponse> {
+    let err = || CommandResponse::error("ERR bit offset is not an integer or out of range");
+    let (mul, digits) = match arg.split_first() {
+        Some((b'#', rest)) => (bits as u64, rest),
+        _ => (1, arg),
+    };
+    let n: u64 = std::str::from_utf8(digits)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(err)?;
+    let off = n.checked_mul(mul).ok_or_else(err)?;
+    if off.saturating_add(bits as u64) > solikv_core::types::MAX_BIT_OFFSET {
+        return Err(err());
+    }
+    Ok(off)
+}
+
+/// `GEORADIUS*` → `GEOSEARCH`/`GEOSEARCHSTORE` arguments.
+fn georadius_translate(
+    by_member: bool,
+    ro: bool,
+    args: &[Bytes],
+) -> Result<(&'static str, Vec<Bytes>), CommandResponse> {
+    let b = |s: &'static str| Bytes::from_static(s.as_bytes());
+    let fixed = if by_member { 4 } else { 5 };
+    if args.len() < fixed {
+        return Err(CommandResponse::wrong_arity(match (by_member, ro) {
+            (false, false) => "georadius",
+            (false, true) => "georadius_ro",
+            (true, false) => "georadiusbymember",
+            (true, true) => "georadiusbymember_ro",
+        }));
+    }
+    let key = args[0].clone();
+    let mut from = if by_member {
+        vec![b("FROMMEMBER"), args[1].clone()]
+    } else {
+        vec![b("FROMLONLAT"), args[1].clone(), args[2].clone()]
+    };
+    from.extend([
+        b("BYRADIUS"),
+        args[fixed - 2].clone(),
+        args[fixed - 1].clone(),
+    ]);
+    let mut opts = Vec::new();
+    let mut store: Option<(Bytes, bool)> = None;
+    let mut with = false;
+    let mut i = fixed;
+    while i < args.len() {
+        let opt = Upper::new(&args[i]);
+        match opt.as_str() {
+            "WITHCOORD" | "WITHDIST" | "WITHHASH" => {
+                with = true;
+                opts.push(args[i].clone());
+            }
+            "ASC" | "DESC" | "ANY" => opts.push(args[i].clone()),
+            "COUNT" => {
+                let Some(n) = args.get(i + 1) else {
+                    return Err(CommandResponse::syntax_error());
+                };
+                opts.push(args[i].clone());
+                opts.push(n.clone());
+                i += 1;
+            }
+            "STORE" | "STOREDIST" if !ro => {
+                let Some(d) = args.get(i + 1) else {
+                    return Err(CommandResponse::syntax_error());
+                };
+                store = Some((d.clone(), opt.as_str() == "STOREDIST"));
+                i += 1;
+            }
+            _ => return Err(CommandResponse::syntax_error()),
+        }
+        i += 1;
+    }
+    match store {
+        None => {
+            let mut a = vec![key];
+            a.extend(from);
+            a.extend(opts);
+            Ok(("GEOSEARCH", a))
+        }
+        Some(_) if with => Err(CommandResponse::error(
+            "ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and \
+             WITHCOORD options",
+        )),
+        Some((dest, dist)) => {
+            let mut a = vec![dest, key];
+            a.extend(from);
+            a.extend(opts);
+            if dist {
+                a.push(b("STOREDIST"));
+            }
+            Ok(("GEOSEARCHSTORE", a))
+        }
+    }
+}
+
+impl CommandEngine {
+    /// `COPY source destination [DB db] [REPLACE]`: the value and its TTL,
+    /// across shards and databases; logged as the destination's value.
+    pub(super) fn copy(&self, args: &[Bytes]) -> CommandResponse {
+        if args.len() < 2 {
+            return CommandResponse::wrong_arity("copy");
+        }
+        let (src, dst) = (args[0].clone(), args[1].clone());
+        let here = crate::shard::current_db();
+        let mut db = here;
+        let mut replace = false;
+        let mut i = 2;
+        while i < args.len() {
+            match Upper::new(&args[i]).as_str() {
+                "REPLACE" => replace = true,
+                "DB" if i + 1 < args.len() => {
+                    match self.parse_db(&args[i + 1]) {
+                        Ok(d) => db = d,
+                        Err(e) => return e,
+                    }
+                    i += 1;
+                }
+                _ => return CommandResponse::syntax_error(),
+            }
+            i += 1;
+        }
+        if src == dst && db == here {
+            return CommandResponse::error("ERR source and destination objects are the same");
+        }
+        let _held = self.shards.lock_keys([src.as_ref(), dst.as_ref()]);
+        let mut got = None;
+        self.shards.shard_for_key(&src).execute(|s| {
+            if let Some(e) = s.get(&src) {
+                got = Some((e.value.clone(), e.expires_at));
+            }
+            CommandResponse::ok()
+        });
+        let Some((value, expires_at)) = got else {
+            return CommandResponse::integer(0);
+        };
+        let _db = DbGuard::enter(db);
+        self.shards
+            .shard_for_key(&dst)
+            .execute_with_effects(move |s, fx| {
+                if !replace && s.exists(&dst) {
+                    return CommandResponse::integer(0);
+                }
+                let entry = match expires_at {
+                    Some(at) => solikv_core::types::KeyEntry::with_expiry(value, at),
+                    None => solikv_core::types::KeyEntry::new(value),
+                };
+                s.insert_entry(dst.clone(), entry);
+                fx.put_key(s, &dst);
+                CommandResponse::integer(1)
+            })
+    }
+
+    /// `TIME`: seconds and microseconds.
+    pub(super) fn time(&self) -> CommandResponse {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        CommandResponse::array(vec![
+            CommandResponse::bulk(Bytes::from(now.as_secs().to_string())),
+            CommandResponse::bulk(Bytes::from(now.subsec_micros().to_string())),
+        ])
+    }
+
+    /// `DUMP key`: a Redis-format payload (see `solikv_persist::dump`).
+    pub(super) fn dump(&self, args: &[Bytes]) -> CommandResponse {
+        if args.len() != 1 {
+            return CommandResponse::wrong_arity("dump");
+        }
+        let key = args[0].clone();
+        self.shards
+            .shard_for_key(&key)
+            .execute(move |s| match s.get(&key) {
+                None => CommandResponse::Nil,
+                Some(e) => CommandResponse::bulk(Bytes::from(solikv_persist::dump::dump(&e.value))),
+            })
+    }
+
+    /// `RESTORE key ttl payload [REPLACE] [ABSTTL] [IDLETIME s] [FREQ f]`;
+    /// logged as the value with its absolute expiry.
+    pub(super) fn restore(&self, args: &[Bytes]) -> CommandResponse {
+        if args.len() < 3 {
+            return CommandResponse::wrong_arity("restore");
+        }
+        let ttl = match int_arg(&args[1]) {
+            Ok(t) if t >= 0 => t as u64,
+            Ok(_) => return CommandResponse::error("ERR Invalid TTL value, must be >= 0"),
+            Err(e) => return e,
+        };
+        let (mut replace, mut absttl) = (false, false);
+        let (mut idle, mut freq) = (None, None);
+        let mut i = 3;
+        while i < args.len() {
+            match Upper::new(&args[i]).as_str() {
+                "REPLACE" => replace = true,
+                "ABSTTL" => absttl = true,
+                "IDLETIME" if i + 1 < args.len() && freq.is_none() => {
+                    match int_arg(&args[i + 1]) {
+                        Ok(n) if n >= 0 => idle = Some(n as u64),
+                        Ok(_) => {
+                            return CommandResponse::error(
+                                "ERR Invalid IDLETIME value, must be >= 0",
+                            )
+                        }
+                        Err(e) => return e,
+                    }
+                    i += 1;
+                }
+                "FREQ" if i + 1 < args.len() && idle.is_none() => {
+                    match int_arg(&args[i + 1]) {
+                        Ok(n) if (0..=255).contains(&n) => freq = Some(n as u8),
+                        Ok(_) => {
+                            return CommandResponse::error(
+                                "ERR Invalid FREQ value, must be >= 0 and <= 255",
+                            )
+                        }
+                        Err(e) => return e,
+                    }
+                    i += 1;
+                }
+                _ => return CommandResponse::syntax_error(),
+            }
+            i += 1;
+        }
+        let value = match solikv_persist::dump::restore(&args[2]) {
+            Ok(v) => v,
+            Err(solikv_persist::dump::RestoreError::VersionOrChecksum) => {
+                return CommandResponse::error("ERR DUMP payload version or checksum are wrong")
+            }
+            Err(solikv_persist::dump::RestoreError::BadData) => {
+                return CommandResponse::error("ERR Bad data format")
+            }
+        };
+        let now = solikv_core::now_millis();
+        let expires_at = match (ttl, absttl) {
+            (0, _) => None,
+            (t, true) => Some(t),
+            (t, false) => Some(now.saturating_add(t)),
+        };
+        let key = args[0].clone();
+        let _ = (idle, freq);
+        self.shards
+            .shard_for_key(&key)
+            .execute_with_effects(move |s, fx| {
+                if !replace && s.exists(&key) {
+                    return CommandResponse::error("BUSYKEY Target key name already exists.");
+                }
+                if expires_at.is_some_and(|at| at <= now) {
+                    // Already expired: nothing is created (a replaced key
+                    // is gone all the same).
+                    if s.del(&key) {
+                        fx.put_key(s, &key);
+                    }
+                    return CommandResponse::ok();
+                }
+                let entry = match expires_at {
+                    Some(at) => solikv_core::types::KeyEntry::with_expiry(value, at),
+                    None => solikv_core::types::KeyEntry::new(value),
+                };
+                s.insert_entry(key.clone(), entry);
+                fx.put_key(s, &key);
+                CommandResponse::ok()
+            })
+    }
+
+    /// `LCS key1 key2 [LEN] [IDX] [MINMATCHLEN n] [WITHMATCHLEN]`.
+    pub(super) fn lcs(&self, args: &[Bytes]) -> CommandResponse {
+        if args.len() < 2 {
+            return CommandResponse::wrong_arity("lcs");
+        }
+        let (mut len_only, mut idx, mut withlen, mut minlen) = (false, false, false, 0usize);
+        let mut i = 2;
+        while i < args.len() {
+            match Upper::new(&args[i]).as_str() {
+                "LEN" => len_only = true,
+                "IDX" => idx = true,
+                "WITHMATCHLEN" => withlen = true,
+                "MINMATCHLEN" if i + 1 < args.len() => {
+                    match int_arg(&args[i + 1]) {
+                        Ok(n) => minlen = n.max(0) as usize,
+                        Err(e) => return e,
+                    }
+                    i += 1;
+                }
+                _ => return CommandResponse::syntax_error(),
+            }
+            i += 1;
+        }
+        if len_only && idx {
+            return CommandResponse::error(
+                "ERR If you want both the length and indexes, please just use IDX.",
+            );
+        }
+        let _held = self.shards.lock_keys([args[0].as_ref(), args[1].as_ref()]);
+        let mut vals = Vec::with_capacity(2);
+        for k in &args[..2] {
+            let kk = k.clone();
+            match self
+                .shards
+                .shard_for_key(k)
+                .execute(move |s| s.string_get_raw(&kk))
+            {
+                CommandResponse::BulkString(b) => vals.push(b),
+                CommandResponse::Nil => vals.push(Bytes::new()),
+                _ => {
+                    return CommandResponse::error(
+                        "ERR The specified keys must contain string values",
+                    )
+                }
+            }
+        }
+        let (a, b) = (&vals[0], &vals[1]);
+        let (al, bl) = (a.len(), b.len());
+        // The DP table is (al+1)*(bl+1) u32s: bounded like Redis' own.
+        let cells = (al as u64 + 1).saturating_mul(bl as u64 + 1);
+        if cells > (512 * 1024 * 1024) / 4 {
+            return CommandResponse::error(
+                "ERR Insufficient memory, transient memory for LCS exceeds proto-max-bulk-len",
+            );
+        }
+        let w = bl + 1;
+        let mut t = vec![0u32; (al + 1) * w];
+        for i in 1..=al {
+            for j in 1..=bl {
+                t[i * w + j] = if a[i - 1] == b[j - 1] {
+                    t[(i - 1) * w + j - 1] + 1
+                } else {
+                    t[(i - 1) * w + j].max(t[i * w + j - 1])
+                };
+            }
+        }
+        let total = t[al * w + bl] as usize;
+        if len_only {
+            return CommandResponse::integer(total as i64);
+        }
+        // Walk back, collecting the LCS and (for IDX) the matching ranges
+        // exactly as Redis does.
+        let mut out = vec![0u8; total];
+        let mut matches = Vec::new();
+        let (mut i, mut j, mut k) = (al, bl, total);
+        let (mut a_start, mut a_end, mut b_start, mut b_end) = (al, 0usize, 0usize, 0usize);
+        while i > 0 && j > 0 {
+            let mut emit = false;
+            if a[i - 1] == b[j - 1] {
+                out[k - 1] = a[i - 1];
+                if a_start == al {
+                    a_start = i - 1;
+                    a_end = i - 1;
+                    b_start = j - 1;
+                    b_end = j - 1;
+                } else if a_start == i && b_start == j {
+                    a_start -= 1;
+                    b_start -= 1;
+                } else {
+                    emit = true;
+                }
+                if a_start == 0 || b_start == 0 {
+                    emit = true;
+                }
+                k -= 1;
+                i -= 1;
+                j -= 1;
+            } else {
+                if t[(i - 1) * w + j] > t[i * w + j - 1] {
+                    i -= 1;
+                } else {
+                    j -= 1;
+                }
+                if a_start != al {
+                    emit = true;
+                }
+            }
+            if emit {
+                let mlen = a_end - a_start + 1;
+                if idx && (minlen == 0 || mlen >= minlen) {
+                    let mut m = vec![
+                        CommandResponse::array(vec![
+                            CommandResponse::integer(a_start as i64),
+                            CommandResponse::integer(a_end as i64),
+                        ]),
+                        CommandResponse::array(vec![
+                            CommandResponse::integer(b_start as i64),
+                            CommandResponse::integer(b_end as i64),
+                        ]),
+                    ];
+                    if withlen {
+                        m.push(CommandResponse::integer(mlen as i64));
+                    }
+                    matches.push(CommandResponse::array(m));
+                }
+                a_start = al;
+            }
+        }
+        if idx {
+            CommandResponse::array(vec![
+                CommandResponse::bulk_string("matches"),
+                CommandResponse::array(matches),
+                CommandResponse::bulk_string("len"),
+                CommandResponse::integer(total as i64),
+            ])
+        } else {
+            CommandResponse::bulk(Bytes::from(out))
+        }
+    }
+
+    /// `BITCOUNT key [start end [BYTE|BIT]]`.
+    pub(super) fn bitcount(&self, args: &[Bytes]) -> CommandResponse {
+        let (range, bitmode) = match args.len() {
+            1 => (None, false),
+            3 | 4 => {
+                let (s, e) = match (int_arg(&args[1]), int_arg(&args[2])) {
+                    (Ok(s), Ok(e)) => (s, e),
+                    (Err(x), _) | (_, Err(x)) => return x,
+                };
+                let bit = match args.get(3).map(|m| Upper::new(m)) {
+                    None => false,
+                    Some(m) if m.as_str() == "BYTE" => false,
+                    Some(m) if m.as_str() == "BIT" => true,
+                    Some(_) => return CommandResponse::syntax_error(),
+                };
+                (Some((s, e)), bit)
+            }
+            0 => return CommandResponse::wrong_arity("bitcount"),
+            _ => return CommandResponse::syntax_error(),
+        };
+        let key = args[0].clone();
+        self.shards
+            .shard_for_key(&key)
+            .execute(move |s| s.string_bitcount_mode(&key, range, bitmode))
+    }
+
+    /// `BITPOS key bit [start [end [BYTE|BIT]]]`.
+    pub(super) fn bitpos(&self, args: &[Bytes]) -> CommandResponse {
+        if args.len() < 2 || args.len() > 5 {
+            return CommandResponse::wrong_arity("bitpos");
+        }
+        let bit = match args[1].as_ref() {
+            b"0" => 0u8,
+            b"1" => 1u8,
+            _ => return CommandResponse::error("ERR The bit argument must be 1 or 0."),
+        };
+        let int = |i: usize| args.get(i).map(|a| int_arg(a)).transpose();
+        let (start, end) = match (int(2), int(3)) {
+            (Ok(s), Ok(e)) => (s, e),
+            (Err(x), _) | (_, Err(x)) => return x,
+        };
+        let bitmode = match args.get(4).map(|m| Upper::new(m)) {
+            None => false,
+            Some(m) if m.as_str() == "BYTE" => false,
+            Some(m) if m.as_str() == "BIT" => true,
+            Some(_) => return CommandResponse::syntax_error(),
+        };
+        let key = args[0].clone();
+        self.shards
+            .shard_for_key(&key)
+            .execute(move |s| s.string_bitpos(&key, bit, start, end, bitmode))
+    }
+
+    /// `BITFIELD key [GET t o] [SET t o v] [INCRBY t o n] [OVERFLOW
+    /// WRAP|SAT|FAIL]…` and `BITFIELD_RO key [GET t o]…`.
+    pub(super) fn bitfield(&self, ro: bool, args: &[Bytes]) -> CommandResponse {
+        use solikv_core::string_ops::{BitOverflow, BitfieldOp};
+        if args.is_empty() {
+            return CommandResponse::wrong_arity(if ro { "bitfield_ro" } else { "bitfield" });
+        }
+        let mut ops = Vec::new();
+        let mut of = BitOverflow::Wrap;
+        let mut i = 1;
+        while i < args.len() {
+            let sub = Upper::new(&args[i]);
+            let need = match sub.as_str() {
+                "GET" => 2,
+                "SET" | "INCRBY" => 3,
+                "OVERFLOW" => 1,
+                _ => return CommandResponse::syntax_error(),
+            };
+            if i + need >= args.len() {
+                return CommandResponse::syntax_error();
+            }
+            if ro && sub.as_str() != "GET" {
+                return CommandResponse::error("ERR BITFIELD_RO only supports the GET subcommand");
+            }
+            if sub.as_str() == "OVERFLOW" {
+                of = match Upper::new(&args[i + 1]).as_str() {
+                    "WRAP" => BitOverflow::Wrap,
+                    "SAT" => BitOverflow::Sat,
+                    "FAIL" => BitOverflow::Fail,
+                    _ => return CommandResponse::error("ERR Invalid OVERFLOW type specified"),
+                };
+                i += 2;
+                continue;
+            }
+            let t = match bit_type(&args[i + 1]) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            let o = match bit_offset(&args[i + 2], t.bits) {
+                Ok(o) => o,
+                Err(e) => return e,
+            };
+            ops.push(match sub.as_str() {
+                "GET" => BitfieldOp::Get(t, o),
+                _ => {
+                    let v = match int_arg(&args[i + 3]) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    if sub.as_str() == "SET" {
+                        BitfieldOp::Set(t, o, v, of)
+                    } else {
+                        BitfieldOp::Incr(t, o, v, of)
+                    }
+                }
+            });
+            i += need + 1;
+        }
+        let key = args[0].clone();
+        self.shards
+            .shard_for_key(&key)
+            .execute(move |s| s.string_bitfield(&key, &ops))
+    }
+
+    /// `GEORADIUS[BYMEMBER][_RO]`: the deprecated forms, run as the
+    /// `GEOSEARCH`/`GEOSEARCHSTORE` they are equivalent to.
+    pub(super) fn georadius(&self, by_member: bool, ro: bool, args: &[Bytes]) -> CommandResponse {
+        match georadius_translate(by_member, ro, args) {
+            Ok((cmd, a)) => self.execute(cmd, &a),
+            Err(e) => e,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SORT
+// ---------------------------------------------------------------------------
+
+/// A `BY`/`GET` pattern applied to one element: the key (and hash field)
+/// it names, `None` for a pattern without `*`.
+fn pattern_target(pattern: &[u8], elem: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    let star = pattern.iter().position(|&c| c == b'*')?;
+    let (key_part, field) = match pattern.windows(2).rposition(|w| w == b"->") {
+        Some(p) if p > star && p + 2 < pattern.len() => {
+            (&pattern[..p], Some(pattern[p + 2..].to_vec()))
+        }
+        _ => (pattern, None),
+    };
+    let mut key = Vec::with_capacity(key_part.len() + elem.len());
+    key.extend_from_slice(&key_part[..star]);
+    key.extend_from_slice(elem);
+    key.extend_from_slice(&key_part[star + 1..]);
+    Some((key, field))
+}
+
+impl CommandEngine {
+    /// What a `BY`/`GET` pattern finds for `elem` (`#` is the element).
+    fn sort_lookup(&self, pattern: &[u8], elem: &Bytes) -> Option<Bytes> {
+        if pattern == b"#" {
+            return Some(elem.clone());
+        }
+        let (key, field) = pattern_target(pattern, elem)?;
+        let r = match field {
+            Some(f) => self.execute("HGET", &[Bytes::from(key), Bytes::from(f)]),
+            None => self.execute("GET", &[Bytes::from(key)]),
+        };
+        match r {
+            CommandResponse::BulkString(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// `SORT key [BY pattern] [LIMIT offset count] [GET pattern…] [ASC|DESC]
+    /// [ALPHA] [STORE destination]` and `SORT_RO` (no STORE). With patterns
+    /// the keys they name can be anywhere, so every shard is held; a stored
+    /// result is logged as the destination's value.
+    pub(super) fn sort(&self, ro: bool, args: &[Bytes]) -> CommandResponse {
+        if args.is_empty() {
+            return CommandResponse::wrong_arity(if ro { "sort_ro" } else { "sort" });
+        }
+        let key = args[0].clone();
+        let mut by: Option<Bytes> = None;
+        let mut gets: Vec<Bytes> = Vec::new();
+        let (mut desc, mut alpha) = (false, false);
+        let mut limit: Option<(i64, i64)> = None;
+        let mut store: Option<Bytes> = None;
+        let mut i = 1;
+        while i < args.len() {
+            let opt = Upper::new(&args[i]);
+            let next = args.get(i + 1);
+            match (opt.as_str(), next) {
+                ("ASC", _) => desc = false,
+                ("DESC", _) => desc = true,
+                ("ALPHA", _) => alpha = true,
+                ("BY", Some(p)) => {
+                    by = Some(p.clone());
+                    i += 1;
+                }
+                ("GET", Some(p)) => {
+                    gets.push(p.clone());
+                    i += 1;
+                }
+                ("STORE", Some(d)) if !ro => {
+                    store = Some(d.clone());
+                    i += 1;
+                }
+                ("LIMIT", Some(o)) => {
+                    let Some(c) = args.get(i + 2) else {
+                        return CommandResponse::syntax_error();
+                    };
+                    match (int_arg(o), int_arg(c)) {
+                        (Ok(o), Ok(c)) => limit = Some((o, c)),
+                        (Err(e), _) | (_, Err(e)) => return e,
+                    }
+                    i += 2;
+                }
+                _ => return CommandResponse::syntax_error(),
+            }
+            i += 1;
+        }
+        let patterns = by.as_ref().is_some_and(|b| b.contains(&b'*'))
+            || gets.iter().any(|g| g.as_ref() != b"#");
+        let _held = if patterns {
+            self.shards.lock_all()
+        } else {
+            self.shards
+                .lock_keys(std::iter::once(key.as_ref()).chain(store.as_ref().map(|d| d.as_ref())))
+        };
+        // The elements, in the value's own order.
+        let mut elems: Vec<Bytes> = Vec::new();
+        let mut is_zset = false;
+        let k = key.clone();
+        let r = self.shards.shard_for_key(&key).execute(|s| {
+            match s.get(&k).map(|e| &e.value) {
+                None => {}
+                Some(RedisValue::List(l)) => elems = l.iter().cloned().collect(),
+                Some(RedisValue::Set(st)) => elems = st.iter().cloned().collect(),
+                Some(RedisValue::ZSet(z)) => {
+                    is_zset = true;
+                    elems = z.scores.iter().map(|(_, m)| m.clone()).collect();
+                }
+                Some(_) => return CommandResponse::wrong_type(),
+            }
+            CommandResponse::ok()
+        });
+        if r.is_error() {
+            return r;
+        }
+        // BY without `*` means "don't sort" (a zset keeps its score order).
+        let dontsort = by.as_ref().is_some_and(|b| !b.contains(&b'*'));
+        if !dontsort {
+            enum SortKey {
+                Num(f64),
+                Str(Option<Bytes>),
+            }
+            let mut keyed: Vec<(SortKey, Bytes)> = Vec::with_capacity(elems.len());
+            for e in elems.drain(..) {
+                let v = match &by {
+                    Some(p) => self.sort_lookup(p, &e),
+                    None => Some(e.clone()),
+                };
+                let sk = if alpha {
+                    SortKey::Str(v)
+                } else {
+                    match v {
+                        None => SortKey::Num(0.0),
+                        Some(b) => match std::str::from_utf8(&b)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<f64>().ok())
+                            .filter(|f| !f.is_nan())
+                        {
+                            Some(f) => SortKey::Num(f),
+                            None => {
+                                return CommandResponse::error(
+                                    "ERR One or more scores can't be converted into double",
+                                )
+                            }
+                        },
+                    }
+                };
+                keyed.push((sk, e));
+            }
+            keyed.sort_by(|(a, ea), (b, eb)| {
+                let c = match (a, b) {
+                    (SortKey::Num(x), SortKey::Num(y)) => x.total_cmp(y),
+                    (SortKey::Str(x), SortKey::Str(y)) => x.cmp(y),
+                    _ => std::cmp::Ordering::Equal,
+                };
+                let c = c.then_with(|| ea.cmp(eb));
+                if desc {
+                    c.reverse()
+                } else {
+                    c
+                }
+            });
+            elems = keyed.into_iter().map(|(_, e)| e).collect();
+        } else if desc && is_zset {
+            elems.reverse();
+        }
+        if let Some((off, cnt)) = limit {
+            let off = off.max(0) as usize;
+            let cnt = if cnt < 0 { usize::MAX } else { cnt as usize };
+            elems = elems.into_iter().skip(off).take(cnt).collect();
+        }
+        let out: Vec<Option<Bytes>> = if gets.is_empty() {
+            elems.into_iter().map(Some).collect()
+        } else {
+            let mut v = Vec::with_capacity(elems.len() * gets.len());
+            for e in &elems {
+                for g in &gets {
+                    v.push(self.sort_lookup(g, e));
+                }
+            }
+            v
+        };
+        match store {
+            None => CommandResponse::array(
+                out.into_iter()
+                    .map(|v| v.map_or(CommandResponse::Nil, CommandResponse::bulk))
+                    .collect(),
+            ),
+            Some(dest) => {
+                let list: std::collections::VecDeque<Bytes> =
+                    out.into_iter().map(|v| v.unwrap_or_default()).collect();
+                let n = list.len() as i64;
+                self.shards
+                    .shard_for_key(&dest)
+                    .execute_with_effects(move |s, fx| {
+                        if list.is_empty() {
+                            s.del(&dest);
+                        } else {
+                            s.set(dest.clone(), RedisValue::List(list), None);
+                        }
+                        fx.put_key(s, &dest);
+                        CommandResponse::integer(n)
+                    })
+            }
+        }
+    }
+}

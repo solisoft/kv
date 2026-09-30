@@ -77,6 +77,9 @@ const EXPLICIT: &[&str] = &[
     "ZRANGESTORE",
     "XCLAIM",
     "XAUTOCLAIM",
+    "COPY",
+    "RESTORE",
+    "SORT",
 ];
 
 /// Write commands that are never records themselves: each runs the plain
@@ -93,6 +96,8 @@ const DELEGATING: &[&str] = &[
     "BZMPOP",
     "LMPOP",
     "ZMPOP",
+    "GEORADIUS",
+    "GEORADIUSBYMEMBER",
 ];
 
 pub(crate) fn mode(name: &str, is_write: bool) -> Mode {

@@ -146,6 +146,87 @@ impl ShardStore {
     }
 }
 
+/// What `OBJECT ENCODING` reports for a value, by Redis 7's thresholds
+/// (`*-max-listpack-entries` 128, `-value` 64, `set-max-intset-entries`
+/// 512, embstr up to 44 bytes). Values are stored one way here; this is the
+/// encoding Redis would pick, which is what clients inspecting it expect.
+pub fn object_encoding(value: &RedisValue) -> &'static str {
+    let small = |n: usize, longest: usize| n <= 128 && longest <= 64;
+    match value {
+        RedisValue::String(s) => {
+            let is_int = std::str::from_utf8(s)
+                .ok()
+                .and_then(|t| t.parse::<i64>().ok())
+                .is_some_and(|n| n.to_string().as_bytes() == &s[..]);
+            if is_int {
+                "int"
+            } else if s.len() <= 44 {
+                "embstr"
+            } else {
+                "raw"
+            }
+        }
+        RedisValue::List(l) => {
+            if small(l.len(), l.iter().map(|e| e.len()).max().unwrap_or(0)) {
+                "listpack"
+            } else {
+                "quicklist"
+            }
+        }
+        RedisValue::Set(s) => {
+            let ints = s.iter().all(|m| {
+                std::str::from_utf8(m)
+                    .ok()
+                    .and_then(|t| t.parse::<i64>().ok())
+                    .is_some_and(|n| n.to_string().as_bytes() == &m[..])
+            });
+            if ints && s.len() <= 512 {
+                "intset"
+            } else if small(s.len(), s.iter().map(|e| e.len()).max().unwrap_or(0)) {
+                "listpack"
+            } else {
+                "hashtable"
+            }
+        }
+        RedisValue::Hash(h) => {
+            let longest = h
+                .iter()
+                .map(|(f, v)| f.len().max(v.len()))
+                .max()
+                .unwrap_or(0);
+            if small(h.len(), longest) {
+                "listpack"
+            } else {
+                "hashtable"
+            }
+        }
+        RedisValue::ZSet(z) => {
+            if small(
+                z.len(),
+                z.members.keys().map(|m| m.len()).max().unwrap_or(0),
+            ) {
+                "listpack"
+            } else {
+                "skiplist"
+            }
+        }
+        RedisValue::Stream(_) => "stream",
+        // A HyperLogLog is a string in Redis.
+        RedisValue::HyperLogLog(_) => "raw",
+        RedisValue::BloomFilter(_) => "raw",
+    }
+}
+
+impl ShardStore {
+    /// `OBJECT ENCODING key`.
+    pub fn object_encoding_of(&mut self, key: &Bytes) -> CommandResponse {
+        match self.peek_value(key) {
+            None => CommandResponse::Nil,
+            Some(v) => CommandResponse::bulk_string(object_encoding(v)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

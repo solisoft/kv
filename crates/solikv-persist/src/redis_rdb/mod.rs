@@ -203,7 +203,7 @@ pub fn import_redis_rdb(
 }
 
 /// Read a Redis value by type code. Returns `Ok(None)` for unsupported types (with a warning logged).
-fn read_value<R: io::Read>(
+pub(crate) fn read_value<R: io::Read>(
     reader: &mut RdbReader<R>,
     type_code: u8,
 ) -> io::Result<Option<RedisValue>> {

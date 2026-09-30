@@ -595,6 +595,260 @@ impl ShardStore {
     }
 }
 
+/// Overflow handling of `BITFIELD` (`OVERFLOW WRAP|SAT|FAIL`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitOverflow {
+    Wrap,
+    Sat,
+    Fail,
+}
+
+/// An integer field of a `BITFIELD` command: `i1`..`i64` or `u1`..`u63`.
+#[derive(Debug, Clone, Copy)]
+pub struct BitType {
+    pub signed: bool,
+    pub bits: u32,
+}
+
+/// One `BITFIELD` sub-command; offsets are in bits.
+#[derive(Debug, Clone, Copy)]
+pub enum BitfieldOp {
+    Get(BitType, u64),
+    Set(BitType, u64, i64, BitOverflow),
+    Incr(BitType, u64, i64, BitOverflow),
+}
+
+impl BitType {
+    fn range(&self) -> (i128, i128) {
+        if self.signed {
+            (-(1i128 << (self.bits - 1)), (1i128 << (self.bits - 1)) - 1)
+        } else {
+            (0, (1i128 << self.bits) - 1)
+        }
+    }
+
+    /// `v` as a field of this type: wrapped, saturated, or `None` (FAIL).
+    fn fit(&self, v: i128, of: BitOverflow) -> Option<i64> {
+        let (lo, hi) = self.range();
+        if (lo..=hi).contains(&v) {
+            return Some(v as i64);
+        }
+        match of {
+            BitOverflow::Fail => None,
+            BitOverflow::Sat => Some(if v < lo { lo } else { hi } as i64),
+            BitOverflow::Wrap => {
+                let m = 1i128 << self.bits;
+                let mut w = v.rem_euclid(m);
+                if self.signed && w > hi {
+                    w -= m;
+                }
+                Some(w as i64)
+            }
+        }
+    }
+
+    fn decode(&self, raw: u64) -> i64 {
+        if self.signed && self.bits < 64 && raw >> (self.bits - 1) & 1 == 1 {
+            (raw | (!0u64 << self.bits)) as i64
+        } else {
+            raw as i64
+        }
+    }
+}
+
+fn read_bits(buf: &[u8], offset: u64, bits: u32) -> u64 {
+    let mut v = 0u64;
+    for i in 0..bits as u64 {
+        let pos = offset + i;
+        let byte = (pos / 8) as usize;
+        let bit = buf.get(byte).map_or(0, |b| (b >> (7 - pos % 8)) & 1);
+        v = (v << 1) | bit as u64;
+    }
+    v
+}
+
+fn write_bits(buf: &mut [u8], offset: u64, bits: u32, value: u64) {
+    for i in 0..bits as u64 {
+        let pos = offset + i;
+        let byte = (pos / 8) as usize;
+        let mask = 1u8 << (7 - pos % 8);
+        if (value >> (bits as u64 - 1 - i)) & 1 == 1 {
+            buf[byte] |= mask;
+        } else {
+            buf[byte] &= !mask;
+        }
+    }
+}
+
+/// Byte range `[start, end]` of a `len`-long string from Redis-style
+/// indexes (negative from the end), or `None` when empty.
+fn norm_range(start: i64, end: i64, len: i64) -> Option<(i64, i64)> {
+    let s = if start < 0 {
+        (len + start).max(0)
+    } else {
+        start
+    };
+    let e = if end < 0 {
+        (len + end).max(-1)
+    } else {
+        end.min(len - 1)
+    };
+    (s <= e && s < len).then_some((s, e))
+}
+
+impl ShardStore {
+    /// `BITFIELD key [GET|SET|INCRBY …] [OVERFLOW …]…`. Write operations
+    /// create the key, grown with zeros to the highest field written.
+    pub fn string_bitfield(&mut self, key: &Bytes, ops: &[BitfieldOp]) -> CommandResponse {
+        let highest_write = ops
+            .iter()
+            .filter_map(|op| match op {
+                BitfieldOp::Set(t, o, ..) | BitfieldOp::Incr(t, o, ..) => Some(o + t.bits as u64),
+                BitfieldOp::Get(..) => None,
+            })
+            .max();
+        let run = |buf: &mut [u8], write: bool| -> Vec<CommandResponse> {
+            let mut out = Vec::with_capacity(ops.len());
+            for op in ops {
+                match *op {
+                    BitfieldOp::Get(t, o) => out.push(CommandResponse::integer(
+                        t.decode(read_bits(buf, o, t.bits)),
+                    )),
+                    BitfieldOp::Set(t, o, v, of) if write => {
+                        let old = t.decode(read_bits(buf, o, t.bits));
+                        if let Some(nv) = t.fit(v as i128, of) {
+                            write_bits(buf, o, t.bits, nv as u64);
+                            out.push(CommandResponse::integer(old));
+                        } else {
+                            out.push(CommandResponse::Nil);
+                        }
+                    }
+                    BitfieldOp::Incr(t, o, by, of) if write => {
+                        let old = t.decode(read_bits(buf, o, t.bits));
+                        match t.fit(old as i128 + by as i128, of) {
+                            Some(nv) => {
+                                write_bits(buf, o, t.bits, nv as u64);
+                                out.push(CommandResponse::integer(nv));
+                            }
+                            None => out.push(CommandResponse::Nil),
+                        }
+                    }
+                    _ => out.push(CommandResponse::Nil),
+                }
+            }
+            out
+        };
+        match highest_write {
+            None => {
+                // Reads only: no copy of the value.
+                let v = match self.get(key) {
+                    None => Bytes::new(),
+                    Some(e) => match &e.value {
+                        RedisValue::String(v) => v.clone(),
+                        _ => return CommandResponse::wrong_type(),
+                    },
+                };
+                CommandResponse::array(
+                    ops.iter()
+                        .map(|op| match *op {
+                            BitfieldOp::Get(t, o) => {
+                                CommandResponse::integer(t.decode(read_bits(&v, o, t.bits)))
+                            }
+                            _ => CommandResponse::Nil,
+                        })
+                        .collect(),
+                )
+            }
+            Some(bits) => {
+                let need = bits.div_ceil(8) as usize;
+                match self.with_string_buf(key, true, |b| {
+                    if b.len() < need {
+                        b.resize(need, 0);
+                    }
+                    run(&mut b[..], true)
+                }) {
+                    Ok(out) => CommandResponse::array(out.unwrap_or_default()),
+                    Err(e) => e,
+                }
+            }
+        }
+    }
+
+    /// `BITPOS key bit [start [end [BYTE|BIT]]]`.
+    pub fn string_bitpos(
+        &mut self,
+        key: &Bytes,
+        bit: u8,
+        start: Option<i64>,
+        end: Option<i64>,
+        bitmode: bool,
+    ) -> CommandResponse {
+        let v = match self.get(key) {
+            None => return CommandResponse::integer(if bit == 1 { -1 } else { 0 }),
+            Some(e) => match &e.value {
+                RedisValue::String(v) => v.clone(),
+                _ => return CommandResponse::wrong_type(),
+            },
+        };
+        let unit = if bitmode { 8 } else { 1 };
+        let total = v.len() as i64 * unit;
+        let end_given = end.is_some();
+        let Some((s, e)) = norm_range(start.unwrap_or(0), end.unwrap_or(-1), total) else {
+            return CommandResponse::integer(-1);
+        };
+        let (first, last) = if bitmode { (s, e) } else { (s * 8, e * 8 + 7) };
+        let mut pos = first;
+        while pos <= last {
+            // Whole bytes that cannot match are skipped.
+            if pos % 8 == 0 && pos + 7 <= last {
+                let b = v[(pos / 8) as usize];
+                if (bit == 1 && b == 0) || (bit == 0 && b == 0xff) {
+                    pos += 8;
+                    continue;
+                }
+            }
+            let b = (v[(pos / 8) as usize] >> (7 - pos % 8)) & 1;
+            if b == bit {
+                return CommandResponse::integer(pos);
+            }
+            pos += 1;
+        }
+        if bit == 0 && !end_given {
+            // Looking for a clear bit past the end: the string is padded
+            // with zeros on the right.
+            return CommandResponse::integer(last + 1);
+        }
+        CommandResponse::integer(-1)
+    }
+
+    /// `BITCOUNT key [start end [BYTE|BIT]]`.
+    pub fn string_bitcount_mode(
+        &mut self,
+        key: &Bytes,
+        range: Option<(i64, i64)>,
+        bitmode: bool,
+    ) -> CommandResponse {
+        if !bitmode {
+            return self.string_bitcount(key, range.map(|r| r.0), range.map(|r| r.1));
+        }
+        let v = match self.get(key) {
+            None => return CommandResponse::integer(0),
+            Some(e) => match &e.value {
+                RedisValue::String(v) => v.clone(),
+                _ => return CommandResponse::wrong_type(),
+            },
+        };
+        let (s, e) = range.unwrap_or((0, -1));
+        let Some((s, e)) = norm_range(s, e, v.len() as i64 * 8) else {
+            return CommandResponse::integer(0);
+        };
+        let n = (s..=e)
+            .filter(|&p| (v[(p / 8) as usize] >> (7 - p % 8)) & 1 == 1)
+            .count();
+        CommandResponse::integer(n as i64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
