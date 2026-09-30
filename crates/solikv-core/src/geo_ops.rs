@@ -88,6 +88,10 @@ pub fn geo_hash_string(lon: f64, lat: f64) -> String {
         }
     }
 
+    // Redis has 52 bits of precision, one short of the 11th character, and
+    // writes that character as '0' ("for compatibility we assume zero").
+    result.pop();
+    result.push('0');
     result
 }
 

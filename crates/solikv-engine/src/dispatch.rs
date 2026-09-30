@@ -856,7 +856,26 @@ impl CommandEngine {
             }
             // The key is the second argument (after CREATE/DESTROY/etc.)
             "XGROUP" if args.len() >= 2 => {
-                self.notify_keyspace_event(NOTIFY_STREAM, "xgroup-create", &args[1]);
+                let ev = match Upper::new(&args[0]).as_str() {
+                    "CREATE" => Some("xgroup-create"),
+                    "SETID" => Some("xgroup-setid"),
+                    "DESTROY" if matches!(_response, CommandResponse::Integer(1)) => {
+                        Some("xgroup-destroy")
+                    }
+                    "CREATECONSUMER" if matches!(_response, CommandResponse::Integer(1)) => {
+                        Some("xgroup-createconsumer")
+                    }
+                    "DELCONSUMER" => Some("xgroup-delconsumer"),
+                    _ => None,
+                };
+                if let Some(ev) = ev {
+                    self.notify_keyspace_event(NOTIFY_STREAM, ev, &args[1]);
+                }
+            }
+            "XSETID" => {
+                if let Some(key) = args.first() {
+                    self.notify_keyspace_event(NOTIFY_STREAM, "xsetid", key);
+                }
             }
 
             // Bitmap commands → $ flag
@@ -1293,9 +1312,10 @@ impl CommandEngine {
                     Some(d) => d,
                     None => return CommandResponse::error("ERR value is not a valid float"),
                 };
+                let text = std::str::from_utf8(&args[1]).unwrap_or("").to_string();
                 self.shards
                     .shard_for_key(&key)
-                    .execute(move |store| store.string_incrbyfloat(&key, delta))
+                    .execute(move |store| store.string_incrbyfloat_text(&key, delta, Some(&text)))
             }
             Cmd::APPEND => {
                 if args.len() != 2 {

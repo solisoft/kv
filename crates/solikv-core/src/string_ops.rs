@@ -282,6 +282,37 @@ impl ShardStore {
 
     // ---- INCRBYFLOAT ----
     pub fn string_incrbyfloat(&mut self, key: &Bytes, delta: f64) -> CommandResponse {
+        self.string_incrbyfloat_text(key, delta, None)
+    }
+
+    /// `INCRBYFLOAT` with the increment as the client wrote it: when both
+    /// numbers are ordinary decimals the sum is exact and printed like
+    /// Redis' long-double `%.17Lf` with trailing zeros cut (`0.1 + 0.2` is
+    /// `0.3`, not the f64 `0.30000000000000004`).
+    pub fn string_incrbyfloat_text(
+        &mut self,
+        key: &Bytes,
+        delta: f64,
+        delta_text: Option<&str>,
+    ) -> CommandResponse {
+        let current_text = match self.get(key) {
+            None => Some("0".to_string()),
+            Some(entry) => match &entry.value {
+                // Not UTF-8: the f64 path below refuses it.
+                RedisValue::String(v) => std::str::from_utf8(v).ok().map(|s| s.to_string()),
+                _ => return CommandResponse::wrong_type(),
+            },
+        };
+        if let (Some(cur), Some(dt)) = (current_text.as_deref(), delta_text) {
+            if let Some(sum) = exact_decimal_sum(cur, dt) {
+                self.set_keep_ttl(key, RedisValue::String(Bytes::from(sum.clone())));
+                return CommandResponse::bulk(Bytes::from(sum));
+            }
+        }
+        self.string_incrbyfloat_f64(key, delta)
+    }
+
+    fn string_incrbyfloat_f64(&mut self, key: &Bytes, delta: f64) -> CommandResponse {
         let current = match self.get(key) {
             None => 0.0f64,
             Some(entry) => match &entry.value {
@@ -593,6 +624,83 @@ impl ShardStore {
             },
         }
     }
+}
+
+/// A decimal as `mantissa * 10^-scale`, when it fits in an i128.
+fn parse_decimal(s: &str) -> Option<(i128, i32)> {
+    let s = s.trim();
+    let (mant, exp) = match s.find(['e', 'E']) {
+        Some(p) => (&s[..p], s[p + 1..].parse::<i32>().ok()?),
+        None => (s, 0),
+    };
+    let (neg, digits) = match mant.as_bytes().first()? {
+        b'-' => (true, &mant[1..]),
+        b'+' => (false, &mant[1..]),
+        _ => (false, mant),
+    };
+    let (int, frac) = match digits.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (digits, ""),
+    };
+    if int.is_empty() && frac.is_empty() {
+        return None;
+    }
+    if !int.bytes().chain(frac.bytes()).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let all = format!("{int}{frac}");
+    let all = all.trim_start_matches('0');
+    if all.len() > 36 {
+        return None;
+    }
+    let m: i128 = if all.is_empty() { 0 } else { all.parse().ok()? };
+    let scale = frac.len() as i32 - exp;
+    if !(-40..=40).contains(&scale) {
+        return None;
+    }
+    Some((if neg { -m } else { m }, scale))
+}
+
+/// `a + b` exactly, printed with at most 17 decimals (rounded half away
+/// from zero) and no trailing zeros — `None` when either is not a plain
+/// decimal small enough to add exactly.
+fn exact_decimal_sum(a: &str, b: &str) -> Option<String> {
+    let (ma, sa) = parse_decimal(a)?;
+    let (mb, sb) = parse_decimal(b)?;
+    let scale = sa.max(sb).max(0);
+    let up = |m: i128, s: i32| m.checked_mul(10i128.checked_pow((scale - s) as u32)?);
+    let mut m = up(ma, sa)?.checked_add(up(mb, sb)?)?;
+    let mut scale = scale;
+    if scale > 17 {
+        let div = 10i128.pow((scale - 17) as u32);
+        let (q, r) = (m / div, m % div);
+        m = if r.abs() * 2 >= div {
+            q + m.signum()
+        } else {
+            q
+        };
+        scale = 17;
+    }
+    let neg = m < 0;
+    let digits = m.unsigned_abs().to_string();
+    let scale = scale as usize;
+    let (int, frac) = if digits.len() > scale {
+        digits.split_at(digits.len() - scale)
+    } else {
+        ("0", digits.as_str())
+    };
+    let frac = format!("{:0>width$}", frac, width = scale);
+    let frac = frac.trim_end_matches('0');
+    let mut out = String::new();
+    if neg && (int != "0" || !frac.is_empty()) {
+        out.push('-');
+    }
+    out.push_str(int);
+    if !frac.is_empty() {
+        out.push('.');
+        out.push_str(frac);
+    }
+    Some(out)
 }
 
 /// Overflow handling of `BITFIELD` (`OVERFLOW WRAP|SAT|FAIL`).

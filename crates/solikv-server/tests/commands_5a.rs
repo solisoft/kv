@@ -1225,3 +1225,143 @@ fn georadius_and_object_encoding() {
         assert_eq!(c.cmd(&["OBJECT", "ENCODING", k]), format!("${enc}"), "{k}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Existing commands, checked against Redis 7 semantics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn existing_commands_behave_like_redis() {
+    let s = Server::new("verify");
+    let mut c = s.client();
+    // Lists.
+    c.cmd(&["RPUSH", "l", "a", "b", "c", "b"]);
+    assert_eq!(c.cmd(&["LINSERT", "l", "BEFORE", "b", "x"]), ":5");
+    assert_eq!(c.cmd(&["LINSERT", "l", "AFTER", "zz", "y"]), ":-1");
+    assert_eq!(c.cmd(&["LINSERT", "nolist", "AFTER", "a", "y"]), ":0");
+    assert!(c
+        .cmd(&["LINSERT", "l", "MIDDLE", "a", "y"])
+        .starts_with("-ERR syntax"));
+    assert_eq!(c.cmd(&["LINDEX", "l", "-1"]), "$b");
+    assert_eq!(c.cmd(&["LINDEX", "l", "99"]), "nil");
+    assert!(c
+        .cmd(&["LSET", "l", "99", "v"])
+        .contains("index out of range"));
+    assert!(c.cmd(&["LSET", "nolist", "0", "v"]).contains("no such key"));
+    assert_eq!(c.cmd(&["LREM", "l", "-1", "b"]), ":1");
+    assert_eq!(c.cmd(&["LRANGE", "l", "0", "-1"]), "[$a,$x,$b,$c]");
+    assert_eq!(c.cmd(&["LTRIM", "l", "1", "-2"]), "+OK");
+    assert_eq!(c.cmd(&["LRANGE", "l", "0", "-1"]), "[$x,$b]");
+    assert_eq!(c.cmd(&["LTRIM", "l", "5", "10"]), "+OK");
+    assert_eq!(c.cmd(&["EXISTS", "l"]), ":0");
+
+    // Sets.
+    c.cmd(&["SADD", "s", "a", "b", "c"]);
+    assert_eq!(c.cmd(&["SRANDMEMBER", "s", "-5"]).matches('$').count(), 5);
+    assert_eq!(c.cmd(&["SRANDMEMBER", "s", "0"]), "[]");
+    let scan = c.cmd(&["SSCAN", "s", "0", "MATCH", "a*", "COUNT", "100"]);
+    assert_eq!(scan, "[$0,[$a]]");
+
+    // Keys.
+    c.cmd(&["SET", "k", "v"]);
+    assert_eq!(c.cmd(&["MOVE", "k", "2"]), ":1");
+    assert_eq!(c.cmd(&["EXISTS", "k"]), ":0");
+    assert_eq!(c.cmd(&["MOVE", "missing", "2"]), ":0");
+    assert!(c.cmd(&["MOVE", "k", "0"]).starts_with("-ERR") || c.cmd(&["MOVE", "k", "0"]) == ":0");
+    c.cmd(&["SET", "t1", "v"]);
+    assert_eq!(c.cmd(&["TOUCH", "t1", "t2"]), ":1");
+    c.cmd(&["SET", "e", "v", "EXAT", "33177117420"]);
+    assert_eq!(c.cmd(&["EXPIRETIME", "e"]), ":33177117420");
+    assert_eq!(c.cmd(&["PEXPIRETIME", "e"]), ":33177117420000");
+    assert_eq!(c.cmd(&["EXPIRETIME", "t1"]), ":-1");
+    assert_eq!(c.cmd(&["EXPIRETIME", "nokey"]), ":-2");
+    assert!(c.cmd(&["RANDOMKEY"]).starts_with('$'));
+    assert_eq!(c.cmd(&["WAIT", "0", "0"]), ":0");
+
+    // Strings.
+    c.cmd(&["SET", "g", "Hello World"]);
+    assert_eq!(c.cmd(&["GETRANGE", "g", "-5", "-1"]), "$World");
+    assert_eq!(c.cmd(&["GETRANGE", "g", "0", "-100"]), "$H");
+    assert_eq!(c.cmd(&["SUBSTR", "g", "0", "4"]), "$Hello");
+    assert_eq!(c.cmd(&["SETRANGE", "g", "6", "Redis"]), ":11");
+    assert_eq!(c.cmd(&["SETRANGE", "pad", "3", "x"]), ":4");
+    assert_eq!(c.bulk_raw(&["GET", "pad"]).unwrap(), b"\0\0\0x");
+    assert_eq!(c.cmd(&["GETDEL", "g"]), "$Hello Redis");
+    assert_eq!(c.cmd(&["GETDEL", "g"]), "nil");
+    c.cmd(&["SET", "gx", "v"]);
+    assert_eq!(c.cmd(&["GETEX", "gx", "PX", "5000"]), "$v");
+    assert!(c.cmd(&["PTTL", "gx"]) != ":-1");
+    assert_eq!(c.cmd(&["GETEX", "gx", "PERSIST"]), "$v");
+    assert_eq!(c.cmd(&["PTTL", "gx"]), ":-1");
+    c.cmd(&["SET", "f", "10.50"]);
+    assert_eq!(c.cmd(&["INCRBYFLOAT", "f", "0.1"]), "$10.6");
+    assert_eq!(c.cmd(&["INCRBYFLOAT", "f", "-5"]), "$5.6");
+    c.cmd(&["SET", "f", "5.0e3"]);
+    assert_eq!(c.cmd(&["INCRBYFLOAT", "f", "2.0e2"]), "$5200");
+    c.cmd(&["SET", "f", "0.1"]);
+    assert_eq!(c.cmd(&["INCRBYFLOAT", "f", "0.2"]), "$0.3");
+    assert_eq!(c.cmd(&["MSETNX", "m1", "a", "m2", "b"]), ":1");
+    assert_eq!(c.cmd(&["MSETNX", "m2", "x", "m3", "c"]), ":0");
+    assert_eq!(c.cmd(&["EXISTS", "m3"]), ":0");
+
+    // Geo.
+    c.cmd(&[
+        "GEOADD",
+        "Sicily",
+        "13.361389",
+        "38.115556",
+        "Palermo",
+        "15.087269",
+        "37.502669",
+        "Catania",
+    ]);
+    assert_eq!(
+        c.cmd(&["GEODIST", "Sicily", "Palermo", "Catania"]),
+        "$166274.1516"
+    );
+    assert_eq!(
+        c.cmd(&["GEODIST", "Sicily", "Palermo", "Catania", "km"]),
+        "$166.2742"
+    );
+    assert_eq!(
+        c.cmd(&["GEOHASH", "Sicily", "Palermo", "Catania"]),
+        "[$sqc8b49rny0,$sqdtr74hyu0]"
+    );
+    assert_eq!(c.cmd(&["GEODIST", "Sicily", "Palermo", "Nowhere"]), "nil");
+    let pos = c.cmd(&["GEOPOS", "Sicily", "Palermo", "Nowhere"]);
+    assert!(
+        pos.starts_with("[[$13.36138") && pos.ends_with(",nilarr]") || pos.ends_with(",nil]"),
+        "{pos}"
+    );
+    assert_eq!(
+        c.cmd(&[
+            "GEOSEARCH",
+            "Sicily",
+            "FROMLONLAT",
+            "15",
+            "37",
+            "BYBOX",
+            "400",
+            "400",
+            "km",
+            "ASC",
+            "WITHDIST"
+        ]),
+        "[[$Catania,$56.4413],[$Palermo,$190.4424]]"
+    );
+
+    // HyperLogLog.
+    assert_eq!(c.cmd(&["PFADD", "h1", "a", "b", "c"]), ":1");
+    assert_eq!(c.cmd(&["PFADD", "h1", "a"]), ":0");
+    c.cmd(&["PFADD", "h2", "c", "d"]);
+    assert_eq!(c.cmd(&["PFCOUNT", "h1", "h2"]), ":4");
+    assert_eq!(c.cmd(&["PFMERGE", "h3", "h1", "h2"]), "+OK");
+    assert_eq!(c.cmd(&["PFCOUNT", "h3"]), ":4");
+
+    // Streams.
+    assert_eq!(
+        c.cmd(&["XADD", "nostream", "NOMKSTREAM", "*", "f", "v"]),
+        "nil"
+    );
+    assert_eq!(c.cmd(&["EXISTS", "nostream"]), ":0");
+}
