@@ -213,6 +213,13 @@ impl Effects {
         }
     }
 
+    /// Log a record encoded beforehand (outside the shard lock).
+    pub fn push_encoded(&mut self, record: Vec<u8>) {
+        if self.enabled {
+            self.records.push(record);
+        }
+    }
+
     /// Log `key`'s current state as a value: `#PUT` of the entry, or `DEL`
     /// when the command left no key.
     pub fn put_key(&mut self, store: &ShardStore, key: &[u8]) {

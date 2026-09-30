@@ -865,26 +865,7 @@ async fn async_main(args: Args) {
     }
 
     // --- Active expiry: keys expire whether or not anything reads them ---
-    {
-        let shards_bg = shards.clone();
-        let hz = args.hz.clamp(1, 500);
-        tokio::spawn(async move {
-            let period = std::time::Duration::from_millis(1000 / hz as u64);
-            let mut ticker = tokio::time::interval(period);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Each shard gets at most 1 ms of its lock per cycle.
-            let budget = std::time::Duration::from_millis(1);
-            loop {
-                ticker.tick().await;
-                for shard in shards_bg.all_shards() {
-                    shard.active_expire_cycle(budget);
-                    // Let the connections this worker also serves run
-                    // between shards.
-                    tokio::task::yield_now().await;
-                }
-            }
-        });
-    }
+    solikv_engine::shard::spawn_active_expiry(shards.clone(), args.hz);
 
     // --- Periodic snapshots and automatic log rewrites ---
     {
@@ -895,6 +876,8 @@ async fn async_main(args: Args) {
             let mut last_save = std::time::Instant::now();
             loop {
                 ticker.tick().await;
+                // Channels whose last subscriber left.
+                engine_bg.pubsub.cleanup();
                 let p = engine_bg.persistence().clone();
                 if p.should_auto_rewrite() {
                     tracing::info!("Append-only log has grown; rewriting it");

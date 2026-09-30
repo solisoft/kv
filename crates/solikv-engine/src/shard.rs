@@ -759,6 +759,28 @@ impl ShardManager {
     }
 }
 
+/// Run active expiry on every shard `hz` times a second (Redis' `hz`), on
+/// the current Tokio runtime — in solo mode that is the only thread allowed
+/// to touch the store. Each shard gets at most 1 ms of its lock per cycle.
+pub fn spawn_active_expiry(shards: Arc<ShardManager>, hz: u32) -> tokio::task::JoinHandle<()> {
+    let hz = hz.clamp(1, 500);
+    tokio::spawn(async move {
+        let period = std::time::Duration::from_millis(1000 / hz as u64);
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let budget = std::time::Duration::from_millis(1);
+        loop {
+            ticker.tick().await;
+            for shard in shards.all_shards() {
+                shard.active_expire_cycle(budget);
+                // Let the connections this worker also serves run between
+                // shards.
+                tokio::task::yield_now().await;
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

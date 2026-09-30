@@ -18,7 +18,8 @@ const LUA_POOL_MAX: usize = 8;
 // ---------------------------------------------------------------------------
 
 pub struct ScriptCache {
-    scripts: DashMap<String, String>,
+    /// SHA1 → source, shared: `EVALSHA` takes a reference, not a copy.
+    scripts: DashMap<String, Arc<str>>,
 }
 
 impl Default for ScriptCache {
@@ -37,12 +38,12 @@ impl ScriptCache {
     /// Cache a script and return its SHA1 hex digest.
     pub fn load(&self, source: &str) -> String {
         let sha = sha1_hex(source);
-        self.scripts.insert(sha.clone(), source.to_owned());
+        self.scripts.insert(sha.clone(), Arc::from(source));
         sha
     }
 
     /// Retrieve a cached script by SHA1.
-    pub fn get(&self, sha: &str) -> Option<String> {
+    pub fn get(&self, sha: &str) -> Option<Arc<str>> {
         self.scripts.get(sha).map(|r| r.value().clone())
     }
 
@@ -110,11 +111,25 @@ fn is_blocked_in_script(cmd: &str) -> bool {
 /// Mutations to the *contents* of pre-existing tables (e.g. replacing
 /// `string.upper`) are not protected by this; full isolation requires a
 /// fresh `_ENV`, which we reserve for a follow-up if it becomes load-bearing.
+///
+/// The VM is set up once. `redis` is a read-only proxy (writes raise an
+/// error, as in Redis 7), and after every script the VM is checked: if the
+/// proxy was bypassed (`rawset`) or `redis` replaced, the VM is not reused.
+/// That replaces re-running the sandbox and re-creating the whole `redis`
+/// module — a table and five closures — on every call.
 struct PooledLua {
     lua: Lua,
     engine_id: usize,
     baseline_globals: std::collections::HashSet<String>,
+    redis: LuaTable,
+    redis_meta: LuaTable,
+    /// Compiled scripts, by source: `EVAL`/`EVALSHA` of a script this VM ran
+    /// before calls the function instead of parsing and compiling it again.
+    compiled: std::collections::HashMap<String, LuaFunction, solikv_core::FastHasher>,
 }
+
+/// Most compiled scripts one VM keeps (then it starts over).
+const COMPILED_MAX: usize = 512;
 
 thread_local! {
     static LUA_POOL: RefCell<Vec<PooledLua>> = const { RefCell::new(Vec::new()) };
@@ -153,35 +168,27 @@ fn reset_globals_to(lua: &Lua, baseline: &std::collections::HashSet<String>) {
     }
 }
 
-/// Take a pre-sandboxed Lua VM from the thread-local pool, or create a new one.
-/// Returns the VM together with its baseline-global snapshot so the caller
-/// can return both to the pool when done.
-fn take_lua(engine: &Arc<CommandEngine>) -> (Lua, std::collections::HashSet<String>) {
+/// Take a pre-sandboxed Lua VM from the thread-local pool, or create one.
+fn take_lua(engine: &Arc<CommandEngine>) -> LuaResult<PooledLua> {
     let engine_id = Arc::as_ptr(engine) as usize;
     let cached = LUA_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
         pool.iter()
             .rposition(|p| p.engine_id == engine_id)
-            .map(|idx| {
-                let p = pool.swap_remove(idx);
-                (p.lua, p.baseline_globals)
-            })
+            .map(|idx| pool.swap_remove(idx))
     });
 
-    if let Some((lua, baseline)) = cached {
-        // Re-apply sandbox + redis.* (defense in depth) and wipe any stray
-        // globals the previous script left behind.
-        reset_globals_to(&lua, &baseline);
-        sandbox_lua(&lua);
-        setup_redis_module(&lua, engine);
-        return (lua, baseline);
+    if let Some(vm) = cached {
+        // Wipe any stray globals the previous script left behind.
+        reset_globals_to(&vm.lua, &vm.baseline_globals);
+        return Ok(vm);
     }
 
     // Cold path: create, sandbox, register redis.*, then snapshot the
     // post-setup global key set.
     let lua = Lua::new();
     sandbox_lua(&lua);
-    setup_redis_module(&lua, engine);
+    let (redis, redis_meta) = setup_redis_module(&lua, engine)?;
     let baseline = snapshot_globals(&lua);
     // After setup, so the limit bounds what scripts allocate, not the VM's
     // own tables.
@@ -189,26 +196,56 @@ fn take_lua(engine: &Arc<CommandEngine>) -> (Lua, std::collections::HashSet<Stri
     if let Err(e) = lua.set_memory_limit(limit) {
         tracing::warn!("could not set the Lua memory limit: {}", e);
     }
-    (lua, baseline)
+    Ok(PooledLua {
+        lua,
+        engine_id,
+        baseline_globals: baseline,
+        redis,
+        redis_meta,
+        compiled: Default::default(),
+    })
 }
 
-/// Return a Lua VM (with its baseline snapshot) to the thread-local pool.
-fn return_lua(lua: Lua, baseline: std::collections::HashSet<String>, engine: &Arc<CommandEngine>) {
-    let engine_id = Arc::as_ptr(engine) as usize;
-    // Free what the script left behind, and retire a VM that is still close
-    // to its memory limit: re-running setup in it could fail to allocate.
-    let _ = lua.gc_collect();
-    if lua.used_memory() > engine.lua_memory_limit / 2 {
+/// Whether a script left the VM as it found it: `redis` still the
+/// read-only proxy, with nothing written into the proxy itself.
+fn vm_intact(vm: &PooledLua) -> bool {
+    let globals = vm.lua.globals();
+    let same_redis = matches!(
+        globals.raw_get::<LuaValue>("redis"),
+        Ok(LuaValue::Table(t)) if t.to_pointer() == vm.redis.to_pointer()
+    );
+    let proxy_empty = vm
+        .redis
+        .clone()
+        .pairs::<LuaValue, LuaValue>()
+        .next()
+        .is_none();
+    let meta_same = vm
+        .redis
+        .metatable()
+        .is_some_and(|m| m.to_pointer() == vm.redis_meta.to_pointer());
+    same_redis && proxy_empty && meta_same
+}
+
+/// Return a Lua VM to the thread-local pool.
+fn return_lua(mut vm: PooledLua, engine: &Arc<CommandEngine>) {
+    if !vm_intact(&vm) {
+        tracing::warn!("a script tampered with the redis module; its Lua VM is discarded");
         return;
+    }
+    // Free what the script left behind, and retire a VM that is still close
+    // to its memory limit: reusing it could fail to allocate.
+    let _ = vm.lua.gc_collect();
+    if vm.lua.used_memory() > engine.lua_memory_limit / 2 {
+        return;
+    }
+    if vm.compiled.len() > COMPILED_MAX {
+        vm.compiled.clear();
     }
     LUA_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
         if pool.len() < LUA_POOL_MAX {
-            pool.push(PooledLua {
-                lua,
-                engine_id,
-                baseline_globals: baseline,
-            });
+            pool.push(vm);
         }
         // else: drop the VM (pool full)
     });
@@ -227,30 +264,44 @@ pub fn execute_script(
     keys: Vec<Bytes>,
     argv: Vec<Bytes>,
 ) -> CommandResponse {
-    let (lua, baseline) = take_lua(engine);
+    let mut vm = match take_lua(engine) {
+        Ok(vm) => vm,
+        Err(e) => return CommandResponse::Error(format!("ERR {}", e)),
+    };
 
     // Set instruction limit to prevent infinite loops / DoS
-    lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(10_000), {
-        let limit = std::cell::Cell::new(LUA_INSTRUCTION_LIMIT);
-        move |_lua, _debug| {
-            let remaining = limit.get();
-            if remaining == 0 {
-                Err(LuaError::RuntimeError(
-                    "ERR script exceeded maximum allowed execution time".into(),
-                ))
-            } else {
-                limit.set(remaining.saturating_sub(10_000));
-                Ok(mlua::VmState::Continue)
+    vm.lua
+        .set_hook(mlua::HookTriggers::new().every_nth_instruction(10_000), {
+            let limit = std::cell::Cell::new(LUA_INSTRUCTION_LIMIT);
+            move |_lua, _debug| {
+                let remaining = limit.get();
+                if remaining == 0 {
+                    Err(LuaError::RuntimeError(
+                        "ERR script exceeded maximum allowed execution time".into(),
+                    ))
+                } else {
+                    limit.set(remaining.saturating_sub(10_000));
+                    Ok(mlua::VmState::Continue)
+                }
             }
-        }
-    });
+        });
 
     // Text only. A precompiled (binary) chunk is not verified by Lua and is
     // a known way to corrupt the VM's memory from inside a script.
-    let result = match setup_keys_argv(&lua, &keys, &argv).and_then(|()| {
-        lua.load(script)
+    let func = match vm.compiled.get(script) {
+        Some(f) => Ok(f.clone()),
+        None => vm
+            .lua
+            .load(script)
             .set_mode(mlua::ChunkMode::Text)
-            .eval::<LuaValue>()
+            .into_function()
+            .inspect(|f| {
+                vm.compiled.insert(script.to_owned(), f.clone());
+            }),
+    };
+    let result = match func.and_then(|f| {
+        setup_keys_argv(&vm.lua, &keys, &argv)?;
+        f.call::<LuaValue>(())
     }) {
         Ok(val) => lua_to_response(val),
         Err(e) => {
@@ -260,9 +311,9 @@ pub fn execute_script(
     };
 
     // Remove the hook before returning to pool
-    lua.remove_hook();
+    vm.lua.remove_hook();
 
-    return_lua(lua, baseline, engine);
+    return_lua(vm, engine);
     result
 }
 
@@ -315,8 +366,10 @@ fn setup_keys_argv(lua: &Lua, keys: &[Bytes], argv: &[Bytes]) -> LuaResult<()> {
 // Set up the redis.* module
 // ---------------------------------------------------------------------------
 
-fn setup_redis_module(lua: &Lua, engine: &Arc<CommandEngine>) {
-    let redis = lua.create_table().expect("create redis table");
+/// Install `redis.*`, as a read-only proxy; returns the proxy and its
+/// metatable (see [`PooledLua`]).
+fn setup_redis_module(lua: &Lua, engine: &Arc<CommandEngine>) -> LuaResult<(LuaTable, LuaTable)> {
+    let redis = lua.create_table()?;
 
     // redis.call(cmd, ...) — execute command, raise on error
     {
@@ -416,7 +469,21 @@ fn setup_redis_module(lua: &Lua, engine: &Arc<CommandEngine>) {
     redis.set("LOG_NOTICE", 2i64).expect("set LOG_NOTICE");
     redis.set("LOG_WARNING", 3i64).expect("set LOG_WARNING");
 
-    lua.globals().set("redis", redis).expect("set redis global");
+    let proxy = lua.create_table()?;
+    let meta = lua.create_table()?;
+    meta.set("__index", redis)?;
+    meta.set(
+        "__newindex",
+        lua.create_function(|_, _: LuaMultiValue| -> LuaResult<()> {
+            Err(LuaError::RuntimeError(
+                "Attempt to modify a readonly table".into(),
+            ))
+        })?,
+    )?;
+    meta.set("__metatable", false)?;
+    proxy.set_metatable(Some(meta.clone()));
+    lua.globals().set("redis", proxy.clone())?;
+    Ok((proxy, meta))
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +632,7 @@ mod tests {
 
         let sha = cache.load("return 1");
         assert_eq!(sha.len(), 40);
-        assert_eq!(cache.get(&sha), Some("return 1".to_owned()));
+        assert_eq!(cache.get(&sha).as_deref(), Some("return 1"));
         assert_eq!(cache.get("nonexistent"), None);
 
         let sha2 = cache.load("return 2");
@@ -879,6 +946,63 @@ mod tests {
         match r {
             CommandResponse::BulkString(b) => assert_eq!(b.as_ref(), b"v"),
             other => panic!("expected BulkString('v'), got {:?}", other),
+        }
+    }
+
+    /// The proxy refuses writes; a script that goes around it (`rawset`,
+    /// or replacing the global) gets its VM thrown away, so the next script
+    /// still sees the real module.
+    #[test]
+    fn redis_module_is_read_only_and_bypasses_retire_the_vm() {
+        let shards = Arc::new(crate::ShardManager::new(1));
+        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
+        let engine = Arc::new(CommandEngine::new(shards, pubsub));
+        engine.init_self_ref(Arc::downgrade(&engine));
+
+        let r = execute_script(&engine, "redis.call = 1; return 1", vec![], vec![]);
+        assert!(
+            matches!(&r, CommandResponse::Error(e) if e.contains("readonly")),
+            "{r:?}"
+        );
+        for evil in [
+            "rawset(redis, 'call', function() return 'pwned' end); return 1",
+            "redis = {call = function() return 'pwned' end}; return 1",
+        ] {
+            let _ = execute_script(&engine, evil, vec![], vec![]);
+            let r = execute_script(
+                &engine,
+                "redis.call('SET', 'k', 'v'); return redis.call('GET', 'k')",
+                vec![],
+                vec![],
+            );
+            assert!(
+                matches!(&r, CommandResponse::BulkString(b) if b.as_ref() == b"v"),
+                "{evil}: {r:?}"
+            );
+        }
+    }
+
+    /// A script compiled once runs again with new KEYS/ARGV.
+    #[test]
+    fn compiled_scripts_are_reused_with_fresh_arguments() {
+        let shards = Arc::new(crate::ShardManager::new(1));
+        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
+        let engine = Arc::new(CommandEngine::new(shards, pubsub));
+        engine.init_self_ref(Arc::downgrade(&engine));
+        let script = "return KEYS[1] .. ':' .. ARGV[1]";
+        for i in 0..5 {
+            let r = execute_script(
+                &engine,
+                script,
+                vec![Bytes::from(format!("k{i}"))],
+                vec![Bytes::from(format!("a{i}"))],
+            );
+            match r {
+                CommandResponse::BulkString(b) => {
+                    assert_eq!(b.as_ref(), format!("k{i}:a{i}").as_bytes())
+                }
+                other => panic!("{other:?}"),
+            }
         }
     }
 }

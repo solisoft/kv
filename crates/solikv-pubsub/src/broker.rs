@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -10,15 +11,26 @@ const CHANNEL_CAPACITY: usize = 1024;
 pub struct PubSubMessage {
     pub channel: Bytes,
     pub message: Bytes,
-    /// If this message was delivered via a pattern subscription, the pattern that matched.
-    pub pattern: Option<String>,
+    /// If this message was delivered via a pattern subscription, the pattern
+    /// that matched (shared, not copied per message).
+    pub pattern: Option<Bytes>,
+}
+
+impl PubSubMessage {
+    /// Bytes this message holds, for output-buffer accounting.
+    pub fn size(&self) -> usize {
+        self.channel.len() + self.message.len() + self.pattern.as_ref().map_or(0, |p| p.len()) + 48
+    }
 }
 
 /// Central pub/sub broker using broadcast channels per topic.
 #[derive(Debug, Clone)]
 pub struct PubSubBroker {
     channels: Arc<DashMap<Bytes, broadcast::Sender<PubSubMessage>>>,
-    patterns: Arc<DashMap<String, broadcast::Sender<PubSubMessage>>>,
+    patterns: Arc<DashMap<String, (Bytes, broadcast::Sender<PubSubMessage>)>>,
+    /// Entries in `patterns`: publish skips the pattern walk when it is 0
+    /// without touching the map's locks.
+    pattern_entries: Arc<AtomicUsize>,
 }
 
 impl PubSubBroker {
@@ -26,6 +38,7 @@ impl PubSubBroker {
         Self {
             channels: Arc::new(DashMap::new()),
             patterns: Arc::new(DashMap::new()),
+            pattern_entries: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -42,9 +55,10 @@ impl PubSubBroker {
     pub fn psubscribe(&self, pattern: String) -> broadcast::Receiver<PubSubMessage> {
         let entry = self.patterns.entry(pattern.clone()).or_insert_with(|| {
             let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
-            tx
+            self.pattern_entries.fetch_add(1, Ordering::Relaxed);
+            (Bytes::from(pattern), tx)
         });
-        entry.subscribe()
+        entry.1.subscribe()
     }
 
     /// Publish a message to a channel. Returns number of receivers that received.
@@ -63,16 +77,19 @@ impl PubSubBroker {
         }
 
         // Pattern match fan-out
+        if self.pattern_entries.load(Ordering::Relaxed) == 0 {
+            return count;
+        }
         let channel_str = std::str::from_utf8(&channel).unwrap_or("");
         for entry in self.patterns.iter() {
             let pat = entry.key();
             if glob_match::glob_match(pat, channel_str) {
-                count += entry
-                    .value()
+                let (pat_bytes, tx) = entry.value();
+                count += tx
                     .send(PubSubMessage {
                         channel: channel.clone(),
                         message: message.clone(),
-                        pattern: Some(pat.clone()),
+                        pattern: Some(pat_bytes.clone()),
                     })
                     .unwrap_or(0);
             }
@@ -106,7 +123,7 @@ impl PubSubBroker {
     pub fn pattern_numsub(&self) -> Vec<(String, usize)> {
         self.patterns
             .iter()
-            .map(|r| (r.key().clone(), r.value().receiver_count()))
+            .map(|r| (r.key().clone(), r.value().1.receiver_count()))
             .collect()
     }
 
@@ -124,17 +141,26 @@ impl PubSubBroker {
             .map(|r| r.key().clone())
             .collect();
         for ch in empty_channels {
-            self.channels.remove(&ch);
+            // Re-checked under the entry's lock: a subscriber may have come
+            // back since.
+            self.channels
+                .remove_if(&ch, |_, tx| tx.receiver_count() == 0);
         }
 
         let empty_patterns: Vec<String> = self
             .patterns
             .iter()
-            .filter(|r| r.value().receiver_count() == 0)
+            .filter(|r| r.value().1.receiver_count() == 0)
             .map(|r| r.key().clone())
             .collect();
         for pat in empty_patterns {
-            self.patterns.remove(&pat);
+            if self
+                .patterns
+                .remove_if(&pat, |_, v| v.1.receiver_count() == 0)
+                .is_some()
+            {
+                self.pattern_entries.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -202,7 +228,7 @@ mod tests {
         let msg = rx.recv().await.unwrap();
         assert_eq!(msg.channel, Bytes::from("ch1"));
         assert_eq!(msg.message, Bytes::from("hello"));
-        assert_eq!(msg.pattern, Some("ch*".to_string()));
+        assert_eq!(msg.pattern, Some(Bytes::from("ch*")));
     }
 
     #[tokio::test]
@@ -225,7 +251,7 @@ mod tests {
         assert!(msg1.pattern.is_none());
 
         let msg2 = rx_pattern.recv().await.unwrap();
-        assert_eq!(msg2.pattern, Some("ch*".to_string()));
+        assert_eq!(msg2.pattern, Some(Bytes::from("ch*")));
     }
 
     #[tokio::test]

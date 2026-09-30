@@ -5102,15 +5102,15 @@ fn multi_shard_mget(shards: &crate::shard::ShardManager, keys: &[Bytes]) -> Comm
     CommandResponse::Array(results)
 }
 
-/// This shard's pairs of an `MSET`/`MSETNX`, as an `MSET` for its log.
-fn log_mset_part(fx: &mut crate::aof_log::Effects, pairs: &[(Bytes, Bytes)]) {
-    if fx.enabled() {
-        let flat: Vec<&[u8]> = pairs
-            .iter()
-            .flat_map(|(k, v)| [k.as_ref(), v.as_ref()])
-            .collect();
-        fx.push("MSET", &flat);
-    }
+/// This shard's pairs of an `MSET`/`MSETNX`, as an `MSET` record for its
+/// log — encoded before the shard is locked (`None` with the log off).
+fn mset_record(shards: &ShardManager, pairs: &[(Bytes, Bytes)]) -> Option<Vec<u8>> {
+    shards.aof()?;
+    let flat: Vec<&[u8]> = pairs
+        .iter()
+        .flat_map(|(k, v)| [k.as_ref(), v.as_ref()])
+        .collect();
+    Some(solikv_persist::aof::encode_command(b"MSET", &flat))
 }
 
 fn multi_shard_mset(
@@ -5130,10 +5130,13 @@ fn multi_shard_mset(
         if group.is_empty() {
             continue;
         }
+        let record = mset_record(shards, &group);
         shards
             .shard(shard_idx)
             .execute_with_effects(move |store, fx| {
-                log_mset_part(fx, &group);
+                if let Some(r) = record {
+                    fx.push_encoded(r);
+                }
                 store.string_mset(group)
             });
     }
@@ -5184,10 +5187,13 @@ fn multi_shard_msetnx(
         if group.is_empty() {
             continue;
         }
+        let record = mset_record(shards, &group);
         shards
             .shard(shard_idx)
             .execute_with_effects(move |store, fx| {
-                log_mset_part(fx, &group);
+                if let Some(r) = record {
+                    fx.push_encoded(r);
+                }
                 store.string_mset(group)
             });
     }

@@ -96,6 +96,9 @@ pub struct Persistence {
     needs_rewrite: AtomicBool,
     /// A `.aof` from before manifests, to retire once rewritten.
     legacy_aof: Mutex<Option<PathBuf>>,
+    /// Held while a snapshot is taken (SAVE, BGSAVE, a log rewrite): a
+    /// store runs one stepped snapshot at a time, so a second waits.
+    snapshotting: Mutex<()>,
 }
 
 impl Persistence {
@@ -108,6 +111,7 @@ impl Persistence {
             manifest: Mutex::new(None),
             needs_rewrite: AtomicBool::new(false),
             legacy_aof: Mutex::new(None),
+            snapshotting: Mutex::new(()),
         }
     }
 
@@ -306,6 +310,7 @@ impl Persistence {
 
     /// `SAVE`: snapshot now, on this thread.
     pub fn save(&self, shards: &ShardManager, dirty: u64) -> io::Result<()> {
+        let _one_at_a_time = self.snapshotting.lock();
         let mut file = SnapshotFile::create(&self.rdb_path())?;
         for i in 0..shards.num_shards() {
             let body = capture_shard(shards, i, None)?;
@@ -362,6 +367,7 @@ impl Persistence {
             .name("solikv-bgsave".into())
             .spawn(move || {
                 let res = (|| -> io::Result<()> {
+                    let _one_at_a_time = this.snapshotting.lock();
                     let mut file = SnapshotFile::create(&this.rdb_path())?;
                     match captured {
                         Some(sections) => {
@@ -371,7 +377,7 @@ impl Persistence {
                         }
                         None => {
                             for i in 0..shards.num_shards() {
-                                let body = capture_shard(&shards, i, None)?;
+                                let body = capture_shard_stepped(&shards, i, None)?;
                                 file.write_section(i as u32, &body)?;
                             }
                         }
@@ -471,6 +477,7 @@ impl Persistence {
             .name("solikv-aofrw".into())
             .spawn(move || {
                 let res = (|| -> io::Result<()> {
+                    let _one_at_a_time = this.snapshotting.lock();
                     let mut file = SnapshotFile::create(&aof::base_path(&aof_dir, g))?;
                     match captured {
                         Some(sections) => {
@@ -480,7 +487,7 @@ impl Persistence {
                         }
                         None => {
                             for i in 0..shards.num_shards() {
-                                let body = capture_shard(&shards, i, Some((&writer, g)))?;
+                                let body = capture_shard_stepped(&shards, i, Some((&writer, g)))?;
                                 file.write_section(i as u32, &body)?;
                             }
                         }
@@ -609,6 +616,49 @@ fn capture_shard(
         }
         Ok(body)
     })
+}
+
+/// Entries serialized per lock hold by a stepped snapshot: small enough
+/// that commands queued on the shard wait well under a millisecond.
+const SNAPSHOT_STEP: usize = 1024;
+
+/// [`capture_shard`] without holding the shard for the whole
+/// serialization: the snapshot begins (and, with `rotate`, the log switches
+/// generation) in one lock hold, then entries are serialized
+/// `SNAPSHOT_STEP` at a time, the lock released in between. The store keeps
+/// the result point-in-time (see `ShardStore::begin_snapshot`): a key
+/// changed before the walk reaches it is saved as it was first. Multi-shard
+/// mode only — a solo store may not be touched from this thread.
+fn capture_shard_stepped(
+    shards: &ShardManager,
+    i: usize,
+    rotate: Option<(&AofWriter, u64)>,
+) -> io::Result<Vec<u8>> {
+    let shard = shards.shard(i);
+    let began = shard.with_store_mut_unlogged(|store| {
+        if !store.begin_snapshot(rdb::snapshot_encoder) {
+            return false;
+        }
+        if let Some((w, g)) = rotate {
+            w.rotate(i as u32, g);
+        }
+        true
+    });
+    if !began {
+        return Err(io::Error::other(
+            "a snapshot of this shard is already running",
+        ));
+    }
+    let mut body = Vec::new();
+    loop {
+        let (chunk, done) = shard.with_store_mut_unlogged(|s| s.snapshot_step(SNAPSHOT_STEP));
+        body.extend_from_slice(&chunk);
+        if done {
+            return Ok(body);
+        }
+        // Let the commands that queued on the lock in.
+        std::thread::yield_now();
+    }
 }
 
 fn max_gen_plus_one(m: &Manifest) -> u64 {
@@ -1004,6 +1054,60 @@ mod tests {
 
     /// Writers keep going while the log is rewritten and a snapshot is taken:
     /// every write lands exactly once.
+    /// Big enough that a snapshot takes many steps, with the lock released
+    /// between them while writers change keys the walk has and has not
+    /// reached: after a restart from the rewritten log (and a BGSAVE file),
+    /// the dataset is exactly what the live server held.
+    #[test]
+    fn stepped_snapshots_under_writes_restart_to_the_same_state() {
+        let dir = TmpDir::new("stepped");
+        let e = start(&dir.0, ShardManager::new(4), true);
+        for chunk in 0..40 {
+            let mut cmd = vec!["MSET".to_string()];
+            for i in chunk * 1000..(chunk + 1) * 1000 {
+                cmd.push(format!("k{i}"));
+                cmd.push(format!("v{i}"));
+            }
+            let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+            run(&e, &refs);
+        }
+        let writers: Vec<_> = (0..3)
+            .map(|t| {
+                let e = e.clone();
+                std::thread::spawn(move || {
+                    for i in 0..6000 {
+                        let k = format!("k{}", (i * 7 + t * 13_331) % 40_000);
+                        match i % 4 {
+                            0 => run(&e, &["SET", &k, &format!("w{t}-{i}")]),
+                            1 => run(&e, &["DEL", &k]),
+                            2 => run(&e, &["APPEND", &k, "+"]),
+                            _ => run(&e, &["SET", &format!("new{t}-{i}"), "n"]),
+                        };
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..4 {
+            let _ = run(&e, &["BGREWRITEAOF"]);
+            wait_rewrite(&e);
+            let _ = run(&e, &["BGSAVE"]);
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        let _ = run(&e, &["BGREWRITEAOF"]);
+        wait_rewrite(&e);
+        let live: Vec<Option<String>> = (0..40_000).map(|i| get(&e, &format!("k{i}"))).collect();
+        let dbsize = int(run(&e, &["DBSIZE"]));
+        stop(&e);
+
+        let e = start(&dir.0, ShardManager::new(4), true);
+        assert_eq!(int(run(&e, &["DBSIZE"])), dbsize);
+        for (i, v) in live.iter().enumerate() {
+            assert_eq!(&get(&e, &format!("k{i}")), v, "k{i}");
+        }
+    }
+
     #[test]
     fn concurrent_writes_during_a_rewrite_are_neither_lost_nor_doubled() {
         let dir = TmpDir::new("concurrent");

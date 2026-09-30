@@ -932,6 +932,10 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
     publish_counts(conn);
     let (fan_tx, mut fan_rx) = mpsc::unbounded_channel::<PubSubMessage>();
     let mut write_buf = BytesMut::with_capacity(65536);
+    // Output-buffer accounting shared with the forwarding tasks (Redis'
+    // `client-output-buffer-limit pubsub 32mb 8mb 60`).
+    let outbuf = Arc::new(OutBuf::default());
+    let mut soft_since: Option<tokio::time::Instant> = None;
 
     // Forwarding tasks: channel_name -> JoinHandle
     let mut channel_tasks: HashMap<Bytes, JoinHandle<()>> = HashMap::new();
@@ -941,13 +945,13 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
     for ch in &conn.subscriptions {
         let rx = pubsub.subscribe(ch.clone());
         let tx = fan_tx.clone();
-        let handle = tokio::spawn(forward_broadcast(rx, tx));
+        let handle = tokio::spawn(forward_broadcast(rx, tx, outbuf.clone()));
         channel_tasks.insert(ch.clone(), handle);
     }
     for pat in &conn.psubscriptions {
         let rx = pubsub.psubscribe(pat.clone());
         let tx = fan_tx.clone();
-        let handle = tokio::spawn(forward_broadcast(rx, tx));
+        let handle = tokio::spawn(forward_broadcast(rx, tx, outbuf.clone()));
         pattern_tasks.insert(pat.clone(), handle);
     }
 
@@ -959,35 +963,56 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                 for (_, h) in pattern_tasks.drain() { h.abort(); }
                 return Ok(());
             }
+            // A forwarder found this client too slow (output buffer over
+            // the hard limit, or messages already lost): disconnect it, as
+            // Redis does, rather than buffer without bound or drop silently.
+            _ = outbuf.overflow.notified() => {
+                tracing::warn!("{}: pub/sub client closed for overcoming the output buffer limit", info.addr);
+                for (_, h) in channel_tasks.drain() { h.abort(); }
+                for (_, h) in pattern_tasks.drain() { h.abort(); }
+                return Ok(());
+            }
             // Branch 1: incoming message from any subscription
             msg = fan_rx.recv() => {
                 let Some(msg) = msg else { break; };
-                if let Some(ref pattern) = msg.pattern {
-                    // pmessage
-                    encode_frame(
-                        &RespFrame::Array(vec![
-                            RespFrame::BulkString(Bytes::from("pmessage")),
-                            RespFrame::BulkString(Bytes::from(pattern.clone())),
-                            RespFrame::BulkString(msg.channel),
-                            RespFrame::BulkString(msg.message),
-                        ]),
-                        &mut write_buf,
-                    );
+                // Everything already queued goes out in the same write.
+                let mut drained = msg.size();
+                encode_pubsub_message(&msg, &mut write_buf);
+                while write_buf.len() < BUF_SIZE {
+                    match fan_rx.try_recv() {
+                        Ok(m) => {
+                            drained += m.size();
+                            encode_pubsub_message(&m, &mut write_buf);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // A subscriber that stopped reading blocks this write; the
+                // forwarders then hit the hard limit, and that must still
+                // close the connection.
+                tokio::select! {
+                    r = socket.write_all(&write_buf) => r?,
+                    _ = outbuf.overflow.notified() => {
+                        tracing::warn!("{}: pub/sub client closed for overcoming the output buffer limit", info.addr);
+                        for (_, h) in channel_tasks.drain() { h.abort(); }
+                        for (_, h) in pattern_tasks.drain() { h.abort(); }
+                        return Ok(());
+                    }
+                }
+                write_buf.clear();
+                let left = outbuf.pending.fetch_sub(drained, std::sync::atomic::Ordering::AcqRel) - drained;
+                if left > PUBSUB_SOFT_LIMIT {
+                    let since = *soft_since.get_or_insert_with(tokio::time::Instant::now);
+                    if since.elapsed() >= PUBSUB_SOFT_SECONDS {
+                        tracing::warn!("{}: pub/sub client closed for staying over the soft output buffer limit", info.addr);
+                        for (_, h) in channel_tasks.drain() { h.abort(); }
+                        for (_, h) in pattern_tasks.drain() { h.abort(); }
+                        return Ok(());
+                    }
                 } else {
-                    // message
-                    encode_frame(
-                        &RespFrame::Array(vec![
-                            RespFrame::BulkString(Bytes::from("message")),
-                            RespFrame::BulkString(msg.channel),
-                            RespFrame::BulkString(msg.message),
-                        ]),
-                        &mut write_buf,
-                    );
+                    soft_since = None;
                 }
-                if !write_buf.is_empty() {
-                    socket.write_all(&write_buf).await?;
-                    write_buf.clear();
-                }
+                shrink_after_spike(&mut write_buf);
             }
             // Branch 2: new data from the client socket
             n = socket.read_buf(read_buf) => {
@@ -1024,7 +1049,7 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                             conn.subscriptions.push(channel.clone());
                                             let rx = pubsub.subscribe(channel.clone());
                                             let tx = fan_tx.clone();
-                                            let handle = tokio::spawn(forward_broadcast(rx, tx));
+                                            let handle = tokio::spawn(forward_broadcast(rx, tx, outbuf.clone()));
                                             channel_tasks.insert(channel.clone(), handle);
                                         }
                                         let count = conn.subscriptions.len() + conn.psubscriptions.len();
@@ -1093,7 +1118,7 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                             conn.psubscriptions.push(pat.clone());
                                             let rx = pubsub.psubscribe(pat.clone());
                                             let tx = fan_tx.clone();
-                                            let handle = tokio::spawn(forward_broadcast(rx, tx));
+                                            let handle = tokio::spawn(forward_broadcast(rx, tx, outbuf.clone()));
                                             pattern_tasks.insert(pat.clone(), handle);
                                         }
                                         let count = conn.subscriptions.len() + conn.psubscriptions.len();
@@ -1233,20 +1258,46 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Forwarding task: reads from a broadcast receiver and sends to the fan-in mpsc channel.
+/// Redis' `client-output-buffer-limit pubsub` defaults: a subscriber
+/// with more than 32 MB queued, or more than 8 MB for 60 s, is disconnected.
+const PUBSUB_HARD_LIMIT: usize = 32 * 1024 * 1024;
+const PUBSUB_SOFT_LIMIT: usize = 8 * 1024 * 1024;
+const PUBSUB_SOFT_SECONDS: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What a subscriber has queued and not yet written.
+#[derive(Default)]
+struct OutBuf {
+    pending: std::sync::atomic::AtomicUsize,
+    overflow: tokio::sync::Notify,
+}
+
 async fn forward_broadcast(
     mut rx: tokio::sync::broadcast::Receiver<PubSubMessage>,
     tx: mpsc::UnboundedSender<PubSubMessage>,
+    outbuf: Arc<OutBuf>,
 ) {
     loop {
         match rx.recv().await {
             Ok(msg) => {
+                let size = msg.size();
+                let queued = outbuf
+                    .pending
+                    .fetch_add(size, std::sync::atomic::Ordering::AcqRel)
+                    + size;
+                if queued > PUBSUB_HARD_LIMIT {
+                    outbuf.overflow.notify_one();
+                    return;
+                }
                 if tx.send(msg).is_err() {
                     return; // fan-in channel closed
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                // Messages were lost for this subscriber: it could not keep
+                // up. Redis never drops a message; it disconnects the client.
                 tracing::debug!("pubsub subscriber lagged by {} messages", n);
-                // Continue receiving
+                outbuf.overflow.notify_one();
+                return;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 return; // channel closed
@@ -1255,27 +1306,44 @@ async fn forward_broadcast(
     }
 }
 
-fn get_command_key<'a>(name: &'a str, args: &'a [bytes::Bytes]) -> Option<&'a [u8]> {
-    let name_upper = name.to_uppercase();
-    match name_upper.as_str() {
-        "GET" | "SET" | "DEL" | "EXISTS" | "EXPIRE" | "EXPIREAT" | "TTL" | "PTTL" | "PERSIST"
-        | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "APPEND" | "STRLEN"
-        | "GETSET" | "SETEX" | "PSETEX" | "SETNX" | "SETXX" | "GETEX" | "HDEL" | "HEXISTS"
-        | "HGET" | "HGETALL" | "HINCRBY" | "HINCRBYFLOAT" | "HMGET" | "HMSET" | "HSET"
-        | "HSETNX" | "HVALS" | "HKEYS" | "HLEN" | "HSCAN" | "LGET" | "LPUSH" | "LPOP" | "RPUSH"
-        | "RPOP" | "LLEN" | "LRANGE" | "LSET" | "LREM" | "LTRIM" | "LINDEX" | "SADD" | "SCARD"
-        | "SDIFF" | "SINTER" | "SISMEMBER" | "SMEMBERS" | "SPOP" | "SRANDMEMBER" | "SUNION"
-        | "ZADD" | "ZCARD" | "ZCOUNT" | "ZRANGE" | "ZRANGEBYSCORE" | "ZRANK" | "ZREVRANGE"
-        | "ZREVRANGEBYSCORE" | "ZREVRANK" | "ZSCORE" | "ZINCRBY" | "ZREM" | "ZREMRANGEBYSCORE"
-        | "ZREMRANGEBYRANK" | "ZSCAN" | "MGET" | "MSET" | "MSETNX" | "GETBIT" | "SETBIT"
-        | "BITCOUNT" | "BITPOS" | "BITOP" | "BITFIELD" | "PFADD" | "PFCOUNT" | "PFMERGE" => {
-            if args.is_empty() {
-                None
-            } else {
-                Some(&args[0])
-            }
+/// `message` / `pmessage` push, encoded directly.
+fn encode_pubsub_message(msg: &PubSubMessage, dst: &mut BytesMut) {
+    fn bulk(dst: &mut BytesMut, b: &[u8]) {
+        dst.extend_from_slice(b"$");
+        write_decimal(dst, b.len() as i64);
+        dst.extend_from_slice(b"\r\n");
+        dst.extend_from_slice(b);
+        dst.extend_from_slice(b"\r\n");
+    }
+    match &msg.pattern {
+        Some(p) => {
+            dst.extend_from_slice(b"*4\r\n");
+            bulk(dst, b"pmessage");
+            bulk(dst, p);
         }
-        _ => None,
+        None => {
+            dst.extend_from_slice(b"*3\r\n");
+            bulk(dst, b"message");
+        }
+    }
+    bulk(dst, &msg.channel);
+    bulk(dst, &msg.message);
+}
+
+/// The key a command is routed by in cluster mode: its first key, from the
+/// command table (every keyed command, not a hand-kept list).
+fn get_command_key<'a>(name: &str, args: &'a [bytes::Bytes]) -> Option<&'a [u8]> {
+    let spec = solikv_engine::commands::lookup(name)?;
+    match spec.keys {
+        solikv_engine::commands::Keys::None => None,
+        solikv_engine::commands::Keys::Range { first, .. } => args
+            .get((first as usize).checked_sub(1)?)
+            .map(|k| k.as_ref()),
+        solikv_engine::commands::Keys::Movable(_) => spec
+            .key_positions(args)
+            .first()
+            .and_then(|&i| args.get(i))
+            .map(|k| k.as_ref()),
     }
 }
 
@@ -1304,9 +1372,7 @@ fn check_cluster_moved(
     }
 
     let key = get_command_key(cmd_name, args)?;
-    let slot = cluster.key_slot(key);
-
-    if !cluster.is_my_slot(key) {
+    if let solikv_cluster::Route::Remote(slot) = cluster.route(key) {
         // The owner's *address*, resolved through gossip. Ownership is recorded
         // by node id — the stable identity — so the address is looked up at
         // redirect time rather than stored beside the claim, where it would go

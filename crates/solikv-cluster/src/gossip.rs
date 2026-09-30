@@ -281,7 +281,14 @@ pub struct GossipState {
     myself: Arc<RwLock<ClusterNodeInfo>>,
     nodes: Arc<RwLock<HashMap<String, ClusterNodeInfo>>>,
     config: Arc<RwLock<GossipConfig>>,
+    /// Per peer: hash of the slot claim last announced to it, and when.
+    announced: Arc<RwLock<HashMap<String, (u64, std::time::Instant)>>>,
 }
+
+/// A peer that already has this node's current claim is sent it again only
+/// this often — to repair a peer that missed it (a restart, a lost frame),
+/// not every round.
+const REANNOUNCE_EVERY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct GossipConfig {
@@ -308,7 +315,22 @@ impl GossipState {
             myself: Arc::new(RwLock::new(myself)),
             nodes: Arc::new(RwLock::new(HashMap::new())),
             config: Arc::new(RwLock::new(GossipConfig::default())),
+            announced: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Whether `peer` should be sent the claim hashed `hash` this round.
+    fn should_announce(&self, peer: &str, hash: u64) -> bool {
+        match self.announced.read().get(peer) {
+            Some((h, at)) => *h != hash || at.elapsed() >= REANNOUNCE_EVERY,
+            None => true,
+        }
+    }
+
+    fn mark_announced(&self, peer: String, hash: u64) {
+        self.announced
+            .write()
+            .insert(peer, (hash, std::time::Instant::now()));
     }
 
     /// This node's advertised address, as peers should reach it.
@@ -336,6 +358,27 @@ impl GossipState {
         let mut result: Vec<ClusterNodeInfo> = vec![self.myself.read().clone()];
         result.extend(self.nodes.read().values().cloned().collect::<Vec<_>>());
         result
+    }
+
+    /// Address of the node `node_id`, without copying the node table (a
+    /// `MOVED` redirect looks one up).
+    pub fn node_address(&self, node_id: &str) -> Option<(String, u16)> {
+        {
+            let me = self.myself.read();
+            if me.node_id == node_id {
+                return Some((me.ip.clone(), me.port));
+            }
+        }
+        let nodes = self.nodes.read();
+        if let Some(n) = nodes.get(node_id) {
+            if n.node_id == node_id {
+                return Some((n.ip.clone(), n.port));
+            }
+        }
+        nodes
+            .values()
+            .find(|n| n.node_id == node_id)
+            .map(|n| (n.ip.clone(), n.port))
     }
 
     pub fn get_known_nodes(&self) -> Vec<(String, u16)> {
@@ -734,18 +777,41 @@ pub async fn send_frame(
     connect_timeout: Duration,
     receiver: &str,
 ) -> Result<(), std::io::Error> {
+    send_frames(
+        peer,
+        std::slice::from_ref(message),
+        secret,
+        connect_timeout,
+        receiver,
+    )
+    .await
+}
+
+/// [`send_frame`] for several messages over one connection, each sealed on
+/// its own (own nonce, own MAC): one connect for a round's ping and slot
+/// announcement instead of one each.
+pub async fn send_frames(
+    peer: SocketAddr,
+    messages: &[GossipMessage],
+    secret: &crate::auth::ClusterSecret,
+    connect_timeout: Duration,
+    receiver: &str,
+) -> Result<(), std::io::Error> {
     use tokio::io::AsyncWriteExt;
 
-    let payload = String::from_utf8_lossy(&message.encode())
-        .trim_end()
-        .to_string();
-    let frame = crate::auth::Envelope::seal(
-        &payload,
-        secret,
-        now_ms(),
-        &crate::auth::new_nonce(),
-        receiver,
-    );
+    let mut out = String::new();
+    for message in messages {
+        let payload = String::from_utf8_lossy(&message.encode())
+            .trim_end()
+            .to_string();
+        out.push_str(&crate::auth::Envelope::seal(
+            &payload,
+            secret,
+            now_ms(),
+            &crate::auth::new_nonce(),
+            receiver,
+        ));
+    }
 
     // A peer that has gone away must not hold this task open. Without the
     // timeout a single unreachable node stalls the whole gossip round, which is
@@ -763,7 +829,7 @@ pub async fn send_frame(
     // The write is bounded too: a peer that accepts and never reads would
     // otherwise hold this task once the socket buffer fills.
     tokio::time::timeout(connect_timeout, async {
-        stream.write_all(frame.as_bytes()).await?;
+        stream.write_all(out.as_bytes()).await?;
         stream.flush().await
     })
     .await
@@ -808,7 +874,16 @@ pub async fn gossip_round_with_slots(
 ) -> usize {
     let myself = state.myself_id();
     let (my_ip, my_port) = state.myself_address();
-    let mut reached = 0;
+    let claim_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        my_slots.hash(&mut h);
+        h.finish()
+    };
+
+    // Peers are dialled concurrently: a slow or unreachable one costs the
+    // round its timeout once, not once per peer after it.
+    let mut sends = tokio::task::JoinSet::new();
 
     // `get_known_nodes` yields `(ip, port)`, not `(node_id, port)`. The first
     // version of this loop read the first element as a node id and looked it up
@@ -823,49 +898,55 @@ pub async fn gossip_round_with_slots(
         // announcement back — it must be addressed, or it replays anywhere.
         let known_id = node_id != format!("{ip}:{port}");
         let receiver = if known_id {
-            node_id.as_str()
+            node_id.clone()
         } else {
-            crate::auth::UNBOUND_RECEIVER
+            crate::auth::UNBOUND_RECEIVER.to_string()
         };
         let Ok(peer) = format!("{}:{}", ip, port + bus_offset).parse::<SocketAddr>() else {
             tracing::warn!(%ip, port, "peer address does not parse");
             continue;
         };
 
-        let ping = GossipMessage::Ping {
+        let mut frames = vec![GossipMessage::Ping {
             node_id: myself.clone(),
             ip: my_ip.clone(),
             port: my_port,
             ping_id: now_ms(),
-        };
-        match send_frame(peer, &ping, secret, connect_timeout, receiver).await {
-            Ok(()) => reached += 1,
-            Err(e) => {
-                tracing::debug!(%peer, error = %e, "gossip ping failed");
-                // No point announcing slots to a peer that did not answer a
-                // ping; the next round will try both again.
-                continue;
-            }
+        }];
+        // The claim goes out when it changed, and otherwise every
+        // `REANNOUNCE_EVERY`: a peer that missed one — a restart, a dropped
+        // frame — still converges, without the full list every second.
+        let announce = known_id && state.should_announce(&node_id, claim_hash);
+        if announce {
+            frames.push(GossipMessage::Update {
+                node_id: myself.clone(),
+                ip: my_ip.clone(),
+                port: my_port,
+                flags: vec!["master".to_string()],
+                master_id: None,
+                slots: my_slots.to_vec(),
+            });
         }
+        let secret = secret.clone();
+        sends.spawn(async move {
+            let res = send_frames(peer, &frames, &secret, connect_timeout, &receiver).await;
+            (peer, node_id, announce, res)
+        });
+    }
 
-        if !known_id {
+    let mut reached = 0;
+    while let Some(done) = sends.join_next().await {
+        let Ok((peer, node_id, announced, res)) = done else {
             continue;
-        }
-
-        // Sent every round, not only on change. A peer that missed one — a
-        // restart, a dropped frame — otherwise keeps a stale ownership table
-        // until something else happens to change, and the symptom is keys
-        // redirected to the wrong node with nothing in either log.
-        let update = GossipMessage::Update {
-            node_id: myself.clone(),
-            ip: my_ip.clone(),
-            port: my_port,
-            flags: vec!["master".to_string()],
-            master_id: None,
-            slots: my_slots.to_vec(),
         };
-        if let Err(e) = send_frame(peer, &update, secret, connect_timeout, receiver).await {
-            tracing::debug!(%peer, error = %e, "gossip slot announcement failed");
+        match res {
+            Ok(()) => {
+                reached += 1;
+                if announced {
+                    state.mark_announced(node_id, claim_hash);
+                }
+            }
+            Err(e) => tracing::debug!(%peer, error = %e, "gossip ping failed"),
         }
     }
 
@@ -1196,5 +1277,26 @@ mod slot_propagation_tests {
         let one_range = encode_slots(&[(0, 16383)]);
         assert_eq!(one_range, "0-16383");
         assert!(one_range.len() < 16, "{one_range}");
+    }
+}
+
+#[cfg(test)]
+mod announce_tests {
+    use super::*;
+
+    #[test]
+    fn a_claim_is_announced_on_change_and_periodically_not_every_round() {
+        let state = GossipState::new("me".into(), "127.0.0.1".into(), 7000);
+        assert!(state.should_announce("peer", 1));
+        state.mark_announced("peer".into(), 1);
+        assert!(!state.should_announce("peer", 1));
+        assert!(state.should_announce("peer", 2));
+        assert!(state.should_announce("other", 1));
+        // Sent long enough ago to repeat.
+        state.announced.write().insert(
+            "peer".into(),
+            (1, std::time::Instant::now() - REANNOUNCE_EVERY),
+        );
+        assert!(state.should_announce("peer", 1));
     }
 }

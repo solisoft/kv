@@ -1,6 +1,19 @@
 use crate::gossip::{GossipMessage, GossipState};
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Where a key is served, as the command hot path needs to know it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Here (cluster mode off, or this node owns the slot).
+    Local,
+    /// Elsewhere, or nowhere: redirect or refuse for this slot.
+    Remote(u16),
+}
+
+/// Words of the owned-slots bitset (16384 slots / 64).
+const SLOT_WORDS: usize = 16384 / 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClusterState {
@@ -23,6 +36,12 @@ pub struct ClusterManager {
     gossip: GossipState,
     slots: Arc<RwLock<Vec<ClusterSlot>>>,
     config: Arc<RwLock<ClusterConfig>>,
+    /// `config.enabled`, readable without a lock on every command.
+    enabled: AtomicBool,
+    /// One bit per slot this node owns, kept in step with `slots` by every
+    /// change to it: [`route`](Self::route) is two atomic loads, where it
+    /// took two lock round-trips and an owner `String` clone per command.
+    mine: Box<[AtomicU64]>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,7 +71,7 @@ impl ClusterManager {
             })
             .collect();
 
-        Self {
+        let m = Self {
             state: Arc::new(RwLock::new(ClusterState::Init)),
             my_node_id: node_id,
             my_ip: ip,
@@ -60,6 +79,39 @@ impl ClusterManager {
             gossip,
             slots: Arc::new(RwLock::new(slots)),
             config: Arc::new(RwLock::new(ClusterConfig::default())),
+            enabled: AtomicBool::new(false),
+            mine: (0..SLOT_WORDS).map(|_| AtomicU64::new(0)).collect(),
+        };
+        m.refresh_mine(&m.slots.read());
+        m
+    }
+
+    /// Recompute the owned-slots bitset from the table (after a change to
+    /// ownership; rare).
+    fn refresh_mine(&self, slots: &[ClusterSlot]) {
+        let mut words = [0u64; SLOT_WORDS];
+        for (i, slot) in slots.iter().enumerate() {
+            if slot.owner.as_deref() == Some(self.my_node_id.as_str()) {
+                words[i / 64] |= 1 << (i % 64);
+            }
+        }
+        for (w, v) in self.mine.iter().zip(words) {
+            w.store(v, Ordering::Release);
+        }
+    }
+
+    /// Where `key` is served: one CRC16 and two atomic loads, no lock.
+    #[inline]
+    pub fn route(&self, key: &[u8]) -> Route {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return Route::Local;
+        }
+        let slot = self.key_slot(key);
+        let word = self.mine[slot as usize / 64].load(Ordering::Acquire);
+        if word & (1 << (slot % 64)) != 0 {
+            Route::Local
+        } else {
+            Route::Remote(slot)
         }
     }
 
@@ -68,14 +120,16 @@ impl ClusterManager {
         // The constructor claims every slot, which is correct for one node and
         // wrong the moment there are several. See `release_all_slots`.
         self.release_all_slots();
+        self.enabled.store(true, Ordering::Release);
     }
 
     pub fn disable(&self) {
         self.config.write().enabled = false;
+        self.enabled.store(false, Ordering::Release);
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.config.read().enabled
+        self.enabled.load(Ordering::Relaxed)
     }
 
     pub fn state(&self) -> ClusterState {
@@ -211,6 +265,7 @@ impl ClusterManager {
                 released += 1;
             }
         }
+        self.refresh_mine(&slots);
         if released > 0 {
             tracing::info!(
                 released,
@@ -233,6 +288,7 @@ impl ClusterManager {
         for i in start..=end {
             slots[i as usize].owner = Some(self.my_node_id.clone());
         }
+        self.refresh_mine(&slots);
 
         tracing::info!("Added slots {}-{} to node {}", start, end, self.my_node_id);
         Ok(())
@@ -252,6 +308,7 @@ impl ClusterManager {
                 slots[i as usize].owner = None;
             }
         }
+        self.refresh_mine(&slots);
 
         tracing::info!(
             "Removed slots {}-{} from node {}",
@@ -321,11 +378,7 @@ impl ClusterManager {
         if owner == self.my_node_id {
             return Some((self.my_ip.clone(), self.my_port));
         }
-        self.gossip
-            .get_all_nodes()
-            .into_iter()
-            .find(|n| n.node_id == owner)
-            .map(|n| (n.ip, n.port))
+        self.gossip.node_address(&owner)
     }
 
     pub fn get_slot_owner_for_key(&self, key: &[u8]) -> Option<String> {
@@ -334,14 +387,7 @@ impl ClusterManager {
     }
 
     pub fn is_my_slot(&self, key: &[u8]) -> bool {
-        if !self.is_enabled() {
-            return true;
-        }
-
-        match self.get_slot_owner_for_key(key) {
-            Some(owner) => owner == self.my_node_id,
-            None => false,
-        }
+        self.route(key) == Route::Local
     }
 
     pub fn cluster_info(&self) -> String {
@@ -711,5 +757,31 @@ mod slot_ownership_tests {
         assert_eq!(m.get_slot_owner(5).as_deref(), Some("b"));
         // Nothing in the slot table mentions an address.
         assert!(!m.get_slot_owner(5).unwrap().contains(':'));
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn route_follows_ownership_without_locks() {
+        let gossip = GossipState::new("me".into(), "127.0.0.1".into(), 7000);
+        let m = ClusterManager::new("me".into(), "127.0.0.1".into(), 7000, gossip);
+        // Cluster mode off: everything is served here.
+        assert_eq!(m.route(b"foo"), Route::Local);
+        m.enable();
+        let slot = m.key_slot(b"foo");
+        assert_eq!(m.route(b"foo"), Route::Remote(slot));
+        m.add_slots(slot, slot).unwrap();
+        assert_eq!(m.route(b"foo"), Route::Local);
+        // Same tag, same slot.
+        assert_eq!(m.route(b"{foo}bar"), Route::Local);
+        m.del_slots(slot, slot).unwrap();
+        assert_eq!(m.route(b"foo"), Route::Remote(slot));
+        m.add_slots(0, 16383).unwrap();
+        assert!(m.is_my_slot(b"anything"));
+        m.release_all_slots();
+        assert!(!m.is_my_slot(b"anything"));
     }
 }

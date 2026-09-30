@@ -24,10 +24,21 @@ const AUTH_COOLDOWN_SECS_REST: u64 = 30;
 #[derive(Default)]
 struct AuthFailureTracker {
     failures: RwLock<std::collections::HashMap<String, (u32, std::time::Instant)>>,
+    /// `failures.len()`, readable without the lock: when nobody has failed
+    /// (the normal case) an authenticated request touches no shared lock.
+    len: std::sync::atomic::AtomicUsize,
 }
 
 impl AuthFailureTracker {
+    #[inline]
+    fn any(&self) -> bool {
+        self.len.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+
     fn is_blocked(&self, ip: &str) -> bool {
+        if !self.any() {
+            return false;
+        }
         let failures = self.failures.read().unwrap();
         if let Some((count, first_failure)) = failures.get(ip) {
             if *count >= MAX_AUTH_FAILURES_REST {
@@ -49,16 +60,20 @@ impl AuthFailureTracker {
         let entry = failures.entry(ip.to_string()).or_insert((0, now));
         entry.0 += 1;
         entry.1 = now;
+        self.len
+            .store(failures.len(), std::sync::atomic::Ordering::Relaxed);
     }
 
     fn record_success(&self, ip: &str) {
-        // Every authenticated request lands here; only take the write lock
-        // when there is something to forget.
-        if !self.failures.read().unwrap().contains_key(ip) {
+        // Every authenticated request lands here; only take a lock when
+        // there is something to forget.
+        if !self.any() || !self.failures.read().unwrap().contains_key(ip) {
             return;
         }
         let mut failures = self.failures.write().unwrap();
         failures.remove(ip);
+        self.len
+            .store(failures.len(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 

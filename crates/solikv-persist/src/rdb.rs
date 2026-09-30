@@ -122,6 +122,28 @@ pub fn serialize_store(store: &ShardStore, out: &mut Vec<u8>) -> io::Result<()> 
     Ok(())
 }
 
+/// `solikv_core::store::SnapshotEncoder` for this format: `key`'s entry,
+/// preceded by a database marker when the stream is in another database.
+/// Expired entries are left out, as `serialize_store` does.
+pub fn snapshot_encoder(
+    out: &mut Vec<u8>,
+    cur_db: &mut u32,
+    db: u32,
+    key: &[u8],
+    entry: &KeyEntry,
+) {
+    if entry.is_expired() {
+        return;
+    }
+    if db != *cur_db {
+        out.push(SELECT_DB);
+        out.extend_from_slice(&db.to_le_bytes());
+        *cur_db = db;
+    }
+    // Writing to a Vec cannot fail.
+    let _ = write_entry(out, key, entry);
+}
+
 /// One key: optional expiry, type, key, value.
 pub fn write_entry<W: Write>(w: &mut W, key: &[u8], entry: &KeyEntry) -> io::Result<()> {
     if let Some(exp) = entry.expires_at {
