@@ -1,7 +1,7 @@
 use bytes::Bytes;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
+use std::time::{Duration, Instant};
 
-use crate::expiry::{ExpiryHeap, MAX_EXPIRE_PER_TICK};
 use crate::types::*;
 
 /// `EXPIRE … NX|XX|GT|LT`.
@@ -13,30 +13,189 @@ pub struct ExpireCond {
     pub lt: bool,
 }
 
+/// Keys a single active-expiry sample looks at (Redis'
+/// `ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP`).
+pub const EXPIRE_SAMPLE: usize = 20;
+
+/// `maxmemory-policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EvictionPolicy {
+    #[default]
+    NoEviction,
+    AllKeysLru,
+    VolatileLru,
+    AllKeysLfu,
+    VolatileLfu,
+    AllKeysRandom,
+    VolatileRandom,
+    VolatileTtl,
+}
+
+impl EvictionPolicy {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "noeviction" => Self::NoEviction,
+            "allkeys-lru" => Self::AllKeysLru,
+            "volatile-lru" => Self::VolatileLru,
+            "allkeys-lfu" => Self::AllKeysLfu,
+            "volatile-lfu" => Self::VolatileLfu,
+            "allkeys-random" => Self::AllKeysRandom,
+            "volatile-random" => Self::VolatileRandom,
+            "volatile-ttl" => Self::VolatileTtl,
+            _ => return None,
+        })
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::NoEviction => "noeviction",
+            Self::AllKeysLru => "allkeys-lru",
+            Self::VolatileLru => "volatile-lru",
+            Self::AllKeysLfu => "allkeys-lfu",
+            Self::VolatileLfu => "volatile-lfu",
+            Self::AllKeysRandom => "allkeys-random",
+            Self::VolatileRandom => "volatile-random",
+            Self::VolatileTtl => "volatile-ttl",
+        }
+    }
+
+    pub fn is_lfu(&self) -> bool {
+        matches!(self, Self::AllKeysLfu | Self::VolatileLfu)
+    }
+
+    fn volatile_only(&self) -> bool {
+        matches!(
+            self,
+            Self::VolatileLru | Self::VolatileLfu | Self::VolatileRandom | Self::VolatileTtl
+        )
+    }
+}
+
+/// Writes one entry of a snapshot. Supplied by the persistence layer (the
+/// store knows nothing of the file format): appends `key`'s entry to `out`,
+/// preceded by a database marker when `db` differs from `*cur_db`, which it
+/// then updates. It may skip the entry (an expired key).
+pub type SnapshotEncoder =
+    fn(out: &mut Vec<u8>, cur_db: &mut u32, db: u32, key: &[u8], entry: &KeyEntry);
+
+/// A snapshot being taken in steps (see [`ShardStore::begin_snapshot`]).
+#[derive(Debug)]
+struct Snapshot {
+    epoch: u32,
+    encoder: SnapshotEncoder,
+    /// Serialized entries not yet handed to the snapshot writer.
+    out: Vec<u8>,
+    /// Database the last entry in the output stream belonged to.
+    cur_db: u32,
+    /// Databases still to walk, each with its cursor (next position is
+    /// `cursor - 1`, walking down).
+    walk: Vec<(u32, usize)>,
+}
+
+type KeyMap = IndexMap<Bytes, KeyEntry, FastHasher>;
+
+/// A distinct, non-zero xorshift seed per store.
+fn seed() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    let mut z = NEXT.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (z ^ (z >> 31)) | 1
+}
+
 /// One logical database's keys (`SELECT n`).
 #[derive(Debug, Default)]
 struct Keyspace {
-    data: IndexMap<Bytes, KeyEntry>,
-    expiry_heap: ExpiryHeap,
+    data: KeyMap,
+    /// Keys that have a TTL — Redis' `expires` dict. Sampled by active
+    /// expiry and by the `volatile-*` eviction policies.
+    volatile: IndexSet<Bytes, FastHasher>,
+}
+
+impl Keyspace {
+    /// Insert or replace, keeping `volatile` in step. Returns the replaced
+    /// entry.
+    fn insert(&mut self, key: Bytes, entry: KeyEntry) -> Option<KeyEntry> {
+        let has_ttl = entry.expires_at.is_some();
+        let (idx, old) = self.data.insert_full(key, entry);
+        let had_ttl = old.as_ref().is_some_and(|o| o.expires_at.is_some());
+        if has_ttl && !had_ttl {
+            let k = self.data.get_index(idx).map(|(k, _)| k.clone());
+            if let Some(k) = k {
+                self.volatile.insert(k);
+            }
+        } else if had_ttl && !has_ttl {
+            let k = self.data.get_index(idx).map(|(k, _)| k.clone());
+            if let Some(k) = k {
+                self.volatile.swap_remove(&k);
+            }
+        }
+        old
+    }
+
+    fn remove_index(&mut self, idx: usize) -> Option<(Bytes, KeyEntry)> {
+        let (k, e) = self.data.swap_remove_index(idx)?;
+        if e.expires_at.is_some() {
+            self.volatile.swap_remove(&k);
+        }
+        Some((k, e))
+    }
+
+    fn set_expiry(&mut self, idx: usize, at: Option<u64>) {
+        let Some((k, e)) = self.data.get_index_mut(idx) else {
+            return;
+        };
+        let had = e.expires_at.is_some();
+        e.expires_at = at;
+        match (had, at.is_some()) {
+            (false, true) => {
+                let k = k.clone();
+                self.volatile.insert(k);
+            }
+            (true, false) => {
+                let k = k.clone();
+                self.volatile.swap_remove(&k);
+            }
+            _ => {}
+        }
+    }
+
+    fn clear(&mut self) {
+        self.data = KeyMap::default();
+        self.volatile = IndexSet::default();
+    }
 }
 
 /// Per-shard key-value store. Owned by a single thread — no locking needed.
 ///
-/// Uses [`IndexMap`] so SCAN/RANDOMKEY can address keys by stable index in O(1)
-/// without cloning the full key set on every call.
+/// Keys live in an [`IndexMap`], so SCAN/RANDOMKEY and eviction sampling
+/// address them by position in O(1) without cloning the key set.
 ///
 /// # Logical databases
 ///
 /// Every shard holds its part of every database. The *selected* one lives in
-/// `data`/`expiry_heap`, where every command method finds it; the others wait
-/// in `parked`. [`select`](Self::select) swaps two keyspaces' headers — a few
-/// pointers, no rehash — and is a no-op for the database already selected,
-/// so a server whose clients never `SELECT` pays one compare per command.
+/// `ks`, where every command method finds it; the others wait in `parked`.
+/// [`select`](Self::select) swaps two keyspaces' headers — a few pointers, no
+/// rehash — and is a no-op for the database already selected, so a server
+/// whose clients never `SELECT` pays one compare per command.
+///
+/// # Snapshots in steps
+///
+/// A snapshot does not hold the shard for its whole serialization. It walks
+/// the keys a bounded number at a time (see [`snapshot_step`]); in between,
+/// commands run. Point-in-time consistency comes from the entries' `snap`
+/// epoch: any change to a key the walk has not reached yet — a write, a
+/// delete, an overwrite — first serializes the key as it was, and marks it
+/// done. Keys created after the snapshot began are marked done from the
+/// start. Each key present when it began is therefore written exactly once,
+/// with the value it had then.
+///
+/// [`snapshot_step`]: Self::snapshot_step
 #[derive(Debug)]
 pub struct ShardStore {
-    data: IndexMap<Bytes, KeyEntry>,
-    expiry_heap: ExpiryHeap,
-    /// Which database `data` is.
+    ks: Keyspace,
+    /// Which database `ks` is.
     db: u32,
     /// Every other database, by index; `parked[db]` is an empty placeholder
     /// for the selected one. Grows on demand to the highest database used.
@@ -45,17 +204,33 @@ pub struct ShardStore {
     /// this, with the database each was in. Drained by `ShardHandle`, which
     /// logs and announces them.
     pub expired_buffer: Vec<(u32, Bytes)>,
+    snapshot: Option<Box<Snapshot>>,
+    /// Epoch of the latest snapshot begun (entries' `snap` compare to it).
+    snap_epoch: u32,
+    rng: u64,
 }
 
 impl ShardStore {
     pub fn new() -> Self {
         Self {
-            data: IndexMap::new(),
-            expiry_heap: ExpiryHeap::new(),
+            ks: Keyspace::default(),
             db: 0,
             parked: Vec::new(),
             expired_buffer: Vec::new(),
+            snapshot: None,
+            snap_epoch: 0,
+            rng: seed(),
         }
+    }
+
+    #[inline]
+    fn next_rand(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x
     }
 
     // ---- Logical databases ----
@@ -81,10 +256,8 @@ impl ShardStore {
         self.ensure_parked(cur.max(want));
         // Park the selected keyspace in its placeholder slot, then take the
         // wanted one out of its slot (which becomes the new placeholder).
-        std::mem::swap(&mut self.data, &mut self.parked[cur].data);
-        std::mem::swap(&mut self.expiry_heap, &mut self.parked[cur].expiry_heap);
-        std::mem::swap(&mut self.data, &mut self.parked[want].data);
-        std::mem::swap(&mut self.expiry_heap, &mut self.parked[want].expiry_heap);
+        std::mem::swap(&mut self.ks, &mut self.parked[cur]);
+        std::mem::swap(&mut self.ks, &mut self.parked[want]);
         self.db = db;
     }
 
@@ -99,23 +272,30 @@ impl ShardStore {
         (self.parked.len() as u32).max(self.db + 1)
     }
 
-    fn keyspace(&self, db: u32) -> Option<&IndexMap<Bytes, KeyEntry>> {
+    fn keyspace(&self, db: u32) -> Option<&Keyspace> {
         if db == self.db {
-            Some(&self.data)
+            Some(&self.ks)
         } else {
-            self.parked.get(db as usize).map(|k| &k.data)
+            self.parked.get(db as usize)
+        }
+    }
+
+    fn keyspace_mut(&mut self, db: u32) -> Option<&mut Keyspace> {
+        if db == self.db {
+            Some(&mut self.ks)
+        } else {
+            self.parked.get_mut(db as usize)
         }
     }
 
     /// Keys in `db` (expired ones not yet reclaimed included, like `DBSIZE`).
     pub fn dbsize_of(&self, db: u32) -> usize {
-        self.keyspace(db).map_or(0, |d| d.len())
+        self.keyspace(db).map_or(0, |k| k.data.len())
     }
 
     /// Keys in `db` that carry a TTL (`INFO keyspace`'s `expires`).
     pub fn expires_of(&self, db: u32) -> usize {
-        self.keyspace(db)
-            .map_or(0, |d| d.values().filter(|e| e.expires_at.is_some()).count())
+        self.keyspace(db).map_or(0, |k| k.volatile.len())
     }
 
     /// Swap the contents of two databases (`SWAPDB`).
@@ -123,17 +303,17 @@ impl ShardStore {
         if a == b {
             return;
         }
-        let cur = self.db;
-        let hi = a.max(b).max(cur) as usize;
+        // A snapshot walks databases by number: finish both first.
+        self.snapshot_capture_db(a);
+        self.snapshot_capture_db(b);
+        let cur = self.db as usize;
+        let hi = a.max(b).max(self.db) as usize;
         self.ensure_parked(hi);
         // Park the selected database so all three live in `parked`, swap,
         // and select the same index again.
-        let c = cur as usize;
-        std::mem::swap(&mut self.data, &mut self.parked[c].data);
-        std::mem::swap(&mut self.expiry_heap, &mut self.parked[c].expiry_heap);
+        std::mem::swap(&mut self.ks, &mut self.parked[cur]);
         self.parked.swap(a as usize, b as usize);
-        std::mem::swap(&mut self.data, &mut self.parked[c].data);
-        std::mem::swap(&mut self.expiry_heap, &mut self.parked[c].expiry_heap);
+        std::mem::swap(&mut self.ks, &mut self.parked[cur]);
     }
 
     /// Move `key` from the selected database to `to` (`MOVE`). False when
@@ -143,24 +323,30 @@ impl ShardStore {
             return false;
         }
         self.ensure_parked(to as usize);
-        let target = &mut self.parked[to as usize];
-        if let Some(existing) = target.data.get(key) {
-            if !existing.is_expired() {
-                return false;
+        let target_expired = match self.parked[to as usize].data.get(key) {
+            Some(existing) if !existing.is_expired() => return false,
+            Some(_) => true,
+            None => false,
+        };
+        if target_expired {
+            if let Some(idx) = self.parked[to as usize].data.get_index_of(key) {
+                self.capture_parked(to, idx);
+                self.parked[to as usize].remove_index(idx);
             }
-            target.data.swap_remove(key);
         }
-        let Some((k, entry)) = self.data.swap_remove_entry(key) else {
+        let Some(idx) = self.ks.data.get_index_of(key) else {
             return false;
         };
-        if let Some(exp) = entry.expires_at {
-            target.expiry_heap.push(k.clone(), exp);
-        }
-        target.data.insert(k, entry);
+        self.capture(idx);
+        let Some((k, entry)) = self.ks.remove_index(idx) else {
+            return false;
+        };
+        let entry = self.fresh(entry);
+        self.parked[to as usize].insert(k, entry);
         true
     }
 
-    /// Every live entry of every database, with the database it is in.
+    /// Every entry of every database, with the database it is in.
     pub fn iter_all(&self) -> impl Iterator<Item = (u32, &Bytes, &KeyEntry)> {
         let active = self.db;
         let parked = self
@@ -169,7 +355,8 @@ impl ShardStore {
             .enumerate()
             .filter(move |(i, _)| *i as u32 != active)
             .flat_map(|(i, ks)| ks.data.iter().map(move |(k, e)| (i as u32, k, e)));
-        self.data
+        self.ks
+            .data
             .iter()
             .map(move |(k, e)| (active, k, e))
             .chain(parked)
@@ -186,50 +373,215 @@ impl ShardStore {
         self.expired_buffer.push((self.db, key));
     }
 
+    // ---- Snapshot hooks ----
+
+    /// A new entry: marked as already saved when a snapshot is running (it
+    /// did not exist when the snapshot began).
+    #[inline]
+    fn fresh(&self, mut entry: KeyEntry) -> KeyEntry {
+        if self.snapshot.is_some() {
+            entry.snap = self.snap_epoch;
+        }
+        entry
+    }
+
+    /// Before the entry at `idx` of the selected database changes or goes:
+    /// if a running snapshot has not saved it yet, save it as it is now.
+    #[inline]
+    fn capture(&mut self, idx: usize) {
+        if self.snapshot.is_some() {
+            self.capture_slow(self.db, idx);
+        }
+    }
+
+    fn capture_parked(&mut self, db: u32, idx: usize) {
+        if self.snapshot.is_some() {
+            self.capture_slow(db, idx);
+        }
+    }
+
+    #[cold]
+    fn capture_slow(&mut self, db: u32, idx: usize) {
+        let epoch = self.snap_epoch;
+        let Some(snap) = self.snapshot.as_deref_mut() else {
+            return;
+        };
+        let ks = if db == self.db {
+            &mut self.ks
+        } else {
+            match self.parked.get_mut(db as usize) {
+                Some(k) => k,
+                None => return,
+            }
+        };
+        let Some((k, e)) = ks.data.get_index_mut(idx) else {
+            return;
+        };
+        if e.snap != epoch {
+            e.snap = epoch;
+            (snap.encoder)(&mut snap.out, &mut snap.cur_db, db, k, e);
+        }
+    }
+
+    /// Save every entry of `db` a running snapshot has not saved yet
+    /// (before a whole-database change: FLUSHDB, SWAPDB).
+    fn snapshot_capture_db(&mut self, db: u32) {
+        if self.snapshot.is_none() {
+            return;
+        }
+        let n = self.keyspace(db).map_or(0, |k| k.data.len());
+        for idx in 0..n {
+            self.capture_slow(db, idx);
+        }
+    }
+
+    /// Start a snapshot of every database of this shard, as of now. Take it
+    /// with [`snapshot_step`](Self::snapshot_step) until that reports done.
+    /// One at a time: returns false if one is already running.
+    pub fn begin_snapshot(&mut self, encoder: SnapshotEncoder) -> bool {
+        if self.snapshot.is_some() {
+            return false;
+        }
+        self.snap_epoch = self.snap_epoch.wrapping_add(1).max(1);
+        let span = self.db_span();
+        let mut walk = Vec::new();
+        for db in (0..span).rev() {
+            let n = self.dbsize_of(db);
+            if n > 0 {
+                walk.push((db, n));
+            }
+        }
+        self.snapshot = Some(Box::new(Snapshot {
+            epoch: self.snap_epoch,
+            encoder,
+            out: Vec::new(),
+            cur_db: 0,
+            walk,
+        }));
+        true
+    }
+
+    /// Serialize up to `budget` more entries of the running snapshot.
+    /// Returns what was serialized since the last step (entries the walk
+    /// reached, and entries commands saved before changing them), and
+    /// whether the snapshot is complete — in which case it has ended.
+    pub fn snapshot_step(&mut self, budget: usize) -> (Vec<u8>, bool) {
+        let Some(mut snap) = self.snapshot.take() else {
+            return (Vec::new(), true);
+        };
+        let mut left = budget.max(1);
+        while left > 0 {
+            let Some(&(db, cursor)) = snap.walk.last() else {
+                break;
+            };
+            let ks = if db == self.db {
+                &mut self.ks
+            } else {
+                match self.parked.get_mut(db as usize) {
+                    Some(k) => k,
+                    None => {
+                        snap.walk.pop();
+                        continue;
+                    }
+                }
+            };
+            // Walk down from the cursor: an entry only ever moves down (a
+            // swap-remove fills a hole with the last entry), so nothing
+            // present at the start can slip past the walk.
+            let mut c = cursor.min(ks.data.len());
+            while c > 0 && left > 0 {
+                c -= 1;
+                left -= 1;
+                if let Some((k, e)) = ks.data.get_index_mut(c) {
+                    if e.snap != snap.epoch {
+                        e.snap = snap.epoch;
+                        (snap.encoder)(&mut snap.out, &mut snap.cur_db, db, k, e);
+                    }
+                }
+            }
+            if c == 0 {
+                snap.walk.pop();
+            } else if let Some(last) = snap.walk.last_mut() {
+                last.1 = c;
+            }
+        }
+        let out = std::mem::take(&mut snap.out);
+        let done = snap.walk.is_empty();
+        if !done {
+            self.snapshot = Some(snap);
+        }
+        (out, done)
+    }
+
+    /// Drop a running snapshot (its writer failed).
+    pub fn abort_snapshot(&mut self) {
+        self.snapshot = None;
+    }
+
+    pub fn snapshot_running(&self) -> bool {
+        self.snapshot.is_some()
+    }
+
+    // ---- Lookups ----
+
     /// Get a reference to an entry, performing lazy expiry check.
     #[inline]
     pub fn get(&mut self, key: &Bytes) -> Option<&KeyEntry> {
         // Single index lookup (IndexMap) instead of get + get after expiry.
-        let idx = self.data.get_index_of(key)?;
-        if self.data[idx].is_expired() {
-            if let Some((k, _)) = self.data.swap_remove_index(idx) {
-                self.note_expired(k);
-            }
+        let idx = self.ks.data.get_index_of(key)?;
+        if self.ks.data[idx].is_expired() {
+            self.expire_index(idx);
             return None;
         }
-        self.data.get_index(idx).map(|(_, e)| e)
+        let e = &mut self.ks.data[idx];
+        e.access = access::touched(e.access);
+        Some(e)
     }
 
     /// Get a mutable reference to an entry, performing lazy expiry check.
     #[inline]
     pub fn get_mut(&mut self, key: &Bytes) -> Option<&mut KeyEntry> {
-        let idx = self.data.get_index_of(key)?;
-        if self.data[idx].is_expired() {
-            if let Some((k, _)) = self.data.swap_remove_index(idx) {
-                self.note_expired(k);
-            }
+        let idx = self.ks.data.get_index_of(key)?;
+        if self.ks.data[idx].is_expired() {
+            self.expire_index(idx);
             return None;
         }
-        self.data.get_index_mut(idx).map(|(_, e)| e)
+        self.capture(idx);
+        let e = &mut self.ks.data[idx];
+        e.access = access::touched(e.access);
+        Some(e)
+    }
+
+    fn expire_index(&mut self, idx: usize) {
+        self.capture(idx);
+        if let Some((k, _)) = self.ks.remove_index(idx) {
+            self.note_expired(k);
+        }
+    }
+
+    /// Replace (or create) `key`'s entry.
+    fn put(&mut self, key: Bytes, entry: KeyEntry) {
+        if self.snapshot.is_some() {
+            if let Some(idx) = self.ks.data.get_index_of(&key) {
+                self.capture_slow(self.db, idx);
+            }
+        }
+        let entry = self.fresh(entry);
+        self.ks.insert(key, entry);
     }
 
     /// Set a key-value pair with optional expiry in milliseconds.
     pub fn set(&mut self, key: Bytes, value: RedisValue, expire_ms: Option<u64>) {
-        let entry = if let Some(ms) = expire_ms {
-            let expires_at = now_millis().saturating_add(ms);
-            self.expiry_heap.push(key.clone(), expires_at);
-            KeyEntry::with_expiry(value, expires_at)
-        } else {
-            KeyEntry::new(value)
+        let entry = match expire_ms {
+            Some(ms) => KeyEntry::with_expiry(value, now_millis().saturating_add(ms)),
+            None => KeyEntry::new(value),
         };
-        self.data.insert(key, entry);
+        self.put(key, entry);
     }
 
     /// Set a key-value pair with an absolute expiry timestamp in milliseconds.
     pub fn set_with_absolute_expiry(&mut self, key: Bytes, value: RedisValue, expires_at: u64) {
-        self.expiry_heap.push(key.clone(), expires_at);
-        self.data
-            .insert(key, KeyEntry::with_expiry(value, expires_at));
+        self.put(key, KeyEntry::with_expiry(value, expires_at));
     }
 
     /// Replace `key`'s value, keeping its TTL if it has a live one (what
@@ -239,21 +591,25 @@ impl ShardStore {
         if let Some(entry) = self.get_mut(key) {
             entry.value = value;
         } else {
-            self.data.insert(key.clone(), KeyEntry::new(value));
+            self.put(key.clone(), KeyEntry::new(value));
         }
     }
 
     /// Insert a KeyEntry directly.
     pub fn insert_entry(&mut self, key: Bytes, entry: KeyEntry) {
-        if let Some(exp) = entry.expires_at {
-            self.expiry_heap.push(key.clone(), exp);
-        }
-        self.data.insert(key, entry);
+        self.put(key, entry);
     }
 
     /// Delete a key. Returns true if the key existed.
     pub fn del(&mut self, key: &Bytes) -> bool {
-        self.data.swap_remove(key).is_some()
+        self.take(key).is_some()
+    }
+
+    /// Remove `key`'s entry, live or not.
+    fn take(&mut self, key: &[u8]) -> Option<(Bytes, KeyEntry)> {
+        let idx = self.ks.data.get_index_of(key)?;
+        self.capture(idx);
+        self.ks.remove_index(idx)
     }
 
     /// Check if a key exists (non-expired).
@@ -261,35 +617,28 @@ impl ShardStore {
         self.get(key).is_some()
     }
 
+    /// Give a live key the absolute deadline `at` (ms); false when missing.
+    fn set_deadline(&mut self, key: &Bytes, at: Option<u64>) -> bool {
+        let Some(idx) = self.ks.data.get_index_of(key) else {
+            return false;
+        };
+        if self.ks.data[idx].is_expired() {
+            self.expire_index(idx);
+            return false;
+        }
+        self.capture(idx);
+        self.ks.set_expiry(idx, at);
+        true
+    }
+
     /// Set expiry on existing key. Returns true if key exists.
     pub fn expire(&mut self, key: &Bytes, expire_ms: u64) -> bool {
-        if let Some(entry) = self.data.get_mut(key) {
-            if entry.is_expired() {
-                self.expire_now(key);
-                return false;
-            }
-            let expires_at = now_millis().saturating_add(expire_ms);
-            entry.expires_at = Some(expires_at);
-            self.expiry_heap.push(key.clone(), expires_at);
-            true
-        } else {
-            false
-        }
+        self.set_deadline(key, Some(now_millis().saturating_add(expire_ms)))
     }
 
     /// Set absolute expiry on existing key. Returns true if key exists.
     pub fn expire_at(&mut self, key: &Bytes, expires_at_ms: u64) -> bool {
-        if let Some(entry) = self.data.get_mut(key) {
-            if entry.is_expired() {
-                self.expire_now(key);
-                return false;
-            }
-            entry.expires_at = Some(expires_at_ms);
-            self.expiry_heap.push(key.clone(), expires_at_ms);
-            true
-        } else {
-            false
-        }
+        self.set_deadline(key, Some(expires_at_ms))
     }
 
     /// `EXPIRE`-family: give `key` the absolute deadline `at` (ms) if the
@@ -311,7 +660,7 @@ impl ShardStore {
             return false;
         }
         if at <= now_millis() {
-            self.data.swap_remove(key);
+            self.take(key);
         } else {
             self.expire_at(key, at);
         }
@@ -320,20 +669,19 @@ impl ShardStore {
 
     /// Remove the expiry from a key. Returns true if key exists.
     pub fn persist(&mut self, key: &Bytes) -> bool {
-        if let Some(entry) = self.data.get_mut(key) {
-            if entry.is_expired() {
-                self.expire_now(key);
-                return false;
-            }
-            if entry.expires_at.is_some() {
-                entry.expires_at = None;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
+        let Some(idx) = self.ks.data.get_index_of(key) else {
+            return false;
+        };
+        if self.ks.data[idx].is_expired() {
+            self.expire_index(idx);
+            return false;
         }
+        if self.ks.data[idx].expires_at.is_none() {
+            return false;
+        }
+        self.capture(idx);
+        self.ks.set_expiry(idx, None);
+        true
     }
 
     /// Get TTL in milliseconds. Returns -2 if key doesn't exist, -1 if no expiry.
@@ -374,32 +722,33 @@ impl ShardStore {
 
     /// Return the number of keys (not checking expiry for all).
     pub fn dbsize(&self) -> usize {
-        self.data.len()
+        self.ks.data.len()
     }
 
     /// Get all keys matching a glob pattern.
     pub fn keys(&mut self, pattern: &str) -> Vec<Bytes> {
-        // Only clone keys that match the pattern (avoid full-set clone when selective).
-        let candidates: Vec<Bytes> = self
-            .data
-            .keys()
-            .filter(|k| {
-                let key_str = std::str::from_utf8(k).unwrap_or("");
-                glob_match(pattern, key_str)
-            })
-            .cloned()
-            .collect();
-        candidates
-            .into_iter()
-            .filter(|k| self.get(k).is_some()) // filter expired
-            .collect()
+        let mut out = Vec::new();
+        for (k, e) in self.ks.data.iter() {
+            if e.is_expired() {
+                continue;
+            }
+            let key_str = std::str::from_utf8(k).unwrap_or("");
+            if glob_match(pattern, key_str) {
+                out.push(k.clone());
+            }
+        }
+        out
     }
 
-    /// SCAN implementation: cursor is an index into the IndexMap.
+    /// SCAN implementation.
     ///
-    /// O(count) key clones per call — does **not** snapshot the full key set.
-    /// Expired keys found during the walk are deferred to `expired_buffer` after
-    /// the scan window so indices stay stable for this call.
+    /// The cursor is a position in the key map, walked from the end down:
+    /// `0` starts at the last key, and the cursor returned is where the next
+    /// call continues (`0` once the walk reached the first key). Removing a
+    /// key moves the *last* key into its hole — a position the walk has
+    /// already been through — so a key present for the whole iteration is
+    /// always returned (possibly twice), the guarantee Redis' SCAN makes.
+    /// A walk upwards, as this was, could miss it.
     pub fn scan(
         &mut self,
         cursor: usize,
@@ -419,68 +768,43 @@ impl ShardStore {
         count: usize,
     ) -> (usize, Vec<Bytes>) {
         let count = count.max(1);
-        let len = self.data.len();
-        if len == 0 {
-            return (0, Vec::new());
-        }
-
+        let len = self.ks.data.len();
+        let mut c = if cursor == 0 { len } else { cursor.min(len) };
         let mut result = Vec::with_capacity(count.min(len));
-        let mut idx = cursor.min(len);
-        // Examine up to `count` slots; pattern non-matches still consume effort.
-        let end = idx.saturating_add(count).min(len);
         let mut deferred_expire: Vec<Bytes> = Vec::new();
-
-        while idx < end {
-            let (key, expired, type_ok) = {
-                let (k, entry) = self.data.get_index(idx).expect("idx in range");
-                let type_ok = type_filter.is_none_or(|t| t.eq_ignore_ascii_case(entry.type_name()));
-                (k.clone(), entry.is_expired(), type_ok)
-            };
-            if expired {
-                deferred_expire.push(key);
-            } else if type_ok {
-                let matches = pattern
-                    .map(|p| {
-                        let key_str = std::str::from_utf8(&key).unwrap_or("");
-                        glob_match(p, key_str)
-                    })
-                    .unwrap_or(true);
-                if matches {
-                    result.push(key);
-                }
+        let mut examined = 0;
+        while c > 0 && examined < count {
+            c -= 1;
+            examined += 1;
+            let (k, entry) = self.ks.data.get_index(c).expect("c < len");
+            if entry.is_expired() {
+                deferred_expire.push(k.clone());
+                continue;
             }
-            idx += 1;
+            if !type_filter.is_none_or(|t| t.eq_ignore_ascii_case(entry.type_name())) {
+                continue;
+            }
+            let matches =
+                pattern.is_none_or(|p| glob_match(p, std::str::from_utf8(k).unwrap_or("")));
+            if matches {
+                result.push(k.clone());
+            }
         }
-
-        // Cursor for the next call is based on the pre-removal map size so a
-        // full pass still terminates even if we expire keys in this window.
-        let next = if idx >= len { 0 } else { idx };
-
-        // Drop expired keys after the window walk so this call's indices stayed stable.
+        // Expired keys go after the walk: removing them moves entries this
+        // call has already passed, never ones still ahead of the cursor.
         for key in deferred_expire {
-            if self.data.swap_remove(&key).is_some() {
-                self.note_expired(key);
+            if let Some((k, _)) = self.take(&key) {
+                self.note_expired(k);
             }
         }
-
-        (next, result)
-    }
-
-    /// Drop a key whose TTL has passed and report it through
-    /// `expired_buffer`, like every other lazy expiry. Silent removals were
-    /// invisible to keyspace notifications, and to the append-only log, which
-    /// records each expiry as a `DEL` so replay reproduces it.
-    fn expire_now(&mut self, key: &Bytes) {
-        if let Some((k, _)) = self.data.swap_remove_entry(key) {
-            self.note_expired(k);
-        }
+        (c, result)
     }
 
     /// Delete `key` if it is (still) there, reporting whether it was live.
     /// An expired key counts as absent but is reported through
     /// `expired_buffer`, like any other lazy expiry.
     pub fn remove_live(&mut self, key: &Bytes) -> Option<KeyEntry> {
-        let (k, entry) = self.data.swap_remove_entry(key)?;
+        let (k, entry) = self.take(key)?;
         if entry.is_expired() {
             self.note_expired(k);
             return None;
@@ -490,45 +814,179 @@ impl ShardStore {
 
     /// Empty the selected database (`FLUSHDB`).
     pub fn flush(&mut self) {
-        self.data.clear();
-        self.expiry_heap = ExpiryHeap::new();
+        self.snapshot_capture_db(self.db);
+        self.ks.clear();
     }
 
     /// Empty every database (`FLUSHALL`).
     pub fn flush_all(&mut self) {
-        self.flush();
+        for db in 0..self.db_span() {
+            self.snapshot_capture_db(db);
+        }
+        self.ks.clear();
         self.parked.clear();
     }
 
-    /// Run active expiry: remove up to [`MAX_EXPIRE_PER_TICK`] expired keys,
-    /// across every database. Returns them with the database each was in.
-    pub fn run_active_expiry(&mut self) -> Vec<(u32, Bytes)> {
-        // Loading: nothing expires (see `LoadingGuard`). Returning before the
-        // heap is drained matters: a drained entry whose key then reads as
-        // live would be gone from the heap for good.
-        if is_loading() {
-            return Vec::new();
-        }
-        let now = now_millis();
+    /// One active-expiry cycle, the way Redis runs `activeExpireCycle`: in
+    /// each database, sample [`EXPIRE_SAMPLE`] keys that have a TTL, delete
+    /// the expired ones, and sample again while more than a quarter of a
+    /// sample had expired — until `budget` is spent. Returns the keys
+    /// removed, with the database each was in.
+    pub fn active_expire_cycle(&mut self, budget: Duration) -> Vec<(u32, Bytes)> {
         let mut removed = Vec::new();
-        let db = self.db;
-        expire_keyspace(&mut self.data, &mut self.expiry_heap, db, now, &mut removed);
-        for (i, ks) in self.parked.iter_mut().enumerate() {
-            if removed.len() >= MAX_EXPIRE_PER_TICK {
-                break;
+        // Loading: nothing expires (see `LoadingGuard`).
+        if is_loading() {
+            return removed;
+        }
+        let start = Instant::now();
+        let span = self.db_span();
+        'dbs: for db in 0..span {
+            while let Some(ks) = self.keyspace(db) {
+                let n = ks.volatile.len();
+                if n == 0 {
+                    break;
+                }
+                let now = now_millis();
+                let sample = EXPIRE_SAMPLE.min(n);
+                let mut expired_here = 0;
+                for _ in 0..sample {
+                    let r = self.next_rand() as usize;
+                    let Some(ks) = self.keyspace(db) else { break };
+                    if ks.volatile.is_empty() {
+                        break;
+                    }
+                    let key = ks.volatile.get_index(r % ks.volatile.len()).cloned();
+                    let Some(key) = key else { break };
+                    let Some(idx) = ks.data.get_index_of(&key) else {
+                        // Out of step (cannot happen); repair.
+                        if let Some(ks) = self.keyspace_mut(db) {
+                            ks.volatile.swap_remove(&key);
+                        }
+                        continue;
+                    };
+                    if ks.data[idx].expires_at.is_some_and(|at| at <= now) {
+                        self.capture_parked(db, idx);
+                        if let Some(ks) = self.keyspace_mut(db) {
+                            if let Some((k, _)) = ks.remove_index(idx) {
+                                removed.push((db, k));
+                                expired_here += 1;
+                            }
+                        }
+                    }
+                }
+                if start.elapsed() >= budget {
+                    break 'dbs;
+                }
+                if expired_here * 4 <= sample {
+                    break;
+                }
             }
-            if i as u32 == db || ks.expiry_heap.is_empty() {
-                continue;
-            }
-            expire_keyspace(
-                &mut ks.data,
-                &mut ks.expiry_heap,
-                i as u32,
-                now,
-                &mut removed,
-            );
         }
         removed
+    }
+
+    /// Run active expiry: one cycle with a 1 ms budget (tests; the server
+    /// runs [`active_expire_cycle`](Self::active_expire_cycle) on a timer).
+    pub fn run_active_expiry(&mut self) -> Vec<(u32, Bytes)> {
+        self.active_expire_cycle(Duration::from_millis(1))
+    }
+
+    // ---- Eviction ----
+
+    /// Keys this shard can evict under `policy` (all keys, or those with a
+    /// TTL), across its databases.
+    pub fn evictable(&self, policy: EvictionPolicy) -> usize {
+        let per = |k: &Keyspace| {
+            if policy.volatile_only() {
+                k.volatile.len()
+            } else {
+                k.data.len()
+            }
+        };
+        per(&self.ks)
+            + self
+                .parked
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i as u32 != self.db)
+                .map(|(_, k)| per(k))
+                .sum::<usize>()
+    }
+
+    /// Evict one key chosen as Redis does: sample `samples` candidates and
+    /// take the best by the policy (idlest, least frequently used, nearest
+    /// to expiring, or any). Returns it with its database, or `None` when
+    /// nothing is evictable.
+    pub fn evict_one(&mut self, policy: EvictionPolicy, samples: usize) -> Option<(u32, Bytes)> {
+        if policy == EvictionPolicy::NoEviction {
+            return None;
+        }
+        let dbs: Vec<u32> = (0..self.db_span())
+            .filter(|&db| {
+                self.keyspace(db).is_some_and(|k| {
+                    if policy.volatile_only() {
+                        !k.volatile.is_empty()
+                    } else {
+                        !k.data.is_empty()
+                    }
+                })
+            })
+            .collect();
+        if dbs.is_empty() {
+            return None;
+        }
+        // (score: higher = better to evict, db, key)
+        let mut best: Option<(u64, u32, Bytes)> = None;
+        let samples = samples.max(1);
+        for _ in 0..samples {
+            let db = dbs[(self.next_rand() as usize) % dbs.len()];
+            let r = self.next_rand() as usize;
+            let ks = self.keyspace(db)?;
+            let (key, entry) = if policy.volatile_only() {
+                let k = ks.volatile.get_index(r % ks.volatile.len())?;
+                match ks.data.get(k) {
+                    Some(e) => (k, e),
+                    None => continue,
+                }
+            } else {
+                let (k, e) = ks.data.get_index(r % ks.data.len())?;
+                (k, e)
+            };
+            let score = match policy {
+                EvictionPolicy::AllKeysLru | EvictionPolicy::VolatileLru => {
+                    access::idle_secs(entry.access)
+                }
+                EvictionPolicy::AllKeysLfu | EvictionPolicy::VolatileLfu => {
+                    255 - access::decayed(entry.access) as u64
+                }
+                EvictionPolicy::VolatileTtl => u64::MAX - entry.expires_at.unwrap_or(u64::MAX),
+                _ => 0,
+            };
+            if best.as_ref().is_none_or(|(s, _, _)| score > *s) {
+                best = Some((score, db, key.clone()));
+            }
+            if matches!(
+                policy,
+                EvictionPolicy::AllKeysRandom | EvictionPolicy::VolatileRandom
+            ) {
+                break;
+            }
+        }
+        let (_, db, key) = best?;
+        let idx = self.keyspace(db)?.data.get_index_of(&key)?;
+        self.capture_parked(db, idx);
+        self.keyspace_mut(db)?.remove_index(idx);
+        Some((db, key))
+    }
+
+    /// `OBJECT IDLETIME` / `OBJECT FREQ` source: the key's access field.
+    pub fn access_of(&mut self, key: &Bytes) -> Option<u32> {
+        let idx = self.ks.data.get_index_of(key)?;
+        if self.ks.data[idx].is_expired() {
+            self.expire_index(idx);
+            return None;
+        }
+        Some(self.ks.data[idx].access)
     }
 
     /// Rename a key. Returns error message if source doesn't exist.
@@ -537,41 +995,36 @@ impl ShardStore {
         if self.get(from).is_none() {
             return Err("ERR no such key");
         }
-        let entry = self.data.swap_remove(from).unwrap();
-        self.insert_entry(to, entry);
+        let (_, entry) = self.take(from).expect("checked above");
+        self.put(to, entry);
         Ok(())
     }
 
     /// Get a pseudo-random key in O(1) via IndexMap index access.
-    pub fn random_key(&self) -> Option<Bytes> {
-        let len = self.data.len();
+    pub fn random_key(&mut self) -> Option<Bytes> {
+        let len = self.ks.data.len();
         if len == 0 {
             return None;
         }
-        // Use a cheap entropy source to pick a random index
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as usize;
-        let idx = seed % len;
-        self.data.get_index(idx).map(|(k, _)| k.clone())
+        let idx = (self.next_rand() as usize) % len;
+        self.ks.data.get_index(idx).map(|(k, _)| k.clone())
     }
 
     /// The live entry for `key`, without the lazy-expiry side effect (for
     /// read-only callers such as persistence, which hold `&self`).
     pub fn peek(&self, key: &[u8]) -> Option<&KeyEntry> {
-        self.data.get(key).filter(|e| !e.is_expired())
+        self.ks.data.get(key).filter(|e| !e.is_expired())
     }
 
     /// Remove and return every entry of every database, with its database,
     /// leaving the store empty. Used to move a dataset replayed into a
     /// scratch store over to the shards that own it.
     pub fn drain_entries(&mut self) -> Vec<(u32, Bytes, KeyEntry)> {
-        self.expiry_heap = ExpiryHeap::new();
         let db = self.db;
+        let ks = std::mem::take(&mut self.ks);
         let mut out: Vec<(u32, Bytes, KeyEntry)> =
-            self.data.drain(..).map(|(k, e)| (db, k, e)).collect();
-        for (i, ks) in self.parked.drain(..).enumerate() {
+            ks.data.into_iter().map(|(k, e)| (db, k, e)).collect();
+        for (i, ks) in std::mem::take(&mut self.parked).into_iter().enumerate() {
             out.extend(ks.data.into_iter().map(|(k, e)| (i as u32, k, e)));
         }
         out
@@ -579,48 +1032,13 @@ impl ShardStore {
 
     /// Get all data for persistence/snapshotting.
     pub fn iter(&self) -> impl Iterator<Item = (&Bytes, &KeyEntry)> {
-        self.data.iter()
-    }
-
-    /// Get mutable reference to underlying data (for restore).
-    pub fn data_mut(&mut self) -> &mut IndexMap<Bytes, KeyEntry> {
-        &mut self.data
+        self.ks.data.iter()
     }
 }
 
 impl Default for ShardStore {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Remove expired keys of one keyspace from its heap, up to the tick budget.
-fn expire_keyspace(
-    data: &mut IndexMap<Bytes, KeyEntry>,
-    heap: &mut ExpiryHeap,
-    db: u32,
-    now: u64,
-    removed: &mut Vec<(u32, Bytes)>,
-) {
-    let budget = MAX_EXPIRE_PER_TICK.saturating_sub(removed.len());
-    for key in heap.drain_expired(now, budget) {
-        if let Some(entry) = data.get(&key) {
-            if entry.is_expired() {
-                data.swap_remove(&key);
-                removed.push((db, key));
-            }
-        }
-    }
-    // Compact the heap if it has grown much larger than the data set: every
-    // EXPIRE on a key pushes a fresh entry and leaves the old one behind.
-    if heap.len() > data.len() * 4 + 1024 {
-        let mut fresh = ExpiryHeap::new();
-        for (key, entry) in data.iter() {
-            if let Some(exp) = entry.expires_at {
-                fresh.push(key.clone(), exp);
-            }
-        }
-        *heap = fresh;
     }
 }
 
@@ -670,17 +1088,21 @@ fn glob_match_impl(pattern: &[u8], text: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    fn s(v: &str) -> RedisValue {
+        RedisValue::String(Bytes::from(v.to_string()))
+    }
+
+    fn b(v: &str) -> Bytes {
+        Bytes::from(v.to_string())
+    }
+
     #[test]
     fn test_set_get() {
         let mut store = ShardStore::new();
-        store.set(
-            Bytes::from("key1"),
-            RedisValue::String(Bytes::from("val1")),
-            None,
-        );
-        let entry = store.get(&Bytes::from("key1")).unwrap();
+        store.set(b("key1"), s("val1"), None);
+        let entry = store.get(&b("key1")).unwrap();
         match &entry.value {
-            RedisValue::String(v) => assert_eq!(v, &Bytes::from("val1")),
+            RedisValue::String(v) => assert_eq!(v, &b("val1")),
             _ => panic!("Expected string"),
         }
     }
@@ -688,103 +1110,104 @@ mod tests {
     #[test]
     fn test_del() {
         let mut store = ShardStore::new();
-        store.set(
-            Bytes::from("key1"),
-            RedisValue::String(Bytes::from("val1")),
-            None,
-        );
-        assert!(store.del(&Bytes::from("key1")));
-        assert!(!store.del(&Bytes::from("key1")));
-        assert!(store.get(&Bytes::from("key1")).is_none());
+        store.set(b("key1"), s("val1"), None);
+        assert!(store.del(&b("key1")));
+        assert!(!store.del(&b("key1")));
+        assert!(store.get(&b("key1")).is_none());
     }
 
     #[test]
     fn test_exists() {
         let mut store = ShardStore::new();
-        store.set(
-            Bytes::from("key1"),
-            RedisValue::String(Bytes::from("val1")),
-            None,
-        );
-        assert!(store.exists(&Bytes::from("key1")));
-        assert!(!store.exists(&Bytes::from("key2")));
+        store.set(b("key1"), s("val1"), None);
+        assert!(store.exists(&b("key1")));
+        assert!(!store.exists(&b("key2")));
     }
 
     #[test]
     fn test_expire_and_ttl() {
         let mut store = ShardStore::new();
-        store.set(
-            Bytes::from("key1"),
-            RedisValue::String(Bytes::from("val1")),
-            Some(5000),
-        );
-        let ttl = store.pttl(&Bytes::from("key1"));
+        store.set(b("key1"), s("val1"), Some(5000));
+        let ttl = store.pttl(&b("key1"));
         assert!(ttl > 0 && ttl <= 5000);
+        assert_eq!(store.expires_of(0), 1);
     }
 
     #[test]
     fn test_lazy_expiry() {
         let mut store = ShardStore::new();
-        // Set with 0ms expiry (immediately expired)
-        store.set(
-            Bytes::from("key1"),
-            RedisValue::String(Bytes::from("val1")),
-            None,
-        );
-        store.data.get_mut(&Bytes::from("key1")).unwrap().expires_at = Some(1); // epoch + 1ms = past
-        assert!(store.get(&Bytes::from("key1")).is_none());
+        store.set_with_absolute_expiry(b("key1"), s("val1"), 1); // long past
+        assert!(store.get(&b("key1")).is_none());
+        assert_eq!(store.expired_buffer, vec![(0, b("key1"))]);
+        assert_eq!(store.expires_of(0), 0);
     }
 
     #[test]
     fn test_persist() {
         let mut store = ShardStore::new();
-        store.set(
-            Bytes::from("key1"),
-            RedisValue::String(Bytes::from("val1")),
-            Some(5000),
-        );
-        assert!(store.persist(&Bytes::from("key1")));
-        assert_eq!(store.pttl(&Bytes::from("key1")), -1);
+        store.set(b("key1"), s("val1"), Some(5000));
+        assert!(store.persist(&b("key1")));
+        assert_eq!(store.pttl(&b("key1")), -1);
+        assert_eq!(store.expires_of(0), 0);
+    }
+
+    #[test]
+    fn volatile_index_follows_every_change() {
+        let mut store = ShardStore::new();
+        store.set(b("a"), s("1"), Some(10_000));
+        store.set(b("b"), s("1"), None);
+        assert_eq!(store.expires_of(0), 1);
+        // Overwrite without a TTL drops it from the index.
+        store.set(b("a"), s("2"), None);
+        assert_eq!(store.expires_of(0), 0);
+        assert!(store.expire(&b("b"), 10_000));
+        assert_eq!(store.expires_of(0), 1);
+        store.rename(&b("b"), b("c")).unwrap();
+        assert_eq!(store.expires_of(0), 1);
+        assert!(store.pttl(&b("c")) > 0);
+        assert!(store.del(&b("c")));
+        assert_eq!(store.expires_of(0), 0);
     }
 
     #[test]
     fn test_key_type() {
         let mut store = ShardStore::new();
-        store.set(Bytes::from("s"), RedisValue::String(Bytes::from("v")), None);
-        assert_eq!(store.key_type(&Bytes::from("s")), "string");
-        assert_eq!(store.key_type(&Bytes::from("x")), "none");
+        store.set(b("s"), s("v"), None);
+        assert_eq!(store.key_type(&b("s")), "string");
+        assert_eq!(store.key_type(&b("x")), "none");
     }
 
     #[test]
     fn test_rename() {
         let mut store = ShardStore::new();
-        store.set(Bytes::from("a"), RedisValue::String(Bytes::from("v")), None);
-        assert!(store.rename(&Bytes::from("a"), Bytes::from("b")).is_ok());
-        assert!(store.get(&Bytes::from("a")).is_none());
-        assert!(store.get(&Bytes::from("b")).is_some());
+        store.set(b("a"), s("v"), None);
+        assert!(store.rename(&b("a"), b("b")).is_ok());
+        assert!(store.get(&b("a")).is_none());
+        assert!(store.get(&b("b")).is_some());
     }
 
     #[test]
     fn test_rename_nonexistent() {
         let mut store = ShardStore::new();
-        assert!(store.rename(&Bytes::from("a"), Bytes::from("b")).is_err());
+        assert!(store.rename(&b("a"), b("b")).is_err());
     }
 
     #[test]
     fn test_dbsize() {
         let mut store = ShardStore::new();
         assert_eq!(store.dbsize(), 0);
-        store.set(Bytes::from("a"), RedisValue::String(Bytes::from("1")), None);
-        store.set(Bytes::from("b"), RedisValue::String(Bytes::from("2")), None);
+        store.set(b("a"), s("1"), None);
+        store.set(b("b"), s("2"), None);
         assert_eq!(store.dbsize(), 2);
     }
 
     #[test]
     fn test_flush() {
         let mut store = ShardStore::new();
-        store.set(Bytes::from("a"), RedisValue::String(Bytes::from("1")), None);
+        store.set(b("a"), s("1"), Some(1000));
         store.flush();
         assert_eq!(store.dbsize(), 0);
+        assert_eq!(store.expires_of(0), 0);
     }
 
     #[test]
@@ -801,21 +1224,9 @@ mod tests {
     #[test]
     fn test_keys_pattern() {
         let mut store = ShardStore::new();
-        store.set(
-            Bytes::from("user:1"),
-            RedisValue::String(Bytes::from("a")),
-            None,
-        );
-        store.set(
-            Bytes::from("user:2"),
-            RedisValue::String(Bytes::from("b")),
-            None,
-        );
-        store.set(
-            Bytes::from("admin:1"),
-            RedisValue::String(Bytes::from("c")),
-            None,
-        );
+        store.set(b("user:1"), s("a"), None);
+        store.set(b("user:2"), s("b"), None);
+        store.set(b("admin:1"), s("c"), None);
         let keys = store.keys("user:*");
         assert_eq!(keys.len(), 2);
     }
@@ -824,13 +1235,8 @@ mod tests {
     fn test_scan() {
         let mut store = ShardStore::new();
         for i in 0..20 {
-            store.set(
-                Bytes::from(format!("key:{}", i)),
-                RedisValue::String(Bytes::from("v")),
-                None,
-            );
+            store.set(b(&format!("key:{}", i)), s("v"), None);
         }
-        // Collect all keys through full scan iteration
         let mut all_keys = Vec::new();
         let mut cursor = 0;
         loop {
@@ -848,43 +1254,212 @@ mod tests {
     fn test_scan_does_not_require_full_clone_for_partial() {
         let mut store = ShardStore::new();
         for i in 0..100 {
-            store.set(
-                Bytes::from(format!("k{i}")),
-                RedisValue::String(Bytes::from("v")),
-                None,
-            );
+            store.set(b(&format!("k{i}")), s("v"), None);
         }
         let (next, batch) = store.scan(0, None, 5);
         assert_eq!(batch.len(), 5);
-        assert_eq!(next, 5);
+        assert_eq!(next, 95);
+    }
+
+    /// Redis' guarantee: a key present from the first call to the last is
+    /// returned, whatever else is deleted or added in between.
+    #[test]
+    fn scan_returns_every_key_present_throughout_despite_deletes() {
+        let mut store = ShardStore::new();
+        for i in 0..2000 {
+            store.set(b(&format!("k{i}")), s("v"), None);
+        }
+        let stable: Vec<Bytes> = (0..2000)
+            .filter(|i| i % 3 == 0)
+            .map(|i| b(&format!("k{i}")))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = 0;
+        let mut round = 0;
+        loop {
+            let (next, batch) = store.scan(cursor, None, 37);
+            seen.extend(batch);
+            // Between calls: delete keys (never the stable ones), add some.
+            for j in 0..25 {
+                let victim = round * 25 + j;
+                if victim % 3 != 0 {
+                    store.del(&b(&format!("k{victim}")));
+                }
+                store.set(b(&format!("new{round}-{j}")), s("v"), None);
+            }
+            round += 1;
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+        for k in &stable {
+            assert!(seen.contains(k), "SCAN missed {:?}", k);
+        }
     }
 
     #[test]
     fn test_random_key_o1() {
         let mut store = ShardStore::new();
         assert!(store.random_key().is_none());
-        store.set(
-            Bytes::from("only"),
-            RedisValue::String(Bytes::from("v")),
-            None,
-        );
-        assert_eq!(store.random_key().unwrap(), Bytes::from("only"));
+        store.set(b("only"), s("v"), None);
+        assert_eq!(store.random_key().unwrap(), b("only"));
     }
 
     #[test]
-    fn test_active_expiry_capped() {
+    fn active_expiry_reclaims_without_any_access() {
         let mut store = ShardStore::new();
-        for i in 0..50 {
-            let key = Bytes::from(format!("e{i}"));
-            store.set(key.clone(), RedisValue::String(Bytes::from("v")), None);
-            // Force already-expired
-            store.data.get_mut(&key).unwrap().expires_at = Some(1);
-            store.expiry_heap.push(key, 1);
+        for i in 0..5000 {
+            store.set_with_absolute_expiry(b(&format!("e{i}")), s("v"), 1);
         }
-        let removed = store.run_active_expiry();
-        assert_eq!(removed.len(), MAX_EXPIRE_PER_TICK);
-        // More remain for the next tick
-        let removed2 = store.run_active_expiry();
-        assert_eq!(removed2.len(), MAX_EXPIRE_PER_TICK);
+        for i in 0..100 {
+            store.set(b(&format!("live{i}")), s("v"), Some(1_000_000));
+        }
+        let mut removed = 0;
+        for _ in 0..200 {
+            removed += store.active_expire_cycle(Duration::from_millis(50)).len();
+            if store.dbsize() == 100 {
+                break;
+            }
+        }
+        assert_eq!(removed, 5000);
+        assert_eq!(store.dbsize(), 100);
+        assert_eq!(store.expires_of(0), 100);
+    }
+
+    #[test]
+    fn eviction_prefers_by_policy() {
+        let mut store = ShardStore::new();
+        store.set(b("persistent"), s("v"), None);
+        store.set(b("soon"), s("v"), Some(1_000));
+        store.set(b("later"), s("v"), Some(1_000_000));
+        // volatile-ttl never picks a key without a TTL, and prefers the one
+        // expiring first when both are sampled.
+        let mut picked_soon = 0;
+        for _ in 0..50 {
+            let mut st = ShardStore::new();
+            st.set(b("persistent"), s("v"), None);
+            st.set(b("soon"), s("v"), Some(1_000));
+            st.set(b("later"), s("v"), Some(1_000_000));
+            let (_, k) = st.evict_one(EvictionPolicy::VolatileTtl, 10).unwrap();
+            assert_ne!(k, b("persistent"));
+            if k == b("soon") {
+                picked_soon += 1;
+            }
+        }
+        assert!(picked_soon > 40);
+        assert!(store.evict_one(EvictionPolicy::NoEviction, 5).is_none());
+        // allkeys-random empties everything.
+        while store.evict_one(EvictionPolicy::AllKeysRandom, 5).is_some() {}
+        assert_eq!(store.dbsize(), 0);
+        assert_eq!(store.expires_of(0), 0);
+    }
+
+    fn encode_for_test(out: &mut Vec<u8>, cur_db: &mut u32, db: u32, key: &[u8], e: &KeyEntry) {
+        if db != *cur_db {
+            out.extend_from_slice(format!("[db{db}]").as_bytes());
+            *cur_db = db;
+        }
+        if let RedisValue::String(v) = &e.value {
+            out.extend_from_slice(key);
+            out.push(b'=');
+            out.extend_from_slice(v);
+            out.push(b';');
+        }
+    }
+
+    fn parse_snapshot(bytes: &[u8]) -> std::collections::BTreeMap<String, String> {
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let mut db = 0;
+        let mut out = std::collections::BTreeMap::new();
+        for part in text.split(';').filter(|p| !p.is_empty()) {
+            let mut p = part;
+            while let Some(rest) = p.strip_prefix("[db") {
+                let end = rest.find(']').unwrap();
+                db = rest[..end].parse::<u32>().unwrap();
+                p = &rest[end + 1..];
+            }
+            let (k, v) = p.split_once('=').unwrap();
+            assert!(
+                out.insert(format!("{db}/{k}"), v.to_string()).is_none(),
+                "{k} twice"
+            );
+        }
+        out
+    }
+
+    /// A snapshot taken in small steps, with writes, deletes, overwrites
+    /// and new keys between the steps, holds exactly the dataset as it was
+    /// when it began.
+    #[test]
+    fn stepped_snapshot_is_point_in_time() {
+        let mut store = ShardStore::new();
+        let mut expect = std::collections::BTreeMap::new();
+        for db in [0u32, 3] {
+            store.select(db);
+            for i in 0..3000 {
+                store.set(b(&format!("k{i}")), s(&format!("v{i}")), None);
+                expect.insert(format!("{db}/k{i}"), format!("v{i}"));
+            }
+        }
+        store.select(0);
+        assert!(store.begin_snapshot(encode_for_test));
+        assert!(!store.begin_snapshot(encode_for_test));
+        let mut out = Vec::new();
+        let mut round = 0;
+        loop {
+            let (chunk, done) = store.snapshot_step(97);
+            out.extend(chunk);
+            if done {
+                break;
+            }
+            // Churn between steps, in both databases.
+            for db in [0u32, 3] {
+                store.select(db);
+                for j in 0..20 {
+                    let i = (round * 53 + j * 7) % 3000;
+                    match j % 4 {
+                        0 => {
+                            store.del(&b(&format!("k{i}")));
+                        }
+                        1 => store.set(b(&format!("k{i}")), s("changed"), None),
+                        2 => store.set(b(&format!("fresh{round}-{j}")), s("x"), None),
+                        _ => {
+                            store.set_keep_ttl(&b(&format!("k{i}")), s("kept"));
+                        }
+                    }
+                }
+            }
+            store.select(0);
+            round += 1;
+        }
+        assert!(!store.snapshot_running());
+        assert_eq!(parse_snapshot(&out), expect);
+    }
+
+    #[test]
+    fn snapshot_captures_flush_and_swapdb() {
+        let mut store = ShardStore::new();
+        store.set(b("a"), s("1"), None);
+        store.select(1);
+        store.set(b("b"), s("2"), None);
+        store.select(0);
+        assert!(store.begin_snapshot(encode_for_test));
+        store.swap_db(0, 1);
+        store.flush_all();
+        let (out, done) = store.snapshot_step(1000);
+        assert!(done);
+        let got = parse_snapshot(&out);
+        assert_eq!(got.get("0/a").map(String::as_str), Some("1"));
+        assert_eq!(got.get("1/b").map(String::as_str), Some("2"));
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn value_sizes() {
+        // Keep an eye on per-key overhead: a string entry is value + TTL +
+        // access/snapshot words.
+        assert!(std::mem::size_of::<RedisValue>() <= 40);
+        assert!(std::mem::size_of::<KeyEntry>() <= 64);
     }
 }

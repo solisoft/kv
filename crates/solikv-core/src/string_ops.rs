@@ -309,25 +309,74 @@ impl ShardStore {
         CommandResponse::bulk(Bytes::from(formatted))
     }
 
+    /// Run `f` on the string at `key` as a growable buffer, in place: the
+    /// value is taken out of the entry, turned back into a `BytesMut`
+    /// without copying when nothing else shares it, and put back — so
+    /// `APPEND` and `SETBIT` grow a value in amortised O(1) instead of
+    /// copying all of it on every call. `create` makes a missing key an
+    /// empty string first. `Ok(None)`: missing and not created. TTL kept.
+    fn with_string_buf<R>(
+        &mut self,
+        key: &Bytes,
+        create: bool,
+        f: impl FnOnce(&mut BytesMut) -> R,
+    ) -> Result<Option<R>, CommandResponse> {
+        match self.get_mut(key) {
+            Some(entry) => match &mut entry.value {
+                RedisValue::String(v) => {
+                    let taken = std::mem::take(v);
+                    let mut buf = taken
+                        .try_into_mut()
+                        .unwrap_or_else(|shared| BytesMut::from(shared.as_ref()));
+                    let r = f(&mut buf);
+                    *v = buf.freeze();
+                    Ok(Some(r))
+                }
+                _ => Err(CommandResponse::wrong_type()),
+            },
+            None if create => {
+                let mut buf = BytesMut::new();
+                let r = f(&mut buf);
+                self.set(key.clone(), RedisValue::String(buf.freeze()), None);
+                Ok(Some(r))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Length of the string at `key` (0 when missing), or WRONGTYPE.
+    fn string_len_of(&mut self, key: &Bytes) -> Result<usize, CommandResponse> {
+        match self.get(key) {
+            None => Ok(0),
+            Some(entry) => match &entry.value {
+                RedisValue::String(v) => Ok(v.len()),
+                _ => Err(CommandResponse::wrong_type()),
+            },
+        }
+    }
+
     // ---- APPEND ----
     pub fn string_append(&mut self, key: &Bytes, value: &Bytes) -> CommandResponse {
-        match self.get(key) {
-            None => {
-                self.set(key.clone(), RedisValue::String(value.clone()), None);
-                CommandResponse::integer(value.len() as i64)
-            }
-            Some(entry) => match &entry.value {
-                RedisValue::String(existing) => {
-                    let mut new_val = BytesMut::with_capacity(existing.len() + value.len());
-                    new_val.extend_from_slice(existing);
-                    new_val.extend_from_slice(value);
-                    let new_bytes = new_val.freeze();
-                    let len = new_bytes.len() as i64;
-                    self.set_keep_ttl(key, RedisValue::String(new_bytes));
-                    CommandResponse::integer(len)
-                }
-                _ => CommandResponse::wrong_type(),
-            },
+        let len = match self.string_len_of(key) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        if len.saturating_add(value.len()) > MAX_STRING_LEN {
+            return CommandResponse::error(
+                "ERR string exceeds maximum allowed size (proto-max-bulk-len)",
+            );
+        }
+        if len == 0 && !self.exists(key) {
+            // A new key: store the argument itself, no buffer.
+            self.set(key.clone(), RedisValue::String(value.clone()), None);
+            return CommandResponse::integer(value.len() as i64);
+        }
+        match self.with_string_buf(key, true, |buf| {
+            buf.extend_from_slice(value);
+            buf.len()
+        }) {
+            Ok(n) => CommandResponse::integer(n.unwrap_or(0) as i64),
+            Err(e) => e,
         }
     }
 
@@ -380,16 +429,13 @@ impl ShardStore {
         offset: usize,
         value: &Bytes,
     ) -> CommandResponse {
-        let current = match self.get(key) {
-            None => Bytes::new(),
-            Some(entry) => match &entry.value {
-                RedisValue::String(v) => v.clone(),
-                _ => return CommandResponse::wrong_type(),
-            },
+        let len = match self.string_len_of(key) {
+            Ok(n) => n,
+            Err(e) => return e,
         };
         // Redis: an empty value changes nothing (and creates no key).
         if value.is_empty() {
-            return CommandResponse::integer(current.len() as i64);
+            return CommandResponse::integer(len as i64);
         }
 
         // Checked, and capped like Redis' proto-max-bulk-len: `offset` comes
@@ -404,56 +450,41 @@ impl ShardStore {
                 )
             }
         };
-        let mut buf = BytesMut::with_capacity(needed.max(current.len()));
-        buf.extend_from_slice(&current);
-        // Pad with zeros if needed
-        if buf.len() < offset {
-            buf.resize(offset, 0);
+        match self.with_string_buf(key, true, |buf| {
+            if buf.len() < needed {
+                buf.resize(needed, 0);
+            }
+            buf[offset..needed].copy_from_slice(value);
+            buf.len()
+        }) {
+            Ok(n) => CommandResponse::integer(n.unwrap_or(0) as i64),
+            Err(e) => e,
         }
-        // Overwrite or extend
-        if offset + value.len() > buf.len() {
-            buf.truncate(offset);
-            buf.extend_from_slice(value);
-        } else {
-            buf[offset..offset + value.len()].copy_from_slice(value);
-        }
-
-        let new_len = buf.len() as i64;
-        self.set_keep_ttl(key, RedisValue::String(buf.freeze()));
-        CommandResponse::integer(new_len)
     }
+
     // ---- SETBIT ----
     pub fn string_setbit(&mut self, key: &Bytes, offset: u64, value: u8) -> CommandResponse {
         if offset >= MAX_BIT_OFFSET {
             return CommandResponse::error("ERR bit offset is not an integer or out of range");
         }
-        let current = match self.get(key) {
-            None => Bytes::new(),
-            Some(entry) => match &entry.value {
-                RedisValue::String(v) => v.clone(),
-                _ => return CommandResponse::wrong_type(),
-            },
-        };
-
         let byte_offset = (offset / 8) as usize;
         let bit_pos = 7 - (offset % 8) as u8;
-
-        let mut buf = BytesMut::from(current.as_ref());
-        // Auto-grow with zero bytes if needed
-        if byte_offset >= buf.len() {
-            buf.resize(byte_offset + 1, 0);
+        match self.with_string_buf(key, true, |buf| {
+            // Auto-grow with zero bytes if needed
+            if byte_offset >= buf.len() {
+                buf.resize(byte_offset + 1, 0);
+            }
+            let old_bit = (buf[byte_offset] >> bit_pos) & 1;
+            if value != 0 {
+                buf[byte_offset] |= 1 << bit_pos;
+            } else {
+                buf[byte_offset] &= !(1 << bit_pos);
+            }
+            old_bit
+        }) {
+            Ok(bit) => CommandResponse::integer(bit.unwrap_or(0) as i64),
+            Err(e) => e,
         }
-
-        let old_bit = (buf[byte_offset] >> bit_pos) & 1;
-
-        if value != 0 {
-            buf[byte_offset] |= 1 << bit_pos;
-        } else {
-            buf[byte_offset] &= !(1 << bit_pos);
-        }
-
-        self.set_keep_ttl(key, RedisValue::String(buf.freeze()));
-        CommandResponse::integer(old_bit as i64)
     }
 
     // ---- GETBIT ----

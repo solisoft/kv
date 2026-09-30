@@ -1,34 +1,31 @@
 use bytes::Bytes;
-use std::collections::HashMap;
 
+use crate::set_ops::{scan_reply, scan_window};
 use crate::store::ShardStore;
 use crate::types::*;
 
 impl ShardStore {
-    fn get_or_create_hash(
-        &mut self,
-        key: &Bytes,
-    ) -> Result<&mut HashMap<Bytes, Bytes>, CommandResponse> {
-        if let Some(entry) = self.get(key) {
-            if !matches!(entry.value, RedisValue::Hash(_)) {
-                return Err(CommandResponse::wrong_type());
+    fn get_or_create_hash(&mut self, key: &Bytes) -> Result<&mut HashValue, CommandResponse> {
+        let exists = match self.get(key) {
+            Some(entry) if !matches!(entry.value, RedisValue::Hash(_)) => {
+                return Err(CommandResponse::wrong_type())
             }
+            Some(_) => true,
+            None => false,
+        };
+        if !exists {
+            self.set(key.clone(), RedisValue::new_hash(), None);
         }
-
-        if self.get(key).is_none() {
-            self.set(key.clone(), RedisValue::Hash(HashMap::new()), None);
-        }
-
-        match self.get_mut(key).unwrap() {
-            KeyEntry {
-                value: RedisValue::Hash(ref mut h),
+        match self.get_mut(key) {
+            Some(KeyEntry {
+                value: RedisValue::Hash(h),
                 ..
-            } => Ok(h),
-            _ => unreachable!(),
+            }) => Ok(h),
+            _ => Err(CommandResponse::wrong_type()),
         }
     }
 
-    fn get_hash(&mut self, key: &Bytes) -> Result<Option<&HashMap<Bytes, Bytes>>, CommandResponse> {
+    fn get_hash(&mut self, key: &Bytes) -> Result<Option<&HashValue>, CommandResponse> {
         match self.get(key) {
             None => Ok(None),
             Some(entry) => match &entry.value {
@@ -72,7 +69,7 @@ impl ShardStore {
             RedisValue::Hash(h) => {
                 let mut removed = 0i64;
                 for field in fields {
-                    if h.remove(field).is_some() {
+                    if h.swap_remove(field).is_some() {
                         removed += 1;
                     }
                 }
@@ -135,7 +132,9 @@ impl ShardStore {
                 Err(_) => return CommandResponse::error("ERR hash value is not an integer"),
             },
         };
-        let new_val = current + delta;
+        let Some(new_val) = current.checked_add(delta) else {
+            return CommandResponse::error("ERR increment or decrement would overflow");
+        };
         hash.insert(field, Bytes::from(new_val.to_string()));
         CommandResponse::integer(new_val)
     }
@@ -156,6 +155,9 @@ impl ShardStore {
             },
         };
         let new_val = current + delta;
+        if !new_val.is_finite() {
+            return CommandResponse::error("ERR increment would produce NaN or Infinity");
+        }
         let formatted = format!("{}", new_val);
         hash.insert(field, Bytes::from(formatted.clone()));
         CommandResponse::bulk(Bytes::from(formatted))
@@ -207,7 +209,7 @@ impl ShardStore {
             Ok(h) => h,
             Err(e) => return e,
         };
-        if let std::collections::hash_map::Entry::Vacant(e) = hash.entry(field) {
+        if let indexmap::map::Entry::Vacant(e) = hash.entry(field) {
             e.insert(value);
             CommandResponse::integer(1)
         } else {
@@ -215,6 +217,8 @@ impl ShardStore {
         }
     }
 
+    /// `HSCAN key cursor [MATCH pattern] [COUNT count]`: visits `count`
+    /// fields by position, no copy of the hash.
     pub fn hash_hscan(
         &mut self,
         key: &Bytes,
@@ -224,47 +228,23 @@ impl ShardStore {
     ) -> CommandResponse {
         match self.get_hash(key) {
             Err(e) => e,
-            Ok(None) => CommandResponse::array(vec![
-                CommandResponse::bulk(Bytes::from("0")),
-                CommandResponse::array(vec![]),
-            ]),
+            Ok(None) => scan_reply(0, vec![]),
             Ok(Some(h)) => {
-                let pairs: Vec<(Bytes, Bytes)> =
-                    h.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                let total = pairs.len();
-                if total == 0 {
-                    return CommandResponse::array(vec![
-                        CommandResponse::bulk(Bytes::from("0")),
-                        CommandResponse::array(vec![]),
-                    ]);
-                }
-
-                let start = cursor;
-                let mut result = Vec::new();
-                let mut i = start;
-                let mut checked = 0;
-
-                while checked < count && i < total {
-                    let (ref field, ref value) = pairs[i];
-                    let matches = pattern
-                        .map(|p| {
-                            let field_str = std::str::from_utf8(field).unwrap_or("");
-                            crate::store::glob_match_pub(p, field_str)
-                        })
-                        .unwrap_or(true);
+                let (window, next) = scan_window(h.len(), cursor, count);
+                let mut items = Vec::with_capacity(window.len() * 2);
+                for i in window.rev() {
+                    let Some((field, value)) = h.get_index(i) else {
+                        continue;
+                    };
+                    let matches = pattern.is_none_or(|p| {
+                        crate::store::glob_match_pub(p, std::str::from_utf8(field).unwrap_or(""))
+                    });
                     if matches {
-                        result.push(CommandResponse::bulk(field.clone()));
-                        result.push(CommandResponse::bulk(value.clone()));
+                        items.push(CommandResponse::bulk(field.clone()));
+                        items.push(CommandResponse::bulk(value.clone()));
                     }
-                    i += 1;
-                    checked += 1;
                 }
-
-                let next_cursor = if i >= total { 0 } else { i };
-                CommandResponse::array(vec![
-                    CommandResponse::bulk(Bytes::from(next_cursor.to_string())),
-                    CommandResponse::array(result),
-                ])
+                scan_reply(next, items)
             }
         }
     }

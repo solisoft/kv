@@ -1,8 +1,10 @@
 use mimalloc::MiMalloc;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
+/// mimalloc, counted: `maxmemory` and `INFO memory` read the running total
+/// (see `solikv_core::memory`).
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: solikv_core::memory::Counting<MiMalloc> = solikv_core::memory::Counting(MiMalloc);
 
 use clap::Parser;
 use std::fs;
@@ -74,6 +76,24 @@ struct Args {
     /// Most memory one Lua scripting VM may use, in bytes
     #[arg(long, default_value = "67108864", value_name = "BYTES")]
     lua_memory_limit: usize,
+
+    /// Memory limit (bytes; k/kb/m/mb/g/gb suffixes allowed; 0 = none).
+    /// Past it, writes evict keys by --maxmemory-policy or are refused
+    #[arg(long, default_value = "0", value_name = "SIZE", value_parser = parse_size)]
+    maxmemory: u64,
+
+    /// noeviction, allkeys-lru, volatile-lru, allkeys-lfu, volatile-lfu,
+    /// allkeys-random, volatile-random or volatile-ttl
+    #[arg(long, default_value = "noeviction", value_parser = parse_policy)]
+    maxmemory_policy: solikv_core::store::EvictionPolicy,
+
+    /// Keys sampled per eviction (more = closer to true LRU/LFU, slower)
+    #[arg(long, default_value = "5")]
+    maxmemory_samples: usize,
+
+    /// Active expiry cycles per second (Redis `hz`)
+    #[arg(long, default_value = "10")]
+    hz: u32,
 
     /// Number of logical databases (SELECT 0 … n-1). Cluster mode uses
     /// database 0 only.
@@ -214,6 +234,7 @@ struct Args {
 }
 
 fn main() {
+    solikv_core::memory::enable();
     let args = Args::parse();
 
     if args.solo && args.cluster_enabled {
@@ -761,6 +782,11 @@ async fn async_main(args: Args) {
         .with_notify_flags(notify_flags)
         .with_lua_memory_limit(args.lua_memory_limit)
         .with_databases(args.databases)
+        .with_maxmemory(
+            args.maxmemory,
+            args.maxmemory_policy,
+            args.maxmemory_samples,
+        )
         .with_persistence(persistence.clone());
     let engine = Arc::new(engine);
     engine.init_self_ref(Arc::downgrade(&engine));
@@ -836,6 +862,28 @@ async fn async_main(args: Args) {
                 }
             }
         }
+    }
+
+    // --- Active expiry: keys expire whether or not anything reads them ---
+    {
+        let shards_bg = shards.clone();
+        let hz = args.hz.clamp(1, 500);
+        tokio::spawn(async move {
+            let period = std::time::Duration::from_millis(1000 / hz as u64);
+            let mut ticker = tokio::time::interval(period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Each shard gets at most 1 ms of its lock per cycle.
+            let budget = std::time::Duration::from_millis(1);
+            loop {
+                ticker.tick().await;
+                for shard in shards_bg.all_shards() {
+                    shard.active_expire_cycle(budget);
+                    // Let the connections this worker also serves run
+                    // between shards.
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
     }
 
     // --- Periodic snapshots and automatic log rewrites ---
@@ -996,6 +1044,11 @@ async fn async_main(args: Args) {
 }
 
 /// `64mb`, `1g`, `4096` → bytes.
+fn parse_policy(s: &str) -> Result<solikv_core::store::EvictionPolicy, String> {
+    solikv_core::store::EvictionPolicy::parse(s)
+        .ok_or_else(|| format!("unknown maxmemory policy '{s}'"))
+}
+
 fn parse_size(s: &str) -> Result<u64, String> {
     let lower = s.trim().to_ascii_lowercase();
     let (num, mult) = [

@@ -1,37 +1,98 @@
 use bytes::Bytes;
+use indexmap::{IndexMap, IndexSet};
 use ordered_float::OrderedFloat;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::sorted_list::SortedList;
+
+/// Hasher of the keyspace and of every collection value.
+///
+/// foldhash instead of the standard SipHash: several times faster on the
+/// short keys a cache holds, and still seeded per map from a random
+/// per-process value, so an attacker who does not know the seed cannot
+/// precompute colliding keys.
+pub type FastHasher = foldhash::fast::RandomState;
+
+/// A hash's fields. Insertion-indexed so `HSCAN` walks it by position and
+/// `HRANDFIELD` picks a field in O(1).
+pub type HashValue = IndexMap<Bytes, Bytes, FastHasher>;
+
+/// A set's members. Insertion-indexed for `SSCAN`, `SPOP` and
+/// `SRANDMEMBER` (random member in O(1)).
+pub type SetValue = IndexSet<Bytes, FastHasher>;
 
 /// Core Redis value types stored in the database.
+///
+/// Everything but strings and lists is boxed: a plain string entry then
+/// costs 40 bytes of value instead of the size of the largest variant (a
+/// stream, 88 bytes), and strings are what most keys hold.
 #[derive(Debug, Clone)]
 pub enum RedisValue {
     String(Bytes),
     List(VecDeque<Bytes>),
-    Hash(HashMap<Bytes, Bytes>),
-    Set(HashSet<Bytes>),
-    ZSet(ZSetValue),
-    Stream(StreamValue),
-    HyperLogLog(HyperLogLogValue),
-    BloomFilter(BloomFilterValue),
+    Hash(Box<HashValue>),
+    Set(Box<SetValue>),
+    ZSet(Box<ZSetValue>),
+    Stream(Box<StreamValue>),
+    HyperLogLog(Box<HyperLogLogValue>),
+    BloomFilter(Box<BloomFilterValue>),
 }
 
-/// Sorted set with dual index: score->member and member->score.
-#[derive(Debug, Clone)]
+impl RedisValue {
+    pub fn new_hash() -> Self {
+        RedisValue::Hash(Box::default())
+    }
+
+    pub fn new_set() -> Self {
+        RedisValue::Set(Box::default())
+    }
+
+    pub fn new_zset() -> Self {
+        RedisValue::ZSet(Box::default())
+    }
+
+    pub fn hash(h: HashValue) -> Self {
+        RedisValue::Hash(Box::new(h))
+    }
+
+    pub fn set(s: SetValue) -> Self {
+        RedisValue::Set(Box::new(s))
+    }
+
+    pub fn zset(z: ZSetValue) -> Self {
+        RedisValue::ZSet(Box::new(z))
+    }
+
+    pub fn stream(s: StreamValue) -> Self {
+        RedisValue::Stream(Box::new(s))
+    }
+
+    pub fn hll(h: HyperLogLogValue) -> Self {
+        RedisValue::HyperLogLog(Box::new(h))
+    }
+
+    pub fn bloom(b: BloomFilterValue) -> Self {
+        RedisValue::BloomFilter(Box::new(b))
+    }
+}
+
+/// Sorted set with dual index: an order-statistic list of `(score, member)`
+/// (ranks and ranges in O(log n), see [`SortedList`]) and member → score.
+#[derive(Debug, Clone, Default)]
 pub struct ZSetValue {
-    pub scores: BTreeMap<(OrderedFloat<f64>, Bytes), ()>,
-    pub members: HashMap<Bytes, OrderedFloat<f64>>,
+    pub scores: SortedList<(OrderedFloat<f64>, Bytes)>,
+    pub members: IndexMap<Bytes, OrderedFloat<f64>, FastHasher>,
 }
 
 impl ZSetValue {
     pub fn new() -> Self {
-        Self {
-            scores: BTreeMap::new(),
-            members: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn len(&self) -> usize {
@@ -45,21 +106,27 @@ impl ZSetValue {
     /// Insert or update a member. Returns true if the member is new.
     pub fn insert(&mut self, score: f64, member: Bytes) -> bool {
         let score = OrderedFloat(score);
-        if let Some(&old_score) = self.members.get(&member) {
-            if old_score == score {
-                return false;
+        match self.members.get_mut(&member) {
+            Some(old) => {
+                if *old == score {
+                    return false;
+                }
+                let prev = std::mem::replace(old, score);
+                self.scores.remove(&(prev, member.clone()));
+                self.scores.insert((score, member));
+                false
             }
-            self.scores.remove(&(old_score, member.clone()));
+            None => {
+                self.members.insert(member.clone(), score);
+                self.scores.insert((score, member));
+                true
+            }
         }
-        let is_new = !self.members.contains_key(&member);
-        self.members.insert(member.clone(), score);
-        self.scores.insert((score, member), ());
-        is_new
     }
 
     /// Remove a member. Returns true if it existed.
     pub fn remove(&mut self, member: &Bytes) -> bool {
-        if let Some(score) = self.members.remove(member) {
+        if let Some(score) = self.members.swap_remove(member) {
             self.scores.remove(&(score, member.clone()));
             true
         } else {
@@ -69,6 +136,12 @@ impl ZSetValue {
 
     pub fn score(&self, member: &Bytes) -> Option<f64> {
         self.members.get(member).map(|s| s.into_inner())
+    }
+
+    /// Rank (0-based, ascending) of `member`.
+    pub fn rank(&self, member: &Bytes) -> Option<usize> {
+        let score = *self.members.get(member)?;
+        self.scores.position(&(score, member.clone()))
     }
 
     /// Increment a member's score. Returns the new score.
@@ -82,11 +155,16 @@ impl ZSetValue {
         self.insert(new_score, member);
         new_score
     }
-}
 
-impl Default for ZSetValue {
-    fn default() -> Self {
-        Self::new()
+    /// Remove and return the lowest (`max = false`) or highest member.
+    pub fn pop(&mut self, max: bool) -> Option<(Bytes, f64)> {
+        let (score, member) = if max {
+            self.scores.pop_last()?
+        } else {
+            self.scores.pop_first()?
+        };
+        self.members.swap_remove(&member);
+        Some((member, score.into_inner()))
     }
 }
 
@@ -388,6 +466,14 @@ impl BloomFilterValue {
 pub struct KeyEntry {
     pub value: RedisValue,
     pub expires_at: Option<u64>, // milliseconds since UNIX epoch
+    /// Last access (LRU clock) or access frequency (LFU), as Redis packs
+    /// them in 24 bits; see [`access`]. Drives eviction, `OBJECT IDLETIME`
+    /// and `OBJECT FREQ`.
+    pub access: u32,
+    /// Snapshot epoch this entry was last written out in (see
+    /// `ShardStore::begin_snapshot`): lets a snapshot that runs in steps
+    /// save each key exactly once, as it was when the snapshot began.
+    pub snap: u32,
 }
 
 impl KeyEntry {
@@ -395,6 +481,8 @@ impl KeyEntry {
         Self {
             value,
             expires_at: None,
+            access: access::initial(),
+            snap: 0,
         }
     }
 
@@ -402,6 +490,8 @@ impl KeyEntry {
         Self {
             value,
             expires_at: Some(expires_at),
+            access: access::initial(),
+            snap: 0,
         }
     }
 
@@ -425,6 +515,122 @@ impl KeyEntry {
             RedisValue::Stream(_) => "stream",
             RedisValue::HyperLogLog(_) => "string",
             RedisValue::BloomFilter(_) => "string",
+        }
+    }
+}
+
+/// Access tracking for eviction: an LRU clock or an LFU counter per key,
+/// packed into the entry's 24-bit `access` field the way Redis packs its
+/// `robj.lru`.
+pub mod access {
+    use super::{now_millis, AtomicU8, Ordering};
+    use std::cell::Cell;
+
+    /// What `access` holds: set from `maxmemory-policy`.
+    static MODE: AtomicU8 = AtomicU8::new(MODE_LRU);
+    const MODE_LRU: u8 = 0;
+    const MODE_LFU: u8 = 1;
+
+    /// 24-bit clock mask.
+    pub const CLOCK_MAX: u32 = (1 << 24) - 1;
+    /// LFU: counter a new key starts with (`LFU_INIT_VAL`).
+    pub const LFU_INIT: u32 = 5;
+    /// LFU tunables, Redis' defaults (`lfu-log-factor`, `lfu-decay-time`).
+    const LFU_LOG_FACTOR: f64 = 10.0;
+    const LFU_DECAY_MINUTES: u32 = 1;
+
+    /// Track frequency (true) or recency (false).
+    pub fn set_lfu(lfu: bool) {
+        MODE.store(if lfu { MODE_LFU } else { MODE_LRU }, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn is_lfu() -> bool {
+        MODE.load(Ordering::Relaxed) == MODE_LFU
+    }
+
+    /// LRU clock: seconds, 24 bits (wraps every ~194 days, like Redis').
+    #[inline]
+    pub fn lru_clock() -> u32 {
+        ((now_millis() / 1000) as u32) & CLOCK_MAX
+    }
+
+    /// LFU time: minutes, 16 bits.
+    #[inline]
+    fn lfu_minutes() -> u32 {
+        ((now_millis() / 60_000) as u32) & 0xFFFF
+    }
+
+    /// `access` for a key just created.
+    #[inline]
+    pub fn initial() -> u32 {
+        if is_lfu() {
+            (lfu_minutes() << 8) | LFU_INIT
+        } else {
+            lru_clock()
+        }
+    }
+
+    /// `access` after the key was read or written.
+    #[inline]
+    pub fn touched(prev: u32) -> u32 {
+        if is_lfu() {
+            let counter = log_incr(decayed(prev));
+            (lfu_minutes() << 8) | counter
+        } else {
+            lru_clock()
+        }
+    }
+
+    /// Seconds since the last access (`OBJECT IDLETIME`, LRU ranking).
+    pub fn idle_secs(access: u32) -> u64 {
+        let now = lru_clock();
+        let a = access & CLOCK_MAX;
+        if now >= a {
+            (now - a) as u64
+        } else {
+            (now + (CLOCK_MAX - a)) as u64
+        }
+    }
+
+    /// The LFU counter, decayed for the time since the last access
+    /// (`OBJECT FREQ`, LFU ranking).
+    pub fn decayed(access: u32) -> u32 {
+        let counter = access & 0xFF;
+        let then = access >> 8;
+        let now = lfu_minutes();
+        let elapsed = if now >= then {
+            now - then
+        } else {
+            0xFFFF - then + now
+        };
+        counter.saturating_sub(elapsed / LFU_DECAY_MINUTES)
+    }
+
+    thread_local! {
+        static RNG: Cell<u64> = const { Cell::new(0x2545_F491_4F6C_DD1D) };
+    }
+
+    /// Redis' logarithmic counter increment: the higher the counter, the
+    /// less likely an access raises it.
+    fn log_incr(counter: u32) -> u32 {
+        if counter >= 255 {
+            return 255;
+        }
+        let r = RNG.with(|c| {
+            let mut x = c.get();
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            c.set(x);
+            (x >> 11) as f64 / (1u64 << 53) as f64
+        });
+        let base = counter.saturating_sub(LFU_INIT) as f64;
+        let p = 1.0 / (base * LFU_LOG_FACTOR + 1.0);
+        if r < p {
+            counter + 1
+        } else {
+            counter
         }
     }
 }
@@ -475,21 +681,61 @@ impl Drop for LoadingGuard {
     }
 }
 
-/// Current time in milliseconds since UNIX epoch.
+/// Current time in milliseconds since UNIX epoch, from a clock a dedicated
+/// thread refreshes every millisecond.
 ///
-/// Read from the clock on every call. It used to be cached and refreshed
-/// every 16th call, which under light traffic left it arbitrarily stale —
-/// a key read after a quiet minute was judged against the time of the last
-/// busy moment, so it outlived its TTL, and a TTL set then was measured from
-/// the past. `SystemTime::now()` is a vDSO call (tens of nanoseconds, no
-/// syscall), and the shared counter the cache needed was a cache line every
-/// core wrote to on every call.
+/// Every command that looks at a TTL asks for the time, often several times;
+/// a cached value is one relaxed load instead of a `clock_gettime`. The
+/// refresh thread keeps it within about a millisecond of the real clock, so
+/// a key never outlives its TTL by more than that — the granularity Redis
+/// works at too (it caches the time once per event-loop iteration). It never
+/// goes backwards: a TTL set now and checked just after is measured against
+/// the same clock. (A cache refreshed from the command path instead, every
+/// 16th call, went arbitrarily stale on a quiet server.)
 #[inline]
 pub fn now_millis() -> u64 {
+    let t = CLOCK.load(Ordering::Relaxed);
+    if t != 0 {
+        t
+    } else {
+        start_clock()
+    }
+}
+
+static CLOCK: AtomicU64 = AtomicU64::new(0);
+static CLOCK_THREAD: OnceLock<()> = OnceLock::new();
+
+fn wall_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cold]
+fn start_clock() -> u64 {
+    CLOCK_THREAD.get_or_init(|| {
+        let spawned = std::thread::Builder::new()
+            .name("solikv-clock".into())
+            .spawn(|| loop {
+                std::thread::sleep(Duration::from_millis(1));
+                // fetch_max: a wall clock stepped back must not make a TTL
+                // already judged expired come back to life.
+                CLOCK.fetch_max(wall_millis(), Ordering::Relaxed);
+            });
+        match spawned {
+            // Only a running refresher may publish a cached time; without
+            // one, 0 keeps every call on the real clock.
+            Ok(_) => {
+                CLOCK.fetch_max(wall_millis(), Ordering::Relaxed);
+            }
+            Err(e) => tracing::error!("clock thread: {e}; reading the time per call"),
+        }
+    });
+    match CLOCK.load(Ordering::Relaxed) {
+        0 => wall_millis(),
+        t => t,
+    }
 }
 
 /// Current time in seconds since UNIX epoch.
@@ -614,28 +860,19 @@ mod tests {
             KeyEntry::new(RedisValue::List(VecDeque::new())).type_name(),
             "list"
         );
+        assert_eq!(KeyEntry::new(RedisValue::new_hash()).type_name(), "hash");
+        assert_eq!(KeyEntry::new(RedisValue::new_set()).type_name(), "set");
+        assert_eq!(KeyEntry::new(RedisValue::new_zset()).type_name(), "zset");
         assert_eq!(
-            KeyEntry::new(RedisValue::Hash(HashMap::new())).type_name(),
-            "hash"
-        );
-        assert_eq!(
-            KeyEntry::new(RedisValue::Set(HashSet::new())).type_name(),
-            "set"
-        );
-        assert_eq!(
-            KeyEntry::new(RedisValue::ZSet(ZSetValue::new())).type_name(),
-            "zset"
-        );
-        assert_eq!(
-            KeyEntry::new(RedisValue::Stream(StreamValue::new())).type_name(),
+            KeyEntry::new(RedisValue::stream(StreamValue::new())).type_name(),
             "stream"
         );
         assert_eq!(
-            KeyEntry::new(RedisValue::HyperLogLog(HyperLogLogValue::new())).type_name(),
+            KeyEntry::new(RedisValue::hll(HyperLogLogValue::new())).type_name(),
             "string"
         );
         assert_eq!(
-            KeyEntry::new(RedisValue::BloomFilter(BloomFilterValue::with_capacity(
+            KeyEntry::new(RedisValue::bloom(BloomFilterValue::with_capacity(
                 100, 0.01
             )))
             .type_name(),

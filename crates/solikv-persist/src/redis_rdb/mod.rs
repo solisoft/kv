@@ -10,7 +10,7 @@ pub mod parser;
 pub mod ziplist;
 
 use bytes::Bytes;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
 
@@ -222,11 +222,14 @@ fn read_value<R: io::Read>(
         }
         TYPE_SET => {
             let len = reader.read_length()?;
-            let mut set = HashSet::with_capacity(len.min(parser::MAX_PREALLOC));
+            let mut set = SetValue::with_capacity_and_hasher(
+                len.min(parser::MAX_PREALLOC),
+                Default::default(),
+            );
             for _ in 0..len {
                 set.insert(reader.read_string()?);
             }
-            Ok(Some(RedisValue::Set(set)))
+            Ok(Some(RedisValue::set(set)))
         }
         TYPE_ZSET => {
             // Scores as ASCII strings
@@ -237,17 +240,20 @@ fn read_value<R: io::Read>(
                 let score = reader.read_string_f64()?;
                 zset.insert(score, member);
             }
-            Ok(Some(RedisValue::ZSet(zset)))
+            Ok(Some(RedisValue::zset(zset)))
         }
         TYPE_HASH => {
             let len = reader.read_length()?;
-            let mut hash = HashMap::with_capacity(len.min(parser::MAX_PREALLOC));
+            let mut hash = HashValue::with_capacity_and_hasher(
+                len.min(parser::MAX_PREALLOC),
+                Default::default(),
+            );
             for _ in 0..len {
                 let field = reader.read_string()?;
                 let value = reader.read_string()?;
                 hash.insert(field, value);
             }
-            Ok(Some(RedisValue::Hash(hash)))
+            Ok(Some(RedisValue::hash(hash)))
         }
         TYPE_ZSET_2 => {
             // Scores as binary f64
@@ -258,7 +264,7 @@ fn read_value<R: io::Read>(
                 let score = reader.read_binary_f64()?;
                 zset.insert(score, member);
             }
-            Ok(Some(RedisValue::ZSet(zset)))
+            Ok(Some(RedisValue::zset(zset)))
         }
         TYPE_LIST_ZIPLIST => {
             let blob = reader.read_string_raw()?;
@@ -268,8 +274,8 @@ fn read_value<R: io::Read>(
         TYPE_SET_INTSET => {
             let blob = reader.read_string_raw()?;
             let members = intset::decode_intset(&blob)?;
-            let set: HashSet<Bytes> = members.into_iter().collect();
-            Ok(Some(RedisValue::Set(set)))
+            let set: SetValue = members.into_iter().collect();
+            Ok(Some(RedisValue::set(set)))
         }
         TYPE_ZSET_ZIPLIST => {
             let blob = reader.read_string_raw()?;
@@ -286,7 +292,7 @@ fn read_value<R: io::Read>(
                 let score = parse_score_bytes(&pair[1])?;
                 zset.insert(score, member);
             }
-            Ok(Some(RedisValue::ZSet(zset)))
+            Ok(Some(RedisValue::zset(zset)))
         }
         TYPE_HASH_ZIPLIST => {
             let blob = reader.read_string_raw()?;
@@ -297,11 +303,12 @@ fn read_value<R: io::Read>(
                     "HASH_ZIPLIST: odd number of entries",
                 ));
             }
-            let mut hash = HashMap::with_capacity(entries.len() / 2);
+            let mut hash =
+                HashValue::with_capacity_and_hasher(entries.len() / 2, Default::default());
             for pair in entries.as_chunks::<2>().0 {
                 hash.insert(pair[0].clone(), pair[1].clone());
             }
-            Ok(Some(RedisValue::Hash(hash)))
+            Ok(Some(RedisValue::hash(hash)))
         }
         TYPE_LIST_QUICKLIST => {
             let count = reader.read_length()?;
@@ -324,11 +331,12 @@ fn read_value<R: io::Read>(
                     "HASH_LISTPACK: odd number of entries",
                 ));
             }
-            let mut hash = HashMap::with_capacity(entries.len() / 2);
+            let mut hash =
+                HashValue::with_capacity_and_hasher(entries.len() / 2, Default::default());
             for pair in entries.as_chunks::<2>().0 {
                 hash.insert(pair[0].clone(), pair[1].clone());
             }
-            Ok(Some(RedisValue::Hash(hash)))
+            Ok(Some(RedisValue::hash(hash)))
         }
         TYPE_ZSET_LISTPACK => {
             let blob = reader.read_string_raw()?;
@@ -345,7 +353,7 @@ fn read_value<R: io::Read>(
                 let score = parse_score_bytes(&pair[1])?;
                 zset.insert(score, member);
             }
-            Ok(Some(RedisValue::ZSet(zset)))
+            Ok(Some(RedisValue::zset(zset)))
         }
         TYPE_LIST_QUICKLIST_2 => {
             let count = reader.read_length()?;
@@ -378,8 +386,8 @@ fn read_value<R: io::Read>(
         TYPE_SET_LISTPACK => {
             let blob = reader.read_string_raw()?;
             let entries = listpack::decode_listpack(&blob)?;
-            let set: HashSet<Bytes> = entries.into_iter().collect();
-            Ok(Some(RedisValue::Set(set)))
+            let set: SetValue = entries.into_iter().collect();
+            Ok(Some(RedisValue::set(set)))
         }
         // Unsupported types — skip and warn
         TYPE_MODULE_OLD

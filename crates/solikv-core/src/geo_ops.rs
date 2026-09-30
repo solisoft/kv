@@ -495,7 +495,7 @@ impl ShardStore {
         if dest_zset.is_empty() {
             self.del(dest);
         } else {
-            self.set(dest.clone(), RedisValue::ZSet(dest_zset), None);
+            self.set(dest.clone(), RedisValue::zset(dest_zset), None);
         }
 
         CommandResponse::integer(len)

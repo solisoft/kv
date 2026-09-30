@@ -30,17 +30,83 @@ pub enum Keys {
 
 #[derive(Debug)]
 pub struct CommandSpec {
+    pub id: Cmd,
     pub name: &'static str,
     /// Exact argument count including the name when positive; at least
     /// `-arity` when negative.
     pub arity: i32,
     pub flags: &'static [&'static str],
+    /// `flags` as bits ([`F_WRITE`] …), for tests on the hot path.
+    pub bits: u32,
     pub keys: Keys,
 }
 
+pub const F_WRITE: u32 = 1 << 0;
+pub const F_READONLY: u32 = 1 << 1;
+pub const F_DENYOOM: u32 = 1 << 2;
+pub const F_ADMIN: u32 = 1 << 3;
+pub const F_PUBSUB: u32 = 1 << 4;
+pub const F_NOSCRIPT: u32 = 1 << 5;
+pub const F_FAST: u32 = 1 << 6;
+pub const F_LOADING: u32 = 1 << 7;
+pub const F_STALE: u32 = 1 << 8;
+pub const F_MOVABLEKEYS: u32 = 1 << 9;
+pub const F_BLOCKING: u32 = 1 << 10;
+
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The bits of a flag list, computed when the table is built.
+const fn flag_bits(flags: &[&str]) -> u32 {
+    const NAMES: [(&str, u32); 11] = [
+        ("write", F_WRITE),
+        ("readonly", F_READONLY),
+        ("denyoom", F_DENYOOM),
+        ("admin", F_ADMIN),
+        ("pubsub", F_PUBSUB),
+        ("noscript", F_NOSCRIPT),
+        ("fast", F_FAST),
+        ("loading", F_LOADING),
+        ("stale", F_STALE),
+        ("movablekeys", F_MOVABLEKEYS),
+        ("blocking", F_BLOCKING),
+    ];
+    let mut bits = 0;
+    let mut i = 0;
+    while i < flags.len() {
+        let mut j = 0;
+        while j < NAMES.len() {
+            if str_eq(flags[i], NAMES[j].0) {
+                bits |= NAMES[j].1;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    bits
+}
+
 impl CommandSpec {
+    #[inline]
     pub fn is_write(&self) -> bool {
-        self.flags.contains(&"write")
+        self.bits & F_WRITE != 0
+    }
+
+    #[inline]
+    pub fn has(&self, flag: u32) -> bool {
+        self.bits & flag != 0
     }
 
     /// Whether `argc` arguments (name excluded) satisfy the arity.
@@ -175,244 +241,261 @@ fn second_arg_key(args: &[Bytes]) -> Vec<usize> {
     }
 }
 
-macro_rules! spec {
-    ($name:expr, $arity:expr, $flags:expr, $keys:expr) => {
-        CommandSpec {
-            name: $name,
-            arity: $arity,
-            flags: $flags,
-            keys: $keys,
+macro_rules! commands {
+    ($( $(#[$m:meta])* $id:ident = $name:expr, $arity:expr, $flags:expr, $keys:expr; )*) => {
+        /// Every command the table knows, in table order: [`CommandSpec::id`].
+        /// `dispatch` matches on this rather than on the name, so finding a
+        /// command's arm is a jump, not a walk down a chain of string
+        /// compares.
+        #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[repr(u16)]
+        pub enum Cmd {
+            $( $id, )*
+            /// Not in the table.
+            Unknown,
         }
+
+        static SPECS: &[CommandSpec] = &[
+            $( CommandSpec {
+                id: Cmd::$id,
+                name: $name,
+                arity: $arity,
+                flags: $flags,
+                bits: flag_bits($flags),
+                keys: $keys,
+            }, )*
+        ];
     };
 }
 
-static SPECS: &[CommandSpec] = &[
+commands! {
     // Connection / server
-    spec!("PING", -1, FAST, NONE),
-    spec!("ECHO", 2, FAST, NONE),
-    spec!("AUTH", -2, CONN, NONE),
-    spec!("HELLO", -1, CONN, NONE),
-    spec!("QUIT", -1, CONN, NONE),
-    spec!("RESET", 1, CONN, NONE),
-    spec!("SELECT", 2, CONN, NONE),
-    spec!(
-        "CLIENT",
-        -2,
-        &["admin", "noscript", "loading", "stale"],
-        NONE
-    ),
-    spec!("COMMAND", -1, &["loading", "stale"], NONE),
-    spec!(
-        "CONFIG",
-        -2,
-        &["admin", "noscript", "loading", "stale"],
-        NONE
-    ),
-    spec!("INFO", -1, &["loading", "stale"], NONE),
-    spec!("DBSIZE", 1, ROF, NONE),
-    spec!("FLUSHDB", -1, W, NONE),
-    spec!("FLUSHALL", -1, W, NONE),
-    spec!("SWAPDB", 3, WF, NONE),
-    spec!("REPLICAOF", 3, ADM, NONE),
-    spec!("SLAVEOF", 3, ADM, NONE),
-    spec!("ROLE", 1, &["noscript", "loading", "stale", "fast"], NONE),
-    spec!("SAVE", 1, ADM, NONE),
-    spec!("BGSAVE", -1, ADM, NONE),
-    spec!("BGREWRITEAOF", 1, ADM, NONE),
-    spec!("LASTSAVE", 1, &["loading", "stale", "fast"], NONE),
-    spec!(
-        "SHUTDOWN",
-        -1,
-        &["admin", "noscript", "loading", "stale"],
-        NONE
-    ),
-    spec!("WAIT", 3, &["noscript"], NONE),
-    spec!("CLUSTER", -2, &["loading", "stale"], NONE),
+    PING = "PING", -1, FAST, NONE;
+    ECHO = "ECHO", 2, FAST, NONE;
+    AUTH = "AUTH", -2, CONN, NONE;
+    HELLO = "HELLO", -1, CONN, NONE;
+    QUIT = "QUIT", -1, CONN, NONE;
+    RESET = "RESET", 1, CONN, NONE;
+    SELECT = "SELECT", 2, CONN, NONE;
+    CLIENT = "CLIENT", -2, &["admin", "noscript", "loading", "stale"], NONE;
+    COMMAND = "COMMAND", -1, &["loading", "stale"], NONE;
+    CONFIG = "CONFIG", -2, &["admin", "noscript", "loading", "stale"], NONE;
+    INFO = "INFO", -1, &["loading", "stale"], NONE;
+    DBSIZE = "DBSIZE", 1, ROF, NONE;
+    FLUSHDB = "FLUSHDB", -1, W, NONE;
+    FLUSHALL = "FLUSHALL", -1, W, NONE;
+    SWAPDB = "SWAPDB", 3, WF, NONE;
+    REPLICAOF = "REPLICAOF", 3, ADM, NONE;
+    SLAVEOF = "SLAVEOF", 3, ADM, NONE;
+    ROLE = "ROLE", 1, &["noscript", "loading", "stale", "fast"], NONE;
+    SAVE = "SAVE", 1, ADM, NONE;
+    BGSAVE = "BGSAVE", -1, ADM, NONE;
+    BGREWRITEAOF = "BGREWRITEAOF", 1, ADM, NONE;
+    LASTSAVE = "LASTSAVE", 1, &["loading", "stale", "fast"], NONE;
+    SHUTDOWN = "SHUTDOWN", -1, &["admin", "noscript", "loading", "stale"], NONE;
+    WAIT = "WAIT", 3, &["noscript"], NONE;
+    CLUSTER = "CLUSTER", -2, &["loading", "stale"], NONE;
     // Transactions
-    spec!("MULTI", 1, CONN, NONE),
-    spec!("EXEC", 1, &["noscript", "loading", "stale"], NONE),
-    spec!("DISCARD", 1, CONN, NONE),
-    spec!("WATCH", -2, CONN, ALL),
-    spec!("UNWATCH", 1, CONN, NONE),
+    MULTI = "MULTI", 1, CONN, NONE;
+    EXEC = "EXEC", 1, &["noscript", "loading", "stale"], NONE;
+    DISCARD = "DISCARD", 1, CONN, NONE;
+    WATCH = "WATCH", -2, CONN, ALL;
+    UNWATCH = "UNWATCH", 1, CONN, NONE;
     // Scripting
-    spec!("EVAL", -3, SCRIPT, Keys::Movable(eval_keys)),
-    spec!("EVALSHA", -3, SCRIPT, Keys::Movable(eval_keys)),
-    spec!("SCRIPT", -2, &["noscript"], NONE),
+    EVAL = "EVAL", -3, SCRIPT, Keys::Movable(eval_keys);
+    EVALSHA = "EVALSHA", -3, SCRIPT, Keys::Movable(eval_keys);
+    SCRIPT = "SCRIPT", -2, &["noscript"], NONE;
     // Pub/sub
-    spec!("PUBLISH", 3, &["pubsub", "loading", "stale", "fast"], NONE),
-    spec!("PUBSUB", -2, &["pubsub", "loading", "stale"], NONE),
-    spec!("SUBSCRIBE", -2, PUBSUB, NONE),
-    spec!("UNSUBSCRIBE", -1, PUBSUB, NONE),
-    spec!("PSUBSCRIBE", -2, PUBSUB, NONE),
-    spec!("PUNSUBSCRIBE", -1, PUBSUB, NONE),
+    PUBLISH = "PUBLISH", 3, &["pubsub", "loading", "stale", "fast"], NONE;
+    PUBSUB = "PUBSUB", -2, &["pubsub", "loading", "stale"], NONE;
+    SUBSCRIBE = "SUBSCRIBE", -2, PUBSUB, NONE;
+    UNSUBSCRIBE = "UNSUBSCRIBE", -1, PUBSUB, NONE;
+    PSUBSCRIBE = "PSUBSCRIBE", -2, PUBSUB, NONE;
+    PUNSUBSCRIBE = "PUNSUBSCRIBE", -1, PUBSUB, NONE;
     // Generic keys
-    spec!("DEL", -2, W, ALL),
-    spec!("UNLINK", -2, WF, ALL),
-    spec!("EXISTS", -2, ROF, ALL),
-    spec!("TOUCH", -2, ROF, ALL),
-    spec!("TYPE", 2, ROF, K1),
-    spec!("EXPIRE", -3, WF, K1),
-    spec!("PEXPIRE", -3, WF, K1),
-    spec!("EXPIREAT", -3, WF, K1),
-    spec!("PEXPIREAT", -3, WF, K1),
-    spec!("EXPIRETIME", 2, ROF, K1),
-    spec!("PEXPIRETIME", 2, ROF, K1),
-    spec!("TTL", 2, ROF, K1),
-    spec!("PTTL", 2, ROF, K1),
-    spec!("PERSIST", 2, WF, K1),
-    spec!("RENAME", 3, W, r(1, 2, 1)),
-    spec!("RENAMENX", 3, WF, r(1, 2, 1)),
-    spec!("MOVE", 3, WF, K1),
-    spec!("KEYS", 2, RO, NONE),
-    spec!("SCAN", -2, RO, NONE),
-    spec!("RANDOMKEY", 1, RO, NONE),
-    spec!("OBJECT", -2, RO, Keys::Movable(second_arg_key)),
-    spec!("DUMP", 2, RO, K1),
-    spec!("RESTORE", -4, WD, K1),
-    spec!("SORT", -2, WD, Keys::Movable(sort_keys)),
+    DEL = "DEL", -2, W, ALL;
+    UNLINK = "UNLINK", -2, WF, ALL;
+    EXISTS = "EXISTS", -2, ROF, ALL;
+    TOUCH = "TOUCH", -2, ROF, ALL;
+    TYPE = "TYPE", 2, ROF, K1;
+    EXPIRE = "EXPIRE", -3, WF, K1;
+    PEXPIRE = "PEXPIRE", -3, WF, K1;
+    EXPIREAT = "EXPIREAT", -3, WF, K1;
+    PEXPIREAT = "PEXPIREAT", -3, WF, K1;
+    EXPIRETIME = "EXPIRETIME", 2, ROF, K1;
+    PEXPIRETIME = "PEXPIRETIME", 2, ROF, K1;
+    TTL = "TTL", 2, ROF, K1;
+    PTTL = "PTTL", 2, ROF, K1;
+    PERSIST = "PERSIST", 2, WF, K1;
+    RENAME = "RENAME", 3, W, r(1, 2, 1);
+    RENAMENX = "RENAMENX", 3, WF, r(1, 2, 1);
+    MOVE = "MOVE", 3, WF, K1;
+    KEYS = "KEYS", 2, RO, NONE;
+    SCAN = "SCAN", -2, RO, NONE;
+    RANDOMKEY = "RANDOMKEY", 1, RO, NONE;
+    OBJECT = "OBJECT", -2, RO, Keys::Movable(second_arg_key);
+    DUMP = "DUMP", 2, RO, K1;
+    RESTORE = "RESTORE", -4, WD, K1;
+    SORT = "SORT", -2, WD, Keys::Movable(sort_keys);
     // Strings
-    spec!("GET", 2, ROF, K1),
-    spec!("SET", -3, WD, K1),
-    spec!("SETNX", 3, WDF, K1),
-    spec!("SETEX", 4, WD, K1),
-    spec!("PSETEX", 4, WD, K1),
-    spec!("GETSET", 3, WDF, K1),
-    spec!("GETDEL", 2, WF, K1),
-    spec!("GETEX", -2, WF, K1),
-    spec!("MGET", -2, ROF, ALL),
-    spec!("MSET", -3, WD, PAIRS),
-    spec!("MSETNX", -3, WD, PAIRS),
-    spec!("INCR", 2, WDF, K1),
-    spec!("DECR", 2, WDF, K1),
-    spec!("INCRBY", 3, WDF, K1),
-    spec!("DECRBY", 3, WDF, K1),
-    spec!("INCRBYFLOAT", 3, WDF, K1),
-    spec!("APPEND", 3, WDF, K1),
-    spec!("STRLEN", 2, ROF, K1),
-    spec!("GETRANGE", 4, RO, K1),
-    spec!("SUBSTR", 4, RO, K1),
-    spec!("SETRANGE", 4, WD, K1),
-    spec!("SETBIT", 4, WD, K1),
-    spec!("GETBIT", 3, ROF, K1),
-    spec!("BITCOUNT", -2, RO, K1),
-    spec!("BITOP", -4, WD, r(2, -1, 1)),
+    GET = "GET", 2, ROF, K1;
+    SET = "SET", -3, WD, K1;
+    SETNX = "SETNX", 3, WDF, K1;
+    SETEX = "SETEX", 4, WD, K1;
+    PSETEX = "PSETEX", 4, WD, K1;
+    GETSET = "GETSET", 3, WDF, K1;
+    GETDEL = "GETDEL", 2, WF, K1;
+    GETEX = "GETEX", -2, WF, K1;
+    MGET = "MGET", -2, ROF, ALL;
+    MSET = "MSET", -3, WD, PAIRS;
+    MSETNX = "MSETNX", -3, WD, PAIRS;
+    INCR = "INCR", 2, WDF, K1;
+    DECR = "DECR", 2, WDF, K1;
+    INCRBY = "INCRBY", 3, WDF, K1;
+    DECRBY = "DECRBY", 3, WDF, K1;
+    INCRBYFLOAT = "INCRBYFLOAT", 3, WDF, K1;
+    APPEND = "APPEND", 3, WDF, K1;
+    STRLEN = "STRLEN", 2, ROF, K1;
+    GETRANGE = "GETRANGE", 4, RO, K1;
+    SUBSTR = "SUBSTR", 4, RO, K1;
+    SETRANGE = "SETRANGE", 4, WD, K1;
+    SETBIT = "SETBIT", 4, WD, K1;
+    GETBIT = "GETBIT", 3, ROF, K1;
+    BITCOUNT = "BITCOUNT", -2, RO, K1;
+    BITOP = "BITOP", -4, WD, r(2, -1, 1);
     // Lists
-    spec!("LPUSH", -3, WDF, K1),
-    spec!("RPUSH", -3, WDF, K1),
-    spec!("LPOP", -2, WF, K1),
-    spec!("RPOP", -2, WF, K1),
-    spec!("LLEN", 2, ROF, K1),
-    spec!("LINDEX", 3, RO, K1),
-    spec!("LSET", 4, WD, K1),
-    spec!("LRANGE", 4, RO, K1),
-    spec!("LINSERT", 5, WD, K1),
-    spec!("LREM", 4, W, K1),
-    spec!("LTRIM", 4, W, K1),
+    LPUSH = "LPUSH", -3, WDF, K1;
+    RPUSH = "RPUSH", -3, WDF, K1;
+    LPOP = "LPOP", -2, WF, K1;
+    RPOP = "RPOP", -2, WF, K1;
+    LLEN = "LLEN", 2, ROF, K1;
+    LINDEX = "LINDEX", 3, RO, K1;
+    LSET = "LSET", 4, WD, K1;
+    LRANGE = "LRANGE", 4, RO, K1;
+    LINSERT = "LINSERT", 5, WD, K1;
+    LREM = "LREM", 4, W, K1;
+    LTRIM = "LTRIM", 4, W, K1;
     // Hashes
-    spec!("HSET", -4, WDF, K1),
-    spec!("HMSET", -4, WDF, K1),
-    spec!("HSETNX", 4, WDF, K1),
-    spec!("HGET", 3, ROF, K1),
-    spec!("HMGET", -3, ROF, K1),
-    spec!("HDEL", -3, WF, K1),
-    spec!("HGETALL", 2, RO, K1),
-    spec!("HINCRBY", 4, WDF, K1),
-    spec!("HINCRBYFLOAT", 4, WDF, K1),
-    spec!("HKEYS", 2, RO, K1),
-    spec!("HVALS", 2, RO, K1),
-    spec!("HLEN", 2, ROF, K1),
-    spec!("HEXISTS", 3, ROF, K1),
-    spec!("HSCAN", -3, RO, K1),
+    HSET = "HSET", -4, WDF, K1;
+    HMSET = "HMSET", -4, WDF, K1;
+    HSETNX = "HSETNX", 4, WDF, K1;
+    HGET = "HGET", 3, ROF, K1;
+    HMGET = "HMGET", -3, ROF, K1;
+    HDEL = "HDEL", -3, WF, K1;
+    HGETALL = "HGETALL", 2, RO, K1;
+    HINCRBY = "HINCRBY", 4, WDF, K1;
+    HINCRBYFLOAT = "HINCRBYFLOAT", 4, WDF, K1;
+    HKEYS = "HKEYS", 2, RO, K1;
+    HVALS = "HVALS", 2, RO, K1;
+    HLEN = "HLEN", 2, ROF, K1;
+    HEXISTS = "HEXISTS", 3, ROF, K1;
+    HSCAN = "HSCAN", -3, RO, K1;
+    SSCAN = "SSCAN", -3, RO, K1;
     // Sets
-    spec!("SADD", -3, WDF, K1),
-    spec!("SREM", -3, WF, K1),
-    spec!("SMEMBERS", 2, RO, K1),
-    spec!("SISMEMBER", 3, ROF, K1),
-    spec!("SCARD", 2, ROF, K1),
-    spec!("SPOP", -2, WF, K1),
-    spec!("SRANDMEMBER", -2, RO, K1),
-    spec!("SMOVE", 4, WF, r(1, 2, 1)),
-    spec!("SINTER", -2, RO, ALL),
-    spec!("SUNION", -2, RO, ALL),
-    spec!("SDIFF", -2, RO, ALL),
-    spec!("SINTERSTORE", -3, WD, ALL),
-    spec!("SUNIONSTORE", -3, WD, ALL),
-    spec!("SDIFFSTORE", -3, WD, ALL),
+    SADD = "SADD", -3, WDF, K1;
+    SREM = "SREM", -3, WF, K1;
+    SMEMBERS = "SMEMBERS", 2, RO, K1;
+    SISMEMBER = "SISMEMBER", 3, ROF, K1;
+    SCARD = "SCARD", 2, ROF, K1;
+    SPOP = "SPOP", -2, WF, K1;
+    SRANDMEMBER = "SRANDMEMBER", -2, RO, K1;
+    SMOVE = "SMOVE", 4, WF, r(1, 2, 1);
+    SINTER = "SINTER", -2, RO, ALL;
+    SUNION = "SUNION", -2, RO, ALL;
+    SDIFF = "SDIFF", -2, RO, ALL;
+    SINTERSTORE = "SINTERSTORE", -3, WD, ALL;
+    SUNIONSTORE = "SUNIONSTORE", -3, WD, ALL;
+    SDIFFSTORE = "SDIFFSTORE", -3, WD, ALL;
     // Sorted sets
-    spec!("ZADD", -4, WDF, K1),
-    spec!("ZREM", -3, WF, K1),
-    spec!("ZSCORE", 3, ROF, K1),
-    spec!("ZCARD", 2, ROF, K1),
-    spec!("ZRANK", -3, ROF, K1),
-    spec!("ZREVRANK", -3, ROF, K1),
-    spec!("ZINCRBY", 4, WDF, K1),
-    spec!("ZCOUNT", 4, ROF, K1),
-    spec!("ZRANGE", -4, RO, K1),
-    spec!("ZREVRANGE", -4, RO, K1),
-    spec!("ZRANGEBYSCORE", -4, RO, K1),
-    spec!("ZREVRANGEBYSCORE", -4, RO, K1),
-    spec!("ZRANGEBYLEX", -4, RO, K1),
-    spec!("ZREVRANGEBYLEX", -4, RO, K1),
-    spec!("ZLEXCOUNT", 4, ROF, K1),
-    spec!("ZREMRANGEBYLEX", 4, W, K1),
-    spec!("ZREMRANGEBYSCORE", 4, W, K1),
-    spec!("ZREMRANGEBYRANK", 4, W, K1),
-    spec!("ZPOPMIN", -2, WF, K1),
-    spec!("ZPOPMAX", -2, WF, K1),
-    spec!("ZUNIONSTORE", -4, WD, Keys::Movable(zstore_keys)),
-    spec!("ZINTERSTORE", -4, WD, Keys::Movable(zstore_keys)),
-    spec!("ZSCAN", -3, RO, K1),
+    ZADD = "ZADD", -4, WDF, K1;
+    ZREM = "ZREM", -3, WF, K1;
+    ZSCORE = "ZSCORE", 3, ROF, K1;
+    ZCARD = "ZCARD", 2, ROF, K1;
+    ZRANK = "ZRANK", -3, ROF, K1;
+    ZREVRANK = "ZREVRANK", -3, ROF, K1;
+    ZINCRBY = "ZINCRBY", 4, WDF, K1;
+    ZCOUNT = "ZCOUNT", 4, ROF, K1;
+    ZRANGE = "ZRANGE", -4, RO, K1;
+    ZREVRANGE = "ZREVRANGE", -4, RO, K1;
+    ZRANGEBYSCORE = "ZRANGEBYSCORE", -4, RO, K1;
+    ZREVRANGEBYSCORE = "ZREVRANGEBYSCORE", -4, RO, K1;
+    ZRANGEBYLEX = "ZRANGEBYLEX", -4, RO, K1;
+    ZREVRANGEBYLEX = "ZREVRANGEBYLEX", -4, RO, K1;
+    ZLEXCOUNT = "ZLEXCOUNT", 4, ROF, K1;
+    ZREMRANGEBYLEX = "ZREMRANGEBYLEX", 4, W, K1;
+    ZREMRANGEBYSCORE = "ZREMRANGEBYSCORE", 4, W, K1;
+    ZREMRANGEBYRANK = "ZREMRANGEBYRANK", 4, W, K1;
+    ZPOPMIN = "ZPOPMIN", -2, WF, K1;
+    ZPOPMAX = "ZPOPMAX", -2, WF, K1;
+    ZUNIONSTORE = "ZUNIONSTORE", -4, WD, Keys::Movable(zstore_keys);
+    ZINTERSTORE = "ZINTERSTORE", -4, WD, Keys::Movable(zstore_keys);
+    ZSCAN = "ZSCAN", -3, RO, K1;
     // Geo
-    spec!("GEOADD", -5, WD, K1),
-    spec!("GEOPOS", -2, RO, K1),
-    spec!("GEOHASH", -2, RO, K1),
-    spec!("GEODIST", -4, RO, K1),
-    spec!("GEOSEARCH", -7, RO, K1),
-    spec!("GEOSEARCHSTORE", -8, WD, r(1, 2, 1)),
+    GEOADD = "GEOADD", -5, WD, K1;
+    GEOPOS = "GEOPOS", -2, RO, K1;
+    GEOHASH = "GEOHASH", -2, RO, K1;
+    GEODIST = "GEODIST", -4, RO, K1;
+    GEOSEARCH = "GEOSEARCH", -7, RO, K1;
+    GEOSEARCHSTORE = "GEOSEARCHSTORE", -8, WD, r(1, 2, 1);
     // Streams
-    spec!("XADD", -5, WDF, K1),
-    spec!("XLEN", 2, ROF, K1),
-    spec!("XRANGE", -4, RO, K1),
-    spec!("XREVRANGE", -4, RO, K1),
-    spec!(
-        "XREAD",
-        -4,
-        &["readonly", "movablekeys"],
-        Keys::Movable(streams_keys)
-    ),
-    spec!(
-        "XREADGROUP",
-        -7,
-        &["write", "movablekeys"],
-        Keys::Movable(streams_keys)
-    ),
-    spec!("XDEL", -3, WF, K1),
-    spec!("XTRIM", -4, W, K1),
-    spec!("XINFO", -2, RO, Keys::Movable(second_arg_key)),
-    spec!("XGROUP", -2, W, Keys::Movable(second_arg_key)),
-    spec!("XACK", -4, WF, K1),
-    spec!("XPENDING", -3, RO, K1),
+    XADD = "XADD", -5, WDF, K1;
+    XLEN = "XLEN", 2, ROF, K1;
+    XRANGE = "XRANGE", -4, RO, K1;
+    XREVRANGE = "XREVRANGE", -4, RO, K1;
+    XREAD = "XREAD", -4, &["readonly", "movablekeys"], Keys::Movable(streams_keys);
+    XREADGROUP = "XREADGROUP", -7, &["write", "movablekeys"], Keys::Movable(streams_keys);
+    XDEL = "XDEL", -3, WF, K1;
+    XTRIM = "XTRIM", -4, W, K1;
+    XINFO = "XINFO", -2, RO, Keys::Movable(second_arg_key);
+    XGROUP = "XGROUP", -2, W, Keys::Movable(second_arg_key);
+    XACK = "XACK", -4, WF, K1;
+    XPENDING = "XPENDING", -3, RO, K1;
     // HyperLogLog
-    spec!("PFADD", -2, WDF, K1),
-    spec!("PFCOUNT", -2, RO, ALL),
-    spec!("PFMERGE", -2, WD, ALL),
+    PFADD = "PFADD", -2, WDF, K1;
+    PFCOUNT = "PFCOUNT", -2, RO, ALL;
+    PFMERGE = "PFMERGE", -2, WD, ALL;
     // Bloom filters
-    spec!("BF.RESERVE", -4, WD, K1),
-    spec!("BF.ADD", 3, WDF, K1),
-    spec!("BF.MADD", -3, WDF, K1),
-    spec!("BF.EXISTS", 3, ROF, K1),
-    spec!("BF.MEXISTS", -3, ROF, K1),
-    spec!("BF.INFO", -2, ROF, K1),
-];
+    BF_RESERVE = "BF.RESERVE", -4, WD, K1;
+    BF_ADD = "BF.ADD", 3, WDF, K1;
+    BF_MADD = "BF.MADD", -3, WDF, K1;
+    BF_EXISTS = "BF.EXISTS", 3, ROF, K1;
+    BF_MEXISTS = "BF.MEXISTS", -3, ROF, K1;
+    BF_INFO = "BF.INFO", -2, ROF, K1;
+}
 
-fn table() -> &'static HashMap<&'static str, &'static CommandSpec> {
-    static T: OnceLock<HashMap<&'static str, &'static CommandSpec>> = OnceLock::new();
-    T.get_or_init(|| SPECS.iter().map(|s| (s.name, s)).collect())
+type Table = HashMap<&'static [u8], &'static CommandSpec, solikv_core::FastHasher>;
+
+fn table() -> &'static Table {
+    static T: OnceLock<Table> = OnceLock::new();
+    T.get_or_init(|| SPECS.iter().map(|s| (s.name.as_bytes(), s)).collect())
 }
 
 /// The spec of `name` (upper case).
+#[inline]
 pub fn lookup(name: &str) -> Option<&'static CommandSpec> {
-    table().get(name).copied()
+    table().get(name.as_bytes()).copied()
+}
+
+/// The spec of a command name as a client sent it, in any case — no
+/// allocation: short names are upper-cased on the stack.
+#[inline]
+pub fn lookup_ci(name: &[u8]) -> Option<&'static CommandSpec> {
+    let mut buf = [0u8; 32];
+    if name.len() > buf.len() {
+        return None;
+    }
+    let up = &mut buf[..name.len()];
+    for (d, s) in up.iter_mut().zip(name) {
+        *d = s.to_ascii_uppercase();
+    }
+    table().get(&*up).copied()
+}
+
+/// The spec of command `id`.
+#[inline]
+pub fn spec(id: Cmd) -> Option<&'static CommandSpec> {
+    SPECS.get(id as usize)
 }
 
 /// Every command, in table order.
@@ -480,6 +563,20 @@ mod tests {
         let set = lookup("SET").unwrap();
         assert!(!set.arity_ok(1));
         assert!(set.arity_ok(5));
+    }
+
+    #[test]
+    fn ids_index_the_table_and_bits_match_flags() {
+        for (i, s) in all().iter().enumerate() {
+            assert_eq!(s.id as usize, i);
+            assert_eq!(spec(s.id).unwrap().name, s.name);
+            assert_eq!(s.is_write(), s.flags.contains(&"write"), "{}", s.name);
+            assert_eq!(s.has(F_DENYOOM), s.flags.contains(&"denyoom"), "{}", s.name);
+        }
+        assert_eq!(lookup_ci(b"gEt").unwrap().id, Cmd::GET);
+        assert_eq!(lookup_ci(b"bf.add").unwrap().id, Cmd::BF_ADD);
+        assert!(lookup_ci(b"nosuchcommand").is_none());
+        assert!(lookup_ci(&[b'x'; 100]).is_none());
     }
 
     #[test]

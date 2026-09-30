@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Mutex, MutexGuard};
@@ -28,6 +28,9 @@ struct Shared {
     frozen: AtomicBool,
     /// Keys clients `WATCH` (marked by writes under the shard lock).
     watch: WatchRegistry,
+    /// `INFO stats` counters.
+    expired_keys: std::sync::atomic::AtomicU64,
+    evicted_keys: std::sync::atomic::AtomicU64,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,15 +213,9 @@ impl Drop for SoloEntry<'_> {
 
 enum StoreBackend {
     /// Multi-threaded / multi-shard path (mutex per shard).
-    Locked {
-        store: Arc<Mutex<ShardStore>>,
-        tick: Arc<AtomicU64>,
-    },
+    Locked { store: Arc<Mutex<ShardStore>> },
     /// Redis-shaped single-thread path: no mutex on the hot path.
-    Solo {
-        store: Arc<SoloStore>,
-        tick: AtomicU64,
-    },
+    Solo { store: Arc<SoloStore> },
 }
 
 /// Handle to a shard's store.
@@ -250,19 +247,19 @@ impl ShardHandle {
 
     /// Run `f` with the store, locked (or, solo, on the only thread).
     #[inline]
-    fn locked<T>(&self, f: impl FnOnce(&mut ShardStore, &AtomicU64) -> T) -> T {
+    fn locked<T>(&self, f: impl FnOnce(&mut ShardStore, ()) -> T) -> T {
         match self.backend.as_ref() {
-            StoreBackend::Locked { store, tick } => {
+            StoreBackend::Locked { store } => {
                 if let Some(p) = held_store(&self.shared, self.index) {
                     // SAFETY: this thread holds the shard's lock (a guard in
                     // a live `HeldShards`), and nothing else uses the store
                     // through that guard while the pointer is registered.
-                    return f(unsafe { &mut *p }, tick);
+                    return f(unsafe { &mut *p }, ());
                 }
                 let mut guard = store.lock();
-                f(&mut guard, tick)
+                f(&mut guard, ())
             }
-            StoreBackend::Solo { store, tick } => store.with_mut(|s| f(s, tick)),
+            StoreBackend::Solo { store } => store.with_mut(|s| f(s, ())),
         }
     }
 
@@ -296,28 +293,16 @@ impl ShardHandle {
     {
         let aof = self.shared.aof.get();
         let db = current_db();
-        let (result, lazy_expired, active_expired) = self.locked(|store, tick| {
+        let (result, lazy_expired) = self.locked(|store, _| {
             // Checked under the lock: once `freeze` has taken and released
             // this lock, nothing changes the store again.
             if self.shared.frozen.load(Ordering::Relaxed) {
-                return (
-                    CommandResponse::error(SHUTTING_DOWN),
-                    Vec::new(),
-                    Vec::new(),
-                );
+                return (CommandResponse::error(SHUTTING_DOWN), Vec::new());
             }
             store.select(db);
             let mut effects = Effects::new(aof.is_some());
             let result = f(store, &mut effects);
             let lazy_expired = std::mem::take(&mut store.expired_buffer);
-            // Relaxed atomic is enough; solo is single-threaded so this is
-            // essentially a plain load/store without cache-line contention.
-            let t = tick.fetch_add(1, Ordering::Relaxed);
-            let active_expired = if t.is_multiple_of(100) {
-                store.run_active_expiry()
-            } else {
-                Vec::new()
-            };
             if let Some(w) = aof {
                 crate::aof_log::log_under_lock(
                     w,
@@ -326,7 +311,7 @@ impl ShardHandle {
                     &result,
                     &lazy_expired,
                     explicit.then_some(&mut effects),
-                    &active_expired,
+                    &[],
                 );
             }
             // Still under the lock: see `watch` for why that matters.
@@ -335,18 +320,92 @@ impl ShardHandle {
                 if !result.is_error() {
                     crate::watch::mark_running(watch);
                 }
-                for (d, k) in lazy_expired.iter().chain(active_expired.iter()) {
+                for (d, k) in lazy_expired.iter() {
                     watch.touch(*d, k);
                 }
             }
-            (result, lazy_expired, active_expired)
+            (result, lazy_expired)
         });
 
-        self.emit_expired_notifications(&lazy_expired);
-        if !active_expired.is_empty() {
-            self.emit_expired_notifications(&active_expired);
+        if !lazy_expired.is_empty() {
+            self.shared
+                .expired_keys
+                .fetch_add(lazy_expired.len() as u64, Ordering::Relaxed);
+            self.emit_expired_notifications(&lazy_expired);
         }
         result
+    }
+
+    /// Remove keys under the lock with `remove` (active expiry, eviction),
+    /// logging each as a `DEL` and marking watchers, as a command's own
+    /// expiries are. Returns the keys removed with their databases.
+    fn remove_keys(
+        &self,
+        remove: impl FnOnce(&mut ShardStore) -> Vec<(u32, Bytes)>,
+    ) -> Vec<(u32, Bytes)> {
+        let aof = self.shared.aof.get();
+        self.locked(|store, _| {
+            if self.shared.frozen.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            let mut removed = std::mem::take(&mut store.expired_buffer);
+            removed.extend(remove(store));
+            if removed.is_empty() {
+                return removed;
+            }
+            if let Some(w) = aof {
+                crate::aof_log::log_under_lock(
+                    w,
+                    self.index,
+                    store.db(),
+                    &CommandResponse::Ok,
+                    &[],
+                    None,
+                    &removed,
+                );
+            }
+            let watch = &self.shared.watch;
+            if watch.is_active() {
+                for (d, k) in removed.iter() {
+                    watch.touch(*d, k);
+                }
+            }
+            removed
+        })
+    }
+
+    /// One active-expiry cycle on this shard (Redis' `activeExpireCycle`,
+    /// see `ShardStore::active_expire_cycle`), run by the server's timer so
+    /// keys expire whether or not anything touches them. Logged and
+    /// announced like lazy expiry.
+    pub fn active_expire_cycle(&self, budget: std::time::Duration) -> usize {
+        let removed = self.remove_keys(|store| store.active_expire_cycle(budget));
+        if !removed.is_empty() {
+            self.shared
+                .expired_keys
+                .fetch_add(removed.len() as u64, Ordering::Relaxed);
+            self.emit_expired_notifications(&removed);
+        }
+        removed.len()
+    }
+
+    /// Evict one key under `policy` (see `ShardStore::evict_one`); logged
+    /// as a `DEL` and announced as `evicted`.
+    pub fn evict_one(
+        &self,
+        policy: solikv_core::store::EvictionPolicy,
+        samples: usize,
+    ) -> Option<(u32, Bytes)> {
+        let removed =
+            self.remove_keys(|store| store.evict_one(policy, samples).into_iter().collect());
+        let evicted = removed.last().cloned();
+        self.emit_notifications(&removed, crate::dispatch::NOTIFY_EVICTED, "evicted");
+        evicted
+    }
+
+    /// Keys evictable under `policy` on this shard.
+    pub fn evictable(&self, policy: solikv_core::store::EvictionPolicy) -> usize {
+        self.with_store(|s| s.evictable(policy))
     }
 
     /// Append a record to this shard's log under its lock (transaction
@@ -363,6 +422,10 @@ impl ShardHandle {
     }
 
     fn emit_expired_notifications(&self, keys: &[(u32, Bytes)]) {
+        self.emit_notifications(keys, NOTIFY_EXPIRED, "expired");
+    }
+
+    fn emit_notifications(&self, keys: &[(u32, Bytes)], class: u16, event: &'static str) {
         if keys.is_empty() {
             return;
         }
@@ -370,17 +433,17 @@ impl ShardHandle {
             return;
         };
         let flags = nf.load(Ordering::Relaxed);
-        if flags == 0 || flags & NOTIFY_EXPIRED == 0 {
+        if flags == 0 || flags & class == 0 {
             return;
         }
         for (db, key) in keys {
-            let key_str = String::from_utf8_lossy(key);
             if flags & NOTIFY_KEYSPACE != 0 {
+                let key_str = String::from_utf8_lossy(key);
                 let channel = Bytes::from(format!("__keyspace@{}__:{}", db, key_str));
-                pubsub.publish(channel, Bytes::from("expired"));
+                pubsub.publish(channel, Bytes::from_static(event.as_bytes()));
             }
             if flags & NOTIFY_KEYEVENT != 0 {
-                let channel = Bytes::from(format!("__keyevent@{}__:expired", db));
+                let channel = Bytes::from(format!("__keyevent@{}__:{}", db, event));
                 pubsub.publish(channel, key.clone());
             }
         }
@@ -391,7 +454,7 @@ impl ShardHandle {
         F: FnOnce(&ShardStore) -> R,
     {
         match self.backend.as_ref() {
-            StoreBackend::Locked { store, .. } => {
+            StoreBackend::Locked { store } => {
                 if let Some(p) = held_store(&self.shared, self.index) {
                     // SAFETY: see `locked`.
                     return f(unsafe { &*p });
@@ -476,12 +539,10 @@ impl ShardManager {
             let backend = if solo {
                 StoreBackend::Solo {
                     store: Arc::new(SoloStore::new()),
-                    tick: AtomicU64::new(0),
                 }
             } else {
                 StoreBackend::Locked {
                     store: Arc::new(Mutex::new(ShardStore::new())),
-                    tick: Arc::new(AtomicU64::new(0)),
                 }
             };
             shards.push(ShardHandle::new(
@@ -544,6 +605,20 @@ impl ShardManager {
         solikv_core::keyspace::hash_slot(key) as usize % self.num_shards
     }
 
+    /// Keys expired so far (`INFO stats`).
+    pub fn expired_keys(&self) -> u64 {
+        self.shared.expired_keys.load(Ordering::Relaxed)
+    }
+
+    /// Keys evicted so far (`INFO stats`).
+    pub fn evicted_keys(&self) -> u64 {
+        self.shared.evicted_keys.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_evicted(&self, n: u64) {
+        self.shared.evicted_keys.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// The watch registry (`WATCH`).
     pub fn watch(&self) -> &WatchRegistry {
         &self.shared.watch
@@ -582,7 +657,7 @@ impl ShardManager {
             if !outermost && held_store(&self.shared, i as u32).is_some() {
                 continue;
             }
-            let StoreBackend::Locked { store, .. } = self.shards[i].backend.as_ref() else {
+            let StoreBackend::Locked { store } = self.shards[i].backend.as_ref() else {
                 continue;
             };
             guards.push((i as u32, store.lock()));
@@ -602,6 +677,25 @@ impl ShardManager {
             HELD_OWNER.with(|o| o.set(me));
         }
         HeldShards { guards, outermost }
+    }
+
+    /// Shard `idx`'s store while `held` holds it (shared borrow, for
+    /// operations that read several shards at once). `None` if not held.
+    ///
+    /// # Safety
+    /// While the returned reference lives, the caller must not run anything
+    /// against shard `idx` (`execute`, `with_store_mut_unlogged`, …): those
+    /// reach the same store through the held lock, mutably.
+    pub unsafe fn held_store<'a>(
+        &'a self,
+        held: &'a HeldShards<'_>,
+        idx: usize,
+    ) -> Option<&'a ShardStore> {
+        let _ = held;
+        // SAFETY: registered by a live `HeldShards` on this thread, whose
+        // guard keeps the lock for at least `'a`; exclusivity is the
+        // caller's contract above.
+        held_store(&self.shared, idx as u32).map(|p| unsafe { &*p })
     }
 
     /// [`lock_shards`](Self::lock_shards) for the shards owning `keys`.

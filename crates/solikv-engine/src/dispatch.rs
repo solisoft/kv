@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 
+use solikv_core::store::EvictionPolicy;
 use solikv_core::types::*;
 use solikv_core::zset_ops::{Aggregate, LexBound, ScoreBound, ZRangeBy, ZRangeQuery};
 
@@ -150,6 +151,7 @@ fn parse_stream_trim(
 use solikv_persist::AofWriter;
 use solikv_pubsub::PubSubBroker;
 
+use crate::commands::Cmd;
 use crate::lua::ScriptCache;
 use crate::persistence::{PersistConfig, Persistence};
 use crate::session::{ClientRegistry, ReplyMode, Session};
@@ -196,7 +198,28 @@ pub struct CommandEngine {
     clients: Arc<ClientRegistry>,
     /// Port the RESP server listens on, for `INFO`.
     tcp_port: std::sync::atomic::AtomicU32,
+    /// `maxmemory` in bytes (0 = no limit), `maxmemory-policy` and
+    /// `maxmemory-samples` (see [`CommandEngine::free_memory`]).
+    maxmemory: AtomicU64,
+    maxmemory_policy: std::sync::atomic::AtomicU8,
+    maxmemory_samples: std::sync::atomic::AtomicUsize,
 }
+
+/// The `maxmemory-policy` values, in the order `maxmemory_policy` stores
+/// them.
+const POLICIES: [EvictionPolicy; 8] = [
+    EvictionPolicy::NoEviction,
+    EvictionPolicy::AllKeysLru,
+    EvictionPolicy::VolatileLru,
+    EvictionPolicy::AllKeysLfu,
+    EvictionPolicy::VolatileLfu,
+    EvictionPolicy::AllKeysRandom,
+    EvictionPolicy::VolatileRandom,
+    EvictionPolicy::VolatileTtl,
+];
+
+/// Reply to a write refused for memory (Redis' wording).
+pub const OOM_ERROR: &str = "OOM command not allowed when used memory > 'maxmemory'.";
 
 /// Default for [`CommandEngine::with_lua_memory_limit`]: 64 MB.
 pub const DEFAULT_LUA_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
@@ -217,6 +240,80 @@ impl CommandEngine {
             databases: DEFAULT_DATABASES,
             clients: Arc::new(ClientRegistry::default()),
             tcp_port: std::sync::atomic::AtomicU32::new(6379),
+            maxmemory: AtomicU64::new(0),
+            maxmemory_policy: std::sync::atomic::AtomicU8::new(0),
+            maxmemory_samples: std::sync::atomic::AtomicUsize::new(5),
+        }
+    }
+
+    /// Cap memory at `bytes` (0 = none), evicting by `policy`.
+    pub fn with_maxmemory(self, bytes: u64, policy: EvictionPolicy, samples: usize) -> Self {
+        self.set_maxmemory(bytes);
+        self.set_maxmemory_policy(policy);
+        self.maxmemory_samples
+            .store(samples.max(1), Ordering::Relaxed);
+        self
+    }
+
+    pub fn set_maxmemory(&self, bytes: u64) {
+        self.maxmemory.store(bytes, Ordering::Relaxed);
+    }
+
+    pub fn set_maxmemory_policy(&self, policy: EvictionPolicy) {
+        let i = POLICIES.iter().position(|p| *p == policy).unwrap_or(0);
+        self.maxmemory_policy.store(i as u8, Ordering::Relaxed);
+        solikv_core::access::set_lfu(policy.is_lfu());
+    }
+
+    pub fn maxmemory_policy(&self) -> EvictionPolicy {
+        POLICIES[self.maxmemory_policy.load(Ordering::Relaxed) as usize % POLICIES.len()]
+    }
+
+    /// Before a command that can grow the dataset: if memory is over
+    /// `maxmemory`, evict keys by the policy until it is not (Redis'
+    /// `performEvictions`). Err(OOM) when the policy forbids evicting or
+    /// nothing evictable is left. Shards are visited in turn, each sampling
+    /// `maxmemory-samples` keys and dropping the best candidate.
+    pub fn free_memory(&self) -> Result<(), CommandResponse> {
+        let limit = self.maxmemory.load(Ordering::Relaxed);
+        if limit == 0 || !solikv_core::memory::is_enabled() {
+            return Ok(());
+        }
+        if (solikv_core::memory::used() as u64) <= limit {
+            return Ok(());
+        }
+        let policy = self.maxmemory_policy();
+        if policy == EvictionPolicy::NoEviction {
+            return Err(CommandResponse::error(OOM_ERROR));
+        }
+        let samples = self.maxmemory_samples.load(Ordering::Relaxed);
+        let shards = self.shards.all_shards();
+        let n = shards.len();
+        let start = (now_millis() as usize) % n;
+        // Bounded: a command never pays for more than this many evictions.
+        const MAX_EVICTIONS: usize = 4096;
+        let mut empty_in_a_row = 0;
+        for i in 0..MAX_EVICTIONS {
+            match shards[(start + i) % n].evict_one(policy, samples) {
+                Some(_) => {
+                    empty_in_a_row = 0;
+                    self.shards.note_evicted(1);
+                    if (solikv_core::memory::used() as u64) <= limit {
+                        return Ok(());
+                    }
+                }
+                None => {
+                    empty_in_a_row += 1;
+                    if empty_in_a_row >= n {
+                        break;
+                    }
+                }
+            }
+        }
+        if (solikv_core::memory::used() as u64) <= limit {
+            Ok(())
+        } else {
+            Err(CommandResponse::error(OOM_ERROR))
         }
     }
 
@@ -340,7 +437,18 @@ impl CommandEngine {
             }
         }
         let _depth = Depth;
-        let write = is_write_command(name);
+        // One hash lookup resolves the name: its arm, and its flags.
+        let spec = crate::commands::lookup(name);
+        let id = spec.map_or(Cmd::Unknown, |s| s.id);
+        let write = spec.is_some_and(|s| s.is_write()) || matches!(id, Cmd::EVAL | Cmd::EVALSHA);
+
+        if self.maxmemory.load(Ordering::Relaxed) != 0
+            && spec.is_some_and(|c| c.has(crate::commands::F_DENYOOM))
+        {
+            if let Err(oom) = self.free_memory() {
+                return oom;
+            }
+        }
 
         // With someone watching keys, tell the shards what this write
         // changes; they mark it under their lock (see `watch`).
@@ -354,9 +462,9 @@ impl CommandEngine {
             let mode = crate::aof_log::mode(name, write);
             let cmd = crate::aof_log::AutoCmd::new(name, args, mode);
             let _frame = crate::aof_log::FrameGuard::enter(mode, &cmd);
-            self.dispatch(name, args)
+            self.dispatch(id, name, args)
         } else {
-            self.dispatch(name, args)
+            self.dispatch(id, name, args)
         };
 
         if response.is_error() {
@@ -685,26 +793,26 @@ impl CommandEngine {
         }
     }
 
-    fn dispatch(&self, name: &str, args: &[Bytes]) -> CommandResponse {
-        match name {
+    fn dispatch(&self, id: Cmd, name: &str, args: &[Bytes]) -> CommandResponse {
+        match id {
             // ---- Server commands ----
-            "PING" => {
+            Cmd::PING => {
                 if args.is_empty() {
                     CommandResponse::simple("PONG")
                 } else {
                     CommandResponse::bulk(args[0].clone())
                 }
             }
-            "ECHO" => {
+            Cmd::ECHO => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("echo");
                 }
                 CommandResponse::bulk(args[0].clone())
             }
-            "COMMAND" => self.command_command(args),
-            "CONFIG" => self.config_command(args),
-            "INFO" => self.info(args),
-            "DBSIZE" => {
+            Cmd::COMMAND => self.command_command(args),
+            Cmd::CONFIG => self.config_command(args),
+            Cmd::INFO => self.info(args),
+            Cmd::DBSIZE => {
                 if !args.is_empty() {
                     return CommandResponse::wrong_arity("dbsize");
                 }
@@ -719,7 +827,7 @@ impl CommandEngine {
                 }
                 CommandResponse::integer(total)
             }
-            "FLUSHDB" | "FLUSHALL" => {
+            Cmd::FLUSHDB | Cmd::FLUSHALL => {
                 match args {
                     [] => {}
                     [mode]
@@ -749,7 +857,7 @@ impl CommandEngine {
                     CommandResponse::ok()
                 })
             }
-            "SWAPDB" => {
+            Cmd::SWAPDB => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("swapdb");
                 }
@@ -774,7 +882,7 @@ impl CommandEngine {
                 }
                 CommandResponse::ok()
             }
-            "SELECT" => {
+            Cmd::SELECT => {
                 // A connection's SELECT is handled by `execute_session`. Here
                 // only a script's: it switches the database of the script's
                 // later calls, and the caller's is restored after it.
@@ -793,9 +901,9 @@ impl CommandEngine {
                 crate::shard::set_current_db(db);
                 CommandResponse::ok()
             }
-            "QUIT" => CommandResponse::ok(),
-            "RESET" => CommandResponse::simple("RESET"),
-            "CLIENT" | "MULTI" | "EXEC" | "DISCARD" | "WATCH" | "UNWATCH" => {
+            Cmd::QUIT => CommandResponse::ok(),
+            Cmd::RESET => CommandResponse::simple("RESET"),
+            Cmd::CLIENT | Cmd::MULTI | Cmd::EXEC | Cmd::DISCARD | Cmd::WATCH | Cmd::UNWATCH => {
                 CommandResponse::error(format!(
                     "ERR {} is only available on a RESP connection",
                     name
@@ -803,7 +911,7 @@ impl CommandEngine {
             }
 
             // ---- Replication commands ----
-            "REPLICAOF" | "SLAVEOF" => {
+            Cmd::REPLICAOF | Cmd::SLAVEOF => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
@@ -814,14 +922,14 @@ impl CommandEngine {
                 }
                 CommandResponse::error("ERR replication is not supported by this server yet")
             }
-            "ROLE" => CommandResponse::array(vec![
+            Cmd::ROLE => CommandResponse::array(vec![
                 CommandResponse::bulk_string("master"),
                 CommandResponse::integer(self.replication_offset.load(Ordering::Relaxed) as i64),
                 CommandResponse::array(vec![]),
             ]),
 
             // ---- String commands ----
-            "GET" => {
+            Cmd::GET => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("get");
                 }
@@ -831,7 +939,7 @@ impl CommandEngine {
                     .shard_for_key(key)
                     .execute(|store| store.string_get(key))
             }
-            "SET" => {
+            Cmd::SET => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("set");
                 }
@@ -853,7 +961,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_set_opts(key, value, opts))
             }
-            "SETNX" => {
+            Cmd::SETNX => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("setnx");
                 }
@@ -863,7 +971,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_setnx(key, value))
             }
-            "SETEX" => {
+            Cmd::SETEX => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("setex");
                 }
@@ -887,7 +995,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_setex(key, seconds, value))
             }
-            "PSETEX" => {
+            Cmd::PSETEX => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("psetex");
                 }
@@ -911,7 +1019,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_psetex(key, millis, value))
             }
-            "GETSET" => {
+            Cmd::GETSET => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("getset");
                 }
@@ -921,7 +1029,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_getset(key, value))
             }
-            "GETDEL" => {
+            Cmd::GETDEL => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("getdel");
                 }
@@ -930,7 +1038,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_getdel(&key))
             }
-            "GETEX" => {
+            Cmd::GETEX => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("getex");
                 }
@@ -966,13 +1074,13 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_getex_at(&key, expire_at, persist))
             }
-            "MGET" => {
+            Cmd::MGET => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("mget");
                 }
                 multi_shard_mget(&self.shards, args)
             }
-            "MSET" => {
+            Cmd::MSET => {
                 if args.len() < 2 || !args.len().is_multiple_of(2) {
                     return CommandResponse::wrong_arity("mset");
                 }
@@ -982,7 +1090,7 @@ impl CommandEngine {
                     .collect();
                 multi_shard_mset(&self.shards, pairs)
             }
-            "MSETNX" => {
+            Cmd::MSETNX => {
                 if args.len() < 2 || !args.len().is_multiple_of(2) {
                     return CommandResponse::wrong_arity("msetnx");
                 }
@@ -992,7 +1100,7 @@ impl CommandEngine {
                     .collect();
                 multi_shard_msetnx(&self.shards, pairs)
             }
-            "INCR" => {
+            Cmd::INCR => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("incr");
                 }
@@ -1001,7 +1109,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_incr(&key))
             }
-            "DECR" => {
+            Cmd::DECR => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("decr");
                 }
@@ -1010,7 +1118,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_decr(&key))
             }
-            "INCRBY" => {
+            Cmd::INCRBY => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("incrby");
                 }
@@ -1030,7 +1138,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_incrby(&key, delta))
             }
-            "DECRBY" => {
+            Cmd::DECRBY => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("decrby");
                 }
@@ -1050,7 +1158,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_decrby(&key, delta))
             }
-            "INCRBYFLOAT" => {
+            Cmd::INCRBYFLOAT => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("incrbyfloat");
                 }
@@ -1066,7 +1174,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_incrbyfloat(&key, delta))
             }
-            "APPEND" => {
+            Cmd::APPEND => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("append");
                 }
@@ -1076,7 +1184,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_append(&key, &value))
             }
-            "STRLEN" => {
+            Cmd::STRLEN => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("strlen");
                 }
@@ -1085,7 +1193,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_strlen(&key))
             }
-            "GETRANGE" | "SUBSTR" => {
+            Cmd::GETRANGE | Cmd::SUBSTR => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("getrange");
                 }
@@ -1116,7 +1224,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_getrange(&key, start, end))
             }
-            "SETRANGE" => {
+            Cmd::SETRANGE => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("setrange");
                 }
@@ -1139,7 +1247,7 @@ impl CommandEngine {
             }
 
             // ---- Generic key commands ----
-            "DEL" | "UNLINK" => {
+            Cmd::DEL | Cmd::UNLINK => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
@@ -1180,7 +1288,7 @@ impl CommandEngine {
                 lazy_free(freed);
                 CommandResponse::integer(total)
             }
-            "EXISTS" | "TOUCH" => {
+            Cmd::EXISTS | Cmd::TOUCH => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
@@ -1197,7 +1305,7 @@ impl CommandEngine {
                 }
                 CommandResponse::integer(total)
             }
-            "MOVE" => {
+            Cmd::MOVE => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("move");
                 }
@@ -1222,7 +1330,7 @@ impl CommandEngine {
                     CommandResponse::integer(moved as i64)
                 })
             }
-            "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => {
+            Cmd::EXPIRE | Cmd::PEXPIRE | Cmd::EXPIREAT | Cmd::PEXPIREAT => {
                 let lname = name.to_lowercase();
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity(&lname);
@@ -1271,7 +1379,7 @@ impl CommandEngine {
                     CommandResponse::integer(store.expire_cond(&key, at, cond) as i64)
                 })
             }
-            "EXPIRETIME" | "PEXPIRETIME" => {
+            Cmd::EXPIRETIME | Cmd::PEXPIRETIME => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
@@ -1288,7 +1396,7 @@ impl CommandEngine {
                     })
                 })
             }
-            "TTL" => {
+            Cmd::TTL => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("ttl");
                 }
@@ -1297,7 +1405,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| CommandResponse::integer(store.ttl(&key)))
             }
-            "PTTL" => {
+            Cmd::PTTL => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("pttl");
                 }
@@ -1306,7 +1414,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| CommandResponse::integer(store.pttl(&key)))
             }
-            "PERSIST" => {
+            Cmd::PERSIST => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("persist");
                 }
@@ -1315,7 +1423,7 @@ impl CommandEngine {
                     CommandResponse::integer(if store.persist(&key) { 1 } else { 0 })
                 })
             }
-            "TYPE" => {
+            Cmd::TYPE => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("type");
                 }
@@ -1324,7 +1432,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| CommandResponse::simple(store.key_type(&key)))
             }
-            "RENAME" | "RENAMENX" => {
+            Cmd::RENAME | Cmd::RENAMENX => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
@@ -1394,7 +1502,7 @@ impl CommandEngine {
                     CommandResponse::ok()
                 }
             }
-            "KEYS" => {
+            Cmd::KEYS => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("keys");
                 }
@@ -1420,7 +1528,7 @@ impl CommandEngine {
                     CommandResponse::array(all_keys)
                 })
             }
-            "SCAN" => {
+            Cmd::SCAN => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("scan");
                 }
@@ -1436,8 +1544,8 @@ impl CommandEngine {
                 };
                 multi_shard_scan(&self.shards, cursor, pattern, count, type_filter)
             }
-            "RANDOMKEY" => multi_shard_randomkey(&self.shards),
-            "OBJECT" => {
+            Cmd::RANDOMKEY => multi_shard_randomkey(&self.shards),
+            Cmd::OBJECT => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("object");
                 }
@@ -1460,15 +1568,61 @@ impl CommandEngine {
                             }
                         })
                     }
-                    "REFCOUNT" | "IDLETIME" | "FREQ" | "HELP" => CommandResponse::integer(0),
+                    "IDLETIME" | "FREQ" | "REFCOUNT" => {
+                        if args.len() != 2 {
+                            return CommandResponse::wrong_arity(&format!(
+                                "object|{}",
+                                sub.to_lowercase()
+                            ));
+                        }
+                        let lfu = self.maxmemory_policy().is_lfu();
+                        if sub == "IDLETIME" && lfu {
+                            return CommandResponse::error(
+                                "ERR An LFU maxmemory policy is selected, idle time not tracked. \
+                                 Please note that when switching between policies at runtime LRU \
+                                 and LFU data will take some time to adjust.",
+                            );
+                        }
+                        if sub == "FREQ" && !lfu {
+                            return CommandResponse::error(
+                                "ERR An LFU maxmemory policy is not selected, access frequency \
+                                 not tracked. Please note that when switching between policies at \
+                                 runtime LRU and LFU data will take some time to adjust.",
+                            );
+                        }
+                        let key = args[1].clone();
+                        let sub2 = sub.clone();
+                        self.shards.shard_for_key(&key).execute(move |store| {
+                            match store.access_of(&key) {
+                                None => CommandResponse::nil(),
+                                Some(a) => CommandResponse::integer(match sub2.as_str() {
+                                    "IDLETIME" => solikv_core::access::idle_secs(a) as i64,
+                                    "FREQ" => solikv_core::access::decayed(a) as i64,
+                                    _ => 1,
+                                }),
+                            }
+                        })
+                    }
+                    "HELP" => CommandResponse::array(
+                        [
+                            "OBJECT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                            "ENCODING <key>",
+                            "FREQ <key>",
+                            "IDLETIME <key>",
+                            "REFCOUNT <key>",
+                        ]
+                        .iter()
+                        .map(|l| CommandResponse::simple(l))
+                        .collect(),
+                    ),
                     _ => CommandResponse::error("ERR Unknown subcommand"),
                 }
             }
-            "DUMP" | "RESTORE" => CommandResponse::error("ERR not implemented"),
-            "WAIT" => CommandResponse::integer(0),
+            Cmd::DUMP | Cmd::RESTORE => CommandResponse::error("ERR not implemented"),
+            Cmd::WAIT => CommandResponse::integer(0),
 
             // ---- List commands ----
-            "LPUSH" => {
+            Cmd::LPUSH => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("lpush");
                 }
@@ -1478,7 +1632,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.list_lpush(&key, values))
             }
-            "RPUSH" => {
+            Cmd::RPUSH => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("rpush");
                 }
@@ -1488,7 +1642,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.list_rpush(&key, values))
             }
-            "LPOP" => {
+            Cmd::LPOP => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("lpop");
                 }
@@ -1501,7 +1655,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.list_lpop(&key, count))
             }
-            "RPOP" => {
+            Cmd::RPOP => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("rpop");
                 }
@@ -1514,7 +1668,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.list_rpop(&key, count))
             }
-            "LLEN" => {
+            Cmd::LLEN => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("llen");
                 }
@@ -1523,7 +1677,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.list_llen(&key))
             }
-            "LINDEX" => {
+            Cmd::LINDEX => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("lindex");
                 }
@@ -1543,7 +1697,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.list_lindex(&key, index))
             }
-            "LSET" => {
+            Cmd::LSET => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("lset");
                 }
@@ -1564,7 +1718,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.list_lset(&key, index, value))
             }
-            "LRANGE" => {
+            Cmd::LRANGE => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("lrange");
                 }
@@ -1595,7 +1749,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.list_lrange(&key, start, stop))
             }
-            "LINSERT" => {
+            Cmd::LINSERT => {
                 if args.len() != 4 {
                     return CommandResponse::wrong_arity("linsert");
                 }
@@ -1612,7 +1766,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.list_linsert(&key, before, &pivot, value))
             }
-            "LREM" => {
+            Cmd::LREM => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("lrem");
                 }
@@ -1633,7 +1787,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.list_lrem(&key, count, &value))
             }
-            "LTRIM" => {
+            Cmd::LTRIM => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("ltrim");
                 }
@@ -1666,7 +1820,7 @@ impl CommandEngine {
             }
 
             // ---- Hash commands ----
-            "HSET" => {
+            Cmd::HSET => {
                 if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
                     return CommandResponse::wrong_arity("hset");
                 }
@@ -1679,7 +1833,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.hash_hset(&key, pairs))
             }
-            "HMSET" => {
+            Cmd::HMSET => {
                 // HMSET is deprecated but still supported, same logic as HSET
                 if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
                     return CommandResponse::wrong_arity("hmset");
@@ -1694,7 +1848,7 @@ impl CommandEngine {
                     CommandResponse::ok()
                 })
             }
-            "HGET" => {
+            Cmd::HGET => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("hget");
                 }
@@ -1704,7 +1858,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.hash_hget(&key, &field))
             }
-            "HDEL" => {
+            Cmd::HDEL => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("hdel");
                 }
@@ -1714,7 +1868,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.hash_hdel(&key, &fields))
             }
-            "HGETALL" => {
+            Cmd::HGETALL => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("hgetall");
                 }
@@ -1723,7 +1877,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.hash_hgetall(&key))
             }
-            "HMGET" => {
+            Cmd::HMGET => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("hmget");
                 }
@@ -1733,7 +1887,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.hash_hmget(&key, &fields))
             }
-            "HINCRBY" => {
+            Cmd::HINCRBY => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("hincrby");
                 }
@@ -1754,7 +1908,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.hash_hincrby(&key, field, delta))
             }
-            "HINCRBYFLOAT" => {
+            Cmd::HINCRBYFLOAT => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("hincrbyfloat");
                 }
@@ -1771,7 +1925,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.hash_hincrbyfloat(&key, field, delta))
             }
-            "HKEYS" => {
+            Cmd::HKEYS => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("hkeys");
                 }
@@ -1780,7 +1934,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.hash_hkeys(&key))
             }
-            "HVALS" => {
+            Cmd::HVALS => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("hvals");
                 }
@@ -1789,7 +1943,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.hash_hvals(&key))
             }
-            "HLEN" => {
+            Cmd::HLEN => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("hlen");
                 }
@@ -1798,7 +1952,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.hash_hlen(&key))
             }
-            "HEXISTS" => {
+            Cmd::HEXISTS => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("hexists");
                 }
@@ -1808,7 +1962,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.hash_hexists(&key, &field))
             }
-            "HSETNX" => {
+            Cmd::HSETNX => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("hsetnx");
                 }
@@ -1819,7 +1973,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.hash_hsetnx(&key, field, value))
             }
-            "HSCAN" => {
+            Cmd::HSCAN => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("hscan");
                 }
@@ -1840,7 +1994,26 @@ impl CommandEngine {
             }
 
             // ---- Set commands ----
-            "SADD" => {
+            Cmd::SSCAN => {
+                if args.len() < 2 {
+                    return CommandResponse::wrong_arity("sscan");
+                }
+                let key = args[0].clone();
+                let Some(cursor) = std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                else {
+                    return CommandResponse::error("ERR invalid cursor");
+                };
+                let (pattern, count, _) = match parse_scan_options(&args[2..], false) {
+                    Ok(o) => o,
+                    Err(e) => return e,
+                };
+                self.shards
+                    .shard_for_key(&key)
+                    .execute(move |store| store.set_sscan(&key, cursor, pattern.as_deref(), count))
+            }
+            Cmd::SADD => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("sadd");
                 }
@@ -1850,7 +2023,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.set_sadd(&key, members))
             }
-            "SREM" => {
+            Cmd::SREM => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("srem");
                 }
@@ -1860,7 +2033,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.set_srem(&key, &members))
             }
-            "SMEMBERS" => {
+            Cmd::SMEMBERS => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("smembers");
                 }
@@ -1869,7 +2042,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.set_smembers(&key))
             }
-            "SISMEMBER" => {
+            Cmd::SISMEMBER => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("sismember");
                 }
@@ -1879,7 +2052,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.set_sismember(&key, &member))
             }
-            "SCARD" => {
+            Cmd::SCARD => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("scard");
                 }
@@ -1888,20 +2061,20 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.set_scard(&key))
             }
-            "SINTER" | "SUNION" | "SDIFF" => {
+            Cmd::SINTER | Cmd::SUNION | Cmd::SDIFF => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
                 self.set_algebra(name, args, None)
             }
-            "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" => {
+            Cmd::SINTERSTORE | Cmd::SUNIONSTORE | Cmd::SDIFFSTORE => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
                 let op = &name[..name.len() - "STORE".len()];
                 self.set_algebra(op, &args[1..], Some(&args[0]))
             }
-            "SPOP" => {
+            Cmd::SPOP => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("spop");
                 }
@@ -1914,7 +2087,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.set_spop(&key, count))
             }
-            "SRANDMEMBER" => {
+            Cmd::SRANDMEMBER => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("srandmember");
                 }
@@ -1926,7 +2099,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.set_srandmember(&key, count))
             }
-            "SMOVE" => {
+            Cmd::SMOVE => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("smove");
                 }
@@ -1946,9 +2119,9 @@ impl CommandEngine {
                 let dst_ok =
                     self.shards
                         .shard(ds)
-                        .execute_with_effects(|s, _| match s.set_clone(&dst) {
+                        .execute_with_effects(|s, _| match s.set_check(&dst) {
                             Err(e) => e,
-                            Ok(_) => CommandResponse::ok(),
+                            Ok(()) => CommandResponse::ok(),
                         });
                 if dst_ok.is_error() {
                     return dst_ok;
@@ -1972,7 +2145,7 @@ impl CommandEngine {
             }
 
             // ---- Sorted Set commands ----
-            "ZADD" => {
+            Cmd::ZADD => {
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity("zadd");
                 }
@@ -2034,7 +2207,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.zset_zadd(&key, pairs, nx, xx, gt, lt, ch))
             }
-            "ZREM" => {
+            Cmd::ZREM => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("zrem");
                 }
@@ -2044,7 +2217,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.zset_zrem(&key, &members))
             }
-            "ZSCORE" => {
+            Cmd::ZSCORE => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("zscore");
                 }
@@ -2054,7 +2227,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.zset_zscore(&key, &member))
             }
-            "ZCARD" => {
+            Cmd::ZCARD => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("zcard");
                 }
@@ -2063,7 +2236,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.zset_zcard(&key))
             }
-            "ZRANK" => {
+            Cmd::ZRANK => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("zrank");
                 }
@@ -2073,7 +2246,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.zset_zrank(&key, &member))
             }
-            "ZREVRANK" => {
+            Cmd::ZREVRANK => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("zrevrank");
                 }
@@ -2083,7 +2256,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.zset_zrevrank(&key, &member))
             }
-            "ZINCRBY" => {
+            Cmd::ZINCRBY => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("zincrby");
                 }
@@ -2099,7 +2272,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.zset_zincrby(&key, delta, member))
             }
-            "ZCOUNT" | "ZLEXCOUNT" => {
+            Cmd::ZCOUNT | Cmd::ZLEXCOUNT => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
@@ -2124,8 +2297,12 @@ impl CommandEngine {
                     }
                 })
             }
-            "ZRANGE" | "ZREVRANGE" | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" | "ZRANGEBYLEX"
-            | "ZREVRANGEBYLEX" => {
+            Cmd::ZRANGE
+            | Cmd::ZREVRANGE
+            | Cmd::ZRANGEBYSCORE
+            | Cmd::ZREVRANGEBYSCORE
+            | Cmd::ZRANGEBYLEX
+            | Cmd::ZREVRANGEBYLEX => {
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
@@ -2141,7 +2318,7 @@ impl CommandEngine {
                     }
                 })
             }
-            "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" | "ZREMRANGEBYLEX" => {
+            Cmd::ZREMRANGEBYSCORE | Cmd::ZREMRANGEBYRANK | Cmd::ZREMRANGEBYLEX => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
@@ -2169,7 +2346,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.zset_remove_range(&key, &q))
             }
-            "ZPOPMIN" => {
+            Cmd::ZPOPMIN => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("zpopmin");
                 }
@@ -2182,7 +2359,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.zset_zpopmin(&key, count))
             }
-            "ZPOPMAX" => {
+            Cmd::ZPOPMAX => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("zpopmax");
                 }
@@ -2195,8 +2372,8 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.zset_zpopmax(&key, count))
             }
-            "ZUNIONSTORE" | "ZINTERSTORE" => self.zstore(name, args),
-            "ZSCAN" => {
+            Cmd::ZUNIONSTORE | Cmd::ZINTERSTORE => self.zstore(name, args),
+            Cmd::ZSCAN => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("zscan");
                 }
@@ -2217,7 +2394,7 @@ impl CommandEngine {
             }
 
             // ---- Geospatial commands ----
-            "GEOADD" => {
+            Cmd::GEOADD => {
                 // GEOADD key [NX|XX] [CH] longitude latitude member [longitude latitude member ...]
                 if args.len() < 4 {
                     return CommandResponse::wrong_arity("geoadd");
@@ -2278,7 +2455,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.geo_add(&key, nx, xx, ch, &items))
             }
-            "GEOPOS" => {
+            Cmd::GEOPOS => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("geopos");
                 }
@@ -2288,7 +2465,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.geo_pos(&key, &members))
             }
-            "GEOHASH" => {
+            Cmd::GEOHASH => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("geohash");
                 }
@@ -2298,7 +2475,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.geo_hash(&key, &members))
             }
-            "GEODIST" => {
+            Cmd::GEODIST => {
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity("geodist");
                 }
@@ -2322,7 +2499,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.geo_dist(&key, &member1, &member2, &unit))
             }
-            "GEOSEARCH" => {
+            Cmd::GEOSEARCH => {
                 // GEOSEARCH key FROMMEMBER member | FROMLONLAT lon lat
                 //   BYRADIUS radius unit | BYBOX width height unit
                 //   [ASC|DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]
@@ -2461,7 +2638,7 @@ impl CommandEngine {
                     )
                 })
             }
-            "GEOSEARCHSTORE" => {
+            Cmd::GEOSEARCHSTORE => {
                 // GEOSEARCHSTORE dest src [FROMMEMBER member | FROMLONLAT lon lat]
                 //   [BYRADIUS radius unit | BYBOX width height unit]
                 //   [ASC|DESC] [COUNT count [ANY]] [STOREDIST]
@@ -2604,7 +2781,7 @@ impl CommandEngine {
             }
 
             // ---- Stream commands ----
-            "XADD" => {
+            Cmd::XADD => {
                 // XADD key [NOMKSTREAM] [MAXLEN|MINID [=|~] N] *|id field value ...
                 if args.len() < 4 {
                     return CommandResponse::wrong_arity("xadd");
@@ -2655,7 +2832,7 @@ impl CommandEngine {
                     store.stream_xadd(&key, id_input, fields, nomkstream, trim)
                 })
             }
-            "XLEN" => {
+            Cmd::XLEN => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("xlen");
                 }
@@ -2664,7 +2841,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.stream_xlen(&key))
             }
-            "XRANGE" => {
+            Cmd::XRANGE => {
                 // XRANGE key start end [COUNT n]
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity("xrange");
@@ -2703,7 +2880,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.stream_xrange(&key, start, end, count))
             }
-            "XREVRANGE" => {
+            Cmd::XREVRANGE => {
                 // XREVRANGE key end start [COUNT n]
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity("xrevrange");
@@ -2742,7 +2919,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.stream_xrevrange(&key, end, start, count))
             }
-            "XREAD" => {
+            Cmd::XREAD => {
                 // XREAD [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity("xread");
@@ -2823,7 +3000,7 @@ impl CommandEngine {
                     CommandResponse::array(results)
                 }
             }
-            "XDEL" => {
+            Cmd::XDEL => {
                 // XDEL key id [id ...]
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("xdel");
@@ -2845,7 +3022,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.stream_xdel(&key, &ids))
             }
-            "XTRIM" => {
+            Cmd::XTRIM => {
                 // XTRIM key MAXLEN|MINID [=|~] N
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity("xtrim");
@@ -2861,7 +3038,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.stream_xtrim(&key, trim))
             }
-            "XINFO" => {
+            Cmd::XINFO => {
                 // XINFO STREAM key
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("xinfo");
@@ -2877,7 +3054,7 @@ impl CommandEngine {
                     _ => CommandResponse::error(format!("ERR Unknown XINFO subcommand '{}'", sub)),
                 }
             }
-            "XGROUP" => {
+            Cmd::XGROUP => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("xgroup");
                 }
@@ -2935,7 +3112,7 @@ impl CommandEngine {
                     _ => CommandResponse::error(format!("ERR Unknown XGROUP subcommand '{}'", sub)),
                 }
             }
-            "XREADGROUP" => {
+            Cmd::XREADGROUP => {
                 // XREADGROUP GROUP group consumer [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]
                 // Six arguments at least: GROUP g c STREAMS key id (the
                 // one-stream form is what the log records per shard).
@@ -3048,7 +3225,7 @@ impl CommandEngine {
                     CommandResponse::array(results)
                 }
             }
-            "XACK" => {
+            Cmd::XACK => {
                 // XACK key group id [id ...]
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity("xack");
@@ -3071,7 +3248,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.stream_xack(&key, &group, &ids))
             }
-            "XPENDING" => {
+            Cmd::XPENDING => {
                 // XPENDING key group [start end count [consumer]]
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("xpending");
@@ -3127,7 +3304,7 @@ impl CommandEngine {
             }
 
             // ---- Pub/Sub commands ----
-            "PUBLISH" => {
+            Cmd::PUBLISH => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("publish");
                 }
@@ -3136,7 +3313,7 @@ impl CommandEngine {
                 let count = self.pubsub.publish(channel, message);
                 CommandResponse::integer(count as i64)
             }
-            "PUBSUB" => {
+            Cmd::PUBSUB => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("pubsub");
                 }
@@ -3199,7 +3376,7 @@ impl CommandEngine {
             }
 
             // ---- Persistence commands ----
-            "SAVE" => {
+            Cmd::SAVE => {
                 if !args.is_empty() {
                     return CommandResponse::wrong_arity("save");
                 }
@@ -3214,7 +3391,7 @@ impl CommandEngine {
                     }
                 })
             }
-            "BGSAVE" => {
+            Cmd::BGSAVE => {
                 // `BGSAVE SCHEDULE` is accepted for compatibility; there is
                 // no conflicting child process to wait for.
                 if args.len() > 1 {
@@ -3225,17 +3402,17 @@ impl CommandEngine {
                     Err(e) => CommandResponse::error(e),
                 }
             }
-            "BGREWRITEAOF" => match self.persistence.bgrewrite(&self.shards) {
+            Cmd::BGREWRITEAOF => match self.persistence.bgrewrite(&self.shards) {
                 Ok(()) => CommandResponse::simple("Background append only file rewriting started"),
                 Err(e) => CommandResponse::error(e),
             },
-            "LASTSAVE" => CommandResponse::integer(
+            Cmd::LASTSAVE => CommandResponse::integer(
                 self.persistence
                     .stats
                     .rdb_last_save_time
                     .load(Ordering::Relaxed) as i64,
             ),
-            "SHUTDOWN" => {
+            Cmd::SHUTDOWN => {
                 // SHUTDOWN [NOSAVE|SAVE] [NOW] [FORCE] [ABORT]
                 let mut save = None;
                 for a in args {
@@ -3261,7 +3438,7 @@ impl CommandEngine {
             }
 
             // ---- Scripting commands ----
-            "EVAL" => {
+            Cmd::EVAL => {
                 // EVAL script numkeys [key ...] [arg ...]
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("eval");
@@ -3301,7 +3478,7 @@ impl CommandEngine {
                 self.script_cache.load(script);
                 self.run_script(script, keys, argv)
             }
-            "EVALSHA" => {
+            Cmd::EVALSHA => {
                 // EVALSHA sha1 numkeys [key ...] [arg ...]
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("evalsha");
@@ -3344,7 +3521,7 @@ impl CommandEngine {
                 let argv: Vec<Bytes> = args[keys_start..].to_vec();
                 self.run_script(&script, keys, argv)
             }
-            "SCRIPT" => {
+            Cmd::SCRIPT => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("script");
                 }
@@ -3387,7 +3564,7 @@ impl CommandEngine {
             }
 
             // ---- HyperLogLog commands ----
-            "PFADD" => {
+            Cmd::PFADD => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("pfadd");
                 }
@@ -3397,7 +3574,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.pfadd(&key, &elements))
             }
-            "PFCOUNT" => {
+            Cmd::PFCOUNT => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("pfcount");
                 }
@@ -3432,7 +3609,7 @@ impl CommandEngine {
                     CommandResponse::integer(hll.count() as i64)
                 }
             }
-            "PFMERGE" => {
+            Cmd::PFMERGE => {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity("pfmerge");
                 }
@@ -3488,7 +3665,7 @@ impl CommandEngine {
             }
 
             // ---- Bloom Filter commands ----
-            "BF.RESERVE" => {
+            Cmd::BF_RESERVE => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("bf.reserve");
                 }
@@ -3511,7 +3688,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.bf_reserve(&key, error_rate, capacity))
             }
-            "BF.ADD" => {
+            Cmd::BF_ADD => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("bf.add");
                 }
@@ -3521,7 +3698,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.bf_add(&key, &item))
             }
-            "BF.MADD" => {
+            Cmd::BF_MADD => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("bf.madd");
                 }
@@ -3531,7 +3708,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.bf_madd(&key, &items))
             }
-            "BF.EXISTS" => {
+            Cmd::BF_EXISTS => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("bf.exists");
                 }
@@ -3541,7 +3718,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.bf_exists(&key, &item))
             }
-            "BF.MEXISTS" => {
+            Cmd::BF_MEXISTS => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("bf.mexists");
                 }
@@ -3551,7 +3728,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.bf_mexists(&key, &items))
             }
-            "BF.INFO" => {
+            Cmd::BF_INFO => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("bf.info");
                 }
@@ -3562,7 +3739,7 @@ impl CommandEngine {
             }
 
             // ---- Bitmap commands ----
-            "SETBIT" => {
+            Cmd::SETBIT => {
                 if args.len() != 3 {
                     return CommandResponse::wrong_arity("setbit");
                 }
@@ -3593,7 +3770,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_setbit(&key, offset, value))
             }
-            "GETBIT" => {
+            Cmd::GETBIT => {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity("getbit");
                 }
@@ -3615,7 +3792,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_getbit(&key, offset))
             }
-            "BITCOUNT" => {
+            Cmd::BITCOUNT => {
                 if args.is_empty() || args.len() == 2 || args.len() > 3 {
                     return CommandResponse::wrong_arity("bitcount");
                 }
@@ -3651,7 +3828,7 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.string_bitcount(&key, start, end))
             }
-            "BITOP" => {
+            Cmd::BITOP => {
                 if args.len() < 3 {
                     return CommandResponse::wrong_arity("bitop");
                 }
@@ -4136,6 +4313,9 @@ impl CommandEngine {
     /// Keys on one shard (hash tags) are computed in place; otherwise the
     /// shards involved are held together and the sets combined here.
     fn set_algebra(&self, op: &str, keys: &[Bytes], dest: Option<&Bytes>) -> CommandResponse {
+        let Some(op) = solikv_core::set_ops::SetOp::parse(op) else {
+            return CommandResponse::syntax_error();
+        };
         let mut idx: Vec<usize> = keys
             .iter()
             .map(|k| self.shards.shard_index_for_key(k))
@@ -4143,59 +4323,45 @@ impl CommandEngine {
         if let Some(d) = dest {
             idx.push(self.shards.shard_index_for_key(d));
         }
-        let one_shard = idx.iter().all(|&i| i == idx[0]);
-        if one_shard && dest.is_none() {
-            let keys = keys.to_vec();
-            return self.shards.shard(idx[0]).execute(move |store| match op {
-                "SINTER" => store.set_sinter(&keys),
-                "SUNION" => store.set_sunion(&keys),
-                _ => store.set_sdiff(&keys),
+        // One shard: computed where the sets are, borrowing them.
+        if idx.iter().all(|&i| i == idx[0]) {
+            return self.shards.shard(idx[0]).execute_with_effects(|store, fx| {
+                match store.set_op(op, keys) {
+                    Err(e) => e,
+                    Ok(result) => match dest {
+                        None => CommandResponse::array(
+                            result.into_iter().map(CommandResponse::bulk).collect(),
+                        ),
+                        Some(d) => {
+                            let n = store.set_store(d, result);
+                            fx.put_key(store, d);
+                            CommandResponse::integer(n)
+                        }
+                    },
+                }
             });
         }
-        // Held even on one shard when storing: read and write in one step.
-        let _held = self.shards.lock_shards(idx.iter().copied());
-        let mut sets: Vec<Option<std::collections::HashSet<Bytes>>> = Vec::new();
-        for k in keys {
-            let mut got = None;
-            let r =
-                self.shards
-                    .shard_for_key(k)
-                    .execute_with_effects(|s, _| match s.set_clone(k) {
-                        Ok(set) => {
-                            got = Some(set);
-                            CommandResponse::ok()
-                        }
-                        Err(e) => e,
-                    });
-            if r.is_error() {
-                return r;
-            }
-            sets.push(got.flatten());
-        }
-        let result: std::collections::HashSet<Bytes> = match op {
-            "SINTER" => {
-                if sets.iter().any(|s| s.is_none()) {
-                    Default::default()
-                } else {
-                    let mut sets: Vec<_> = sets.into_iter().flatten().collect();
-                    sets.sort_by_key(|s| s.len());
-                    let (first, rest) = sets.split_first().expect("keys is not empty");
-                    first
-                        .iter()
-                        .filter(|m| rest.iter().all(|s| s.contains(*m)))
-                        .cloned()
-                        .collect()
+        // Several shards, held together so the result is one consistent
+        // view; the sources are borrowed in place, not copied.
+        let held = self.shards.lock_shards(idx.iter().copied());
+        let result = {
+            let mut sets = Vec::with_capacity(keys.len());
+            for k in keys {
+                let si = self.shards.shard_index_for_key(k);
+                // SAFETY: the borrows end with this block, before the
+                // destination is written below.
+                let Some(store) = (unsafe { self.shards.held_store(&held, si) }) else {
+                    return CommandResponse::error("ERR internal: shard not held");
+                };
+                match store.peek(k) {
+                    None => sets.push(None),
+                    Some(e) => match &e.value {
+                        RedisValue::Set(s) => sets.push(Some(&**s)),
+                        _ => return CommandResponse::wrong_type(),
+                    },
                 }
             }
-            "SUNION" => sets.into_iter().flatten().flatten().collect(),
-            _ => {
-                let mut it = sets.into_iter();
-                let mut first = it.next().flatten().unwrap_or_default();
-                for s in it.flatten() {
-                    first.retain(|m| !s.contains(m));
-                }
-                first
-            }
+            solikv_core::set_ops::set_op_members(op, &sets)
         };
         match dest {
             None => CommandResponse::array(result.into_iter().map(CommandResponse::bulk).collect()),
@@ -4509,9 +4675,18 @@ impl CommandEngine {
                 flags_to_string(self.notify_flags.load(Ordering::Relaxed)),
             ),
             ("port", self.tcp_port.load(Ordering::Relaxed).to_string()),
-            // No memory limit or eviction yet: report what is true.
-            ("maxmemory", "0".to_string()),
-            ("maxmemory-policy", "noeviction".to_string()),
+            (
+                "maxmemory",
+                self.maxmemory.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "maxmemory-policy",
+                self.maxmemory_policy().name().to_string(),
+            ),
+            (
+                "maxmemory-samples",
+                self.maxmemory_samples.load(Ordering::Relaxed).to_string(),
+            ),
         ]
     }
 
@@ -4547,25 +4722,56 @@ impl CommandEngine {
                 // Validate all first: Redis applies all or none.
                 for pair in args[1..].chunks(2) {
                     let param = String::from_utf8_lossy(&pair[0]).to_ascii_lowercase();
-                    if param == "notify-keyspace-events" {
-                        continue;
-                    }
-                    if known.contains(&param.as_str()) {
+                    let value = String::from_utf8_lossy(&pair[1]);
+                    let bad_value = match param.as_str() {
+                        "notify-keyspace-events" => false,
+                        "maxmemory" => solikv_core::memory::parse_size(&value).is_none(),
+                        "maxmemory-policy" => EvictionPolicy::parse(&value).is_none(),
+                        "maxmemory-samples" => {
+                            !matches!(value.parse::<usize>(), Ok(n) if (1..=64).contains(&n))
+                        }
+                        p if known.contains(&p) => {
+                            return CommandResponse::error(format!(
+                                "ERR CONFIG SET failed (possibly related to argument '{}') - \
+                                 can't set immutable config",
+                                param
+                            ));
+                        }
+                        _ => {
+                            return CommandResponse::error(format!(
+                                "ERR Unknown option or number of arguments for CONFIG SET - '{}'",
+                                param
+                            ));
+                        }
+                    };
+                    if bad_value {
                         return CommandResponse::error(format!(
                             "ERR CONFIG SET failed (possibly related to argument '{}') - \
-                             can't set immutable config",
+                             argument couldn't be parsed into an integer or is invalid",
                             param
                         ));
                     }
-                    return CommandResponse::error(format!(
-                        "ERR Unknown option or number of arguments for CONFIG SET - '{}'",
-                        param
-                    ));
                 }
                 for pair in args[1..].chunks(2) {
+                    let param = String::from_utf8_lossy(&pair[0]).to_ascii_lowercase();
                     let value = String::from_utf8_lossy(&pair[1]);
-                    self.notify_flags
-                        .store(parse_notify_flags(&value), Ordering::Relaxed);
+                    match param.as_str() {
+                        "notify-keyspace-events" => self
+                            .notify_flags
+                            .store(parse_notify_flags(&value), Ordering::Relaxed),
+                        "maxmemory" => {
+                            self.set_maxmemory(solikv_core::memory::parse_size(&value).unwrap_or(0))
+                        }
+                        "maxmemory-policy" => {
+                            if let Some(p) = EvictionPolicy::parse(&value) {
+                                self.set_maxmemory_policy(p);
+                            }
+                        }
+                        "maxmemory-samples" => self
+                            .maxmemory_samples
+                            .store(value.parse().unwrap_or(5), Ordering::Relaxed),
+                        _ => {}
+                    }
                 }
                 CommandResponse::ok()
             }
@@ -4644,13 +4850,32 @@ impl CommandEngine {
                 "# Clients\r\nconnected_clients:{}\r\nblocked_clients:0\r\n",
                 self.clients.count()
             ),
-            // No allocator statistics are collected yet.
-            "memory" => "# Memory\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\n".to_string(),
+            "memory" => {
+                let used = solikv_core::memory::used() as u64;
+                let max = self.maxmemory.load(Ordering::Relaxed);
+                format!(
+                    "# Memory\r\n\
+                     used_memory:{}\r\n\
+                     used_memory_human:{}\r\n\
+                     maxmemory:{}\r\n\
+                     maxmemory_human:{}\r\n\
+                     maxmemory_policy:{}\r\n\
+                     mem_allocator:mimalloc\r\n",
+                    used,
+                    solikv_core::memory::human(used),
+                    max,
+                    solikv_core::memory::human(max),
+                    self.maxmemory_policy().name(),
+                )
+            }
             "persistence" => self.persistence.stats.info_section(self.dirty()),
             "stats" => format!(
-                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n",
+                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
+                 expired_keys:{}\r\nevicted_keys:{}\r\n",
                 self.clients.connections_received(),
-                self.clients.commands_processed()
+                self.clients.commands_processed(),
+                self.shards.expired_keys(),
+                self.shards.evicted_keys(),
             ),
             "replication" => format!(
                 "# Replication\r\nrole:master\r\nconnected_slaves:0\r\nmaster_repl_offset:{}\r\n",
@@ -5100,89 +5325,6 @@ fn multi_shard_randomkey(shards: &crate::shard::ShardManager) -> CommandResponse
         }
     }
     CommandResponse::nil()
-}
-
-fn is_write_command(name: &str) -> bool {
-    matches!(
-        name,
-        "SET"
-            | "SETNX"
-            | "SETEX"
-            | "PSETEX"
-            | "GETSET"
-            | "GETDEL"
-            | "GETEX"
-            | "MSET"
-            | "MSETNX"
-            | "INCR"
-            | "DECR"
-            | "INCRBY"
-            | "DECRBY"
-            | "INCRBYFLOAT"
-            | "APPEND"
-            | "SETRANGE"
-            | "DEL"
-            | "UNLINK"
-            | "EXPIRE"
-            | "PEXPIRE"
-            | "EXPIREAT"
-            | "PEXPIREAT"
-            | "PERSIST"
-            | "RENAME"
-            | "RENAMENX"
-            | "FLUSHDB"
-            | "FLUSHALL"
-            | "LPUSH"
-            | "RPUSH"
-            | "LPOP"
-            | "RPOP"
-            | "LSET"
-            | "LINSERT"
-            | "LREM"
-            | "LTRIM"
-            | "HSET"
-            | "HMSET"
-            | "HDEL"
-            | "HINCRBY"
-            | "HINCRBYFLOAT"
-            | "HSETNX"
-            | "SADD"
-            | "SREM"
-            | "SPOP"
-            | "SMOVE"
-            | "ZADD"
-            | "ZREM"
-            | "ZINCRBY"
-            | "ZPOPMIN"
-            | "ZPOPMAX"
-            | "ZUNIONSTORE"
-            | "ZINTERSTORE"
-            | "XADD"
-            | "XDEL"
-            | "XTRIM"
-            | "XGROUP"
-            | "XREADGROUP"
-            | "XACK"
-            | "EVAL"
-            | "EVALSHA"
-            | "PFADD"
-            | "PFMERGE"
-            | "BF.RESERVE"
-            | "BF.ADD"
-            | "BF.MADD"
-            | "SETBIT"
-            | "BITOP"
-            | "GEOADD"
-            | "GEOSEARCHSTORE"
-            | "MOVE"
-            | "SWAPDB"
-            | "SINTERSTORE"
-            | "SUNIONSTORE"
-            | "SDIFFSTORE"
-            | "ZREMRANGEBYSCORE"
-            | "ZREMRANGEBYRANK"
-            | "ZREMRANGEBYLEX"
-    )
 }
 
 fn parse_score_range(min: &Bytes, max: &Bytes) -> Result<ZRangeBy, CommandResponse> {

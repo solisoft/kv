@@ -12,11 +12,7 @@ impl ShardStore {
         }
 
         if self.get(key).is_none() {
-            self.set(
-                key.clone(),
-                RedisValue::HyperLogLog(HyperLogLogValue::new()),
-                None,
-            );
+            self.set(key.clone(), RedisValue::hll(HyperLogLogValue::new()), None);
         }
 
         match self.get_mut(key).unwrap() {
@@ -89,7 +85,7 @@ impl ShardStore {
     /// Set HLL registers directly (for cross-shard merge).
     pub fn pfset_registers(&mut self, key: &Bytes, registers: Vec<u8>) -> CommandResponse {
         let hll = HyperLogLogValue { registers };
-        self.set_keep_ttl(key, RedisValue::HyperLogLog(hll));
+        self.set_keep_ttl(key, RedisValue::hll(hll));
         CommandResponse::ok()
     }
 
@@ -115,7 +111,7 @@ impl ShardStore {
         }
 
         // Store merged result into dest
-        self.set(dest.clone(), RedisValue::HyperLogLog(merged), None);
+        self.set(dest.clone(), RedisValue::hll(merged), None);
         CommandResponse::ok()
     }
 }

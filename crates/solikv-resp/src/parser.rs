@@ -1,11 +1,61 @@
 use bytes::Bytes;
+use std::borrow::Cow;
+use std::fmt;
+use std::ops::Deref;
 
 use crate::codec::RespFrame;
+
+/// An upper-case command name: the table's static spelling for a known
+/// command (no allocation), an owned copy for anything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Name(Cow<'static, str>);
+
+impl Name {
+    pub fn from_static(s: &'static str) -> Self {
+        Name(Cow::Borrowed(s))
+    }
+
+    /// Upper-case `raw` (lossily, for a name that is not UTF-8).
+    pub fn from_raw(raw: &[u8]) -> Self {
+        Name(Cow::Owned(
+            String::from_utf8_lossy(raw).to_ascii_uppercase(),
+        ))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Deref for Name {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<&str> for Name {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<str> for Name {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl fmt::Display for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// A parsed Redis command with name and arguments.
 #[derive(Debug, Clone)]
 pub struct ParsedCommand {
-    pub name: String,     // uppercase command name
+    pub name: Name,       // uppercase command name
     pub args: Vec<Bytes>, // arguments (raw bytes)
 }
 
@@ -27,7 +77,7 @@ impl ParsedCommand {
 
                 // Split command name from args without skip(1).collect() realloc.
                 let cmd_bytes = args.remove(0);
-                let name = ascii_uppercase_owned(&cmd_bytes)?;
+                let name = Name(Cow::Owned(ascii_uppercase_owned(&cmd_bytes)?));
 
                 Ok(ParsedCommand { name, args })
             }

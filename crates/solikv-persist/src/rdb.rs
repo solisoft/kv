@@ -191,7 +191,7 @@ fn write_value<W: Write>(w: &mut W, value: &RedisValue) -> io::Result<()> {
         }
         RedisValue::Hash(hash) => {
             write_len(w, hash.len())?;
-            for (field, value) in hash {
+            for (field, value) in hash.iter() {
                 write_bytes(w, field)?;
                 write_bytes(w, value)?;
             }
@@ -199,14 +199,14 @@ fn write_value<W: Write>(w: &mut W, value: &RedisValue) -> io::Result<()> {
         }
         RedisValue::Set(set) => {
             write_len(w, set.len())?;
-            for member in set {
+            for member in set.iter() {
                 write_bytes(w, member)?;
             }
             Ok(())
         }
         RedisValue::ZSet(zset) => {
             write_len(w, zset.len())?;
-            for (score, member) in zset.scores.keys() {
+            for (score, member) in zset.scores.iter() {
                 write_bytes(w, member)?;
                 w.write_all(&score.into_inner().to_le_bytes())?;
             }
@@ -359,21 +359,23 @@ fn read_value<R: Read>(r: &mut R, type_byte: u8) -> io::Result<RedisValue> {
         }
         TYPE_HASH => {
             let len = sanitize_collection_len(read_len(r)?)?;
-            let mut hash = HashMap::with_capacity(len.min(PREALLOC_CAP));
+            let mut hash =
+                HashValue::with_capacity_and_hasher(len.min(PREALLOC_CAP), Default::default());
             for _ in 0..len {
                 let field = read_bytes(r)?;
                 let value = read_bytes(r)?;
                 hash.insert(field, value);
             }
-            RedisValue::Hash(hash)
+            RedisValue::hash(hash)
         }
         TYPE_SET => {
             let len = sanitize_collection_len(read_len(r)?)?;
-            let mut set = std::collections::HashSet::with_capacity(len.min(PREALLOC_CAP));
+            let mut set =
+                SetValue::with_capacity_and_hasher(len.min(PREALLOC_CAP), Default::default());
             for _ in 0..len {
                 set.insert(read_bytes(r)?);
             }
-            RedisValue::Set(set)
+            RedisValue::set(set)
         }
         TYPE_ZSET => {
             let len = sanitize_collection_len(read_len(r)?)?;
@@ -384,14 +386,14 @@ fn read_value<R: Read>(r: &mut R, type_byte: u8) -> io::Result<RedisValue> {
                 r.read_exact(&mut score_buf)?;
                 zset.insert(f64::from_le_bytes(score_buf), member);
             }
-            RedisValue::ZSet(zset)
+            RedisValue::zset(zset)
         }
         TYPE_HLL => {
             let registers = read_bytes(r)?;
             if registers.len() != 16384 {
                 return Err(invalid("invalid HLL register size"));
             }
-            RedisValue::HyperLogLog(HyperLogLogValue {
+            RedisValue::hll(HyperLogLogValue {
                 registers: registers.to_vec(),
             })
         }
@@ -404,7 +406,7 @@ fn read_value<R: Read>(r: &mut R, type_byte: u8) -> io::Result<RedisValue> {
             let capacity = read_u64(r)?;
             let error_rate = f64::from_le_bytes(read_u64(r)?.to_le_bytes());
             let bits = read_bytes(r)?;
-            RedisValue::BloomFilter(BloomFilterValue {
+            RedisValue::bloom(BloomFilterValue {
                 bits: bits.to_vec(),
                 num_bits,
                 num_hashes,
@@ -413,7 +415,7 @@ fn read_value<R: Read>(r: &mut R, type_byte: u8) -> io::Result<RedisValue> {
                 error_rate,
             })
         }
-        TYPE_STREAM => RedisValue::Stream(read_stream(r)?),
+        TYPE_STREAM => RedisValue::stream(read_stream(r)?),
         b => return Err(invalid(format!("unknown type byte: {}", b))),
     })
 }
@@ -978,7 +980,7 @@ mod tests {
             },
         );
         let mut store = ShardStore::new();
-        store.insert_entry(Bytes::from("st"), KeyEntry::new(RedisValue::Stream(s)));
+        store.insert_entry(Bytes::from("st"), KeyEntry::new(RedisValue::stream(s)));
         let loaded = roundtrip(&store);
         match &loaded.peek(b"st").unwrap().value {
             RedisValue::Stream(s) => {

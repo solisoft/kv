@@ -15,9 +15,10 @@ trait AsyncSocket: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncSocket for T {}
 use solikv_pubsub::{PubSubBroker, PubSubMessage};
-use solikv_resp::codec::{decode_frame, decode_frame_with_auth, encode_frame, RespFrame};
+use solikv_resp::codec::{decode_frame, encode_frame, RespFrame};
 use solikv_resp::connection::ClientConnection;
 use solikv_resp::parser::ParsedCommand;
+use solikv_resp::{CommandDecoder, Resolved};
 
 use solikv_cluster::ClusterManager;
 use solikv_core::CommandResponse;
@@ -246,30 +247,29 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     let mut session = engine.new_session(peer_addr.to_string(), local_addr);
     let info = session.info.clone();
 
+    let mut decoder = CommandDecoder::new();
     loop {
-        // ── Phase 1: Decode all complete frames from buffer ──
-        // Apply tighter pre-auth limits until the connection has AUTHed:
-        // a not-yet-authenticated peer cannot force the server to allocate
-        // arrays larger than MAX_UNAUTH_ARRAY_LEN or bulks larger than
-        // MAX_UNAUTH_BULK_LEN. (SEC-013)
-        let mut frames = Vec::new();
+        // ── Phase 1: Decode every complete command in the buffer ──
+        // Tighter limits apply until the connection has AUTHed: a
+        // not-yet-authenticated peer cannot declare arrays larger than
+        // MAX_UNAUTH_ARRAY_LEN or bulks larger than MAX_UNAUTH_BULK_LEN
+        // (SEC-013). The decoder resumes where the last read left off, and
+        // read-only commands borrow their arguments from `read_buf`.
+        let mut commands = Vec::new();
         loop {
-            match decode_frame_with_auth(&read_buf, conn.authenticated) {
-                Ok(Some((frame, consumed))) => {
-                    read_buf.advance(consumed);
-                    frames.push(frame);
-                }
+            match decoder.next(&mut read_buf, conn.authenticated, resolve_command) {
+                Ok(Some(cmd)) => commands.push(cmd),
                 Ok(None) => break, // need more data
                 Err(e) => {
-                    encode_frame(&RespFrame::error(e), &mut write_buf);
+                    encode_frame(&RespFrame::error(format!("ERR {e}")), &mut write_buf);
                     socket.write_all(&write_buf).await?;
                     return Ok(());
                 }
             }
         }
 
-        // If no complete frames, read more data from socket
-        if frames.is_empty() {
+        // If no complete command, read more data from the socket
+        if commands.is_empty() {
             let cap = if conn.authenticated {
                 limits.query_buffer_limit
             } else {
@@ -286,6 +286,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             if info.is_killed() {
                 return Ok(());
             }
+            prepare_read_buf(&mut read_buf, decoder.missing().min(cap));
             let read = async {
                 // `CLIENT KILL` from another connection ends this one even
                 // while it waits for input.
@@ -321,20 +322,6 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             continue;
         }
 
-        // ── Phase 2: Parse all frames into commands ──
-        let mut commands = Vec::with_capacity(frames.len());
-        for frame in frames {
-            match ParsedCommand::from_frame(frame) {
-                Ok(cmd) => commands.push(cmd),
-                Err(e) => {
-                    encode_frame(&RespFrame::error(e), &mut write_buf);
-                    socket.write_all(&write_buf).await?;
-                    write_buf.clear();
-                    return Ok(());
-                }
-            }
-        }
-
         // ── Phase 3: Execute commands ──
         // Fast path: all commands are pure engine commands (no MULTI/EXEC/SUBSCRIBE/AUTH)
         // This is the common case for pipelined benchmarks
@@ -343,22 +330,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         }
         let fast_path = conn.authenticated
             && !session.in_multi()
-            && commands.iter().all(|cmd| {
-                !matches!(
-                    cmd.name.as_str(),
-                    "MULTI"
-                        | "SUBSCRIBE"
-                        | "UNSUBSCRIBE"
-                        | "PSUBSCRIBE"
-                        | "PUNSUBSCRIBE"
-                        | "QUIT"
-                        | "AUTH"
-                        | "HELLO"
-                        | "CLUSTER"
-                        | "SELECT"
-                        | "RESET"
-                )
-            });
+            && commands
+                .iter()
+                .all(|cmd| !needs_connection_state(&cmd.name));
 
         if fast_path {
             // Pre-reserve write buffer for batch responses
@@ -370,8 +344,15 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     continue;
                 }
                 let resp = engine.execute_session(&mut session, &cmd.name, &cmd.args);
+                drop(cmd);
                 if session.reply_allowed() {
-                    encode_frame(&command_response_to_frame(resp), &mut write_buf);
+                    encode_response(&resp, &mut write_buf);
+                }
+                // A long pipeline's replies go out as they accumulate
+                // instead of all being held until the batch ends.
+                if write_buf.len() >= FLUSH_AT {
+                    socket.write_all(&write_buf).await?;
+                    write_buf.clear();
                 }
             }
         } else {
@@ -774,7 +755,11 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     conn.authenticated = password.is_none();
                 }
                 if session.reply_allowed() {
-                    encode_frame(&command_response_to_frame(response), &mut write_buf);
+                    encode_response(&response, &mut write_buf);
+                }
+                if write_buf.len() >= FLUSH_AT {
+                    socket.write_all(&write_buf).await?;
+                    write_buf.clear();
                 }
             }
         }
@@ -784,7 +769,128 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             socket.write_all(&write_buf).await?;
             write_buf.clear();
         }
+        shrink_after_spike(&mut write_buf);
+        if !decoder.in_progress() {
+            shrink_after_spike(&mut read_buf);
+        }
     }
+}
+
+/// Replies are written out once this many bytes are pending.
+const FLUSH_AT: usize = 1024 * 1024;
+
+/// Buffers start at, and shrink back to, this size.
+const BUF_SIZE: usize = 64 * 1024;
+
+/// Name → static spelling, and whether the arguments may borrow the read
+/// buffer: only for read-only commands, whose arguments are gone once they
+/// ran (a stored key or value must not pin the buffer it arrived in).
+fn resolve_command(name: &[u8]) -> Option<Resolved> {
+    solikv_engine::commands::lookup_ci(name).map(|s| Resolved {
+        name: s.name,
+        zero_copy: s.has(solikv_engine::commands::F_READONLY),
+    })
+}
+
+/// Commands the connection loop handles itself (the slow path).
+fn needs_connection_state(name: &str) -> bool {
+    matches!(
+        name,
+        "MULTI"
+            | "SUBSCRIBE"
+            | "UNSUBSCRIBE"
+            | "PSUBSCRIBE"
+            | "PUNSUBSCRIBE"
+            | "QUIT"
+            | "AUTH"
+            | "HELLO"
+            | "CLUSTER"
+            | "SELECT"
+            | "RESET"
+    )
+}
+
+/// Make room before a read: at least what the command being assembled
+/// still needs, and otherwise grow geometrically. (`read_buf`'s own growth
+/// could be as small as 64 bytes a read, a copy of the whole buffer each
+/// time a big command came in.)
+fn prepare_read_buf(buf: &mut BytesMut, missing: usize) {
+    let spare = buf.capacity() - buf.len();
+    let want = missing.max(if spare < 16 * 1024 {
+        BUF_SIZE.max(buf.len())
+    } else {
+        0
+    });
+    if want > spare {
+        buf.reserve(want);
+    }
+}
+
+/// Give back the memory a burst (a huge command or reply) left behind.
+fn shrink_after_spike(buf: &mut BytesMut) {
+    if buf.is_empty() && buf.capacity() > 16 * BUF_SIZE {
+        *buf = BytesMut::with_capacity(BUF_SIZE);
+    }
+}
+
+/// Encode a reply straight into the output buffer (no intermediate frame
+/// tree).
+pub fn encode_response(resp: &CommandResponse, dst: &mut BytesMut) {
+    match resp {
+        CommandResponse::Ok => dst.extend_from_slice(b"+OK\r\n"),
+        CommandResponse::Nil => dst.extend_from_slice(b"$-1\r\n"),
+        CommandResponse::Integer(n) => {
+            dst.extend_from_slice(b":");
+            write_decimal(dst, *n);
+            dst.extend_from_slice(b"\r\n");
+        }
+        CommandResponse::BulkString(b) => {
+            dst.reserve(b.len() + 16);
+            dst.extend_from_slice(b"$");
+            write_decimal(dst, b.len() as i64);
+            dst.extend_from_slice(b"\r\n");
+            dst.extend_from_slice(b);
+            dst.extend_from_slice(b"\r\n");
+        }
+        CommandResponse::SimpleString(s) => {
+            dst.extend_from_slice(b"+");
+            dst.extend_from_slice(s);
+            dst.extend_from_slice(b"\r\n");
+        }
+        CommandResponse::Error(msg) => {
+            dst.extend_from_slice(b"-");
+            dst.extend_from_slice(msg.as_bytes());
+            dst.extend_from_slice(b"\r\n");
+        }
+        CommandResponse::Array(items) => {
+            dst.extend_from_slice(b"*");
+            write_decimal(dst, items.len() as i64);
+            dst.extend_from_slice(b"\r\n");
+            for item in items {
+                encode_response(item, dst);
+            }
+        }
+        CommandResponse::Queued => dst.extend_from_slice(b"+QUEUED\r\n"),
+    }
+}
+
+fn write_decimal(dst: &mut BytesMut, n: i64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let neg = n < 0;
+    let mut v = n.unsigned_abs();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    if neg {
+        dst.extend_from_slice(b"-");
+    }
+    dst.extend_from_slice(&buf[i..]);
 }
 
 /// Most bytes buffered from a client in pub/sub mode, where only short
@@ -1373,21 +1479,6 @@ fn hello(
         bulk("modules"),
         RespFrame::Array(vec![]),
     ])
-}
-
-fn command_response_to_frame(resp: CommandResponse) -> RespFrame {
-    match resp {
-        CommandResponse::Ok => RespFrame::ok(),
-        CommandResponse::Nil => RespFrame::Null,
-        CommandResponse::Integer(n) => RespFrame::Integer(n),
-        CommandResponse::BulkString(b) => RespFrame::BulkString(b),
-        CommandResponse::SimpleString(s) => RespFrame::SimpleString(s),
-        CommandResponse::Array(items) => {
-            RespFrame::Array(items.into_iter().map(command_response_to_frame).collect())
-        }
-        CommandResponse::Error(msg) => RespFrame::Error(msg),
-        CommandResponse::Queued => RespFrame::SimpleString(Bytes::from("QUEUED")),
-    }
 }
 
 #[cfg(test)]

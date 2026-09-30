@@ -110,7 +110,7 @@ impl ShardStore {
         }
 
         if self.get(key).is_none() {
-            self.set(key.clone(), RedisValue::Stream(StreamValue::new()), None);
+            self.set(key.clone(), RedisValue::stream(StreamValue::new()), None);
         }
 
         match self.get_mut(key).unwrap() {
@@ -359,7 +359,7 @@ impl ShardStore {
                     );
                 }
                 // Create the stream
-                self.set(key.clone(), RedisValue::Stream(StreamValue::new()), None);
+                self.set(key.clone(), RedisValue::stream(StreamValue::new()), None);
             }
             Ok(Some(_)) => {}
         }

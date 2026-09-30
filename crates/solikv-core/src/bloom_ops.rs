@@ -22,7 +22,7 @@ impl ShardStore {
         if self.get(key).is_none() {
             self.set(
                 key.clone(),
-                RedisValue::BloomFilter(BloomFilterValue::with_capacity(
+                RedisValue::bloom(BloomFilterValue::with_capacity(
                     DEFAULT_CAPACITY,
                     DEFAULT_ERROR_RATE,
                 )),
@@ -66,7 +66,7 @@ impl ShardStore {
             return CommandResponse::error("ERR filter would exceed the maximum size (512 MB)");
         }
         let bf = BloomFilterValue::with_capacity(capacity, error_rate);
-        self.set(key.clone(), RedisValue::BloomFilter(bf), None);
+        self.set(key.clone(), RedisValue::bloom(bf), None);
         CommandResponse::ok()
     }
 

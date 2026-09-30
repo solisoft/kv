@@ -1,27 +1,28 @@
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
 
+use crate::set_ops::{scan_reply, scan_window};
 use crate::store::ShardStore;
 use crate::types::*;
 
 impl ShardStore {
     fn get_or_create_zset(&mut self, key: &Bytes) -> Result<&mut ZSetValue, CommandResponse> {
-        if let Some(entry) = self.get(key) {
-            if !matches!(entry.value, RedisValue::ZSet(_)) {
-                return Err(CommandResponse::wrong_type());
+        let exists = match self.get(key) {
+            Some(entry) if !matches!(entry.value, RedisValue::ZSet(_)) => {
+                return Err(CommandResponse::wrong_type())
             }
+            Some(_) => true,
+            None => false,
+        };
+        if !exists {
+            self.set(key.clone(), RedisValue::new_zset(), None);
         }
-
-        if self.get(key).is_none() {
-            self.set(key.clone(), RedisValue::ZSet(ZSetValue::new()), None);
-        }
-
-        match self.get_mut(key).unwrap() {
-            KeyEntry {
-                value: RedisValue::ZSet(ref mut zs),
+        match self.get_mut(key) {
+            Some(KeyEntry {
+                value: RedisValue::ZSet(zs),
                 ..
-            } => Ok(zs),
-            _ => unreachable!(),
+            }) => Ok(zs),
+            _ => Err(CommandResponse::wrong_type()),
         }
     }
 
@@ -134,33 +135,27 @@ impl ShardStore {
         }
     }
 
+    /// `ZRANK`: O(log n).
     pub fn zset_zrank(&mut self, key: &Bytes, member: &Bytes) -> CommandResponse {
         match self.get_zset(key) {
             Err(e) => e,
             Ok(None) => CommandResponse::nil(),
-            Ok(Some(zset)) => {
-                let score = match zset.members.get(member) {
-                    Some(s) => *s,
-                    None => return CommandResponse::nil(),
-                };
-                let rank = zset.scores.range(..(score, member.clone())).count();
-                CommandResponse::integer(rank as i64)
-            }
+            Ok(Some(zset)) => match zset.rank(member) {
+                Some(r) => CommandResponse::integer(r as i64),
+                None => CommandResponse::nil(),
+            },
         }
     }
 
+    /// `ZREVRANK`: O(log n).
     pub fn zset_zrevrank(&mut self, key: &Bytes, member: &Bytes) -> CommandResponse {
         match self.get_zset(key) {
             Err(e) => e,
             Ok(None) => CommandResponse::nil(),
-            Ok(Some(zset)) => {
-                let score = match zset.members.get(member) {
-                    Some(s) => *s,
-                    None => return CommandResponse::nil(),
-                };
-                let rank = zset.scores.range(..(score, member.clone())).count();
-                CommandResponse::integer((zset.len() - 1 - rank) as i64)
-            }
+            Ok(Some(zset)) => match zset.rank(member) {
+                Some(r) => CommandResponse::integer((zset.len() - 1 - r) as i64),
+                None => CommandResponse::nil(),
+            },
         }
     }
 
@@ -177,17 +172,25 @@ impl ShardStore {
         CommandResponse::bulk(Bytes::from(format_score(new_score)))
     }
 
+    /// `ZCOUNT key min max` (inclusive bounds): O(log n).
     pub fn zset_zcount(&mut self, key: &Bytes, min: f64, max: f64) -> CommandResponse {
+        let q = ZRangeQuery {
+            by: ZRangeBy::Score(ScoreBound::Incl(min), ScoreBound::Incl(max)),
+            rev: false,
+            limit: None,
+        };
+        self.zset_range_count(key, &q)
+    }
+
+    /// How many members `q` selects (`ZCOUNT`, `ZLEXCOUNT`): two binary
+    /// searches, nothing collected.
+    pub fn zset_range_count(&mut self, key: &Bytes, q: &ZRangeQuery) -> CommandResponse {
         match self.get_zset(key) {
             Err(e) => e,
             Ok(None) => CommandResponse::integer(0),
-            Ok(Some(zset)) => {
-                let count = zset
-                    .scores
-                    .range((OrderedFloat(min), Bytes::new())..)
-                    .take_while(|((s, _), _)| s.into_inner() <= max)
-                    .count();
-                CommandResponse::integer(count as i64)
+            Ok(Some(z)) => {
+                let (lo, hi) = q.span(z);
+                CommandResponse::integer((hi - lo) as i64)
             }
         }
     }
@@ -200,29 +203,7 @@ impl ShardStore {
         stop: i64,
         withscores: bool,
     ) -> CommandResponse {
-        match self.get_zset(key) {
-            Err(e) => e,
-            Ok(None) => CommandResponse::array(vec![]),
-            Ok(Some(zset)) => {
-                let len = zset.len() as i64;
-                let s = normalize_index(start, len);
-                let e = normalize_index(stop, len);
-                if s > e || s >= len as usize {
-                    return CommandResponse::array(vec![]);
-                }
-                let e = e.min(len as usize - 1);
-
-                let items: Vec<(f64, Bytes)> = zset
-                    .scores
-                    .iter()
-                    .skip(s)
-                    .take(e - s + 1)
-                    .map(|((score, member), _)| (score.into_inner(), member.clone()))
-                    .collect();
-
-                format_zrange_result(items, withscores)
-            }
-        }
+        self.rank_range(key, start, stop, false, withscores)
     }
 
     /// ZREVRANGE key start stop [WITHSCORES]
@@ -233,29 +214,25 @@ impl ShardStore {
         stop: i64,
         withscores: bool,
     ) -> CommandResponse {
-        match self.get_zset(key) {
+        self.rank_range(key, start, stop, true, withscores)
+    }
+
+    fn rank_range(
+        &mut self,
+        key: &Bytes,
+        start: i64,
+        stop: i64,
+        rev: bool,
+        withscores: bool,
+    ) -> CommandResponse {
+        let q = ZRangeQuery {
+            by: ZRangeBy::Rank(start, stop),
+            rev,
+            limit: None,
+        };
+        match self.zset_range_query(key, &q) {
+            Ok(items) => zrange_reply(items, withscores),
             Err(e) => e,
-            Ok(None) => CommandResponse::array(vec![]),
-            Ok(Some(zset)) => {
-                let len = zset.len() as i64;
-                let s = normalize_index(start, len);
-                let e = normalize_index(stop, len);
-                if s > e || s >= len as usize {
-                    return CommandResponse::array(vec![]);
-                }
-                let e = e.min(len as usize - 1);
-
-                let items: Vec<(f64, Bytes)> = zset
-                    .scores
-                    .iter()
-                    .rev()
-                    .skip(s)
-                    .take(e - s + 1)
-                    .map(|((score, member), _)| (score.into_inner(), member.clone()))
-                    .collect();
-
-                format_zrange_result(items, withscores)
-            }
         }
     }
 
@@ -269,95 +246,56 @@ impl ShardStore {
         offset: usize,
         count: Option<usize>,
     ) -> CommandResponse {
-        match self.get_zset(key) {
+        let q = ZRangeQuery {
+            by: ZRangeBy::Score(ScoreBound::Incl(min), ScoreBound::Incl(max)),
+            rev: false,
+            limit: Some((
+                offset.min(i64::MAX as usize) as i64,
+                count.map_or(-1, |c| c.min(i64::MAX as usize) as i64),
+            )),
+        };
+        match self.zset_range_query(key, &q) {
+            Ok(items) => zrange_reply(items, withscores),
             Err(e) => e,
-            Ok(None) => CommandResponse::array(vec![]),
-            Ok(Some(zset)) => {
-                let iter = zset
-                    .scores
-                    .range((OrderedFloat(min), Bytes::new())..)
-                    .take_while(|((s, _), _)| s.into_inner() <= max)
-                    .skip(offset);
+        }
+    }
 
-                let items: Vec<(f64, Bytes)> = if let Some(c) = count {
-                    iter.take(c)
-                        .map(|((s, m), _)| (s.into_inner(), m.clone()))
-                        .collect()
-                } else {
-                    iter.map(|((s, m), _)| (s.into_inner(), m.clone()))
-                        .collect()
-                };
-
-                format_zrange_result(items, withscores)
+    fn zset_pop(&mut self, key: &Bytes, count: usize, max: bool) -> CommandResponse {
+        let entry = match self.get_mut(key) {
+            None => return CommandResponse::array(vec![]),
+            Some(e) => e,
+        };
+        match &mut entry.value {
+            RedisValue::ZSet(zset) => {
+                let mut items = Vec::with_capacity(2 * count.min(zset.len()));
+                for _ in 0..count {
+                    let Some((member, score)) = zset.pop(max) else {
+                        break;
+                    };
+                    items.push(CommandResponse::bulk(member));
+                    items.push(CommandResponse::bulk(Bytes::from(format_score(score))));
+                }
+                if zset.is_empty() {
+                    self.del(key);
+                }
+                CommandResponse::array(items)
             }
+            _ => CommandResponse::wrong_type(),
         }
     }
 
     /// ZPOPMIN key [count]
     pub fn zset_zpopmin(&mut self, key: &Bytes, count: usize) -> CommandResponse {
-        let entry = match self.get_mut(key) {
-            None => return CommandResponse::array(vec![]),
-            Some(e) => e,
-        };
-        match &mut entry.value {
-            RedisValue::ZSet(zset) => {
-                let mut items = Vec::new();
-                for _ in 0..count {
-                    let first = zset.scores.keys().next().cloned();
-                    match first {
-                        Some((score, member)) => {
-                            zset.scores.remove(&(score, member.clone()));
-                            zset.members.remove(&member);
-                            items.push(CommandResponse::bulk(member));
-                            items.push(CommandResponse::bulk(Bytes::from(format_score(
-                                score.into_inner(),
-                            ))));
-                        }
-                        None => break,
-                    }
-                }
-                if zset.is_empty() {
-                    self.del(key);
-                }
-                CommandResponse::array(items)
-            }
-            _ => CommandResponse::wrong_type(),
-        }
+        self.zset_pop(key, count, false)
     }
 
     /// ZPOPMAX key [count]
     pub fn zset_zpopmax(&mut self, key: &Bytes, count: usize) -> CommandResponse {
-        let entry = match self.get_mut(key) {
-            None => return CommandResponse::array(vec![]),
-            Some(e) => e,
-        };
-        match &mut entry.value {
-            RedisValue::ZSet(zset) => {
-                let mut items = Vec::new();
-                for _ in 0..count {
-                    let last = zset.scores.keys().next_back().cloned();
-                    match last {
-                        Some((score, member)) => {
-                            zset.scores.remove(&(score, member.clone()));
-                            zset.members.remove(&member);
-                            items.push(CommandResponse::bulk(member));
-                            items.push(CommandResponse::bulk(Bytes::from(format_score(
-                                score.into_inner(),
-                            ))));
-                        }
-                        None => break,
-                    }
-                }
-                if zset.is_empty() {
-                    self.del(key);
-                }
-                CommandResponse::array(items)
-            }
-            _ => CommandResponse::wrong_type(),
-        }
+        self.zset_pop(key, count, true)
     }
 
-    /// ZSCAN key cursor [MATCH pattern] [COUNT count]
+    /// ZSCAN key cursor [MATCH pattern] [COUNT count]: visits `count`
+    /// members by position, no copy of the set.
     pub fn zset_zscan(
         &mut self,
         key: &Bytes,
@@ -367,40 +305,25 @@ impl ShardStore {
     ) -> CommandResponse {
         match self.get_zset(key) {
             Err(e) => e,
-            Ok(None) => CommandResponse::array(vec![
-                CommandResponse::bulk(Bytes::from("0")),
-                CommandResponse::array(vec![]),
-            ]),
+            Ok(None) => scan_reply(0, vec![]),
             Ok(Some(zset)) => {
-                let pairs: Vec<(Bytes, f64)> = zset
-                    .scores
-                    .iter()
-                    .map(|((score, member), _)| (member.clone(), score.into_inner()))
-                    .collect();
-                let total = pairs.len();
-                let start = cursor;
-                let mut result = Vec::new();
-                let mut i = start;
-                let mut checked = 0;
-
-                while checked < count && i < total {
-                    let (ref member, score) = pairs[i];
+                let (window, next) = scan_window(zset.members.len(), cursor, count);
+                let mut items = Vec::with_capacity(window.len() * 2);
+                for i in window.rev() {
+                    let Some((member, score)) = zset.members.get_index(i) else {
+                        continue;
+                    };
                     let matches = pattern.is_none_or(|p| {
                         crate::store::glob_match_pub(p, &String::from_utf8_lossy(member))
                     });
                     if matches {
-                        result.push(CommandResponse::bulk(member.clone()));
-                        result.push(CommandResponse::bulk(Bytes::from(format_score(score))));
+                        items.push(CommandResponse::bulk(member.clone()));
+                        items.push(CommandResponse::bulk(Bytes::from(format_score(
+                            score.into_inner(),
+                        ))));
                     }
-                    i += 1;
-                    checked += 1;
                 }
-
-                let next_cursor = if i >= total { 0 } else { i };
-                CommandResponse::array(vec![
-                    CommandResponse::bulk(Bytes::from(next_cursor.to_string())),
-                    CommandResponse::array(result),
-                ])
+                scan_reply(next, items)
             }
         }
     }
@@ -413,35 +336,24 @@ impl ShardStore {
         weights: &[f64],
         aggregate: Aggregate,
     ) -> CommandResponse {
-        let mut result = ZSetValue::new();
-
+        let mut acc: indexmap::IndexMap<Bytes, f64, FastHasher> = Default::default();
         for (i, key) in keys.iter().enumerate() {
             let weight = weights.get(i).copied().unwrap_or(1.0);
-            if let Some(entry) = self.get(key) {
-                if let RedisValue::ZSet(zset) = &entry.value {
-                    for (member, &score) in &zset.members {
-                        let weighted = score.into_inner() * weight;
-                        match result.members.get(member) {
-                            Some(&existing) => {
-                                let new_score = match aggregate {
-                                    Aggregate::Sum => existing.into_inner() + weighted,
-                                    Aggregate::Min => existing.into_inner().min(weighted),
-                                    Aggregate::Max => existing.into_inner().max(weighted),
-                                };
-                                result.insert(new_score, member.clone());
-                            }
-                            None => {
-                                result.insert(weighted, member.clone());
-                            }
-                        }
-                    }
+            if let Some(KeyEntry {
+                value: RedisValue::ZSet(zset),
+                ..
+            }) = self.get(key)
+            {
+                for (member, &score) in &zset.members {
+                    let weighted = score.into_inner() * weight;
+                    acc.entry(member.clone())
+                        .and_modify(|s| *s = aggregate.apply(*s, weighted))
+                        .or_insert(weighted);
                 }
             }
         }
-
-        let len = result.len() as i64;
-        self.set(dest.clone(), RedisValue::ZSet(result), None);
-        CommandResponse::integer(len)
+        let n = self.zset_store(dest, acc.into_iter().collect());
+        CommandResponse::integer(n)
     }
 
     /// ZINTERSTORE dest numkeys key [key ...] [WEIGHTS weight ...] [AGGREGATE SUM|MIN|MAX]
@@ -452,65 +364,55 @@ impl ShardStore {
         weights: &[f64],
         aggregate: Aggregate,
     ) -> CommandResponse {
-        if keys.is_empty() {
-            self.set(dest.clone(), RedisValue::ZSet(ZSetValue::new()), None);
-            return CommandResponse::integer(0);
-        }
-
-        // Get all zsets as cloned data
-        let mut sets: Vec<Option<ZSetValue>> = Vec::new();
-        for key in keys {
-            match self.get(key) {
-                Some(entry) => match &entry.value {
-                    RedisValue::ZSet(zs) => sets.push(Some(zs.clone())),
-                    _ => sets.push(None),
-                },
-                None => sets.push(None),
+        for k in keys {
+            if let Err(e) = self.get_zset(k) {
+                return e;
             }
         }
-
-        // If any set is missing, result is empty
-        if sets.iter().any(|s| s.is_none()) {
-            self.set(dest.clone(), RedisValue::ZSet(ZSetValue::new()), None);
-            return CommandResponse::integer(0);
-        }
-
-        let first_weight = weights.first().copied().unwrap_or(1.0);
-        let first_set = sets[0].as_ref().unwrap();
-        let mut result = ZSetValue::new();
-
-        for (member, &score) in &first_set.members {
-            let base_score = score.into_inner() * first_weight;
-            let mut final_score = base_score;
-            let mut in_all = true;
-
-            for (i, set_opt) in sets.iter().enumerate().skip(1) {
-                let set = set_opt.as_ref().unwrap();
-                let weight = weights.get(i).copied().unwrap_or(1.0);
-                match set.members.get(member) {
-                    Some(&s) => {
-                        let weighted = s.into_inner() * weight;
-                        final_score = match aggregate {
-                            Aggregate::Sum => final_score + weighted,
-                            Aggregate::Min => final_score.min(weighted),
-                            Aggregate::Max => final_score.max(weighted),
-                        };
-                    }
-                    None => {
-                        in_all = false;
-                        break;
-                    }
+        let sets: Vec<Option<&ZSetValue>> = keys
+            .iter()
+            .map(|k| match self.peek(k) {
+                Some(KeyEntry {
+                    value: RedisValue::ZSet(z),
+                    ..
+                }) => Some(&**z),
+                _ => None,
+            })
+            .collect();
+        let mut result: Vec<(Bytes, f64)> = Vec::new();
+        if !sets.is_empty() && sets.iter().all(|s| s.is_some()) {
+            let sets: Vec<&ZSetValue> = sets.into_iter().flatten().collect();
+            let w = |i: usize| weights.get(i).copied().unwrap_or(1.0);
+            // Walk the smallest set; probe the others.
+            let (si, smallest) = sets
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.len())
+                .map(|(i, s)| (i, *s))
+                .expect("non-empty");
+            'members: for (member, &score) in &smallest.members {
+                let mut total: Option<f64> = None;
+                for (i, set) in sets.iter().enumerate() {
+                    let s = if i == si {
+                        score.into_inner()
+                    } else {
+                        match set.members.get(member) {
+                            Some(s) => s.into_inner(),
+                            None => continue 'members,
+                        }
+                    } * w(i);
+                    total = Some(match total {
+                        None => s,
+                        Some(t) => aggregate.apply(t, s),
+                    });
+                }
+                if let Some(t) = total {
+                    result.push((member.clone(), t));
                 }
             }
-
-            if in_all {
-                result.insert(final_score, member.clone());
-            }
         }
-
-        let len = result.len() as i64;
-        self.set(dest.clone(), RedisValue::ZSet(result), None);
-        CommandResponse::integer(len)
+        let n = self.zset_store(dest, result);
+        CommandResponse::integer(n)
     }
 }
 
@@ -548,12 +450,6 @@ impl ScoreBound {
         match *self {
             ScoreBound::Incl(m) => v <= m,
             ScoreBound::Excl(m) => v < m,
-        }
-    }
-
-    fn value(&self) -> f64 {
-        match *self {
-            ScoreBound::Incl(v) | ScoreBound::Excl(v) => v,
         }
     }
 }
@@ -627,6 +523,41 @@ pub struct ZRangeQuery {
 }
 
 impl ZRangeQuery {
+    /// Positions `[lo, hi)` (ascending score order) the bounds select,
+    /// before `LIMIT`. Two binary searches; ranks are direct.
+    pub fn span(&self, zset: &ZSetValue) -> (usize, usize) {
+        let len = zset.len();
+        let sl = &zset.scores;
+        match &self.by {
+            ZRangeBy::Rank(start, stop) => {
+                let s = normalize_index(*start, len as i64);
+                let e = normalize_index(*stop, len as i64);
+                if len == 0 || s > e || s >= len {
+                    return (0, 0);
+                }
+                let e = e.min(len - 1);
+                if self.rev {
+                    // Ranks count from the highest score.
+                    (len - 1 - e, len - s)
+                } else {
+                    (s, e + 1)
+                }
+            }
+            ZRangeBy::Score(min, max) => {
+                let lo = sl.partition_point(|(s, _)| !min.above_min(s.into_inner()));
+                let hi = sl.partition_point(|(s, _)| max.below_max(s.into_inner()));
+                (lo, hi.max(lo))
+            }
+            ZRangeBy::Lex(min, max) => {
+                // Lexicographic ranges assume every member has the same
+                // score, as Redis does; then member order is list order.
+                let lo = sl.partition_point(|(_, m)| !min.above_min(m));
+                let hi = sl.partition_point(|(_, m)| max.below_max(m));
+                (lo, hi.max(lo))
+            }
+        }
+    }
+
     /// The selected `(member, score)` pairs, in order.
     pub fn collect(&self, zset: &ZSetValue) -> Vec<(Bytes, f64)> {
         let (offset, count) = match self.limit {
@@ -634,92 +565,38 @@ impl ZRangeQuery {
             Some((o, c)) => (o as usize, if c < 0 { usize::MAX } else { c as usize }),
             None => (0, usize::MAX),
         };
-        let pair = |((s, m), _): (&(OrderedFloat<f64>, Bytes), &())| (m.clone(), s.into_inner());
-        match &self.by {
-            ZRangeBy::Rank(start, stop) => {
-                let len = zset.len() as i64;
-                let s = normalize_index(*start, len);
-                let e = normalize_index(*stop, len);
-                if len == 0 || s > e || s >= len as usize {
-                    return Vec::new();
-                }
-                let e = e.min(len as usize - 1);
-                let take = e - s + 1;
-                if self.rev {
-                    zset.scores
-                        .iter()
-                        .rev()
-                        .skip(s)
-                        .take(take)
-                        .map(pair)
-                        .collect()
-                } else {
-                    zset.scores.iter().skip(s).take(take).map(pair).collect()
-                }
-            }
-            ZRangeBy::Score(min, max) => {
-                let lo = (OrderedFloat(min.value()), Bytes::new());
-                let range = zset.scores.range(lo..);
-                if self.rev {
-                    // Start at the top of the range: one-sided, so no
-                    // start > end panic whatever the bounds.
-                    use std::ops::Bound;
-                    let hi = match *max {
-                        ScoreBound::Incl(v) if v == f64::INFINITY => Bound::Unbounded,
-                        ScoreBound::Incl(v) => {
-                            Bound::Excluded((OrderedFloat(v.next_up()), Bytes::new()))
-                        }
-                        ScoreBound::Excl(v) => Bound::Excluded((OrderedFloat(v), Bytes::new())),
-                    };
-                    zset.scores
-                        .range((Bound::Unbounded, hi))
-                        .rev()
-                        .skip_while(|((s, _), _)| !max.below_max(s.into_inner()))
-                        .take_while(|((s, _), _)| min.above_min(s.into_inner()))
-                        .skip(offset)
-                        .take(count)
-                        .map(pair)
-                        .collect()
-                } else {
-                    range
-                        .skip_while(|((s, _), _)| !min.above_min(s.into_inner()))
-                        .take_while(|((s, _), _)| max.below_max(s.into_inner()))
-                        .skip(offset)
-                        .take(count)
-                        .map(pair)
-                        .collect()
-                }
-            }
-            ZRangeBy::Lex(min, max) => {
-                let inside = |((_, m), _): &(&(OrderedFloat<f64>, Bytes), &())| {
-                    min.above_min(m) && max.below_max(m)
-                };
-                if self.rev {
-                    zset.scores
-                        .iter()
-                        .rev()
-                        .filter(inside)
-                        .skip(offset)
-                        .take(count)
-                        .map(pair)
-                        .collect()
-                } else {
-                    zset.scores
-                        .iter()
-                        .filter(inside)
-                        .skip(offset)
-                        .take(count)
-                        .map(pair)
-                        .collect()
-                }
-            }
+        let (lo, hi) = self.span(zset);
+        let n = hi - lo;
+        if offset >= n {
+            return Vec::new();
+        }
+        let take = count.min(n - offset);
+        let pair = |(s, m): &(OrderedFloat<f64>, Bytes)| (m.clone(), s.into_inner());
+        if self.rev {
+            zset.scores
+                .range(hi - offset - take, hi - offset)
+                .rev()
+                .map(pair)
+                .collect()
+        } else {
+            zset.scores
+                .range(lo + offset, lo + offset + take)
+                .map(pair)
+                .collect()
         }
     }
 }
 
 /// Reply for a range: members, or member/score pairs `WITHSCORES`.
 pub fn zrange_reply(items: Vec<(Bytes, f64)>, withscores: bool) -> CommandResponse {
-    format_zrange_result(items.into_iter().map(|(m, s)| (s, m)).collect(), withscores)
+    let mut result = Vec::with_capacity(items.len() * if withscores { 2 } else { 1 });
+    for (member, score) in items {
+        result.push(CommandResponse::bulk(member));
+        if withscores {
+            result.push(CommandResponse::bulk(Bytes::from(format_score(score))));
+        }
+    }
+    CommandResponse::array(result)
 }
 
 impl ShardStore {
@@ -777,11 +654,17 @@ impl ShardStore {
             return 0;
         }
         let mut z = ZSetValue::new();
+        z.members.reserve(members.len());
         for (m, s) in members {
-            z.insert(s, m);
+            // A repeated member: the later score wins.
+            z.members.insert(m, OrderedFloat(s));
         }
+        let mut pairs: Vec<(OrderedFloat<f64>, Bytes)> =
+            z.members.iter().map(|(m, s)| (*s, m.clone())).collect();
+        pairs.sort();
+        z.scores = crate::sorted_list::SortedList::from_sorted(pairs);
         let n = z.len() as i64;
-        self.set(dest.clone(), RedisValue::ZSet(z), None);
+        self.set(dest.clone(), RedisValue::zset(z), None);
         n
     }
 
@@ -827,6 +710,16 @@ pub enum Aggregate {
     Max,
 }
 
+impl Aggregate {
+    pub fn apply(&self, a: f64, b: f64) -> f64 {
+        match self {
+            Aggregate::Sum => a + b,
+            Aggregate::Min => a.min(b),
+            Aggregate::Max => a.max(b),
+        }
+    }
+}
+
 fn normalize_index(idx: i64, len: i64) -> usize {
     if idx < 0 {
         (len + idx).max(0) as usize
@@ -841,17 +734,6 @@ fn format_score(score: f64) -> String {
     } else {
         format!("{}", score)
     }
-}
-
-fn format_zrange_result(items: Vec<(f64, Bytes)>, withscores: bool) -> CommandResponse {
-    let mut result = Vec::new();
-    for (score, member) in items {
-        result.push(CommandResponse::bulk(member));
-        if withscores {
-            result.push(CommandResponse::bulk(Bytes::from(format_score(score))));
-        }
-    }
-    CommandResponse::array(result)
 }
 
 #[cfg(test)]
