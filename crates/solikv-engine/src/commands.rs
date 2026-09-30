@@ -176,6 +176,12 @@ const FAST: &[&str] = &["fast"];
 const CONN: &[&str] = &["noscript", "loading", "stale", "fast"];
 const PUBSUB: &[&str] = &["pubsub", "noscript", "loading", "stale"];
 const SCRIPT: &[&str] = &["noscript", "movablekeys"];
+const BLK: &[&str] = &["write", "blocking"];
+const BLKD: &[&str] = &["write", "denyoom", "blocking"];
+const BLKM: &[&str] = &["write", "blocking", "movablekeys"];
+const WM: &[&str] = &["write", "movablekeys"];
+/// All keys but the last argument (`BLPOP k1 k2 timeout`).
+const ALL_BUT_LAST: Keys = r(1, -2, 1);
 
 fn numkeys_at(args: &[Bytes], at: usize, first: usize) -> Vec<usize> {
     let n = args
@@ -199,15 +205,12 @@ fn zstore_keys(args: &[Bytes]) -> Vec<usize> {
     v
 }
 
-/// `ZUNION numkeys key…` / `ZINTERCARD`, `SINTERCARD`, `LMPOP`, `ZMPOP`
-/// (commands still to come; tested here so they are ready).
-#[cfg_attr(not(test), allow(dead_code))]
+/// `ZUNION numkeys key…` / `ZINTERCARD`, `SINTERCARD`, `LMPOP`, `ZMPOP`.
 fn numkeys_first(args: &[Bytes]) -> Vec<usize> {
     numkeys_at(args, 0, 1)
 }
 
 /// `BLMPOP timeout numkeys key…` / `BZMPOP`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn numkeys_second(args: &[Bytes]) -> Vec<usize> {
     numkeys_at(args, 1, 2)
 }
@@ -376,6 +379,17 @@ commands! {
     LINSERT = "LINSERT", 5, WD, K1;
     LREM = "LREM", 4, W, K1;
     LTRIM = "LTRIM", 4, W, K1;
+    LPUSHX = "LPUSHX", -3, WDF, K1;
+    RPUSHX = "RPUSHX", -3, WDF, K1;
+    LPOS = "LPOS", -3, RO, K1;
+    LMOVE = "LMOVE", 5, WD, r(1, 2, 1);
+    RPOPLPUSH = "RPOPLPUSH", 3, WD, r(1, 2, 1);
+    LMPOP = "LMPOP", -4, WM, Keys::Movable(numkeys_first);
+    BLPOP = "BLPOP", -3, BLK, ALL_BUT_LAST;
+    BRPOP = "BRPOP", -3, BLK, ALL_BUT_LAST;
+    BLMOVE = "BLMOVE", 6, BLKD, r(1, 2, 1);
+    BRPOPLPUSH = "BRPOPLPUSH", 4, BLKD, r(1, 2, 1);
+    BLMPOP = "BLMPOP", -5, BLKM, Keys::Movable(numkeys_second);
     // Hashes
     HSET = "HSET", -4, WDF, K1;
     HMSET = "HMSET", -4, WDF, K1;
@@ -391,6 +405,8 @@ commands! {
     HLEN = "HLEN", 2, ROF, K1;
     HEXISTS = "HEXISTS", 3, ROF, K1;
     HSCAN = "HSCAN", -3, RO, K1;
+    HSTRLEN = "HSTRLEN", 3, ROF, K1;
+    HRANDFIELD = "HRANDFIELD", -2, RO, K1;
     SSCAN = "SSCAN", -3, RO, K1;
     // Sets
     SADD = "SADD", -3, WDF, K1;
@@ -407,6 +423,8 @@ commands! {
     SINTERSTORE = "SINTERSTORE", -3, WD, ALL;
     SUNIONSTORE = "SUNIONSTORE", -3, WD, ALL;
     SDIFFSTORE = "SDIFFSTORE", -3, WD, ALL;
+    SMISMEMBER = "SMISMEMBER", -3, ROF, K1;
+    SINTERCARD = "SINTERCARD", -3, &["readonly", "movablekeys"], Keys::Movable(numkeys_first);
     // Sorted sets
     ZADD = "ZADD", -4, WDF, K1;
     ZREM = "ZREM", -3, WF, K1;
@@ -428,9 +446,21 @@ commands! {
     ZREMRANGEBYRANK = "ZREMRANGEBYRANK", 4, W, K1;
     ZPOPMIN = "ZPOPMIN", -2, WF, K1;
     ZPOPMAX = "ZPOPMAX", -2, WF, K1;
-    ZUNIONSTORE = "ZUNIONSTORE", -4, WD, Keys::Movable(zstore_keys);
-    ZINTERSTORE = "ZINTERSTORE", -4, WD, Keys::Movable(zstore_keys);
+    ZMPOP = "ZMPOP", -4, WM, Keys::Movable(numkeys_first);
+    BZPOPMIN = "BZPOPMIN", -3, &["write", "blocking", "fast"], ALL_BUT_LAST;
+    BZPOPMAX = "BZPOPMAX", -3, &["write", "blocking", "fast"], ALL_BUT_LAST;
+    BZMPOP = "BZMPOP", -5, BLKM, Keys::Movable(numkeys_second);
+    ZUNIONSTORE = "ZUNIONSTORE", -4, &["write", "denyoom", "movablekeys"], Keys::Movable(zstore_keys);
+    ZINTERSTORE = "ZINTERSTORE", -4, &["write", "denyoom", "movablekeys"], Keys::Movable(zstore_keys);
     ZSCAN = "ZSCAN", -3, RO, K1;
+    ZUNION = "ZUNION", -3, &["readonly", "movablekeys"], Keys::Movable(numkeys_first);
+    ZINTER = "ZINTER", -3, &["readonly", "movablekeys"], Keys::Movable(numkeys_first);
+    ZDIFF = "ZDIFF", -3, &["readonly", "movablekeys"], Keys::Movable(numkeys_first);
+    ZINTERCARD = "ZINTERCARD", -3, &["readonly", "movablekeys"], Keys::Movable(numkeys_first);
+    ZDIFFSTORE = "ZDIFFSTORE", -4, &["write", "denyoom", "movablekeys"], Keys::Movable(zstore_keys);
+    ZRANGESTORE = "ZRANGESTORE", -5, WD, r(1, 2, 1);
+    ZMSCORE = "ZMSCORE", -3, ROF, K1;
+    ZRANDMEMBER = "ZRANDMEMBER", -2, RO, K1;
     // Geo
     GEOADD = "GEOADD", -5, WD, K1;
     GEOPOS = "GEOPOS", -2, RO, K1;

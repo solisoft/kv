@@ -343,7 +343,26 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     encode_frame(&moved_frame, &mut write_buf);
                     continue;
                 }
-                let resp = engine.execute_session(&mut session, &cmd.name, &cmd.args);
+                let resp = if engine.is_blocking_form(&cmd.name, &cmd.args) {
+                    match run_blocking(
+                        &mut socket,
+                        &mut read_buf,
+                        &mut write_buf,
+                        &engine,
+                        &mut session,
+                        &info,
+                        &cmd.name,
+                        &cmd.args,
+                        limits.query_buffer_limit,
+                    )
+                    .await?
+                    {
+                        Some(r) => r,
+                        None => return Ok(()),
+                    }
+                } else {
+                    engine.execute_session(&mut session, &cmd.name, &cmd.args)
+                };
                 drop(cmd);
                 if session.reply_allowed() {
                     encode_response(&resp, &mut write_buf);
@@ -748,7 +767,27 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         continue;
                     }
                 }
-                let response = engine.execute_session(&mut session, &cmd.name, &cmd.args);
+                let response =
+                    if !session.in_multi() && engine.is_blocking_form(&cmd.name, &cmd.args) {
+                        match run_blocking(
+                            &mut socket,
+                            &mut read_buf,
+                            &mut write_buf,
+                            &engine,
+                            &mut session,
+                            &info,
+                            &cmd.name,
+                            &cmd.args,
+                            limits.query_buffer_limit,
+                        )
+                        .await?
+                        {
+                            Some(r) => r,
+                            None => return Ok(()),
+                        }
+                    } else {
+                        engine.execute_session(&mut session, &cmd.name, &cmd.args)
+                    };
                 if cmd.name == "RESET" {
                     // Back to the default user: with a password, that is
                     // unauthenticated.
@@ -778,6 +817,45 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Replies are written out once this many bytes are pending.
 const FLUSH_AT: usize = 1024 * 1024;
+
+/// Run a command that may block (`BLPOP`, `XREAD … BLOCK`, …). While the
+/// client waits, replies already produced go out, and the socket is still
+/// read: bytes the client pipelines behind the blocking command are kept for
+/// later, and a client that hangs up (or is `CLIENT KILL`ed) stops waiting
+/// and is unregistered. `Ok(None)`: the connection is done.
+#[allow(clippy::too_many_arguments)]
+async fn run_blocking<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut S,
+    read_buf: &mut BytesMut,
+    write_buf: &mut BytesMut,
+    engine: &CommandEngine,
+    session: &mut solikv_engine::Session,
+    info: &solikv_engine::session::ClientInfo,
+    name: &str,
+    args: &[Bytes],
+    query_buffer_limit: usize,
+) -> std::io::Result<Option<CommandResponse>> {
+    let blocked = match engine.block_start(session, name, args) {
+        solikv_engine::BlockStart::Done(r) => return Ok(Some(r)),
+        solikv_engine::BlockStart::Wait(b) => b,
+    };
+    if !write_buf.is_empty() {
+        socket.write_all(write_buf).await?;
+        write_buf.clear();
+    }
+    loop {
+        tokio::select! {
+            r = blocked.wait() => return Ok(Some(r)),
+            n = socket.read_buf(read_buf) => {
+                let n = n?;
+                if n == 0 || read_buf.len() > query_buffer_limit {
+                    return Ok(None);
+                }
+            }
+            _ = info.killed() => return Ok(None),
+        }
+    }
+}
 
 /// Buffers start at, and shrink back to, this size.
 const BUF_SIZE: usize = 64 * 1024;
@@ -839,6 +917,7 @@ pub fn encode_response(resp: &CommandResponse, dst: &mut BytesMut) {
     match resp {
         CommandResponse::Ok => dst.extend_from_slice(b"+OK\r\n"),
         CommandResponse::Nil => dst.extend_from_slice(b"$-1\r\n"),
+        CommandResponse::NilArray => dst.extend_from_slice(b"*-1\r\n"),
         CommandResponse::Integer(n) => {
             dst.extend_from_slice(b":");
             write_decimal(dst, *n);

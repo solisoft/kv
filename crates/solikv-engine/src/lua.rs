@@ -538,7 +538,7 @@ fn parse_redis_call_args(args: &LuaMultiValue) -> LuaResult<(String, Vec<Bytes>)
 
 fn response_to_lua(lua: &Lua, resp: CommandResponse) -> LuaResult<LuaValue> {
     match resp {
-        CommandResponse::Nil => Ok(LuaValue::Boolean(false)),
+        CommandResponse::Nil | CommandResponse::NilArray => Ok(LuaValue::Boolean(false)),
         CommandResponse::Ok => {
             let t = lua.create_table()?;
             t.set("ok", "OK")?;

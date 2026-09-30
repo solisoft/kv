@@ -466,17 +466,20 @@ impl ShardStore {
         count: Option<usize>,
         noack: bool,
     ) -> CommandResponse {
+        let nogroup = || {
+            CommandResponse::error(format!(
+                "NOGROUP No such key '{}' or consumer group '{}' in XREADGROUP with GROUP option",
+                String::from_utf8_lossy(key),
+                String::from_utf8_lossy(group)
+            ))
+        };
         match self.get_stream_mut(key) {
             Err(e) => e,
-            Ok(None) => {
-                CommandResponse::error("ERR The XREADGROUP subcommand requires the key to exist")
-            }
+            Ok(None) => nogroup(),
             Ok(Some(sv)) => {
                 let grp = match sv.groups.get_mut(group) {
                     Some(g) => g,
-                    None => {
-                        return CommandResponse::error("NOGROUP No such consumer group for key")
-                    }
+                    None => return nogroup(),
                 };
 
                 // Ensure consumer exists

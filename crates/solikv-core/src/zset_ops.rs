@@ -722,7 +722,7 @@ fn normalize_index(idx: i64, len: i64) -> usize {
     }
 }
 
-fn format_score(score: f64) -> String {
+pub fn format_score(score: f64) -> String {
     if score == score.trunc() && score.abs() < 1e15 {
         format!("{}", score as i64)
     } else {

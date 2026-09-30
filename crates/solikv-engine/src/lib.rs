@@ -1,4 +1,5 @@
 pub mod aof_log;
+pub mod blocking;
 pub mod commands;
 pub mod dispatch;
 pub mod lua;
@@ -9,6 +10,7 @@ pub mod shard;
 pub mod watch;
 
 pub use aof_log::{Effects, TxGuard};
+pub use blocking::{BlockStart, Blocked};
 pub use dispatch::CommandEngine;
 pub use persistence::{PersistConfig, Persistence};
 pub use session::Session;

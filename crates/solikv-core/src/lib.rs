@@ -1,4 +1,5 @@
 pub mod bloom_ops;
+pub mod extra_ops;
 pub mod geo_ops;
 pub mod hash_ops;
 pub mod hll_ops;

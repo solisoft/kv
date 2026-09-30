@@ -769,6 +769,10 @@ pub fn now_secs() -> u64 {
 pub enum CommandResponse {
     Ok,
     Nil,
+    /// The null array (`*-1`): what Redis answers for "nothing" where the
+    /// reply would otherwise be an array (`BLPOP` timing out, `LMPOP` and
+    /// `XREAD` finding nothing).
+    NilArray,
     Integer(i64),
     BulkString(Bytes),
     SimpleString(Bytes),

@@ -71,10 +71,30 @@ const EXPLICIT: &[&str] = &[
     "PFMERGE",
     "BITOP",
     "XREADGROUP",
+    "LMOVE",
+    "RPOPLPUSH",
+    "ZDIFFSTORE",
+    "ZRANGESTORE",
+];
+
+/// Write commands that are never records themselves: each runs the plain
+/// commands that are its effect (`BLPOP` → `LPOP`, `LMPOP` → `LPOP key n`)
+/// through `execute`, and those log.
+const DELEGATING: &[&str] = &[
+    "BLPOP",
+    "BRPOP",
+    "BLMOVE",
+    "BRPOPLPUSH",
+    "BLMPOP",
+    "BZPOPMIN",
+    "BZPOPMAX",
+    "BZMPOP",
+    "LMPOP",
+    "ZMPOP",
 ];
 
 pub(crate) fn mode(name: &str, is_write: bool) -> Mode {
-    if !is_write || name == "EVAL" || name == "EVALSHA" {
+    if !is_write || name == "EVAL" || name == "EVALSHA" || DELEGATING.contains(&name) {
         Mode::Idle
     } else if EXPLICIT.contains(&name) {
         Mode::Explicit

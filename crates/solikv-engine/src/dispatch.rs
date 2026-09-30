@@ -1,3 +1,5 @@
+mod ext;
+
 use bytes::Bytes;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
@@ -6,7 +8,7 @@ use std::time::Instant;
 
 use solikv_core::store::EvictionPolicy;
 use solikv_core::types::*;
-use solikv_core::zset_ops::{Aggregate, LexBound, ScoreBound, ZRangeBy, ZRangeQuery};
+use solikv_core::zset_ops::{LexBound, ScoreBound, ZRangeBy, ZRangeQuery};
 
 // ── Keyspace notification flags ──
 // Manual bitflags (no extra crate).
@@ -203,6 +205,8 @@ pub struct CommandEngine {
     maxmemory: AtomicU64,
     maxmemory_policy: std::sync::atomic::AtomicU8,
     maxmemory_samples: std::sync::atomic::AtomicUsize,
+    /// Clients blocked in `BLPOP` & co (see `crate::blocking`).
+    blocking: Arc<crate::blocking::BlockingRegistry>,
 }
 
 /// The `maxmemory-policy` values, in the order `maxmemory_policy` stores
@@ -243,7 +247,13 @@ impl CommandEngine {
             maxmemory: AtomicU64::new(0),
             maxmemory_policy: std::sync::atomic::AtomicU8::new(0),
             maxmemory_samples: std::sync::atomic::AtomicUsize::new(5),
+            blocking: Arc::new(crate::blocking::BlockingRegistry::default()),
         }
+    }
+
+    /// Blocked clients.
+    pub fn blocking(&self) -> &Arc<crate::blocking::BlockingRegistry> {
+        &self.blocking
     }
 
     /// Cap memory at `bytes` (0 = none), evicting by `policy`.
@@ -478,6 +488,15 @@ impl CommandEngine {
         // Keyspace notifications (zero-cost when flags == 0).
         self.emit_notifications(name, args, &response);
 
+        // Someone is blocked: note what this write touched, and once the
+        // outermost command is done, serve them (see `crate::blocking`).
+        if write && self.blocking.is_active() {
+            crate::blocking::note(crate::commands::keys_of(name, args));
+            if DEPTH.with(|d| d.get()) == 1 && !crate::blocking::deferred() {
+                self.serve_blocked();
+            }
+        }
+
         response
     }
 
@@ -634,6 +653,38 @@ impl CommandEngine {
             "SPOP" => {
                 if let Some(key) = args.first() {
                     self.notify_keyspace_event(NOTIFY_SET, "spop", key);
+                }
+            }
+            "LPUSHX" | "RPUSHX" => {
+                if let Some(key) = args.first() {
+                    let ev = if name == "LPUSHX" { "lpush" } else { "rpush" };
+                    self.notify_keyspace_event(NOTIFY_LIST, ev, key);
+                }
+            }
+            "LMOVE" | "RPOPLPUSH" if args.len() >= 2 => {
+                if matches!(_response, CommandResponse::BulkString(_)) {
+                    let (from_left, to_left) = if name == "RPOPLPUSH" {
+                        (false, true)
+                    } else {
+                        (
+                            args.get(2).is_some_and(|a| a.eq_ignore_ascii_case(b"LEFT")),
+                            args.get(3).is_some_and(|a| a.eq_ignore_ascii_case(b"LEFT")),
+                        )
+                    };
+                    let pop = if from_left { "lpop" } else { "rpop" };
+                    let push = if to_left { "lpush" } else { "rpush" };
+                    self.notify_keyspace_event(NOTIFY_LIST, pop, &args[0]);
+                    self.notify_keyspace_event(NOTIFY_LIST, push, &args[1]);
+                }
+            }
+            "ZDIFFSTORE" | "ZRANGESTORE" => {
+                if let Some(key) = args.first() {
+                    let ev = if name == "ZDIFFSTORE" {
+                        "zdiffstore"
+                    } else {
+                        "zrangestore"
+                    };
+                    self.notify_keyspace_event(NOTIFY_ZSET, ev, key);
                 }
             }
             "SMOVE" if args.len() >= 2 => {
@@ -1642,32 +1693,23 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.list_rpush(&key, values))
             }
-            Cmd::LPOP => {
-                if args.is_empty() {
-                    return CommandResponse::wrong_arity("lpop");
-                }
-                let key = args[0].clone();
-                let count = args
-                    .get(1)
-                    .and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok())
-                    .unwrap_or(1);
-                self.shards
-                    .shard_for_key(&key)
-                    .execute(move |store| store.list_lpop(&key, count))
-            }
-            Cmd::RPOP => {
-                if args.is_empty() {
-                    return CommandResponse::wrong_arity("rpop");
-                }
-                let key = args[0].clone();
-                let count = args
-                    .get(1)
-                    .and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok())
-                    .unwrap_or(1);
-                self.shards
-                    .shard_for_key(&key)
-                    .execute(move |store| store.list_rpop(&key, count))
-            }
+            Cmd::LPOP => self.list_pop(true, args),
+            Cmd::RPOP => self.list_pop(false, args),
+            Cmd::LPUSHX => self.list_pushx(true, args),
+            Cmd::RPUSHX => self.list_pushx(false, args),
+            Cmd::LMOVE => self.lmove("LMOVE", args),
+            Cmd::RPOPLPUSH => self.lmove("RPOPLPUSH", args),
+            Cmd::LPOS => self.lpos(args),
+            Cmd::LMPOP => self.lmpop(args),
+            Cmd::ZMPOP => self.zmpop(args),
+            Cmd::BLPOP
+            | Cmd::BRPOP
+            | Cmd::BLMOVE
+            | Cmd::BRPOPLPUSH
+            | Cmd::BLMPOP
+            | Cmd::BZPOPMIN
+            | Cmd::BZPOPMAX
+            | Cmd::BZMPOP => self.blocking_once(name, args),
             Cmd::LLEN => {
                 if args.len() != 1 {
                     return CommandResponse::wrong_arity("llen");
@@ -2372,7 +2414,20 @@ impl CommandEngine {
                     .shard_for_key(&key)
                     .execute(move |store| store.zset_zpopmax(&key, count))
             }
-            Cmd::ZUNIONSTORE | Cmd::ZINTERSTORE => self.zstore(name, args),
+            Cmd::ZUNIONSTORE
+            | Cmd::ZINTERSTORE
+            | Cmd::ZDIFFSTORE
+            | Cmd::ZUNION
+            | Cmd::ZINTER
+            | Cmd::ZDIFF
+            | Cmd::ZINTERCARD => self.zalgebra(name, args),
+            Cmd::ZRANGESTORE => self.zrangestore(args),
+            Cmd::ZMSCORE => self.zmscore(args),
+            Cmd::ZRANDMEMBER => self.randmember(false, args),
+            Cmd::HRANDFIELD => self.randmember(true, args),
+            Cmd::HSTRLEN => self.hstrlen(args),
+            Cmd::SMISMEMBER => self.smismember(args),
+            Cmd::SINTERCARD => self.sintercard(args),
             Cmd::ZSCAN => {
                 if args.len() < 2 {
                     return CommandResponse::wrong_arity("zscan");
@@ -2995,7 +3050,7 @@ impl CommandEngine {
                 }
 
                 if results.is_empty() {
-                    CommandResponse::nil()
+                    CommandResponse::NilArray
                 } else {
                     CommandResponse::array(results)
                 }
@@ -3209,6 +3264,9 @@ impl CommandEngine {
                                 r
                             });
 
+                    if resp.is_error() {
+                        return resp;
+                    }
                     if !matches!(resp, CommandResponse::Nil) {
                         results.push(CommandResponse::array(vec![
                             CommandResponse::bulk(key.clone()),
@@ -3218,7 +3276,7 @@ impl CommandEngine {
                 }
 
                 if results.is_empty() {
-                    CommandResponse::nil()
+                    CommandResponse::NilArray
                 } else {
                     CommandResponse::array(results)
                 }
@@ -4046,6 +4104,19 @@ impl CommandEngine {
     /// runs in between — and a watched key changed before this point has
     /// flagged the session by then (see `watch`).
     fn exec(&self, session: &mut Session) -> CommandResponse {
+        let r = {
+            let _defer = crate::blocking::DeferGuard::enter();
+            self.exec_locked(session)
+        };
+        // Blocked clients are served after the whole transaction, never in
+        // the middle of it — and after its shard locks are released.
+        if !crate::blocking::deferred() {
+            self.serve_blocked();
+        }
+        r
+    }
+
+    fn exec_locked(&self, session: &mut Session) -> CommandResponse {
         let Some(queue) = session.multi.take() else {
             return CommandResponse::error("ERR EXEC without MULTI");
         };
@@ -4125,6 +4196,27 @@ impl CommandEngine {
         let rest = &args[1..];
         match sub.as_str() {
             "ID" => CommandResponse::integer(session.info.id as i64),
+            "UNBLOCK" => {
+                let (id, mode) = match rest {
+                    [id] => (id, None),
+                    [id, mode] => (id, Some(Upper::new(mode))),
+                    _ => return CommandResponse::wrong_arity("client|unblock"),
+                };
+                let Some(id) = parse_i64_arg(id) else {
+                    return CommandResponse::error("ERR value is not an integer or out of range");
+                };
+                let error = match mode.as_ref().map(|m| m.as_str()) {
+                    None | Some("TIMEOUT") => false,
+                    Some("ERROR") => true,
+                    Some(_) => {
+                        return CommandResponse::error(
+                            "ERR CLIENT UNBLOCK reason should be TIMEOUT or ERROR",
+                        )
+                    }
+                };
+                let done = id >= 0 && self.blocking.unblock(id as u64, error);
+                CommandResponse::integer(done as i64)
+            }
             "SETNAME" => {
                 let [name] = rest else {
                     return CommandResponse::wrong_arity("client|setname");
@@ -4228,7 +4320,7 @@ impl CommandEngine {
             "TRACKING" | "CACHING" | "GETREDIR" | "TRACKINGINFO" => CommandResponse::error(
                 "ERR client-side caching (CLIENT TRACKING) is not supported by this server",
             ),
-            "PAUSE" | "UNPAUSE" | "UNBLOCK" => CommandResponse::error(format!(
+            "PAUSE" | "UNPAUSE" => CommandResponse::error(format!(
                 "ERR CLIENT {} is not supported by this server",
                 sub
             )),
@@ -4369,158 +4461,6 @@ impl CommandEngine {
                 CommandResponse::integer(n)
             }),
         }
-    }
-}
-
-impl CommandEngine {
-    /// `ZUNIONSTORE`/`ZINTERSTORE dest numkeys key… [WEIGHTS w…]
-    /// [AGGREGATE SUM|MIN|MAX]`, over sources on any shards (sets count as
-    /// sorted sets scored 1, as in Redis). The shards involved are held
-    /// together; the result is logged as the destination's value.
-    fn zstore(&self, name: &str, args: &[Bytes]) -> CommandResponse {
-        let lname = name.to_lowercase();
-        if args.len() < 3 {
-            return CommandResponse::wrong_arity(&lname);
-        }
-        let dest = args[0].clone();
-        let numkeys = match std::str::from_utf8(&args[1]).ok().map(|s| s.parse::<u64>()) {
-            Some(Ok(n)) => n,
-            _ => return CommandResponse::error("ERR value is not an integer or out of range"),
-        };
-        if numkeys < 1 {
-            return CommandResponse::error(format!(
-                "ERR at least 1 input key is needed for '{}' command",
-                lname
-            ));
-        }
-        let Some(keys_end) = usize::try_from(numkeys)
-            .ok()
-            .and_then(|n| n.checked_add(2))
-            .filter(|&e| e <= args.len())
-        else {
-            return CommandResponse::error(
-                "ERR Number of keys can't be greater than number of args",
-            );
-        };
-        let numkeys = keys_end - 2;
-        let keys = &args[2..keys_end];
-        let mut weights = vec![1.0f64; numkeys];
-        let mut aggregate = Aggregate::Sum;
-        let mut i = keys_end;
-        while i < args.len() {
-            match String::from_utf8_lossy(&args[i])
-                .to_ascii_uppercase()
-                .as_str()
-            {
-                "WEIGHTS" if i + numkeys < args.len() => {
-                    for (w, a) in weights.iter_mut().zip(&args[i + 1..=i + numkeys]) {
-                        match std::str::from_utf8(a)
-                            .ok()
-                            .and_then(solikv_core::zset_ops::parse_float)
-                        {
-                            Some(v) => *w = v,
-                            None => {
-                                return CommandResponse::error("ERR weight value is not a float")
-                            }
-                        }
-                    }
-                    i += numkeys + 1;
-                }
-                "AGGREGATE" if i + 1 < args.len() => {
-                    aggregate = match String::from_utf8_lossy(&args[i + 1])
-                        .to_ascii_uppercase()
-                        .as_str()
-                    {
-                        "SUM" => Aggregate::Sum,
-                        "MIN" => Aggregate::Min,
-                        "MAX" => Aggregate::Max,
-                        _ => return CommandResponse::syntax_error(),
-                    };
-                    i += 2;
-                }
-                _ => return CommandResponse::syntax_error(),
-            }
-        }
-
-        let idx: Vec<usize> = std::iter::once(&dest)
-            .chain(keys)
-            .map(|k| self.shards.shard_index_for_key(k))
-            .collect();
-        let _held = self.shards.lock_shards(idx);
-        let mut sources = Vec::with_capacity(numkeys);
-        for k in keys {
-            let mut got = None;
-            let r =
-                self.shards
-                    .shard_for_key(k)
-                    .execute_with_effects(|s, _| match s.zset_source(k) {
-                        Ok(v) => {
-                            got = v;
-                            CommandResponse::ok()
-                        }
-                        Err(e) => e,
-                    });
-            if r.is_error() {
-                return r;
-            }
-            sources.push(got);
-        }
-        let combine = |a: f64, b: f64| match aggregate {
-            // +inf + -inf is NaN; Redis makes it 0.
-            Aggregate::Sum => {
-                let s = a + b;
-                if s.is_nan() {
-                    0.0
-                } else {
-                    s
-                }
-            }
-            Aggregate::Min => a.min(b),
-            Aggregate::Max => a.max(b),
-        };
-        let weighted = |score: f64, w: f64| {
-            let v = score * w;
-            if v.is_nan() {
-                0.0
-            } else {
-                v
-            }
-        };
-        let mut acc: std::collections::HashMap<Bytes, f64> = std::collections::HashMap::new();
-        if name == "ZUNIONSTORE" {
-            for (src, w) in sources.into_iter().zip(&weights) {
-                for (m, sc) in src.unwrap_or_default() {
-                    let v = weighted(sc, *w);
-                    acc.entry(m)
-                        .and_modify(|cur| *cur = combine(*cur, v))
-                        .or_insert(v);
-                }
-            }
-        } else if sources.iter().all(|s| s.is_some()) {
-            let mut srcs: Vec<(std::collections::HashMap<Bytes, f64>, f64)> = sources
-                .into_iter()
-                .zip(&weights)
-                .map(|(s, w)| (s.unwrap_or_default().into_iter().collect(), *w))
-                .collect();
-            let (first, w0) = srcs.remove(0);
-            'member: for (m, sc) in first {
-                let mut v = weighted(sc, w0);
-                for (other, w) in &srcs {
-                    match other.get(&m) {
-                        Some(o) => v = combine(v, weighted(*o, *w)),
-                        None => continue 'member,
-                    }
-                }
-                acc.insert(m, v);
-            }
-        }
-        self.shards
-            .shard_for_key(&dest)
-            .execute_with_effects(|s, fx| {
-                let n = s.zset_store(&dest, acc.into_iter().collect());
-                fx.put_key(s, &dest);
-                CommandResponse::integer(n)
-            })
     }
 }
 
@@ -4845,8 +4785,11 @@ impl CommandEngine {
                 uptime / 86400,
             ),
             "clients" => format!(
-                "# Clients\r\nconnected_clients:{}\r\nblocked_clients:0\r\n",
-                self.clients.count()
+                "# Clients\r\nconnected_clients:{}\r\nblocked_clients:{}\r\n\
+                 total_blocking_keys:{}\r\n",
+                self.clients.count(),
+                self.blocking.blocked_clients(),
+                self.blocking.blocking_keys(),
             ),
             "memory" => {
                 let used = solikv_core::memory::used() as u64;
@@ -5726,7 +5669,7 @@ mod sec_tests {
     fn huge_counts_do_not_preallocate() {
         let e = engine();
         e.execute("RPUSH", &[b("l"), b("a"), b("b")]);
-        let r = e.execute("LPOP", &[b("l"), b("18446744073709551615")]);
+        let r = e.execute("LPOP", &[b("l"), b("9223372036854775807")]);
         assert!(
             matches!(r, CommandResponse::Array(ref v) if v.len() == 2),
             "{r:?}"

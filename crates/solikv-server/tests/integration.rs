@@ -31,6 +31,7 @@ async fn start_test_server(port: u16) -> tokio::task::JoinHandle<()> {
                     match r {
                         CommandResponse::Ok => RespFrame::ok(),
                         CommandResponse::Nil => RespFrame::Null,
+                        CommandResponse::NilArray => RespFrame::Null,
                         CommandResponse::Integer(n) => RespFrame::Integer(n),
                         CommandResponse::BulkString(b) => RespFrame::BulkString(b),
                         CommandResponse::SimpleString(s) => RespFrame::SimpleString(s),
