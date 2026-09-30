@@ -173,7 +173,14 @@ pub struct CommandEngine {
     /// data it appears to.
     rdb_dir: PathBuf,
     rdb_basename: String,
+    /// Most memory one Lua VM may allocate. Without a cap a script such as
+    /// `string.rep("x", 2^31)` asks the allocator for whatever it likes, and
+    /// the instruction hook cannot interrupt a C function to stop it.
+    pub(crate) lua_memory_limit: usize,
 }
+
+/// Default for [`CommandEngine::with_lua_memory_limit`]: 64 MB.
+pub const DEFAULT_LUA_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 
 impl CommandEngine {
     pub fn new(shards: Arc<ShardManager>, pubsub: Arc<PubSubBroker>) -> Self {
@@ -188,7 +195,14 @@ impl CommandEngine {
             replication_offset: Arc::new(AtomicU64::new(0)),
             rdb_dir: PathBuf::from("data"),
             rdb_basename: "dump".to_string(),
+            lua_memory_limit: DEFAULT_LUA_MEMORY_LIMIT,
         }
+    }
+
+    /// Cap the memory each Lua VM may use (bytes).
+    pub fn with_lua_memory_limit(mut self, bytes: usize) -> Self {
+        self.lua_memory_limit = bytes;
+        self
     }
 
     pub fn with_notify_flags(mut self, flags: Arc<AtomicU16>) -> Self {
@@ -658,7 +672,7 @@ impl CommandEngine {
             }
             "FLUSHDB" | "FLUSHALL" => {
                 // Heavy: release the async worker while we lock every shard.
-                maybe_block_in_place(|| {
+                self.maybe_block_in_place(|| {
                     let shards = self.shards.clone();
                     let num = shards.num_shards();
                     for i in 0..num {
@@ -748,7 +762,10 @@ impl CommandEngine {
                                 .get(i)
                                 .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok())
                             {
-                                expire_ms = Some(secs * 1000);
+                                match ttl_ms(secs, true) {
+                                    Some(ms) => expire_ms = Some(ms),
+                                    None => return invalid_expire("set"),
+                                }
                             } else {
                                 return CommandResponse::syntax_error();
                             }
@@ -759,7 +776,10 @@ impl CommandEngine {
                                 .get(i)
                                 .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok())
                             {
-                                expire_ms = Some(ms);
+                                match ttl_ms(ms, false) {
+                                    Some(ms) => expire_ms = Some(ms),
+                                    None => return invalid_expire("set"),
+                                }
                             } else {
                                 return CommandResponse::syntax_error();
                             }
@@ -770,9 +790,10 @@ impl CommandEngine {
                                 .get(i)
                                 .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok())
                             {
-                                let now = now_millis();
-                                let target = ts * 1000;
-                                expire_ms = Some(target.saturating_sub(now));
+                                let Some(target) = ts.checked_mul(1000) else {
+                                    return invalid_expire("set");
+                                };
+                                expire_ms = Some(target.saturating_sub(now_millis()));
                             } else {
                                 return CommandResponse::syntax_error();
                             }
@@ -828,6 +849,9 @@ impl CommandEngine {
                         )
                     }
                 };
+                if ttl_ms(seconds, true).is_none() {
+                    return invalid_expire("setex");
+                }
                 let value = args[2].clone();
                 self.shards
                     .shard_for_key(&key)
@@ -849,6 +873,9 @@ impl CommandEngine {
                         )
                     }
                 };
+                if ttl_ms(millis, false).is_none() {
+                    return invalid_expire("psetex");
+                }
                 let value = args[2].clone();
                 self.shards
                     .shard_for_key(&key)
@@ -884,18 +911,20 @@ impl CommandEngine {
                 while i < args.len() {
                     let opt = std::str::from_utf8(&args[i]).unwrap_or("").to_uppercase();
                     match opt.as_str() {
-                        "EX" => {
+                        "EX" | "PX" => {
                             i += 1;
-                            expire_ms = args
-                                .get(i)
-                                .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok())
-                                .map(|s| s * 1000);
-                        }
-                        "PX" => {
-                            i += 1;
-                            expire_ms = args
+                            let amount = args
                                 .get(i)
                                 .and_then(|b| std::str::from_utf8(b).ok()?.parse::<u64>().ok());
+                            match amount.map(|a| ttl_ms(a, opt == "EX")) {
+                                Some(Some(ms)) => expire_ms = Some(ms),
+                                Some(None) => return invalid_expire("getex"),
+                                None => {
+                                    return CommandResponse::error(
+                                        "ERR value is not an integer or out of range",
+                                    )
+                                }
+                            }
                         }
                         "PERSIST" => persist = true,
                         _ => return CommandResponse::syntax_error(),
@@ -1144,12 +1173,11 @@ impl CommandEngine {
                         )
                     }
                 };
+                let Some(ms) = ttl_ms(seconds, true) else {
+                    return invalid_expire("expire");
+                };
                 self.shards.shard_for_key(&key).execute(move |store| {
-                    CommandResponse::integer(if store.expire(&key, seconds * 1000) {
-                        1
-                    } else {
-                        0
-                    })
+                    CommandResponse::integer(if store.expire(&key, ms) { 1 } else { 0 })
                 })
             }
             "PEXPIRE" => {
@@ -1168,6 +1196,9 @@ impl CommandEngine {
                         )
                     }
                 };
+                if ttl_ms(millis, false).is_none() {
+                    return invalid_expire("pexpire");
+                }
                 self.shards.shard_for_key(&key).execute(move |store| {
                     CommandResponse::integer(if store.expire(&key, millis) { 1 } else { 0 })
                 })
@@ -1188,12 +1219,11 @@ impl CommandEngine {
                         )
                     }
                 };
+                let Some(at_ms) = ts.checked_mul(1000) else {
+                    return invalid_expire("expireat");
+                };
                 self.shards.shard_for_key(&key).execute(move |store| {
-                    CommandResponse::integer(if store.expire_at(&key, ts * 1000) {
-                        1
-                    } else {
-                        0
-                    })
+                    CommandResponse::integer(if store.expire_at(&key, at_ms) { 1 } else { 0 })
                 })
             }
             "PEXPIREAT" => {
@@ -1288,7 +1318,7 @@ impl CommandEngine {
                 }
                 let pattern = std::str::from_utf8(&args[0]).unwrap_or("*").to_string();
                 // Heavy full-space walk: don't pin the Tokio worker.
-                maybe_block_in_place(|| {
+                self.maybe_block_in_place(|| {
                     let shards = self.shards.clone();
                     let num = shards.num_shards();
                     let mut all_keys = Vec::new();
@@ -3208,7 +3238,7 @@ impl CommandEngine {
             // ---- Persistence commands ----
             "SAVE" | "BGSAVE" => {
                 // Disk I/O under shard locks — release the async worker while saving.
-                maybe_block_in_place(|| {
+                self.maybe_block_in_place(|| {
                     let dir = self.rdb_dir.as_path();
                     let shards = self.shards.clone();
                     let num = shards.num_shards();
@@ -3569,8 +3599,10 @@ impl CommandEngine {
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok())
                 {
-                    Some(o) => o,
-                    None => {
+                    // 2^32 bits is a 512 MB string, Redis' limit. Unbounded, one
+                    // SETBIT could make the server allocate 2^61 bytes.
+                    Some(o) if o < solikv_core::types::MAX_BIT_OFFSET => o,
+                    _ => {
                         return CommandResponse::error(
                             "ERR bit offset is not an integer or out of range",
                         )
@@ -3598,8 +3630,10 @@ impl CommandEngine {
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok())
                 {
-                    Some(o) => o,
-                    None => {
+                    // 2^32 bits is a 512 MB string, Redis' limit. Unbounded, one
+                    // SETBIT could make the server allocate 2^61 bytes.
+                    Some(o) if o < solikv_core::types::MAX_BIT_OFFSET => o,
+                    _ => {
                         return CommandResponse::error(
                             "ERR bit offset is not an integer or out of range",
                         )
@@ -3693,19 +3727,48 @@ impl CommandEngine {
     }
 }
 
-/// Run `f` via `block_in_place` when on Tokio's multi-thread runtime so other
-/// async tasks can progress while we hold shard locks / do disk I/O.
-/// On current-thread runtimes (e.g. some tests) `block_in_place` panics — run
-/// `f` directly instead.
-fn maybe_block_in_place<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(f)
+/// Relative TTL in milliseconds from a client-supplied amount, or `None` when
+/// it cannot be represented: `secs * 1000` used to wrap in release builds, so
+/// a huge `EX` produced a tiny TTL. The bound keeps `now + ttl` inside an
+/// `i64`, which is what TTL/PTTL report.
+fn ttl_ms(amount: u64, seconds: bool) -> Option<u64> {
+    const MAX_TTL_MS: u64 = (i64::MAX as u64) / 2;
+    let ms = if seconds {
+        amount.checked_mul(1000)?
+    } else {
+        amount
+    };
+    (ms <= MAX_TTL_MS).then_some(ms)
+}
+
+fn invalid_expire(cmd: &str) -> CommandResponse {
+    CommandResponse::error(format!("ERR invalid expire time in '{}' command", cmd))
+}
+
+impl CommandEngine {
+    /// Run `f` via `block_in_place` on the multi-thread runtime so other async
+    /// tasks can progress while we hold shard locks / do disk I/O.
+    ///
+    /// Never in solo mode. `block_in_place` hands this worker's queue to a
+    /// new thread, and with the solo store unlocked that meant two threads in
+    /// it at once — KEYS or FLUSHALL walking the store while another
+    /// connection wrote to it. Solo runs `f` inline, as Redis would: the
+    /// single thread is busy, and that is the model. On current-thread
+    /// runtimes (e.g. some tests) `block_in_place` panics, so those run
+    /// inline too.
+    fn maybe_block_in_place<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        if self.shards.is_solo() {
+            return f();
         }
-        _ => f(),
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(f)
+            }
+            _ => f(),
+        }
     }
 }
 
@@ -4123,6 +4186,176 @@ mod sec_tests {
             "unexpected error: {}",
             msg
         );
+    }
+
+    fn b(s: &str) -> Bytes {
+        Bytes::from(s.to_string())
+    }
+
+    /// SETRANGE with an offset near usize::MAX wrapped `offset + len` and
+    /// then zero-padded a byte at a time while holding the shard lock.
+    #[test]
+    fn setrange_huge_offset_is_refused() {
+        let e = engine();
+        for off in ["18446744073709551615", "536870912"] {
+            let r = e.execute("SETRANGE", &[b("k"), b(off), b("x")]);
+            assert!(err_string(&r).contains("maximum allowed size"), "{off}");
+        }
+        assert!(matches!(
+            e.execute("SETRANGE", &[b("k"), b("3"), b("x")]),
+            CommandResponse::Integer(4)
+        ));
+    }
+
+    #[test]
+    fn bit_offsets_are_capped_at_2_pow_32() {
+        let e = engine();
+        for cmd in ["SETBIT", "GETBIT"] {
+            let mut args = vec![b("bm"), b("4294967296")];
+            if cmd == "SETBIT" {
+                args.push(b("1"));
+            }
+            assert!(err_string(&e.execute(cmd, &args)).contains("bit offset"));
+        }
+        assert!(matches!(
+            e.execute("SETBIT", &[b("bm"), b("7"), b("1")]),
+            CommandResponse::Integer(0)
+        ));
+    }
+
+    #[test]
+    fn bf_reserve_refuses_filters_it_cannot_afford() {
+        let e = engine();
+        let r = e.execute(
+            "BF.RESERVE",
+            &[b("bf"), b("0.0000001"), b("1152921504606846976")],
+        );
+        assert!(err_string(&r).contains("maximum size"));
+        assert!(e
+            .execute("BF.RESERVE", &[b("bf"), b("1.5"), b("100")])
+            .is_error());
+        assert!(e
+            .execute("BF.RESERVE", &[b("bf"), b("0.01"), b("0")])
+            .is_error());
+        assert!(matches!(
+            e.execute("BF.RESERVE", &[b("bf"), b("0.01"), b("1000")]),
+            CommandResponse::Ok
+        ));
+    }
+
+    /// `secs * 1000` wrapped in release builds, so a huge EX set a tiny TTL.
+    #[test]
+    fn overflowing_ttls_are_invalid_expire_times() {
+        let e = engine();
+        let huge = "18446744073709551615";
+        let secs = "9223372036854775"; // * 1000 overflows the i64 range
+        let cases: Vec<(&str, Vec<Bytes>)> = vec![
+            ("SET", vec![b("k"), b("v"), b("EX"), b(huge)]),
+            ("SET", vec![b("k"), b("v"), b("EX"), b(secs)]),
+            ("SET", vec![b("k"), b("v"), b("PX"), b(huge)]),
+            ("SET", vec![b("k"), b("v"), b("EXAT"), b(huge)]),
+            ("SETEX", vec![b("k"), b(huge), b("v")]),
+            ("PSETEX", vec![b("k"), b(huge), b("v")]),
+            ("GETEX", vec![b("k"), b("EX"), b(huge)]),
+        ];
+        for (cmd, args) in cases {
+            let r = e.execute(cmd, &args);
+            assert!(
+                err_string(&r).contains("invalid expire time"),
+                "{cmd} {args:?}"
+            );
+        }
+        e.execute("SET", &[b("k"), b("v")]);
+        for (cmd, arg) in [("EXPIRE", huge), ("PEXPIRE", huge), ("EXPIREAT", huge)] {
+            let r = e.execute(cmd, &[b("k"), b(arg)]);
+            assert!(err_string(&r).contains("invalid expire time"), "{cmd}");
+        }
+        // The key is untouched by the refused commands.
+        assert!(matches!(
+            e.execute("TTL", &[b("k")]),
+            CommandResponse::Integer(-1)
+        ));
+    }
+
+    #[test]
+    fn huge_counts_do_not_preallocate() {
+        let e = engine();
+        e.execute("RPUSH", &[b("l"), b("a"), b("b")]);
+        let r = e.execute("LPOP", &[b("l"), b("18446744073709551615")]);
+        assert!(
+            matches!(r, CommandResponse::Array(ref v) if v.len() == 2),
+            "{r:?}"
+        );
+        e.execute("SET", &[b("k"), b("v")]);
+        let r = e.execute("SCAN", &[b("0"), b("COUNT"), b("18446744073709551615")]);
+        assert!(!r.is_error(), "{r:?}");
+    }
+
+    /// KEYS / FLUSHALL / SAVE used `block_in_place`, which on the solo
+    /// runtime hands the worker to a second thread and lets it into the
+    /// unlocked store. The debug guard in `SoloStore` turns any such overlap
+    /// into a panic, so hammering the store from other tasks while KEYS runs
+    /// must stay quiet.
+    #[test]
+    fn solo_heavy_commands_stay_on_the_worker() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let shards = Arc::new(ShardManager::solo_plain());
+        let pubsub = Arc::new(PubSubBroker::new());
+        let e = Arc::new(CommandEngine::new(shards, pubsub));
+        e.init_self_ref(Arc::downgrade(&e));
+        for i in 0..2000 {
+            e.execute("SET", &[b(&format!("k{i}")), b("v")]);
+        }
+        rt.block_on(async {
+            let mut tasks = Vec::new();
+            for t in 0..8 {
+                let e = e.clone();
+                tasks.push(tokio::spawn(async move {
+                    for i in 0..200 {
+                        e.execute("SET", &[b(&format!("w{t}-{i}")), b("v")]);
+                        if i % 50 == 0 {
+                            e.execute("KEYS", &[b("*")]);
+                            e.execute("FLUSHALL", &[]);
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }));
+            }
+            for t in tasks {
+                t.await
+                    .expect("a task panicked: the solo store was entered concurrently");
+            }
+        });
+    }
+
+    #[test]
+    fn lua_memory_is_limited() {
+        let shards = Arc::new(ShardManager::new(1));
+        let pubsub = Arc::new(PubSubBroker::new());
+        let e = Arc::new(CommandEngine::new(shards, pubsub).with_lua_memory_limit(8 * 1024 * 1024));
+        e.init_self_ref(Arc::downgrade(&e));
+        let r = e.execute(
+            "EVAL",
+            &[
+                b("return string.len(string.rep('x', 64 * 1024 * 1024))"),
+                b("0"),
+            ],
+        );
+        assert!(r.is_error(), "{r:?}");
+        // The VM is still usable afterwards.
+        let r = e.execute("EVAL", &[b("return 1 + 1"), b("0")]);
+        assert!(matches!(r, CommandResponse::Integer(2)), "{r:?}");
+    }
+
+    #[test]
+    fn lua_refuses_binary_chunks() {
+        let e = engine();
+        let r = e.execute("EVAL", &[b("\x1bLuaT\x00"), b("0")]);
+        assert!(r.is_error(), "{r:?}");
     }
 
     /// Solo mode: unlocked store still serves SET/GET correctly.

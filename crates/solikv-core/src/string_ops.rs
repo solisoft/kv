@@ -69,7 +69,11 @@ impl ShardStore {
 
     // ---- SETEX ----
     pub fn string_setex(&mut self, key: Bytes, seconds: u64, value: Bytes) -> CommandResponse {
-        self.set(key, RedisValue::String(value), Some(seconds * 1000));
+        self.set(
+            key,
+            RedisValue::String(value),
+            Some(seconds.saturating_mul(1000)),
+        );
         CommandResponse::ok()
     }
 
@@ -320,12 +324,23 @@ impl ShardStore {
             },
         };
 
-        let needed = offset + value.len();
+        // Checked, and capped like Redis' proto-max-bulk-len: `offset` comes
+        // from the client, and `usize::MAX + len` used to wrap to a small
+        // `needed` and then zero-pad one byte at a time towards 2^64 while
+        // holding the shard lock.
+        let needed = match offset.checked_add(value.len()) {
+            Some(n) if n <= MAX_STRING_LEN => n,
+            _ => {
+                return CommandResponse::error(
+                    "ERR string exceeds maximum allowed size (proto-max-bulk-len)",
+                )
+            }
+        };
         let mut buf = BytesMut::with_capacity(needed.max(current.len()));
         buf.extend_from_slice(&current);
         // Pad with zeros if needed
-        while buf.len() < offset {
-            buf.extend_from_slice(&[0]);
+        if buf.len() < offset {
+            buf.resize(offset, 0);
         }
         // Overwrite or extend
         if offset + value.len() > buf.len() {
@@ -341,6 +356,9 @@ impl ShardStore {
     }
     // ---- SETBIT ----
     pub fn string_setbit(&mut self, key: &Bytes, offset: u64, value: u8) -> CommandResponse {
+        if offset >= MAX_BIT_OFFSET {
+            return CommandResponse::error("ERR bit offset is not an integer or out of range");
+        }
         let current = match self.get(key) {
             None => Bytes::new(),
             Some(entry) => match &entry.value {

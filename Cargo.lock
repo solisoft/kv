@@ -1952,6 +1952,7 @@ name = "solikv-persist"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "libc",
  "lzf",
  "serde",
  "serde_json",
@@ -1993,6 +1994,7 @@ name = "solikv-resp"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "memchr",
  "thiserror",
  "tokio",
  "tokio-util",

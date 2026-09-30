@@ -2,6 +2,9 @@ use crc16::*;
 
 const NUM_SLOTS: u16 = 16384;
 
+/// Number of hash slots; every valid slot is `< SLOT_COUNT`.
+pub const SLOT_COUNT: u16 = NUM_SLOTS;
+
 /// Redis-compatible consistent hash ring with 16384 slots.
 #[derive(Debug, Clone)]
 pub struct ConsistentHash {

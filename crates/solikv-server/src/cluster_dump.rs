@@ -511,7 +511,9 @@ pub fn dump_cluster(
     };
 
     if format == "jsonl" {
-        let file = std::fs::File::create(output_path)?;
+        // Every key and value of the cluster: 0600, and no following a
+        // symlink planted at the output path.
+        let file = solikv_persist::fsutil::create_private(output_path)?;
         let mut writer = std::io::BufWriter::new(file);
 
         // Write header as first line
@@ -523,7 +525,9 @@ pub fn dump_cluster(
         }
     } else {
         // Binary format
-        let file = std::fs::File::create(output_path)?;
+        // Every key and value of the cluster: 0600, and no following a
+        // symlink planted at the output path.
+        let file = solikv_persist::fsutil::create_private(output_path)?;
         let mut writer = std::io::BufWriter::new(file);
 
         // Magic + version

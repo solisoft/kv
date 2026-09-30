@@ -3,6 +3,13 @@ use std::io::{self, BufReader, Read};
 
 use super::lzf;
 
+/// Largest string an RDB may hold (Redis' `proto-max-bulk-len`).
+pub const MAX_STRING_LEN: usize = 512 * 1024 * 1024;
+
+/// Most slots reserved up front for a collection whose length comes from the
+/// file. Beyond it, collections grow as elements are actually read.
+pub const MAX_PREALLOC: usize = 4096;
+
 /// Result of `read_length_encoding`: either a plain length or a special encoding marker.
 pub enum LengthResult {
     /// A plain length value.
@@ -41,6 +48,45 @@ impl<R: Read> RdbReader<R> {
         self.reader.read_exact(buf)?;
         self.pos += buf.len() as u64;
         Ok(())
+    }
+
+    /// Read `len` bytes into a fresh buffer.
+    ///
+    /// The length comes from the file, so nothing is allocated for it up
+    /// front: `take` + `read_to_end` grows with the bytes that actually
+    /// arrive. A forged `len` of 2^60 used to be `vec![0; len]` — an abort
+    /// before a single byte was read.
+    pub fn read_vec(&mut self, len: usize) -> io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        (&mut self.reader).take(len as u64).read_to_end(&mut buf)?;
+        self.pos += buf.len() as u64;
+        if buf.len() < len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("RDB ends inside a {len}-byte string"),
+            ));
+        }
+        Ok(buf)
+    }
+
+    /// Read an LZF string's two lengths and decompress it, refusing an
+    /// uncompressed length the compressed bytes could not possibly produce
+    /// (the decompressor allocates it up front).
+    fn read_lzf(&mut self) -> io::Result<Vec<u8>> {
+        let compressed_len = self.read_length()?;
+        let uncompressed_len = self.read_length()?;
+        // LZF expands at most ~88x (a 3-byte back-reference yields 264 bytes).
+        let plausible = compressed_len.saturating_mul(100).saturating_add(64);
+        if uncompressed_len > plausible || uncompressed_len > MAX_STRING_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "LZF string claims {uncompressed_len} bytes from {compressed_len} compressed"
+                ),
+            ));
+        }
+        let compressed = self.read_vec(compressed_len)?;
+        lzf::decompress(&compressed, uncompressed_len)
     }
 
     /// Read a single byte.
@@ -151,11 +197,7 @@ impl<R: Read> RdbReader<R> {
     /// Read a length-prefixed string (handles raw bytes, integer encodings, and LZF).
     pub fn read_string(&mut self) -> io::Result<Bytes> {
         match self.read_length_encoding()? {
-            LengthResult::Length(len) => {
-                let mut buf = vec![0u8; len];
-                self.read_exact(&mut buf)?;
-                Ok(Bytes::from(buf))
-            }
+            LengthResult::Length(len) => Ok(Bytes::from(self.read_vec(len)?)),
             LengthResult::Int8 => {
                 let val = self.read_u8()? as i8;
                 Ok(Bytes::from(val.to_string()))
@@ -172,25 +214,14 @@ impl<R: Read> RdbReader<R> {
                 let val = i32::from_le_bytes(buf);
                 Ok(Bytes::from(val.to_string()))
             }
-            LengthResult::Lzf => {
-                let compressed_len = self.read_length()?;
-                let uncompressed_len = self.read_length()?;
-                let mut compressed = vec![0u8; compressed_len];
-                self.read_exact(&mut compressed)?;
-                let decompressed = lzf::decompress(&compressed, uncompressed_len)?;
-                Ok(Bytes::from(decompressed))
-            }
+            LengthResult::Lzf => Ok(Bytes::from(self.read_lzf()?)),
         }
     }
 
     /// Read raw string bytes (not converting to Bytes, for use in sub-decoders).
     pub fn read_string_raw(&mut self) -> io::Result<Vec<u8>> {
         match self.read_length_encoding()? {
-            LengthResult::Length(len) => {
-                let mut buf = vec![0u8; len];
-                self.read_exact(&mut buf)?;
-                Ok(buf)
-            }
+            LengthResult::Length(len) => self.read_vec(len),
             LengthResult::Int8 => {
                 let val = self.read_u8()? as i8;
                 Ok(val.to_string().into_bytes())
@@ -207,13 +238,7 @@ impl<R: Read> RdbReader<R> {
                 let val = i32::from_le_bytes(buf);
                 Ok(val.to_string().into_bytes())
             }
-            LengthResult::Lzf => {
-                let compressed_len = self.read_length()?;
-                let uncompressed_len = self.read_length()?;
-                let mut compressed = vec![0u8; compressed_len];
-                self.read_exact(&mut compressed)?;
-                lzf::decompress(&compressed, uncompressed_len)
-            }
+            LengthResult::Lzf => self.read_lzf(),
         }
     }
 
@@ -264,6 +289,24 @@ impl<R: Read> RdbReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_forged_string_length_does_not_preallocate() {
+        // 0x80 = 32-bit length follows; claim ~4 GiB, supply 3 bytes.
+        let data = [0x80u8, 0xFF, 0xFF, 0xFF, 0xFF, b'a', b'b', b'c'];
+        let mut r = RdbReader::new(std::io::Cursor::new(&data[..]));
+        let err = r.read_string().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn an_implausible_lzf_length_is_refused() {
+        // 0xC3 = LZF; compressed 2 bytes claiming 1 GiB uncompressed.
+        let data = [0xC3u8, 0x02, 0x80, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut r = RdbReader::new(std::io::Cursor::new(&data[..]));
+        let err = r.read_string().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
     use std::io::Cursor;
 
     #[test]

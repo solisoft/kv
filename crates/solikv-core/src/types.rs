@@ -298,6 +298,16 @@ impl Default for HyperLogLogValue {
     }
 }
 
+/// Largest string value, same as Redis' `proto-max-bulk-len` (512 MB).
+pub const MAX_STRING_LEN: usize = 512 * 1024 * 1024;
+
+/// SETBIT/GETBIT offsets must be below this (2^32 bits = a 512 MB string).
+pub const MAX_BIT_OFFSET: u64 = 1 << 32;
+
+/// Largest bloom filter bit array (2^32 bits = 512 MB), whatever the
+/// requested capacity and error rate work out to.
+pub const MAX_BLOOM_BITS: u64 = 1 << 32;
+
 /// Bloom Filter — double hashing, configurable capacity and error rate.
 #[derive(Debug, Clone)]
 pub struct BloomFilterValue {
@@ -310,9 +320,21 @@ pub struct BloomFilterValue {
 }
 
 impl BloomFilterValue {
+    /// Bits a filter for `capacity` items at `error_rate` needs, or `None`
+    /// when the parameters are invalid or it would exceed `MAX_BLOOM_BITS`.
+    pub fn required_bits(capacity: u64, error_rate: f64) -> Option<u64> {
+        if capacity == 0 || !(error_rate > 0.0 && error_rate < 1.0) {
+            return None;
+        }
+        let bits = (-((capacity as f64) * error_rate.ln()) / (2.0_f64.ln().powi(2))).ceil();
+        (bits.is_finite() && bits <= MAX_BLOOM_BITS as f64).then_some((bits as u64).max(8))
+    }
+
+    /// Callers pass parameters that [`Self::required_bits`] accepts; anything
+    /// else is clamped rather than allocated as asked.
     pub fn with_capacity(capacity: u64, error_rate: f64) -> Self {
-        let num_bits =
-            (-((capacity as f64) * error_rate.ln()) / (2.0_f64.ln().powi(2))).ceil() as u64;
+        let capacity = capacity.max(1);
+        let num_bits = Self::required_bits(capacity, error_rate).unwrap_or(MAX_BLOOM_BITS);
         let num_bits = num_bits.max(8); // minimum 8 bits
         let num_hashes = ((num_bits as f64 / capacity as f64) * 2.0_f64.ln()).ceil() as u32;
         let num_hashes = num_hashes.max(1);

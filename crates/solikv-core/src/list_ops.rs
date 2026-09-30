@@ -77,7 +77,7 @@ impl ShardStore {
                         None => CommandResponse::nil(),
                     }
                 } else {
-                    let mut items = Vec::with_capacity(count);
+                    let mut items = Vec::with_capacity(count.min(list.len()));
                     for _ in 0..count {
                         match list.pop_front() {
                             Some(v) => items.push(CommandResponse::bulk(v)),
@@ -117,7 +117,7 @@ impl ShardStore {
                         None => CommandResponse::nil(),
                     }
                 } else {
-                    let mut items = Vec::with_capacity(count);
+                    let mut items = Vec::with_capacity(count.min(list.len()));
                     for _ in 0..count {
                         match list.pop_back() {
                             Some(v) => items.push(CommandResponse::bulk(v)),

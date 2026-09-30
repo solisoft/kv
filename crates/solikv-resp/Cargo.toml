@@ -7,6 +7,7 @@ edition = "2021"
 bytes = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["codec"] }
+memchr = "2"
 tracing = { workspace = true }
 thiserror = { workspace = true }
 

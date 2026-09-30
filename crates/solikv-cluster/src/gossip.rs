@@ -16,6 +16,8 @@ use tokio::sync::mpsc;
 //                                            handshake: a handshake authenticates
 //                                            a connection once and trusts every
 //                                            later byte on it
+//   [x] frames bound to their receiver and   crate::auth::Opened::receiver_bound,
+//       one replay memory for the bus        start_gossip_server
 //   [ ] TLS on the bus and replica links     NOT DONE — see below
 //
 // The HMAC authenticates and detects tampering; it does not encrypt. Anyone on
@@ -167,8 +169,10 @@ pub fn decode_slots(text: &str) -> Vec<(u16, u16)> {
             }
         })
         // Backwards is not a range. Accepting one would have every reader
-        // iterating an empty span and silently recording no owner.
-        .filter(|(start, end)| start <= end)
+        // iterating an empty span and silently recording no owner. Past the
+        // last slot is not one either, and indexing with it panicked the
+        // gossip drain task.
+        .filter(|(start, end)| start <= end && *end < crate::consistent_hash::SLOT_COUNT)
         .collect()
 }
 
@@ -344,6 +348,18 @@ impl GossipState {
             .collect()
     }
 
+    /// Peers as `(node_id, ip, port)`. A node id equal to `"ip:port"` is the
+    /// `CLUSTER MEET` placeholder: the real identity is not known yet.
+    pub fn get_known_peers(&self) -> Vec<(String, String, u16)> {
+        let myself_id = self.myself.read().node_id.clone();
+        self.nodes
+            .read()
+            .values()
+            .filter(|n| n.node_id != myself_id)
+            .map(|n| (n.node_id.clone(), n.ip.clone(), n.port))
+            .collect()
+    }
+
     pub fn get_alive_nodes(&self) -> Vec<ClusterNodeInfo> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -476,7 +492,12 @@ pub async fn start_gossip_server(
     let listener = TcpListener::bind(bind).await?;
     tracing::info!(%bind, "cluster gossip server listening, every frame authenticated");
 
-    let _ = &state;
+    // One replay memory for the whole bus. Senders open a connection per
+    // frame, so a per-connection memory never saw the same nonce twice.
+    let seen = Arc::new(parking_lot::Mutex::new(crate::auth::NonceMemory::new()));
+    let me: Arc<str> = state.myself_id().into();
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_BUS_CONNECTIONS));
+    let rejected_log = Arc::new(RateLimitedLog::default());
 
     tokio::spawn(async move {
         loop {
@@ -488,12 +509,27 @@ pub async fn start_gossip_server(
                 }
             };
 
-            let tx = msg_tx.clone();
-            let secret = secret.clone();
+            // Bounded, because the bus is reachable before anything is
+            // authenticated: without a cap, idle sockets are free memory.
+            let Ok(permit) = permits.clone().try_acquire_owned() else {
+                rejected_log.warn(|suppressed| {
+                    tracing::warn!(%peer_addr, suppressed, "gossip connection limit reached");
+                });
+                continue;
+            };
+
+            let ctx = PeerContext {
+                secret: secret.clone(),
+                seen: seen.clone(),
+                me: me.clone(),
+                msg_tx: msg_tx.clone(),
+                rejected_log: rejected_log.clone(),
+            };
             tokio::spawn(async move {
-                if let Err(e) = serve_peer(stream, peer_addr, secret, tx).await {
+                if let Err(e) = serve_peer(stream, peer_addr, ctx).await {
                     tracing::debug!(%peer_addr, error = %e, "gossip connection closed");
                 }
+                drop(permit);
             });
         }
     });
@@ -501,56 +537,175 @@ pub async fn start_gossip_server(
     Ok(())
 }
 
+/// Most concurrent inbound bus connections. A peer holds one for the length
+/// of a frame, so this is far above what any real cluster needs.
+pub const MAX_BUS_CONNECTIONS: usize = 256;
+
+/// How long a bus connection may sit without completing a frame. Senders
+/// write one line and close, so anything slower is not a peer.
+pub const BUS_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Everything a connection needs from the server.
+struct PeerContext {
+    secret: crate::auth::ClusterSecret,
+    seen: Arc<parking_lot::Mutex<crate::auth::NonceMemory>>,
+    me: Arc<str>,
+    msg_tx: mpsc::UnboundedSender<GossipMessage>,
+    rejected_log: Arc<RateLimitedLog>,
+}
+
+/// A warn that fires at most once a second, counting what it swallowed.
+///
+/// Rejected frames come from the network; logging each one at `warn` let
+/// anyone who can reach the port fill the disk.
+#[derive(Default)]
+pub struct RateLimitedLog {
+    last_ms: std::sync::atomic::AtomicU64,
+    suppressed: std::sync::atomic::AtomicU64,
+}
+
+impl RateLimitedLog {
+    pub fn warn(&self, emit: impl FnOnce(u64)) {
+        use std::sync::atomic::Ordering;
+        let now = now_ms();
+        let last = self.last_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 1_000
+            && self
+                .last_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            emit(self.suppressed.swap(0, Ordering::Relaxed));
+        } else {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Whether a message may arrive unaddressed (receiver `*`).
+///
+/// Only the handshake: a `PING` or `MEET` is sent before the peer's node id is
+/// known. `UPDATE` moves slot ownership and `PONG` vouches for liveness, so
+/// both must name this node — otherwise one capture replays at every node.
+fn may_be_unbound(message: &GossipMessage) -> bool {
+    matches!(
+        message,
+        GossipMessage::Ping { .. } | GossipMessage::Meet { .. }
+    )
+}
+
+/// Reads one `\n`-terminated line of at most `MAX_FRAME_BYTES`.
+///
+/// `Ok(None)` at a clean end of stream. A longer line is an error and ends
+/// the connection: it is refused *before* being buffered, which the previous
+/// `BufReader::lines()` could not do — it read until `\n` however far away.
+async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> Result<Option<()>, std::io::Error> {
+    use tokio::io::AsyncBufReadExt;
+    use tokio::io::AsyncReadExt;
+
+    buf.clear();
+    let limit = (crate::auth::MAX_FRAME_BYTES + 2) as u64;
+    let n = reader.take(limit).read_until(b'\n', buf).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() != Some(&b'\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            if n as u64 >= limit {
+                "gossip frame over the size limit"
+            } else {
+                "gossip frame truncated"
+            },
+        ));
+    }
+    Ok(Some(()))
+}
+
 /// One connection.
 ///
 /// Line-framed, because the protocol is line-terminated and TCP is not. The
-/// nonce memory and the claimed identity are per connection: the identity
-/// because that is the only scope in which it means anything, and the nonces
-/// because a shared one would be a lock on the hot path for a defence that is
-/// already per-peer.
+/// claimed identity is per connection, because that is the only scope in
+/// which it means anything; the nonce memory is shared (see
+/// `start_gossip_server`).
 async fn serve_peer(
     stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
-    secret: crate::auth::ClusterSecret,
-    msg_tx: mpsc::UnboundedSender<GossipMessage>,
+    ctx: PeerContext,
 ) -> Result<(), std::io::Error> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    let mut lines = BufReader::new(stream).lines();
-    let mut seen = crate::auth::NonceMemory::new();
+    let mut reader = tokio::io::BufReader::new(stream);
     let mut identity = crate::auth::SenderIdentity::new();
+    let mut buf = Vec::with_capacity(512);
 
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        let read = tokio::time::timeout(BUS_READ_TIMEOUT, read_frame(&mut reader, &mut buf))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "gossip read timed out")
+            })??;
+        if read.is_none() {
+            break;
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            ctx.rejected_log.warn(|suppressed| {
+                tracing::warn!(%peer_addr, suppressed, "rejected gossip frame: not UTF-8");
+            });
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
 
-        let payload = match crate::auth::Envelope::open(&line, &secret, now_ms(), &mut seen) {
-            Ok(payload) => payload,
+        let opened = {
+            let mut seen = ctx.seen.lock();
+            crate::auth::Envelope::open(line, &ctx.secret, now_ms(), &mut seen, &ctx.me)
+        };
+        let opened = match opened {
+            Ok(opened) => opened,
             Err(e) => {
-                // Logged at warn and dropped. Not a disconnect: a single bad
-                // frame is far more often a clock that drifted than an attack,
-                // and dropping the connection would turn one skewed node into a
-                // reconnect storm against every peer.
-                tracing::warn!(%peer_addr, error = %e, "rejected gossip frame");
+                // Dropped, not a disconnect: a single bad frame is far more
+                // often a clock that drifted than an attack, and dropping the
+                // connection would turn one skewed node into a reconnect storm.
+                // Rate-limited, because the network decides how often this runs.
+                ctx.rejected_log.warn(|suppressed| {
+                    tracing::warn!(%peer_addr, error = %e, suppressed, "rejected gossip frame");
+                });
                 continue;
             }
         };
 
-        let Some(message) = GossipMessage::decode(payload.as_bytes()) else {
-            tracing::warn!(%peer_addr, "authenticated frame did not parse as gossip");
+        let Some(message) = GossipMessage::decode(opened.payload.as_bytes()) else {
+            ctx.rejected_log.warn(|suppressed| {
+                tracing::warn!(%peer_addr, suppressed, "authenticated frame did not parse as gossip");
+            });
             continue;
         };
+
+        if !opened.receiver_bound && !may_be_unbound(&message) {
+            ctx.rejected_log.warn(|suppressed| {
+                tracing::warn!(
+                    %peer_addr,
+                    suppressed,
+                    "rejected unaddressed gossip frame that carries authority"
+                );
+            });
+            continue;
+        }
 
         if let Err(e) = identity.observe(message.node_id()) {
             // A connection that changes who it claims to be. See the note in
             // `crate::auth` on what a shared secret can prove: this catches
-            // confusion and cross-connection replay, not a malicious member.
-            tracing::warn!(%peer_addr, error = %e, "gossip identity switch");
+            // confusion, not a malicious member.
+            ctx.rejected_log.warn(|suppressed| {
+                tracing::warn!(%peer_addr, error = %e, suppressed, "gossip identity switch");
+            });
             continue;
         }
 
-        if msg_tx.send(message).is_err() {
+        if ctx.msg_tx.send(message).is_err() {
             break;
         }
     }
@@ -569,18 +724,28 @@ async fn serve_peer(
 /// Every frame carries its own proof, so there is no session to establish and
 /// nothing is trusted because of what an earlier frame on the same connection
 /// said.
+///
+/// `receiver` is the peer's node id, or [`crate::auth::UNBOUND_RECEIVER`]
+/// while it is not known — which only a `PING` or `MEET` may use.
 pub async fn send_frame(
     peer: SocketAddr,
     message: &GossipMessage,
     secret: &crate::auth::ClusterSecret,
     connect_timeout: Duration,
+    receiver: &str,
 ) -> Result<(), std::io::Error> {
     use tokio::io::AsyncWriteExt;
 
     let payload = String::from_utf8_lossy(&message.encode())
         .trim_end()
         .to_string();
-    let frame = crate::auth::Envelope::seal(&payload, secret, now_ms(), &crate::auth::new_nonce());
+    let frame = crate::auth::Envelope::seal(
+        &payload,
+        secret,
+        now_ms(),
+        &crate::auth::new_nonce(),
+        receiver,
+    );
 
     // A peer that has gone away must not hold this task open. Without the
     // timeout a single unreachable node stalls the whole gossip round, which is
@@ -595,8 +760,19 @@ pub async fn send_frame(
             )
         })??;
 
-    stream.write_all(frame.as_bytes()).await?;
-    stream.flush().await
+    // The write is bounded too: a peer that accepts and never reads would
+    // otherwise hold this task once the socket buffer fills.
+    tokio::time::timeout(connect_timeout, async {
+        stream.write_all(frame.as_bytes()).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("write to {peer} timed out"),
+        )
+    })?
 }
 
 /// One round of gossip: ping every known peer.
@@ -638,10 +814,19 @@ pub async fn gossip_round_with_slots(
     // version of this loop read the first element as a node id and looked it up
     // — which never matched, so the round found no peers and gossip stayed
     // silent with a listener running and nothing in the log to say why.
-    for (ip, port) in state.get_known_nodes() {
+    for (node_id, ip, port) in state.get_known_peers() {
         if ip == my_ip && port == my_port {
             continue;
         }
+        // Until the peer's pong reveals its id, all this node has is the
+        // `CLUSTER MEET` placeholder: ping unaddressed, and hold the slot
+        // announcement back — it must be addressed, or it replays anywhere.
+        let known_id = node_id != format!("{ip}:{port}");
+        let receiver = if known_id {
+            node_id.as_str()
+        } else {
+            crate::auth::UNBOUND_RECEIVER
+        };
         let Ok(peer) = format!("{}:{}", ip, port + bus_offset).parse::<SocketAddr>() else {
             tracing::warn!(%ip, port, "peer address does not parse");
             continue;
@@ -653,7 +838,7 @@ pub async fn gossip_round_with_slots(
             port: my_port,
             ping_id: now_ms(),
         };
-        match send_frame(peer, &ping, secret, connect_timeout).await {
+        match send_frame(peer, &ping, secret, connect_timeout, receiver).await {
             Ok(()) => reached += 1,
             Err(e) => {
                 tracing::debug!(%peer, error = %e, "gossip ping failed");
@@ -661,6 +846,10 @@ pub async fn gossip_round_with_slots(
                 // ping; the next round will try both again.
                 continue;
             }
+        }
+
+        if !known_id {
+            continue;
         }
 
         // Sent every round, not only on change. A peer that missed one — a
@@ -675,7 +864,7 @@ pub async fn gossip_round_with_slots(
             master_id: None,
             slots: my_slots.to_vec(),
         };
-        if let Err(e) = send_frame(peer, &update, secret, connect_timeout).await {
+        if let Err(e) = send_frame(peer, &update, secret, connect_timeout, receiver).await {
             tracing::debug!(%peer, error = %e, "gossip slot announcement failed");
         }
     }

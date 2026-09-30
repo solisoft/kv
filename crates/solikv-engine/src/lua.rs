@@ -177,12 +177,24 @@ fn take_lua(engine: &Arc<CommandEngine>) -> (Lua, std::collections::HashSet<Stri
     sandbox_lua(&lua);
     setup_redis_module(&lua, engine);
     let baseline = snapshot_globals(&lua);
+    // After setup, so the limit bounds what scripts allocate, not the VM's
+    // own tables.
+    let limit = engine.lua_memory_limit.max(lua.used_memory() + 1024 * 1024);
+    if let Err(e) = lua.set_memory_limit(limit) {
+        tracing::warn!("could not set the Lua memory limit: {}", e);
+    }
     (lua, baseline)
 }
 
 /// Return a Lua VM (with its baseline snapshot) to the thread-local pool.
 fn return_lua(lua: Lua, baseline: std::collections::HashSet<String>, engine: &Arc<CommandEngine>) {
     let engine_id = Arc::as_ptr(engine) as usize;
+    // Free what the script left behind, and retire a VM that is still close
+    // to its memory limit: re-running setup in it could fail to allocate.
+    let _ = lua.gc_collect();
+    if lua.used_memory() > engine.lua_memory_limit / 2 {
+        return;
+    }
     LUA_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
         if pool.len() < LUA_POOL_MAX {
@@ -227,9 +239,13 @@ pub fn execute_script(
         }
     });
 
-    setup_keys_argv(&lua, &keys, &argv);
-
-    let result = match lua.load(script).eval::<LuaValue>() {
+    // Text only. A precompiled (binary) chunk is not verified by Lua and is
+    // a known way to corrupt the VM's memory from inside a script.
+    let result = match setup_keys_argv(&lua, &keys, &argv).and_then(|()| {
+        lua.load(script)
+            .set_mode(mlua::ChunkMode::Text)
+            .eval::<LuaValue>()
+    }) {
         Ok(val) => lua_to_response(val),
         Err(e) => {
             let msg = e.to_string();
@@ -271,24 +287,22 @@ fn sandbox_lua(lua: &Lua) {
 // Set up KEYS and ARGV tables
 // ---------------------------------------------------------------------------
 
-fn setup_keys_argv(lua: &Lua, keys: &[Bytes], argv: &[Bytes]) {
-    fn bytes_to_table(lua: &Lua, items: &[Bytes]) -> LuaTable {
-        let t = lua.create_table().expect("create table");
+/// Fallible: under the memory limit, building the tables can fail, and that
+/// is an error for this script — not a panic in the server.
+fn setup_keys_argv(lua: &Lua, keys: &[Bytes], argv: &[Bytes]) -> LuaResult<()> {
+    fn bytes_to_table(lua: &Lua, items: &[Bytes]) -> LuaResult<LuaTable> {
+        let t = lua.create_table()?;
         for (i, item) in items.iter().enumerate() {
             let s = String::from_utf8_lossy(item);
-            t.set(i + 1, s.as_ref().to_owned())
-                .expect("set table entry");
+            t.set(i + 1, s.as_ref().to_owned())?;
         }
-        t
+        Ok(t)
     }
 
     let globals = lua.globals();
-    globals
-        .set("KEYS", bytes_to_table(lua, keys))
-        .expect("set KEYS");
-    globals
-        .set("ARGV", bytes_to_table(lua, argv))
-        .expect("set ARGV");
+    globals.set("KEYS", bytes_to_table(lua, keys)?)?;
+    globals.set("ARGV", bytes_to_table(lua, argv)?)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

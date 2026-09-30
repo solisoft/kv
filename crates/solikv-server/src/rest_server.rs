@@ -1,3 +1,4 @@
+use axum::serve::ListenerExt;
 use axum::{
     extract::{ConnectInfo, Path, Query, Request, State},
     http::StatusCode,
@@ -40,16 +41,29 @@ impl AuthFailureTracker {
     fn record_failure(&self, ip: &str) {
         let mut failures = self.failures.write().unwrap();
         let now = std::time::Instant::now();
+        // Keyed by peer IP, so it grows with the number of addresses that
+        // ever failed. Forget the ones whose cooldown is long over.
+        if failures.len() >= AUTH_TRACKER_PRUNE_AT {
+            failures.retain(|_, (_, last)| last.elapsed().as_secs() < AUTH_COOLDOWN_SECS_REST);
+        }
         let entry = failures.entry(ip.to_string()).or_insert((0, now));
         entry.0 += 1;
         entry.1 = now;
     }
 
     fn record_success(&self, ip: &str) {
+        // Every authenticated request lands here; only take the write lock
+        // when there is something to forget.
+        if !self.failures.read().unwrap().contains_key(ip) {
+            return;
+        }
         let mut failures = self.failures.write().unwrap();
         failures.remove(ip);
     }
 }
+
+/// Prune the failure map once it holds this many addresses.
+const AUTH_TRACKER_PRUNE_AT: usize = 4096;
 
 #[derive(Clone)]
 struct AppState {
@@ -58,16 +72,59 @@ struct AppState {
     auth_tracker: Arc<AuthFailureTracker>,
 }
 
+/// How the REST listener is exposed.
+#[derive(Clone, Default)]
+pub struct RestConfig {
+    /// Bearer token. `None` = no authentication.
+    pub token: Option<Arc<String>>,
+    /// Terminate TLS with this configuration.
+    pub tls: Option<rustls::ServerConfig>,
+    /// Accepted `Host` header names (without port). `None` = no check.
+    ///
+    /// A browser can be made to send requests to a loopback port from any
+    /// web page by DNS rebinding: the attacker's name resolves to 127.0.0.1,
+    /// and the page then reads and writes every key. The `Host` header still
+    /// carries the attacker's name, which is what this refuses.
+    pub allowed_hosts: Option<Vec<String>>,
+    /// Longest a TLS handshake may take.
+    pub handshake_timeout: std::time::Duration,
+}
+
+/// Host names that always reach a loopback listener legitimately.
+pub const LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
+
 pub async fn run(
     addr: &str,
     engine: Arc<CommandEngine>,
     password: Option<Arc<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_with(
+        addr,
+        engine,
+        RestConfig {
+            token: password,
+            handshake_timeout: std::time::Duration::from_secs(10),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+pub async fn run_with(
+    addr: &str,
+    engine: Arc<CommandEngine>,
+    config: RestConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         engine,
-        password,
+        password: config.token.clone(),
         auth_tracker: Arc::new(AuthFailureTracker::default()),
     };
+    let allowed_hosts: Arc<Option<Vec<String>>> = Arc::new(
+        config
+            .allowed_hosts
+            .map(|hosts| hosts.into_iter().map(|h| h.to_ascii_lowercase()).collect()),
+    );
 
     let app = Router::new()
         // Key-value operations
@@ -119,16 +176,139 @@ pub async fn run(
             state.clone(),
             auth_middleware,
         ))
+        // Outermost: a request for a foreign Host is refused before anything
+        // else, including the auth failure accounting.
+        .layer(axum::middleware::from_fn_with_state(
+            allowed_hosts,
+            host_middleware,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("REST API listening on {}", addr);
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    match config.tls {
+        Some(tls) => {
+            tracing::info!("REST API listening on {} (TLS)", addr);
+            let listener = TlsListener::spawn(listener, tls, config.handshake_timeout);
+            axum::serve(
+                listener.tap_io(|_| {}),
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await?;
+        }
+        None => {
+            tracing::info!("REST API listening on {}", addr);
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await?;
+        }
+    }
     Ok(())
+}
+
+/// A listener that hands axum TLS streams.
+///
+/// Handshakes run in their own tasks, bounded by a timeout, and only finished
+/// ones reach `accept`: done inline, one client that opens a socket and never
+/// completes the handshake would stall every connection behind it.
+struct TlsListener {
+    rx: tokio::sync::mpsc::Receiver<(
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        SocketAddr,
+    )>,
+    local: SocketAddr,
+}
+
+impl TlsListener {
+    fn spawn(
+        listener: tokio::net::TcpListener,
+        config: rustls::ServerConfig,
+        handshake_timeout: std::time::Duration,
+    ) -> Self {
+        let local = listener
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        tokio::spawn(async move {
+            loop {
+                let (socket, peer) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        tracing::debug!("REST accept error: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                let acceptor = acceptor.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    match tokio::time::timeout(handshake_timeout, acceptor.accept(socket)).await {
+                        Ok(Ok(stream)) => {
+                            let _ = tx.send((stream, peer)).await;
+                        }
+                        Ok(Err(e)) => tracing::debug!("REST TLS handshake from {}: {}", peer, e),
+                        Err(_) => tracing::debug!("REST TLS handshake from {} timed out", peer),
+                    }
+                });
+            }
+        });
+        Self { rx, local }
+    }
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        match self.rx.recv().await {
+            Some(accepted) => accepted,
+            // The accept task only ends with the process.
+            None => std::future::pending().await,
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        Ok(self.local)
+    }
+}
+
+/// The host part of a `Host` header: `name`, `name:port`, `[v6]` or `[v6]:port`.
+fn host_name(header: &str) -> &str {
+    let header = header.trim();
+    if let Some(rest) = header.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or("");
+    }
+    match header.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => header,
+    }
+}
+
+async fn host_middleware(
+    State(allowed): State<Arc<Option<Vec<String>>>>,
+    req: Request,
+    next: Next,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    if let Some(allowed) = allowed.as_ref() {
+        // No Host header at all is an HTTP/1.0 client, not a browser — and a
+        // rebinding attack needs a browser, which always sends one.
+        if let Some(host) = req.headers().get("host") {
+            let name = host
+                .to_str()
+                .map(|h| host_name(h).to_ascii_lowercase())
+                .unwrap_or_default();
+            if !allowed.contains(&name) {
+                return Err((
+                    StatusCode::MISDIRECTED_REQUEST,
+                    Json(serde_json::json!({"error": "Host not allowed"})),
+                ));
+            }
+        }
+    }
+    Ok(next.run(req).await)
 }
 
 async fn auth_middleware(
@@ -173,7 +353,9 @@ async fn auth_middleware(
             }
         }
         _ => {
-            state.auth_tracker.record_failure(&ip);
+            // No credentials is not a failed guess. Counting it locked out
+            // every client behind a shared address — a reverse proxy — after
+            // ten unauthenticated probes.
             Err((
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "Unauthorized"})),
@@ -536,6 +718,9 @@ const REST_BLOCKED_COMMANDS: &[&str] = &[
     "WAIT",
     "FAILOVER",
     "CLIENT",
+    // INFO and DBSIZE have their own read-only routes (`/info`, `/dbsize`),
+    // behind the same authentication. They are listed here so `/cmd` stays
+    // data commands only, not because the answers are secret.
     "INFO",
     "DBSIZE",
 ];
@@ -790,4 +975,38 @@ fn to_json_response(resp: CommandResponse) -> (StatusCode, Json<serde_json::Valu
         _ => StatusCode::OK,
     };
     (status, Json(response_to_json(&resp)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_names_are_extracted_without_port() {
+        assert_eq!(host_name("localhost:5020"), "localhost");
+        assert_eq!(host_name("127.0.0.1"), "127.0.0.1");
+        assert_eq!(host_name("[::1]:5020"), "::1");
+        assert_eq!(host_name("[::1]"), "::1");
+        assert_eq!(host_name("evil.example:5020"), "evil.example");
+    }
+
+    #[test]
+    fn the_auth_failure_map_is_pruned() {
+        let tracker = AuthFailureTracker::default();
+        {
+            let mut map = tracker.failures.write().unwrap();
+            // `Instant` cannot predate boot; on a machine up for less than
+            // the cooldown there is no "long ago" to test with.
+            let Some(long_ago) = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(AUTH_COOLDOWN_SECS_REST + 5))
+            else {
+                return;
+            };
+            for i in 0..AUTH_TRACKER_PRUNE_AT {
+                map.insert(format!("10.0.{}.{}", i / 256, i % 256), (1, long_ago));
+            }
+        }
+        tracker.record_failure("192.0.2.1");
+        assert_eq!(tracker.failures.read().unwrap().len(), 1);
+    }
 }

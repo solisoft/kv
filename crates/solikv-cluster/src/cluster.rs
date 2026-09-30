@@ -166,7 +166,10 @@ impl ClusterManager {
         }
         let mut slots = self.slots.write();
         for (start, end) in ranges {
-            if start > end {
+            // A range past the last slot is refused whole rather than
+            // clamped: indexing with it panicked the gossip drain task, which
+            // then stopped applying frames with nothing in the log.
+            if start > end || *end >= crate::consistent_hash::SLOT_COUNT {
                 continue;
             }
             for i in *start..=*end {
@@ -239,6 +242,9 @@ impl ClusterManager {
         if start > end {
             return Err("Invalid slot range".to_string());
         }
+        if end >= 16384 {
+            return Err("Slot out of range".to_string());
+        }
 
         let mut slots = self.slots.write();
         for i in start..=end {
@@ -257,7 +263,7 @@ impl ClusterManager {
     }
 
     pub fn get_slot_owner(&self, slot: u16) -> Option<String> {
-        self.slots.read()[slot as usize].owner.clone()
+        self.slots.read().get(slot as usize)?.owner.clone()
     }
 
     pub fn get_my_slots(&self) -> Vec<(u16, u16)> {
@@ -539,6 +545,25 @@ mod slot_ownership_tests {
     fn manager(id: &str) -> ClusterManager {
         let gossip = GossipState::new(id.to_string(), "127.0.0.1".to_string(), 6379);
         ClusterManager::new(id.to_string(), "127.0.0.1".to_string(), 6379, gossip)
+    }
+
+    #[test]
+    fn a_slot_past_the_last_is_refused_not_a_panic() {
+        // `UPDATE … 0-20000` indexed past the table and panicked the gossip
+        // drain task; `CLUSTER DELSLOTS 20000` did the same to a connection.
+        let m = manager("a");
+        m.enable();
+        m.record_peer_slots("b", &[(0, 20000), (16383, 16384), (10, 20)]);
+        assert!(
+            m.get_slot_owner(0).is_none(),
+            "an out-of-range claim was clamped"
+        );
+        assert_eq!(m.get_slot_owner(10).as_deref(), Some("b"));
+        assert!(m.del_slots(20000, 20000).is_err());
+        assert!(m.del_slots(0, 16384).is_err());
+        assert!(m.add_slots(0, 16384).is_err());
+        assert!(m.get_slot_owner(u16::MAX).is_none());
+        assert!(crate::gossip::decode_slots("0-20000,5").eq(&vec![(5, 5)]));
     }
 
     #[test]

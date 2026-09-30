@@ -4,6 +4,9 @@ use std::path::Path;
 
 const MAX_AOF_BULK_LEN: usize = 512 * 1024 * 1024;
 
+/// Most arguments one AOF command may declare (same bound as the RESP decoder).
+const MAX_AOF_ARGS: usize = 1024 * 1024;
+
 // Commands rejected during AOF replay. The on-disk AOF is trusted only as
 // far as filesystem permissions go; an attacker who can write to the data
 // directory shouldn't be able to make us run scripting, server-control, or
@@ -42,14 +45,28 @@ pub enum FsyncPolicy {
 /// Lock-free AOF writer handle.
 ///
 /// Commands are RESP-serialized on the caller's thread and sent through
-/// a bounded channel to a dedicated writer task. Zero lock contention on
+/// a bounded channel to a dedicated writer thread. Zero lock contention on
 /// the hot path — callers only pay for serialization + a channel send.
+///
+/// The writer is an OS thread, not a Tokio task: on the solo runtime a task
+/// would share the single worker with the producers, so a full channel could
+/// only be drained by handing the worker to another thread — which is what
+/// `block_in_place` did, and it let two threads into the unlocked solo store.
 #[derive(Clone)]
 pub struct AofWriter {
-    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    /// Set for the solo runtime: wait for channel space on this thread instead
+    /// of `block_in_place`, which would let another thread run the store.
+    single_threaded: bool,
 }
 
 impl AofWriter {
+    /// Declare that producers run on the solo (single-worker) runtime.
+    pub fn single_threaded(mut self, yes: bool) -> Self {
+        self.single_threaded = yes;
+        self
+    }
+
     /// Log a write command. Serializes on the caller's thread, then enqueues.
     ///
     /// Never drops writes: if the channel is full we apply backpressure by
@@ -71,125 +88,92 @@ impl AofWriter {
 
         match self.tx.try_send(buf) {
             Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(buf)) => {
-                // Backpressure: wait for the AOF writer to catch up. Never drop
-                // on the multi-thread runtime (production path).
-                match tokio::runtime::Handle::try_current() {
-                    Ok(handle)
-                        if handle.runtime_flavor()
-                            == tokio::runtime::RuntimeFlavor::MultiThread =>
-                    {
-                        let tx = self.tx.clone();
-                        if let Err(e) =
-                            tokio::task::block_in_place(|| handle.block_on(tx.send(buf)))
-                        {
-                            tracing::error!(
-                                "AOF channel closed while applying backpressure: {}",
-                                e
-                            );
-                        }
-                    }
-                    Ok(_) => {
-                        // Current-thread runtime: cannot block_in_place without
-                        // deadlocking the single worker. Brief yield-retry, then
-                        // give up (production uses multi-thread + real backpressure).
-                        let mut pending = buf;
-                        let mut accepted = false;
-                        for _ in 0..10_000 {
-                            match self.tx.try_send(pending) {
-                                Ok(()) => {
-                                    accepted = true;
-                                    break;
-                                }
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(b)) => {
-                                    pending = b;
-                                    std::thread::yield_now();
-                                }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                    tracing::error!("AOF channel closed — write not persisted");
-                                    accepted = true; // don't double-log
-                                    break;
-                                }
-                            }
-                        }
-                        if !accepted {
-                            tracing::error!(
-                                "AOF channel full on current-thread runtime — write may be lost"
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        if let Err(e) = self.tx.blocking_send(buf) {
-                            tracing::error!("AOF channel closed: {}", e);
-                        }
-                    }
+            Err(std::sync::mpsc::TrySendError::Full(buf)) => {
+                // Backpressure: wait for the writer thread to catch up. The
+                // writer is its own OS thread, so a blocking send always
+                // makes progress. On the multi-thread runtime, hand the
+                // worker's other tasks to another thread while we wait; on
+                // the solo runtime, block right here — the store belongs to
+                // this thread alone.
+                let multi = !self.single_threaded
+                    && matches!(
+                        tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+                        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+                    );
+                let sent = if multi {
+                    tokio::task::block_in_place(|| self.tx.send(buf))
+                } else {
+                    self.tx.send(buf)
+                };
+                if sent.is_err() {
+                    tracing::error!("AOF writer is gone — write not persisted");
                 }
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                tracing::error!("AOF channel closed — write not persisted");
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                tracing::error!("AOF writer is gone — write not persisted");
             }
         }
     }
 }
 
-/// Spawn a background AOF writer task. Returns a lock-free [`AofWriter`] handle.
+/// Spawn the AOF writer thread. Returns a lock-free [`AofWriter`] handle.
 ///
-/// The writer task:
+/// The writer thread:
 /// - Receives pre-serialized RESP bytes through a channel
 /// - Batch-drains all pending messages per wake-up
 /// - Writes through a 64 KB `BufWriter` (reduces syscalls)
 /// - Applies fsync according to the chosen policy
 /// - On channel close (all senders dropped): flushes + fsyncs + exits
 pub fn spawn_aof_writer(path: &Path, policy: FsyncPolicy) -> io::Result<AofWriter> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let file = crate::fsutil::open_private_append(path)?;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256 * 1024);
-    let needs_periodic_sync = policy == FsyncPolicy::Everysec;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(256 * 1024);
 
-    tokio::spawn(async move {
-        let mut writer = BufWriter::with_capacity(64 * 1024, file);
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        // First tick fires immediately — consume it.
-        interval.tick().await;
+    std::thread::Builder::new()
+        .name("solikv-aof".into())
+        .spawn(move || {
+            use std::sync::mpsc::RecvTimeoutError;
+            use std::time::{Duration, Instant};
 
-        loop {
-            tokio::select! {
-                biased; // prefer draining messages over timer ticks
-
-                msg = rx.recv() => {
-                    match msg {
-                        Some(buf) => {
+            let mut writer = BufWriter::with_capacity(64 * 1024, file);
+            let mut last_sync = Instant::now();
+            loop {
+                let wait = Duration::from_secs(1).saturating_sub(last_sync.elapsed());
+                match rx.recv_timeout(wait) {
+                    Ok(buf) => {
+                        let _ = writer.write_all(&buf);
+                        // Batch-drain everything pending
+                        while let Ok(buf) = rx.try_recv() {
                             let _ = writer.write_all(&buf);
-                            // Batch-drain everything pending
-                            while let Ok(buf) = rx.try_recv() {
-                                let _ = writer.write_all(&buf);
-                            }
-                            if policy == FsyncPolicy::Always {
-                                let _ = writer.flush();
-                                let _ = writer.get_ref().sync_data();
-                            }
                         }
-                        None => {
-                            // All senders dropped — final flush
+                        if policy == FsyncPolicy::Always {
                             let _ = writer.flush();
                             let _ = writer.get_ref().sync_data();
-                            break;
+                            last_sync = Instant::now();
                         }
                     }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        // All senders dropped — final flush
+                        let _ = writer.flush();
+                        let _ = writer.get_ref().sync_data();
+                        break;
+                    }
                 }
-
-                _ = interval.tick(), if needs_periodic_sync => {
+                if last_sync.elapsed() >= Duration::from_secs(1) {
                     let _ = writer.flush();
-                    let _ = writer.get_ref().sync_data();
+                    if policy == FsyncPolicy::Everysec {
+                        let _ = writer.get_ref().sync_data();
+                    }
+                    last_sync = Instant::now();
                 }
             }
-        }
-    });
+        })?;
 
-    Ok(AofWriter { tx })
+    Ok(AofWriter {
+        tx,
+        single_threaded: false,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -204,10 +188,7 @@ pub struct AofPersistence {
 
 impl AofPersistence {
     pub fn new(path: &Path, policy: FsyncPolicy) -> io::Result<Self> {
-        let writer = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let writer = crate::fsutil::open_private_append(path)?;
         Ok(Self {
             writer: Some(writer),
             policy,
@@ -237,80 +218,103 @@ impl AofPersistence {
     }
 
     /// Replay AOF file and return commands (binary-safe).
+    ///
+    /// A file that ends part-way through a command — the crash-while-writing
+    /// case — loads everything before it and logs a warning, like Redis'
+    /// default `aof-load-truncated yes`. Anything else that does not parse is
+    /// corruption and is an `InvalidData` error: replaying past it would
+    /// resynchronise on arbitrary bytes and load commands nobody wrote.
+    ///
+    /// Nothing is allocated from a length in the file before the bytes are
+    /// actually there, so a forged header cannot make startup allocate
+    /// gigabytes.
     pub fn replay(path: &Path) -> io::Result<Vec<Vec<Bytes>>> {
         let file = std::fs::File::open(path)?;
         let mut reader = BufReader::new(file);
         let mut commands = Vec::new();
+        let mut entry = 0usize;
 
-        while let Ok(line) = read_line_crlf(&mut reader) {
+        let corrupt = |entry: usize, what: &str| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("AOF corrupt at command #{}: {}", entry + 1, what),
+            )
+        };
+
+        loop {
+            let line = match read_line_crlf(&mut reader) {
+                Ok(line) => line,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            };
             if line.is_empty() {
-                break;
-            }
-            if !line.starts_with(b"*") {
                 continue;
             }
-            let count: usize = match std::str::from_utf8(&line[1..])
+            if !line.starts_with(b"*") {
+                return Err(corrupt(entry, "expected '*'"));
+            }
+            let count: usize = std::str::from_utf8(&line[1..])
                 .ok()
                 .and_then(|s| s.parse().ok())
-            {
-                Some(c) => c,
-                None => continue,
-            };
+                .filter(|&c| c > 0 && c <= MAX_AOF_ARGS)
+                .ok_or_else(|| corrupt(entry, "bad argument count"))?;
 
-            let mut args = Vec::with_capacity(count);
-            let mut valid = true;
+            let mut args = Vec::with_capacity(count.min(64));
+            let mut truncated = false;
             for _ in 0..count {
                 let len_line = match read_line_crlf(&mut reader) {
                     Ok(l) => l,
-                    Err(_) => {
-                        valid = false;
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        truncated = true;
                         break;
                     }
+                    Err(e) => return Err(e),
                 };
                 if !len_line.starts_with(b"$") {
-                    valid = false;
-                    break;
+                    return Err(corrupt(entry, "expected '$'"));
                 }
-                let len: usize = match std::str::from_utf8(&len_line[1..])
+                let len: usize = std::str::from_utf8(&len_line[1..])
                     .ok()
                     .and_then(|s| s.parse().ok())
-                {
-                    Some(l) if l <= MAX_AOF_BULK_LEN => l,
-                    Some(_) => {
-                        valid = false;
-                        break;
-                    }
-                    None => {
-                        valid = false;
-                        break;
-                    }
-                };
+                    .filter(|&l| l <= MAX_AOF_BULK_LEN)
+                    .ok_or_else(|| corrupt(entry, "bad or over-large bulk length"))?;
 
-                let mut buf = vec![0u8; len];
-                if reader.read_exact(&mut buf).is_err() {
-                    valid = false;
-                    break;
-                }
+                // `take` + `read_to_end` grows with the bytes that really
+                // exist, instead of `vec![0; len]` up front.
+                let mut buf = Vec::new();
+                (&mut reader).take(len as u64).read_to_end(&mut buf)?;
                 let mut crlf = [0u8; 2];
-                if reader.read_exact(&mut crlf).is_err() {
-                    valid = false;
+                if buf.len() < len || reader.read_exact(&mut crlf).is_err() {
+                    truncated = true;
                     break;
                 }
-
+                if &crlf != b"\r\n" {
+                    return Err(corrupt(entry, "bulk not terminated by CRLF"));
+                }
                 args.push(Bytes::from(buf));
             }
-            if valid && args.len() == count {
-                if let Some(cmd) = args.first() {
-                    let cmd_upper = std::str::from_utf8(cmd)
-                        .map(|s| s.to_uppercase())
-                        .unwrap_or_default();
-                    if AOF_BLOCKED_COMMANDS.contains(&cmd_upper.as_str()) {
-                        tracing::warn!("Skipping blocked command in AOF replay: {}", cmd_upper);
-                        continue;
-                    }
-                }
-                commands.push(args);
+            if truncated {
+                tracing::warn!(
+                    "AOF {:?} ends part-way through command #{}; loading the {} complete \
+                     commands before it",
+                    path,
+                    entry + 1,
+                    commands.len()
+                );
+                break;
             }
+            entry += 1;
+
+            if let Some(cmd) = args.first() {
+                let cmd_upper = std::str::from_utf8(cmd)
+                    .map(|s| s.to_uppercase())
+                    .unwrap_or_default();
+                if AOF_BLOCKED_COMMANDS.contains(&cmd_upper.as_str()) {
+                    tracing::warn!("Skipping blocked command in AOF replay: {}", cmd_upper);
+                    continue;
+                }
+            }
+            commands.push(args);
         }
 
         Ok(commands)
@@ -318,10 +322,20 @@ impl AofPersistence {
 }
 
 /// Read a line terminated by \r\n, returning content without the terminator.
+///
+/// Only `*<n>` / `$<n>` headers are read this way, so a line longer than a few
+/// dozen bytes is corruption — refused rather than buffered without limit.
 fn read_line_crlf<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
+    const MAX_HEADER_LINE: usize = 64;
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     loop {
+        if buf.len() > MAX_HEADER_LINE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "AOF header line too long",
+            ));
+        }
         match reader.read_exact(&mut byte) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -448,8 +462,54 @@ mod tests {
         // Don't even bother writing the body: the length check fires first.
         drop(f);
 
+        // An over-large declared length is corruption, not a truncated tail:
+        // replay refuses rather than loading around it.
+        let err = AofPersistence::replay(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_aof_replay_huge_count_does_not_preallocate() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("count.aof");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "*18446744073709551615\r\n").unwrap();
+        drop(f);
+        assert!(AofPersistence::replay(&path).is_err());
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Within bounds, but the file ends: a truncated tail, loaded as empty.
+        write!(f, "*1000000\r\n$3\r\nSET\r\n").unwrap();
+        drop(f);
+        assert!(AofPersistence::replay(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_aof_replay_truncated_tail_keeps_complete_commands() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tail.aof");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n").unwrap();
+        // A declared 100-byte bulk with 3 bytes present: crash mid-write.
+        write!(f, "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$100\r\nabc").unwrap();
+        drop(f);
         let commands = AofPersistence::replay(&path).unwrap();
-        // Replay treats malformed/over-large entries as end-of-valid-stream.
-        assert!(commands.is_empty());
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0][1], Bytes::from("a"));
+    }
+
+    #[test]
+    fn test_aof_replay_garbage_in_the_middle_is_an_error() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mid.aof");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n").unwrap();
+        write!(f, "garbage\r\n").unwrap();
+        write!(f, "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n").unwrap();
+        drop(f);
+        assert!(AofPersistence::replay(&path).is_err());
     }
 }

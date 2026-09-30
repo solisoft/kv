@@ -214,7 +214,7 @@ fn read_value<R: io::Read>(
         }
         TYPE_LIST => {
             let len = reader.read_length()?;
-            let mut list = VecDeque::with_capacity(len);
+            let mut list = VecDeque::with_capacity(len.min(parser::MAX_PREALLOC));
             for _ in 0..len {
                 list.push_back(reader.read_string()?);
             }
@@ -222,7 +222,7 @@ fn read_value<R: io::Read>(
         }
         TYPE_SET => {
             let len = reader.read_length()?;
-            let mut set = HashSet::with_capacity(len);
+            let mut set = HashSet::with_capacity(len.min(parser::MAX_PREALLOC));
             for _ in 0..len {
                 set.insert(reader.read_string()?);
             }
@@ -241,7 +241,7 @@ fn read_value<R: io::Read>(
         }
         TYPE_HASH => {
             let len = reader.read_length()?;
-            let mut hash = HashMap::with_capacity(len);
+            let mut hash = HashMap::with_capacity(len.min(parser::MAX_PREALLOC));
             for _ in 0..len {
                 let field = reader.read_string()?;
                 let value = reader.read_string()?;

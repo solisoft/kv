@@ -106,8 +106,16 @@ async fn start_test_server(port: u16) -> tokio::task::JoinHandle<()> {
 
 use std::sync::atomic::{AtomicU16, Ordering};
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(16379);
+/// The next test port that nothing else on the machine is listening on. A
+/// port taken by an unrelated service (the build server has one at 16380)
+/// otherwise fails whichever test happens to draw it.
 fn next_port() -> u16 {
-    PORT_COUNTER.fetch_add(1, Ordering::SeqCst)
+    loop {
+        let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 #[tokio::test]

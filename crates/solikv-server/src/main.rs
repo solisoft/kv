@@ -5,7 +5,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 static GLOBAL: MiMalloc = MiMalloc;
 
 use clap::Parser;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -31,9 +31,53 @@ struct Args {
     #[arg(long, default_value = "6379")]
     port: u16,
 
-    /// REST API port
+    /// REST API port (0 = REST API disabled)
     #[arg(long, default_value = "5020")]
     rest_port: u16,
+
+    /// Bearer token for the REST API. Defaults to the RESP password. A
+    /// separate token keeps a leaked REST credential from also being the
+    /// RESP password.
+    #[arg(long, value_name = "TOKEN")]
+    rest_token: Option<String>,
+
+    /// Read the REST token from a file (mode 0600 enforced)
+    #[arg(long, value_name = "PATH")]
+    rest_token_file: Option<PathBuf>,
+
+    /// Extra Host header names the REST API accepts (comma-separated). On a
+    /// loopback bind, localhost/127.0.0.1/::1 are always accepted and any
+    /// other Host is refused, which stops DNS rebinding from a browser. On
+    /// other binds the check only runs when this is set.
+    #[arg(long, value_name = "HOSTS", value_delimiter = ',')]
+    rest_allowed_hosts: Vec<String>,
+
+    /// Close an authenticated client idle for this many seconds (0 = never,
+    /// like Redis' `timeout 0`)
+    #[arg(long, default_value = "0", value_name = "SECS")]
+    timeout: u64,
+
+    /// When a password is set, a client must authenticate within this many
+    /// seconds of connecting (0 = no limit)
+    #[arg(long, default_value = "10", value_name = "SECS")]
+    auth_timeout: u64,
+
+    /// Longest a TLS handshake may take, in seconds
+    #[arg(long, default_value = "10", value_name = "SECS")]
+    tls_handshake_timeout: u64,
+
+    /// Most bytes buffered for one client's pending queries (Redis
+    /// `client-query-buffer-limit`)
+    #[arg(long, default_value = "1073741824", value_name = "BYTES")]
+    client_query_buffer_limit: usize,
+
+    /// Most memory one Lua scripting VM may use, in bytes
+    #[arg(long, default_value = "67108864", value_name = "BYTES")]
+    lua_memory_limit: usize,
+
+    /// Daemon mode log file (default: <dir>/solikv.log)
+    #[arg(long, value_name = "PATH")]
+    logfile: Option<PathBuf>,
 
     /// Number of shards (0 = number of CPU cores). Ignored when --solo is set.
     #[arg(long, default_value = "0")]
@@ -84,7 +128,9 @@ struct Args {
     #[arg(long, default_value = "yes")]
     protected_mode: String,
 
-    /// TLS certificate file (enables TLS on RESP and REST if set)
+    /// TLS certificate file. With --tls-key, enables TLS on both the RESP
+    /// and the REST port. The cluster bus is not encrypted (it is
+    /// authenticated; see SECURITY.md).
     #[arg(long, value_name = "PATH")]
     tls_cert: Option<String>,
 
@@ -92,7 +138,8 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     tls_key: Option<String>,
 
-    /// TLS client CA certificate for client certificate verification
+    /// Reserved for client-certificate (mTLS) verification. Not implemented:
+    /// the server refuses to start with it rather than silently skip it.
     #[arg(long, value_name = "PATH")]
     tls_client_ca: Option<String>,
 
@@ -132,8 +179,16 @@ struct Args {
     #[arg(long)]
     cluster_password_file: Option<PathBuf>,
 
-    /// For cluster dump/restore: send password only to seed node, not to discovered nodes
-    #[arg(long, default_value = "true")]
+    /// For cluster dump/restore: send password only to seed node, not to
+    /// discovered nodes. `--cluster-password-seed-only=false` sends it to
+    /// every node.
+    #[arg(
+        long,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
     cluster_password_seed_only: bool,
 }
 
@@ -160,7 +215,15 @@ fn main() {
         .enable_all()
         .build()
         .expect("failed to build Tokio runtime");
-    rt.block_on(async_main(args));
+    // Run the server *on* a runtime worker, not on this thread. `block_on`
+    // polls its future on the calling thread, which in solo mode is a second
+    // thread next to the single worker — and the shutdown save ran there,
+    // walking the unlocked solo store while connections were still served.
+    let server = rt.spawn(async_main(args));
+    if let Err(e) = rt.block_on(server) {
+        eprintln!("ERROR: server task failed: {e}");
+        std::process::exit(1);
+    }
 }
 
 /// Best-effort absolute rendering of a path, for error messages. `--dir` defaults
@@ -202,12 +265,26 @@ async fn async_main(args: Args) {
             }
         }
 
-        let log_file = PathBuf::from("/tmp/solikv.log");
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file)
-            .expect("Failed to open log file");
+        // Not a fixed path in /tmp: any local user could pre-create
+        // /tmp/solikv.log as a symlink and have the daemon append to a file
+        // of their choosing. The data directory is ours; the file is 0600
+        // and opened without following symlinks.
+        if let Err(e) = solikv_persist::fsutil::create_private_dir_all(&args.dir) {
+            eprintln!("ERROR: cannot create {}: {}", abs_display(&args.dir), e);
+            std::process::exit(1);
+        }
+        let log_file = args
+            .logfile
+            .clone()
+            .unwrap_or_else(|| args.dir.join("solikv.log"));
+        let file = solikv_persist::fsutil::open_private_append(&log_file).unwrap_or_else(|e| {
+            eprintln!(
+                "ERROR: cannot open log file {}: {}",
+                abs_display(&log_file),
+                e
+            );
+            std::process::exit(1);
+        });
 
         #[allow(clippy::zombie_processes)]
         let child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -222,10 +299,15 @@ async fn async_main(args: Args) {
             .expect("Failed to spawn daemon");
 
         let pid = child.id();
-        fs::write(&pidfile, pid.to_string()).expect("Failed to write pidfile");
+        solikv_persist::fsutil::write_private(&pidfile, pid.to_string())
+            .expect("Failed to write pidfile");
         println!("Started daemon, PID: {}", pid);
         return;
     }
+
+    // Warnings found before logging is set up. Printed once it is, or to
+    // stderr by the dump/restore paths that exit before that point.
+    let mut early_warnings: Vec<&str> = Vec::new();
 
     let cluster_password: Option<String> = if let Some(file_path) = &args.cluster_password_file {
         let pw = read_secret_file(file_path).unwrap_or_else(|e| {
@@ -237,13 +319,21 @@ async fn async_main(args: Args) {
         });
         Some(pw)
     } else if let Some(pw) = &args.cluster_password {
-        tracing::warn!("Cluster password via CLI flag is visible in /proc/cmdline. Consider using --cluster-password-file or SOLIKV_CLUSTER_PASSWORD env var.");
+        early_warnings.push(
+            "Cluster password via CLI flag is visible in /proc/cmdline. Consider using \
+             --cluster-password-file or SOLIKV_CLUSTER_PASSWORD env var.",
+        );
         Some(pw.clone())
     } else {
         std::env::var("SOLIKV_CLUSTER_PASSWORD").ok()
     };
 
     // Handle cluster dump/restore operations (run standalone, don't start server)
+    if args.cluster_dump.is_some() || args.cluster_restore.is_some() {
+        for w in &early_warnings {
+            eprintln!("WARNING: {w}");
+        }
+    }
     if let Some(dump_path) = &args.cluster_dump {
         if args.cluster_connect.is_none() {
             eprintln!("Error: --cluster-connect required for cluster dump");
@@ -307,6 +397,17 @@ async fn async_main(args: Args) {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
         )
         .init();
+    for w in &early_warnings {
+        tracing::warn!("{}", w);
+    }
+
+    if args.tls_client_ca.is_some() {
+        eprintln!(
+            "ERROR: --tls-client-ca (client certificate verification) is not implemented. \
+             Refusing to start rather than accept clients without the check you asked for."
+        );
+        std::process::exit(1);
+    }
 
     let num_shards = if args.solo {
         1
@@ -337,8 +438,27 @@ async fn async_main(args: Args) {
         None
     };
 
+    let rest_token: Option<Arc<String>> = if let Some(file_path) = &args.rest_token_file {
+        let token = read_secret_file(file_path).unwrap_or_else(|e| {
+            eprintln!(
+                "ERROR: failed to read REST token file {:?}: {}",
+                file_path, e
+            );
+            std::process::exit(1);
+        });
+        Some(Arc::new(token))
+    } else if let Some(token) = &args.rest_token {
+        tracing::warn!("REST token supplied via CLI flag is visible in /proc/cmdline. Consider using --rest-token-file or SOLIKV_REST_TOKEN env var.");
+        Some(Arc::new(token.clone()))
+    } else if let Ok(token) = std::env::var("SOLIKV_REST_TOKEN") {
+        Some(Arc::new(token))
+    } else {
+        password.clone()
+    };
+
     let is_loopback = args.bind == "127.0.0.1" || args.bind == "::1" || args.bind == "localhost";
-    if !is_loopback && password.is_none() && args.protected_mode.to_lowercase() != "no" {
+    let protected = args.protected_mode.to_lowercase() != "no";
+    if !is_loopback && password.is_none() && protected {
         eprintln!("ERROR: SoliKV is running in protected mode because no password is set.");
         eprintln!("To disable protected mode, either set a password with --requirepass PASSWORD");
         eprintln!("or pass --protected-mode no (NOT RECOMMENDED for exposed deployments).");
@@ -511,11 +631,12 @@ async fn async_main(args: Args) {
         tokio::spawn(async move {
             while let Some(message) = gossip_rx.recv().await {
                 let sender = match &message {
-                    solikv_cluster::GossipMessage::Ping { ip, port, .. } => {
-                        format!("{}:{}", ip, port + solikv_cluster::CLUSTER_BUS_PORT_OFFSET)
-                            .parse::<std::net::SocketAddr>()
-                            .ok()
-                    }
+                    solikv_cluster::GossipMessage::Ping {
+                        node_id, ip, port, ..
+                    } => format!("{}:{}", ip, port + solikv_cluster::CLUSTER_BUS_PORT_OFFSET)
+                        .parse::<std::net::SocketAddr>()
+                        .ok()
+                        .map(|addr| (addr, node_id.clone())),
                     _ => None,
                 };
                 if let Some(reply) = cluster_for_gossip.handle_gossip(message) {
@@ -523,14 +644,18 @@ async fn async_main(args: Args) {
                     // ping advertised, not back down the inbound socket: the
                     // inbound one may be a client that only writes, and the
                     // advertised address is the one the rest of the cluster uses.
-                    if let Some(peer) = sender {
+                    if let Some((peer, peer_id)) = sender {
                         let secret = reply_secret.clone();
                         tokio::spawn(async move {
+                            // Addressed to the pinger by id: a pong vouches for
+                            // liveness, and an unaddressed one could be replayed
+                            // at every node to keep a dead peer looking alive.
                             if let Err(e) = solikv_cluster::gossip::send_frame(
                                 peer,
                                 &reply,
                                 &secret,
                                 std::time::Duration::from_secs(3),
+                                &peer_id,
                             )
                             .await
                             {
@@ -690,14 +815,24 @@ async fn async_main(args: Args) {
                     }
                     tracing::info!("Replayed {} AOF commands from {:?}", count, aof_path);
                 }
-                Err(e) => tracing::warn!("AOF replay error: {}", e),
+                Err(e) => {
+                    // Starting anyway would serve a partial dataset and then
+                    // append new writes after the damage. Redis refuses too.
+                    tracing::error!(
+                        "AOF {} cannot be replayed: {}. Refusing to start: repair or move \
+                         the file (a truncated tail is loaded automatically; this is not one).",
+                        abs_display(&aof_path),
+                        e
+                    );
+                    std::process::exit(1);
+                }
             }
         }
     }
 
     // --- Create lock-free AOF writer (channel-based, background task handles I/O + fsync) ---
     let aof_writer = if args.appendonly {
-        if let Err(e) = std::fs::create_dir_all(&args.dir) {
+        if let Err(e) = solikv_persist::fsutil::create_private_dir_all(&args.dir) {
             tracing::error!(
                 "Cannot create data directory {}: {} — pass --dir <writable path>",
                 abs_display(&args.dir),
@@ -708,7 +843,9 @@ async fn async_main(args: Args) {
         match solikv_persist::spawn_aof_writer(&aof_path, fsync_policy) {
             Ok(writer) => {
                 tracing::info!("AOF enabled ({:?} fsync) at {:?}", fsync_policy, aof_path);
-                Some(writer)
+                // Solo: backpressure must wait on this thread, never hand the
+                // worker to another one (see `AofWriter::single_threaded`).
+                Some(writer.single_threaded(args.solo))
             }
             Err(e) => {
                 tracing::error!(
@@ -727,6 +864,7 @@ async fn async_main(args: Args) {
     // --- Create engine with AOF ---
     let mut engine = solikv_engine::CommandEngine::new(shards.clone(), pubsub.clone())
         .with_notify_flags(notify_flags)
+        .with_lua_memory_limit(args.lua_memory_limit)
         // Without this, an explicit SAVE/BGSAVE writes to ./data/dump-*.rdb
         // regardless of --dir/--dbfilename, so it lands somewhere startup never
         // reads from.
@@ -763,21 +901,31 @@ async fn async_main(args: Args) {
     let rest_addr = format!("{}:{}", args.bind, args.rest_port);
 
     tracing::info!("Starting RESP server on {}", resp_addr);
-    tracing::info!("Starting REST server on {}", rest_addr);
+    if args.rest_port != 0 {
+        tracing::info!("Starting REST server on {}", rest_addr);
+    }
 
     let engine_resp = engine.clone();
     let pubsub_resp = pubsub.clone();
     let password_resp = password.clone();
     let cluster_resp = cluster_manager.clone();
     let tls_config_resp = tls_config.clone();
+    let secs = |n: u64| (n > 0).then(|| std::time::Duration::from_secs(n));
+    let limits = resp_server::ConnLimits {
+        handshake_timeout: std::time::Duration::from_secs(args.tls_handshake_timeout.max(1)),
+        auth_timeout: secs(args.auth_timeout),
+        idle_timeout: secs(args.timeout),
+        query_buffer_limit: args.client_query_buffer_limit,
+    };
     let resp_handle = tokio::spawn(async move {
-        if let Err(e) = resp_server::run(
+        if let Err(e) = resp_server::run_with_limits(
             &resp_addr,
             engine_resp,
             pubsub_resp,
             password_resp,
             cluster_resp,
             tls_config_resp,
+            limits,
         )
         .await
         {
@@ -785,10 +933,28 @@ async fn async_main(args: Args) {
         }
     });
 
+    let rest_config = rest_server::RestConfig {
+        token: rest_token.clone(),
+        tls: tls_config.clone(),
+        allowed_hosts: if is_loopback || !args.rest_allowed_hosts.is_empty() {
+            let mut hosts: Vec<String> = args.rest_allowed_hosts.clone();
+            if is_loopback {
+                hosts.extend(rest_server::LOOPBACK_HOSTS.iter().map(|h| h.to_string()));
+            }
+            Some(hosts)
+        } else {
+            None
+        },
+        handshake_timeout: std::time::Duration::from_secs(args.tls_handshake_timeout.max(1)),
+    };
     let engine_rest = engine.clone();
-    let password_rest = password.clone();
+    let rest_enabled = args.rest_port != 0;
     let rest_handle = tokio::spawn(async move {
-        if let Err(e) = rest_server::run(&rest_addr, engine_rest, password_rest).await {
+        if !rest_enabled {
+            tracing::info!("REST API disabled (--rest-port 0)");
+            return std::future::pending::<()>().await;
+        }
+        if let Err(e) = rest_server::run_with(&rest_addr, engine_rest, rest_config).await {
             tracing::error!("REST server error: {}", e);
         }
     });
@@ -817,7 +983,7 @@ async fn async_main(args: Args) {
                 let cluster_path = args.dir.join("cluster.json");
                 match serde_json::to_string_pretty(&cluster_state) {
                     Ok(json) => {
-                        if let Err(e) = std::fs::write(&cluster_path, json) {
+                        if let Err(e) = solikv_persist::fsutil::write_private(&cluster_path, json) {
                             tracing::error!("Failed to save cluster state: {}", e);
                         } else {
                             tracing::info!("Cluster state saved to {:?}", cluster_path);

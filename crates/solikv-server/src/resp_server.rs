@@ -55,14 +55,58 @@ impl AuthFailureTracker {
     fn record_failure(&self, ip: &str) {
         let mut failures = self.failures.write().unwrap();
         let now = std::time::Instant::now();
+        // Keyed by peer IP, so it grows with every address that ever failed.
+        // Forget the ones whose cooldown is long over.
+        if failures.len() >= AUTH_TRACKER_PRUNE_AT {
+            failures.retain(|_, (_, last)| last.elapsed().as_secs() < AUTH_COOLDOWN_SECS);
+        }
         let entry = failures.entry(ip.to_string()).or_insert((0, now));
         entry.0 += 1;
         entry.1 = now;
     }
 
     fn record_success(&self, ip: &str) {
+        if !self.failures.read().unwrap().contains_key(ip) {
+            return;
+        }
         let mut failures = self.failures.write().unwrap();
         failures.remove(ip);
+    }
+}
+
+/// Prune the failure map once it holds this many addresses.
+const AUTH_TRACKER_PRUNE_AT: usize = 4096;
+
+/// Most bytes buffered for a connection that has not authenticated: enough
+/// for `AUTH` with a password up to `MAX_UNAUTH_BULK_LEN`, and nothing like
+/// the 256 MB that used to be allowed before a single credential was checked.
+pub const MAX_UNAUTH_READ_BUF: usize = 128 * 1024;
+
+/// Per-connection limits.
+#[derive(Debug, Clone)]
+pub struct ConnLimits {
+    /// Longest a TLS handshake may take before the socket is dropped.
+    pub handshake_timeout: std::time::Duration,
+    /// A connection that must authenticate has this long to do it, from
+    /// accept. `None` disables. Holds the connection slots (10 000) against
+    /// peers that connect and say nothing.
+    pub auth_timeout: Option<std::time::Duration>,
+    /// Close an authenticated client idle this long (Redis `timeout`).
+    /// `None` = never, the Redis default. Not applied in pub/sub mode.
+    pub idle_timeout: Option<std::time::Duration>,
+    /// Most bytes buffered for one authenticated client's queries (Redis
+    /// `client-query-buffer-limit`).
+    pub query_buffer_limit: usize,
+}
+
+impl Default for ConnLimits {
+    fn default() -> Self {
+        Self {
+            handshake_timeout: std::time::Duration::from_secs(10),
+            auth_timeout: Some(std::time::Duration::from_secs(10)),
+            idle_timeout: None,
+            query_buffer_limit: 1024 * 1024 * 1024,
+        }
     }
 }
 
@@ -74,6 +118,28 @@ pub async fn run(
     cluster: Option<Arc<ClusterManager>>,
     tls_config: Option<ServerConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_limits(
+        addr,
+        engine,
+        pubsub,
+        password,
+        cluster,
+        tls_config,
+        ConnLimits::default(),
+    )
+    .await
+}
+
+pub async fn run_with_limits(
+    addr: &str,
+    engine: Arc<CommandEngine>,
+    pubsub: Arc<PubSubBroker>,
+    password: Option<Arc<String>>,
+    cluster: Option<Arc<ClusterManager>>,
+    tls_config: Option<ServerConfig>,
+    limits: ConnLimits,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let limits = Arc::new(limits);
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("RESP server listening on {}", addr);
     let tls_acceptor = tls_config.map(|c| TlsAcceptor::from(Arc::new(c)));
@@ -107,17 +173,30 @@ pub async fn run(
         let cluster = cluster.clone();
         let tls_acceptor = tls_acceptor.clone();
         let auth_tracker = auth_tracker.clone();
+        let limits = limits.clone();
 
         tokio::spawn(async move {
+            let accepted_at = tokio::time::Instant::now();
             let mut socket: Box<dyn AsyncSocket> = match tls_acceptor {
-                Some(acceptor) => match acceptor.accept(socket).await {
-                    Ok(stream) => Box::new(stream),
-                    Err(e) => {
-                        tracing::debug!("TLS accept error from {}: {}", peer_addr, e);
-                        drop(permit);
-                        return;
+                // Bounded: a peer that opens a socket and never finishes the
+                // handshake otherwise holds a connection slot forever.
+                Some(acceptor) => {
+                    match tokio::time::timeout(limits.handshake_timeout, acceptor.accept(socket))
+                        .await
+                    {
+                        Ok(Ok(stream)) => Box::new(stream),
+                        Ok(Err(e)) => {
+                            tracing::debug!("TLS accept error from {}: {}", peer_addr, e);
+                            drop(permit);
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::debug!("TLS handshake from {} timed out", peer_addr);
+                            drop(permit);
+                            return;
+                        }
                     }
-                },
+                }
                 None => Box::new(socket),
             };
             if let Err(e) = handle_connection(
@@ -128,6 +207,8 @@ pub async fn run(
                 password,
                 cluster,
                 auth_tracker,
+                &limits,
+                accepted_at,
             )
             .await
             {
@@ -138,6 +219,7 @@ pub async fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     mut socket: S,
     engine: Arc<CommandEngine>,
@@ -146,9 +228,10 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     password: Option<Arc<String>>,
     cluster: Option<Arc<ClusterManager>>,
     auth_tracker: Arc<AuthFailureTracker>,
+    limits: &ConnLimits,
+    accepted_at: tokio::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    /// Maximum read buffer size per connection (256 MB).
-    const MAX_READ_BUF: usize = 256 * 1024 * 1024;
+    let auth_deadline = limits.auth_timeout.map(|t| accepted_at + t);
 
     let mut read_buf = BytesMut::with_capacity(65536);
     let mut write_buf = BytesMut::with_capacity(65536);
@@ -178,10 +261,37 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
         // If no complete frames, read more data from socket
         if frames.is_empty() {
-            if read_buf.len() > MAX_READ_BUF {
+            let cap = if conn.authenticated {
+                limits.query_buffer_limit
+            } else {
+                MAX_UNAUTH_READ_BUF
+            };
+            if read_buf.len() > cap {
+                encode_frame(
+                    &RespFrame::error("ERR Protocol error: query buffer limit exceeded"),
+                    &mut write_buf,
+                );
+                let _ = socket.write_all(&write_buf).await;
                 return Err("read buffer exceeded maximum size".into());
             }
-            let n = socket.read_buf(&mut read_buf).await?;
+            let read = socket.read_buf(&mut read_buf);
+            let n = match (conn.authenticated, auth_deadline, limits.idle_timeout) {
+                // Not yet authenticated: the whole connection has until the
+                // deadline, not each read — a byte every few seconds must not
+                // keep a slot forever.
+                (false, Some(deadline), _) => match tokio::time::timeout_at(deadline, read).await {
+                    Ok(n) => n?,
+                    Err(_) => {
+                        tracing::debug!("{} did not authenticate in time", peer_addr);
+                        return Ok(());
+                    }
+                },
+                (true, _, Some(idle)) => match tokio::time::timeout(idle, read).await {
+                    Ok(n) => n?,
+                    Err(_) => return Ok(()),
+                },
+                _ => read.await?,
+            };
             if n == 0 {
                 return Ok(()); // EOF
             }
@@ -569,26 +679,30 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                                         );
                                         continue;
                                     }
+                                    // Parsed like ADDSLOTS. `unwrap_or(0)` made
+                                    // `DELSLOTS abc` release slot 0, and an
+                                    // out-of-range slot indexed past the table.
+                                    let mut failed = false;
                                     for slot_arg in &cmd.args[1..] {
                                         let slot_str = std::str::from_utf8(slot_arg).unwrap_or("");
-                                        if let Some((start, end)) = slot_str.split_once('-') {
-                                            let start: u16 = start.parse().unwrap_or(0);
-                                            let end: u16 = end.parse().unwrap_or(0);
-                                            if let Err(e) = cluster_mgr.del_slots(start, end) {
-                                                encode_frame(&RespFrame::error(e), &mut write_buf);
-                                                break;
-                                            }
-                                        } else {
-                                            let slot: u16 = slot_str.parse().unwrap_or(0);
-                                            if let Err(e) = cluster_mgr.del_slots(slot, slot) {
-                                                encode_frame(&RespFrame::error(e), &mut write_buf);
-                                                break;
-                                            }
+                                        let Some((start, end)) = parse_slot_range(slot_str) else {
+                                            encode_frame(
+                                                &RespFrame::error(format!(
+                                                    "ERR {:?} is not a slot or a slot range",
+                                                    slot_str
+                                                )),
+                                                &mut write_buf,
+                                            );
+                                            failed = true;
+                                            break;
+                                        };
+                                        if let Err(e) = cluster_mgr.del_slots(start, end) {
+                                            encode_frame(&RespFrame::error(e), &mut write_buf);
+                                            failed = true;
+                                            break;
                                         }
                                     }
-                                    if write_buf.is_empty()
-                                        || !matches!(write_buf.last(), Some(b'*'))
-                                    {
+                                    if !failed {
                                         encode_frame(
                                             &RespFrame::SimpleString(Bytes::from("OK")),
                                             &mut write_buf,
@@ -655,6 +769,10 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
 }
+
+/// Most bytes buffered from a client in pub/sub mode, where only short
+/// (P)SUBSCRIBE / PING / QUIT commands are valid.
+const MAX_PUBSUB_READ_BUF: usize = 1024 * 1024;
 
 /// Pub/sub delivery loop. Entered when client issues SUBSCRIBE or PSUBSCRIBE.
 /// Uses a fan-in mpsc channel: each subscription spawns a forwarding task from
@@ -724,6 +842,11 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
             // Branch 2: new data from the client socket
             n = socket.read_buf(read_buf) => {
                 let n = n?;
+                // Frames are decoded below as they complete, so a full buffer
+                // here is one frame larger than the limit.
+                if read_buf.len() > MAX_PUBSUB_READ_BUF {
+                    return Err("pub/sub read buffer exceeded maximum size".into());
+                }
                 if n == 0 {
                     // Client disconnected — abort all forwarding tasks
                     for (_, h) in channel_tasks.drain() { h.abort(); }
@@ -1060,6 +1183,18 @@ fn check_cluster_moved(
     None
 }
 
+/// `N` or `N-M`, each below 16384.
+fn parse_slot_range(text: &str) -> Option<(u16, u16)> {
+    let (start, end) = match text.split_once('-') {
+        Some((start, end)) => (start.parse::<u16>().ok()?, end.parse::<u16>().ok()?),
+        None => {
+            let slot = text.parse::<u16>().ok()?;
+            (slot, slot)
+        }
+    };
+    (start <= end && end < 16384).then_some((start, end))
+}
+
 /// Constant-time byte comparison to prevent timing side-channel attacks on password checks.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -1085,5 +1220,39 @@ fn command_response_to_frame(resp: CommandResponse) -> RespFrame {
         }
         CommandResponse::Error(msg) => RespFrame::Error(msg),
         CommandResponse::Queued => RespFrame::SimpleString(Bytes::from("QUEUED")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_ranges_are_parsed_and_bounded() {
+        assert_eq!(parse_slot_range("5"), Some((5, 5)));
+        assert_eq!(parse_slot_range("0-16383"), Some((0, 16383)));
+        assert_eq!(parse_slot_range("16384"), None);
+        assert_eq!(parse_slot_range("20000"), None);
+        assert_eq!(parse_slot_range("10-5"), None);
+        assert_eq!(parse_slot_range("abc"), None);
+        assert_eq!(parse_slot_range("1-x"), None);
+    }
+
+    #[test]
+    fn the_auth_failure_map_is_pruned() {
+        let tracker = AuthFailureTracker::default();
+        let Some(long_ago) = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(AUTH_COOLDOWN_SECS + 5))
+        else {
+            return;
+        };
+        {
+            let mut map = tracker.failures.write().unwrap();
+            for i in 0..AUTH_TRACKER_PRUNE_AT {
+                map.insert(format!("10.1.{}.{}", i / 256, i % 256), (1, long_ago));
+            }
+        }
+        tracker.record_failure("192.0.2.1");
+        assert_eq!(tracker.failures.read().unwrap().len(), 1);
     }
 }

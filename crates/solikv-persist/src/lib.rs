@@ -1,4 +1,5 @@
 pub mod aof;
+pub mod fsutil;
 pub mod rdb;
 pub mod redis_rdb;
 

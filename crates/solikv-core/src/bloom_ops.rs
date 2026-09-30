@@ -54,6 +54,17 @@ impl ShardStore {
         if self.get(key).is_some() {
             return CommandResponse::error("ERR item exists");
         }
+        if capacity == 0 {
+            return CommandResponse::error("ERR (capacity should be larger than 0)");
+        }
+        if !(error_rate > 0.0 && error_rate < 1.0) {
+            return CommandResponse::error("ERR (0 < error rate range < 1)");
+        }
+        // The size follows from the two parameters, both client-chosen; an
+        // unchecked capacity of 2^60 was an allocation abort.
+        if BloomFilterValue::required_bits(capacity, error_rate).is_none() {
+            return CommandResponse::error("ERR filter would exceed the maximum size (512 MB)");
+        }
         let bf = BloomFilterValue::with_capacity(capacity, error_rate);
         self.set(key.clone(), RedisValue::BloomFilter(bf), None);
         CommandResponse::ok()

@@ -55,7 +55,7 @@ impl ShardStore {
     /// Set a key-value pair with optional expiry in milliseconds.
     pub fn set(&mut self, key: Bytes, value: RedisValue, expire_ms: Option<u64>) {
         let entry = if let Some(ms) = expire_ms {
-            let expires_at = now_millis() + ms;
+            let expires_at = now_millis().saturating_add(ms);
             self.expiry_heap.push(key.clone(), expires_at);
             KeyEntry::with_expiry(value, expires_at)
         } else {
@@ -96,7 +96,7 @@ impl ShardStore {
                 self.data.swap_remove(key);
                 return false;
             }
-            let expires_at = now_millis() + expire_ms;
+            let expires_at = now_millis().saturating_add(expire_ms);
             entry.expires_at = Some(expires_at);
             self.expiry_heap.push(key.clone(), expires_at);
             true
@@ -214,10 +214,10 @@ impl ShardStore {
             return (0, Vec::new());
         }
 
-        let mut result = Vec::with_capacity(count);
+        let mut result = Vec::with_capacity(count.min(len));
         let mut idx = cursor.min(len);
         // Examine up to `count` slots; pattern non-matches still consume effort.
-        let end = (idx + count).min(len);
+        let end = idx.saturating_add(count).min(len);
         let mut deferred_expire: Vec<Bytes> = Vec::new();
 
         while idx < end {

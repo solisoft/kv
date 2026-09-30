@@ -170,6 +170,22 @@ pub const MAX_UNAUTH_ARRAY_LEN: usize = 32;
 /// Maximum pre-auth bulk string length (before user is authenticated).
 pub const MAX_UNAUTH_BULK_LEN: usize = 64 * 1024;
 
+/// Maximum array nesting depth once authenticated. Commands are flat arrays,
+/// but the same decoder reads server replies (SCAN, CLUSTER SLOTS…), which
+/// nest a couple of levels. Each level is one stack frame of recursion, so
+/// this bound is what keeps `*1\r\n*1\r\n…` from overflowing the stack.
+pub const MAX_NESTING_DEPTH: usize = 32;
+
+/// Maximum nesting depth before AUTH: a command is a flat array, so an
+/// unauthenticated peer gets no nesting at all.
+pub const MAX_UNAUTH_NESTING_DEPTH: usize = 1;
+
+/// Longest line accepted before its CRLF: an inline command, a simple
+/// string/error/integer, or a `$`/`*` length header. Same bound as Redis'
+/// `PROTO_INLINE_MAX_SIZE`. Without it a peer that never sends `\r\n` makes
+/// the server buffer — and rescan — an ever-growing line.
+pub const MAX_INLINE_LEN: usize = 64 * 1024;
+
 /// Try to decode a frame from an authenticated connection.
 /// Returns (frame, bytes_consumed) or None if incomplete.
 pub fn decode_frame(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
@@ -185,6 +201,14 @@ pub fn decode_frame_with_auth(
     src: &[u8],
     authenticated: bool,
 ) -> Result<Option<(RespFrame, usize)>, String> {
+    decode_at_depth(src, authenticated, 0)
+}
+
+fn decode_at_depth(
+    src: &[u8],
+    authenticated: bool,
+    depth: usize,
+) -> Result<Option<(RespFrame, usize)>, String> {
     if src.is_empty() {
         return Ok(None);
     }
@@ -194,20 +218,44 @@ pub fn decode_frame_with_auth(
         b'-' => decode_error(src),
         b':' => decode_integer(src),
         b'$' => decode_bulk_string(src, authenticated),
-        b'*' => decode_array(src, authenticated),
+        b'*' => decode_array(src, authenticated, depth),
         _ => {
             // Try inline command (plain text terminated by \r\n)
-            decode_inline(src)
+            decode_inline(src, authenticated)
         }
     }
 }
 
+/// Position of the first `\r\n` in `src`.
 fn find_crlf(src: &[u8]) -> Option<usize> {
-    (0..src.len().saturating_sub(1)).find(|&i| src[i] == b'\r' && src[i + 1] == b'\n')
+    let mut start = 0;
+    while let Some(i) = memchr::memchr(b'\r', &src[start..]) {
+        let pos = start + i;
+        match src.get(pos + 1) {
+            Some(b'\n') => return Some(pos),
+            Some(_) => start = pos + 1,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// `find_crlf`, bounded: a line longer than `MAX_INLINE_LEN` is a protocol
+/// error whether or not its CRLF has arrived yet.
+fn find_line_end(src: &[u8]) -> Result<Option<usize>, String> {
+    // Never scan past the bound: a huge buffer with no CRLF costs at most
+    // MAX_INLINE_LEN bytes of search per decode attempt.
+    let window = &src[..src.len().min(MAX_INLINE_LEN + 2)];
+    match find_crlf(window) {
+        Some(pos) if pos > MAX_INLINE_LEN => Err("Protocol error: too big inline request".into()),
+        Some(pos) => Ok(Some(pos)),
+        None if src.len() > MAX_INLINE_LEN => Err("Protocol error: too big inline request".into()),
+        None => Ok(None),
+    }
 }
 
 fn decode_simple_string(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
-    match find_crlf(&src[1..]) {
+    match find_line_end(&src[1..])? {
         None => Ok(None),
         Some(pos) => {
             let s = Bytes::copy_from_slice(&src[1..1 + pos]);
@@ -217,7 +265,7 @@ fn decode_simple_string(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String
 }
 
 fn decode_error(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
-    match find_crlf(&src[1..]) {
+    match find_line_end(&src[1..])? {
         None => Ok(None),
         Some(pos) => {
             let s = String::from_utf8_lossy(&src[1..1 + pos]).to_string();
@@ -227,7 +275,7 @@ fn decode_error(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
 }
 
 fn decode_integer(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
-    match find_crlf(&src[1..]) {
+    match find_line_end(&src[1..])? {
         None => Ok(None),
         Some(pos) => {
             let s = std::str::from_utf8(&src[1..1 + pos])
@@ -242,7 +290,7 @@ fn decode_bulk_string(
     src: &[u8],
     authenticated: bool,
 ) -> Result<Option<(RespFrame, usize)>, String> {
-    match find_crlf(&src[1..]) {
+    match find_line_end(&src[1..])? {
         None => Ok(None),
         Some(pos) => {
             let len_str = std::str::from_utf8(&src[1..1 + pos])
@@ -285,8 +333,23 @@ fn decode_bulk_string(
     }
 }
 
-fn decode_array(src: &[u8], authenticated: bool) -> Result<Option<(RespFrame, usize)>, String> {
-    match find_crlf(&src[1..]) {
+fn decode_array(
+    src: &[u8],
+    authenticated: bool,
+    depth: usize,
+) -> Result<Option<(RespFrame, usize)>, String> {
+    let max_depth = if authenticated {
+        MAX_NESTING_DEPTH
+    } else {
+        MAX_UNAUTH_NESTING_DEPTH
+    };
+    if depth >= max_depth {
+        return Err(format!(
+            "Protocol error: array nesting exceeds maximum depth {}",
+            max_depth
+        ));
+    }
+    match find_line_end(&src[1..])? {
         None => Ok(None),
         Some(pos) => {
             let count_str = std::str::from_utf8(&src[1..1 + pos])
@@ -317,7 +380,7 @@ fn decode_array(src: &[u8], authenticated: bool) -> Result<Option<(RespFrame, us
             let mut items = Vec::new();
 
             for _ in 0..count {
-                match decode_frame_with_auth(&src[offset..], authenticated)? {
+                match decode_at_depth(&src[offset..], authenticated, depth + 1)? {
                     Some((frame, consumed)) => {
                         items.push(frame);
                         offset += consumed;
@@ -331,13 +394,20 @@ fn decode_array(src: &[u8], authenticated: bool) -> Result<Option<(RespFrame, us
     }
 }
 
-fn decode_inline(src: &[u8]) -> Result<Option<(RespFrame, usize)>, String> {
-    match find_crlf(src) {
+fn decode_inline(src: &[u8], authenticated: bool) -> Result<Option<(RespFrame, usize)>, String> {
+    match find_line_end(src)? {
         None => Ok(None),
         Some(pos) => {
             let line = std::str::from_utf8(&src[..pos])
                 .map_err(|e| format!("invalid utf8 in inline: {}", e))?;
             let parts: Vec<&str> = line.split_whitespace().collect();
+            if !authenticated && parts.len() > MAX_UNAUTH_ARRAY_LEN {
+                return Err(format!(
+                    "array count {} exceeds maximum {}",
+                    parts.len(),
+                    MAX_UNAUTH_ARRAY_LEN
+                ));
+            }
             let items: Vec<RespFrame> = parts
                 .into_iter()
                 .map(|p| RespFrame::BulkString(Bytes::from(p.to_string())))
@@ -606,5 +676,68 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+    // A deeply nested frame (`*1\r\n` repeated) used to recurse once per
+    // level and overflow the stack before AUTH. It must now be rejected
+    // quickly, both pre- and post-auth, without recursing that deep.
+    #[test]
+    fn test_decode_deep_nesting_rejected() {
+        let buf = b"*1\r\n".repeat(100_000);
+        let err = decode_frame_with_auth(&buf, true).unwrap_err();
+        assert!(err.contains("nesting"), "unexpected error: {}", err);
+        let err = decode_frame_with_auth(&buf, false).unwrap_err();
+        assert!(err.contains("nesting"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_decode_nesting_pre_auth_flat_only() {
+        // A flat command array is fine before AUTH…
+        let flat = b"*2\r\n$4\r\nAUTH\r\n$2\r\npw\r\n";
+        assert!(decode_frame_with_auth(flat, false).unwrap().is_some());
+        // …an array inside an array is not.
+        let nested = b"*1\r\n*1\r\n$4\r\nPING\r\n";
+        assert!(decode_frame_with_auth(nested, false).is_err());
+        // Post-auth, modest nesting (server replies) still decodes.
+        assert!(decode_frame_with_auth(nested, true).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_decode_nesting_at_limit_ok() {
+        let mut buf = b"*1\r\n".repeat(MAX_NESTING_DEPTH);
+        buf.extend_from_slice(b":1\r\n");
+        assert!(decode_frame(&buf).unwrap().is_some());
+        let mut buf = b"*1\r\n".repeat(MAX_NESTING_DEPTH + 1);
+        buf.extend_from_slice(b":1\r\n");
+        assert!(decode_frame(&buf).is_err());
+    }
+
+    // A line that never ends must be refused once it passes the inline
+    // bound, instead of being buffered until the 256 MB read cap.
+    #[test]
+    fn test_decode_unterminated_inline_rejected() {
+        let buf = vec![b'A'; MAX_INLINE_LEN + 10];
+        let err = decode_frame_with_auth(&buf, false).unwrap_err();
+        assert!(err.contains("too big inline"), "unexpected error: {}", err);
+        let mut plus = vec![b'+'];
+        plus.extend(vec![b'x'; MAX_INLINE_LEN + 10]);
+        assert!(decode_frame(&plus).is_err());
+        // Just under the bound is merely incomplete.
+        let buf = vec![b'A'; MAX_INLINE_LEN - 1];
+        assert!(decode_frame(&buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_decode_inline_pre_auth_arg_cap() {
+        let mut line = "X ".repeat(MAX_UNAUTH_ARRAY_LEN + 1).into_bytes();
+        line.extend_from_slice(b"\r\n");
+        assert!(decode_frame_with_auth(&line, false).is_err());
+        assert!(decode_frame_with_auth(&line, true).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_find_crlf_lone_cr() {
+        assert_eq!(find_crlf(b"ab\rc\r\n"), Some(4));
+        assert_eq!(find_crlf(b"ab\r"), None);
+        assert_eq!(find_crlf(b"\r\n"), Some(0));
     }
 }

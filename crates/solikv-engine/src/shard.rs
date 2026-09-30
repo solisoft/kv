@@ -19,6 +19,11 @@ use crate::dispatch::{NOTIFY_EXPIRED, NOTIFY_KEYEVENT, NOTIFY_KEYSPACE};
 /// OS thread is undefined behaviour.
 struct SoloStore {
     inner: UnsafeCell<ShardStore>,
+    /// Debug builds check the invariant instead of trusting it: entering the
+    /// store while another entry is live is exactly the data race the
+    /// invariant forbids, and it is how `block_in_place` went unnoticed.
+    #[cfg(debug_assertions)]
+    busy: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: solo mode guarantees single-threaded access.
@@ -29,18 +34,47 @@ impl SoloStore {
     fn new() -> Self {
         Self {
             inner: UnsafeCell::new(ShardStore::new()),
+            #[cfg(debug_assertions)]
+            busy: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     #[inline]
+    fn enter(&self) -> SoloEntry<'_> {
+        #[cfg(debug_assertions)]
+        assert!(
+            !self.busy.swap(true, Ordering::Acquire),
+            "solo store entered concurrently: two threads (or a re-entrant call) \
+             touched the unlocked store"
+        );
+        SoloEntry { _store: self }
+    }
+
+    #[inline]
     fn with_mut<R>(&self, f: impl FnOnce(&mut ShardStore) -> R) -> R {
+        let _entry = self.enter();
         // SAFETY: solo invariant — only one thread mutates the store.
         f(unsafe { &mut *self.inner.get() })
     }
 
     #[inline]
     fn with_ref<R>(&self, f: impl FnOnce(&ShardStore) -> R) -> R {
+        let _entry = self.enter();
+        // SAFETY: as above.
         f(unsafe { &*self.inner.get() })
+    }
+}
+
+/// Marks the solo store as in use for the length of one closure.
+struct SoloEntry<'a> {
+    _store: &'a SoloStore,
+}
+
+impl Drop for SoloEntry<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        self._store.busy.store(false, Ordering::Release);
     }
 }
 

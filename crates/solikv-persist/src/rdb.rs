@@ -321,7 +321,7 @@ pub fn save_all_shards<F>(
 where
     F: Fn(usize, &dyn Fn(&ShardStore) -> io::Result<()>) -> io::Result<()>,
 {
-    std::fs::create_dir_all(dir)?;
+    crate::fsutil::create_private_dir_all(dir)?;
     for idx in 0..num_shards {
         let final_path = rdb_path_for_shard(dir, basename, idx);
         let tmp_path = dir.join(format!("{}-{}.rdb.tmp", basename, idx));
@@ -336,7 +336,7 @@ where
         let rdb_buf = rdb_buf.into_inner();
 
         // Write buffer to disk outside the lock (no shard blocking during I/O)
-        let file = std::fs::File::create(&tmp_path)?;
+        let file = crate::fsutil::create_private(&tmp_path)?;
         let mut writer = BufWriter::new(file);
         writer.write_all(&rdb_buf)?;
         writer.flush()?;
