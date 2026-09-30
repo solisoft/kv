@@ -12,3 +12,4 @@ tasks
 *.pdb
 *.pdb.lock
 tasks*
+www/node_modules
