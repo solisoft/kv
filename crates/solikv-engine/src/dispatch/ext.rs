@@ -30,7 +30,13 @@ impl CommandEngine {
     /// Whether `name args` may block (a blocking command, or `XREAD`/
     /// `XREADGROUP` with `BLOCK`): the connection then runs it through
     /// [`block_start`](Self::block_start) instead of `execute_session`.
+    #[inline]
     pub fn is_blocking_form(&self, name: &str, args: &[Bytes]) -> bool {
+        // Every blocking command starts with B or X: the rest of the hot
+        // path pays one byte compare, not a table lookup.
+        if !matches!(name.as_bytes().first(), Some(b'B' | b'X')) {
+            return false;
+        }
         match name {
             "XREAD" | "XREADGROUP" => blocking::xread_blocks(args),
             _ => crate::commands::lookup(name).is_some_and(|s| s.has(crate::commands::F_BLOCKING)),

@@ -637,6 +637,20 @@ mod tests {
     }
 
     #[test]
+    fn blocking_commands_start_with_b_or_x() {
+        // `CommandEngine::is_blocking_form` relies on it to skip the lookup.
+        for s in all() {
+            if s.has(F_BLOCKING) {
+                assert!(
+                    s.name.starts_with('B') || s.name.starts_with('X'),
+                    "{}",
+                    s.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn names_are_unique_and_upper_case() {
         let mut seen = std::collections::HashSet::new();
         for s in all() {
