@@ -56,6 +56,33 @@ pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> 
     f.sync_all()
 }
 
+/// `<path>.tmp`, where a file is written before it is renamed over `path`.
+pub fn tmp_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+/// fsync the directory holding `path`, so a rename or a new file in it
+/// survives a power loss, not only a crash.
+pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    File::open(dir)?.sync_all()
+}
+
+/// Replace `path` with `contents` atomically: temp file, fsync, rename,
+/// fsync the directory. A crash leaves the old file or the new one, never a
+/// torn mix.
+pub fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    let tmp = tmp_path(path);
+    write_private(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
+    sync_parent_dir(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

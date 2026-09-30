@@ -93,7 +93,7 @@ impl ShardStore {
     pub fn expire(&mut self, key: &Bytes, expire_ms: u64) -> bool {
         if let Some(entry) = self.data.get_mut(key) {
             if entry.is_expired() {
-                self.data.swap_remove(key);
+                self.expire_now(key);
                 return false;
             }
             let expires_at = now_millis().saturating_add(expire_ms);
@@ -109,7 +109,7 @@ impl ShardStore {
     pub fn expire_at(&mut self, key: &Bytes, expires_at_ms: u64) -> bool {
         if let Some(entry) = self.data.get_mut(key) {
             if entry.is_expired() {
-                self.data.swap_remove(key);
+                self.expire_now(key);
                 return false;
             }
             entry.expires_at = Some(expires_at_ms);
@@ -124,7 +124,7 @@ impl ShardStore {
     pub fn persist(&mut self, key: &Bytes) -> bool {
         if let Some(entry) = self.data.get_mut(key) {
             if entry.is_expired() {
-                self.data.swap_remove(key);
+                self.expire_now(key);
                 return false;
             }
             if entry.expires_at.is_some() {
@@ -255,6 +255,16 @@ impl ShardStore {
         (next, result)
     }
 
+    /// Drop a key whose TTL has passed and report it through
+    /// `expired_buffer`, like every other lazy expiry. Silent removals were
+    /// invisible to keyspace notifications, and to the append-only log, which
+    /// records each expiry as a `DEL` so replay reproduces it.
+    fn expire_now(&mut self, key: &Bytes) {
+        if let Some((k, _)) = self.data.swap_remove_entry(key) {
+            self.expired_buffer.push(k);
+        }
+    }
+
     /// Flush all keys.
     pub fn flush(&mut self) {
         self.data.clear();
@@ -264,6 +274,12 @@ impl ShardStore {
     /// Run active expiry: remove up to [`MAX_EXPIRE_PER_TICK`] expired keys.
     /// Returns the expired key names that were actually removed from the map.
     pub fn run_active_expiry(&mut self) -> Vec<Bytes> {
+        // Loading: nothing expires (see `LoadingGuard`). Returning before the
+        // heap is drained matters: a drained entry whose key then reads as
+        // live would be gone from the heap for good.
+        if is_loading() {
+            return Vec::new();
+        }
         let now = now_millis();
         let expired_keys = self.expiry_heap.drain_expired(now, MAX_EXPIRE_PER_TICK);
         let mut removed = Vec::new();
@@ -319,6 +335,19 @@ impl ShardStore {
             .subsec_nanos() as usize;
         let idx = seed % len;
         self.data.get_index(idx).map(|(k, _)| k.clone())
+    }
+
+    /// The live entry for `key`, without the lazy-expiry side effect (for
+    /// read-only callers such as persistence, which hold `&self`).
+    pub fn peek(&self, key: &[u8]) -> Option<&KeyEntry> {
+        self.data.get(key).filter(|e| !e.is_expired())
+    }
+
+    /// Remove and return every entry, leaving the store empty. Used to move a
+    /// dataset replayed into a scratch store over to the shards that own it.
+    pub fn drain_entries(&mut self) -> Vec<(Bytes, KeyEntry)> {
+        self.expiry_heap = ExpiryHeap::new();
+        self.data.drain(..).collect()
     }
 
     /// Get all data for persistence/snapshotting.

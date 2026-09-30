@@ -405,10 +405,12 @@ impl KeyEntry {
         }
     }
 
+    /// Whether the TTL has passed. Never true while this thread is loading
+    /// (see [`LoadingGuard`]).
     #[inline]
     pub fn is_expired(&self) -> bool {
         match self.expires_at {
-            Some(exp) => now_millis() >= exp,
+            Some(exp) => now_millis() >= exp && !is_loading(),
             None => false,
         }
     }
@@ -427,39 +429,67 @@ impl KeyEntry {
     }
 }
 
-/// Cached wall-clock ms (updated lazily). Avoids a `SystemTime::now()` syscall
-/// on every GET/SET/TTL when many ops land in the same millisecond.
-static CACHED_NOW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static CACHE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    static LOADING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread is replaying persisted data (see [`LoadingGuard`]).
+#[inline]
+pub fn is_loading() -> bool {
+    LOADING.with(|l| l.get())
+}
+
+/// Marks this thread as loading persisted data until dropped.
+///
+/// While loading, no key counts as expired. The append-only log records every
+/// expiry the live server acted on as an explicit `DEL`, at the point it
+/// happened; replaying with the clock running as well would expire keys at
+/// *replay* time instead, and a later logged command would then run against
+/// a different state than it did live (`INCR` on a key that had not expired
+/// yet, say, recreating it from 0). Redis loads the same way. Keys whose TTL
+/// passed while the server was down expire normally once loading ends.
+///
+/// Thread-local rather than global so loading one dataset (a test, a replay
+/// into a scratch store) never changes expiry for another thread.
+pub struct LoadingGuard {
+    prev: bool,
+}
+
+impl LoadingGuard {
+    pub fn new() -> Self {
+        let prev = LOADING.with(|l| l.replace(true));
+        Self { prev }
+    }
+}
+
+impl Default for LoadingGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for LoadingGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        LOADING.with(|l| l.set(prev));
+    }
+}
 
 /// Current time in milliseconds since UNIX epoch.
 ///
-/// Refreshes from the OS at most every ~16 calls (amortized), which is plenty
-/// for second/ms TTLs while keeping the hot path off `clock_gettime`.
+/// Read from the clock on every call. It used to be cached and refreshed
+/// every 16th call, which under light traffic left it arbitrarily stale —
+/// a key read after a quiet minute was judged against the time of the last
+/// busy moment, so it outlived its TTL, and a TTL set then was measured from
+/// the past. `SystemTime::now()` is a vDSO call (tens of nanoseconds, no
+/// syscall), and the shared counter the cache needed was a cache line every
+/// core wrote to on every call.
 #[inline]
 pub fn now_millis() -> u64 {
-    use std::sync::atomic::Ordering;
-    // Refresh every 16th call; also force-refresh if cache is still zero.
-    let tick = CACHE_TICK.fetch_add(1, Ordering::Relaxed);
-    if tick & 15 == 0 {
-        let ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        CACHED_NOW_MS.store(ms, Ordering::Relaxed);
-        return ms;
-    }
-    let cached = CACHED_NOW_MS.load(Ordering::Relaxed);
-    if cached != 0 {
-        cached
-    } else {
-        let ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        CACHED_NOW_MS.store(ms, Ordering::Relaxed);
-        ms
-    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Current time in seconds since UNIX epoch.

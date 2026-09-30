@@ -523,12 +523,15 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         conn.in_transaction = false;
 
                         let mut results = Vec::new();
+                        // Bracket the batch in the log (no `.await` inside).
+                        let tx = engine.aof_transaction();
                         for args in queue {
                             let name = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
                             let cmd_args: Vec<Bytes> = args[1..].to_vec();
                             let resp = engine.execute(&name, &cmd_args);
                             results.push(command_response_to_frame(resp));
                         }
+                        drop(tx);
                         encode_frame(&RespFrame::Array(results), &mut write_buf);
                         continue;
                     }

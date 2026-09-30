@@ -69,8 +69,11 @@ to the data directory after server startup.
 ### Persistence
 
 - **RDB length sanitization (SEC-006)**: `read_bytes` rejects any chunk longer
-  than 512 MB (`MAX_VALUE_LEN`); collection counts are clamped to 16 M
-  (`MAX_COLLECTION_LEN`) before `with_capacity`. The Redis `dump.rdb`
+  than 512 MB (`MAX_VALUE_LEN`) and grows with the bytes actually present;
+  collections preallocate at most 4096 slots whatever count the file
+  declares. Snapshots end with a CRC-32 that is checked on load. (The old
+  16 M element cap is gone: a larger list saved fine and then refused to
+  load.) The Redis `dump.rdb`
   importer (`--import-redis-rdb`) reads strings with `take` + `read_to_end`
   instead of `vec![0; len]`, refuses LZF strings claiming more than the
   compressed bytes could expand to, and caps collection pre-allocation at
@@ -81,14 +84,17 @@ to the data directory after server startup.
   `aof-load-truncated yes`. Anything else that does not parse — a bad header,
   a bulk above 512 MB, a missing CRLF — is corruption, and the server
   **refuses to start** rather than serve a partial dataset and append after
-  the damage.
+  the damage. A cut-off tail is truncated away before the log is appended
+  to again, and a trailing `MULTI` block without its `EXEC` is not applied.
 - **File permissions**: the data directory is created `0700` and every
   persistence file (RDB, AOF, `cluster.json`, cluster dumps, pid file,
   daemon log) `0600`, opened with `O_NOFOLLOW`. They used to follow the
   umask (typically world-readable), handing the dataset to any local user.
 - **AOF replay denylist (SEC-007)**: `EVAL`, `EVALSHA`, `SCRIPT`, `DEBUG`,
-  `SHUTDOWN`, `BGREWRITEAOF`, `BGSAVE`, `SLAVEOF`/`REPLICAOF`, `CLUSTER`,
-  `MIGRATE`, `RESTORE`, `MODULE` are skipped (with a `warn`) on replay.
+  `SHUTDOWN`, `BGREWRITEAOF`, `BGSAVE`, `SAVE`, `SLAVEOF`/`REPLICAOF`,
+  `CLUSTER`, `MIGRATE`, `RESTORE`, `MODULE` are skipped (with a `warn`) on
+  replay. Scripts are never replayed: the commands a script runs are logged
+  one by one as it runs them.
   The data directory must still be on a filesystem only the SoliKV UID can
   write to — replay is not authenticated.
 

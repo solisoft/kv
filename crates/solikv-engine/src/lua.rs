@@ -84,6 +84,12 @@ const BLOCKED_COMMANDS: &[&str] = &[
     "EVAL",
     "EVALSHA",
     "SCRIPT",
+    // Server control: a script must not stop the server or block it on disk
+    // I/O (Redis marks these `noscript` too).
+    "SHUTDOWN",
+    "SAVE",
+    "BGSAVE",
+    "BGREWRITEAOF",
 ];
 
 fn is_blocked_in_script(cmd: &str) -> bool {

@@ -151,28 +151,29 @@ use solikv_persist::AofWriter;
 use solikv_pubsub::PubSubBroker;
 
 use crate::lua::ScriptCache;
+use crate::persistence::{PersistConfig, Persistence};
 use crate::shard::ShardManager;
 
 /// The central command engine that routes commands to appropriate shards.
 pub struct CommandEngine {
     pub shards: Arc<ShardManager>,
     pub pubsub: Arc<PubSubBroker>,
-    aof: Option<AofWriter>,
     start_time: Instant,
     pub(crate) script_cache: ScriptCache,
     weak_self: OnceLock<Weak<CommandEngine>>,
     notify_flags: Arc<AtomicU16>,
     pub replication_offset: Arc<AtomicU64>,
-    /// Where `SAVE`/`BGSAVE` write, mirroring `--dir` and `--dbfilename`.
+    /// Snapshots, the append-only log and shutdown.
     ///
-    /// These used to be hardcoded to `data`/`dump` in the command handler, so a
-    /// server started with `--dir /var/lib/solikv` wrote its background and
-    /// shutdown snapshots there but an explicit `SAVE` wrote to `./data`
-    /// relative to the process CWD — a snapshot that the next startup never
-    /// loads, and an operator-triggered save that silently does not protect the
-    /// data it appears to.
-    rdb_dir: PathBuf,
-    rdb_basename: String,
+    /// `SAVE`/`BGSAVE` used to write to a hardcoded `data`/`dump` in the
+    /// command handler, so a server started with `--dir /var/lib/solikv`
+    /// wrote its background and shutdown snapshots there but an explicit
+    /// `SAVE` wrote to `./data` relative to the process CWD — a snapshot that
+    /// the next startup never loads. Everything now goes through the one
+    /// configuration the server started with.
+    persistence: Arc<Persistence>,
+    /// Woken by `SHUTDOWN` once the final save succeeded; the server exits.
+    shutdown_requested: Arc<tokio::sync::Notify>,
     /// Most memory one Lua VM may allocate. Without a cap a script such as
     /// `string.rep("x", 2^31)` asks the allocator for whatever it likes, and
     /// the instruction hook cannot interrupt a C function to stop it.
@@ -187,14 +188,13 @@ impl CommandEngine {
         Self {
             shards,
             pubsub,
-            aof: None,
             start_time: Instant::now(),
             script_cache: ScriptCache::new(),
             weak_self: OnceLock::new(),
             notify_flags: Arc::new(AtomicU16::new(0)),
             replication_offset: Arc::new(AtomicU64::new(0)),
-            rdb_dir: PathBuf::from("data"),
-            rdb_basename: "dump".to_string(),
+            persistence: Arc::new(Persistence::new(PersistConfig::default())),
+            shutdown_requested: Arc::new(tokio::sync::Notify::new()),
             lua_memory_limit: DEFAULT_LUA_MEMORY_LIMIT,
         }
     }
@@ -223,47 +223,77 @@ impl CommandEngine {
         self.weak_self.get().and_then(|w| w.upgrade())
     }
 
-    pub fn with_aof(mut self, aof: AofWriter) -> Self {
-        self.aof = Some(aof);
+    /// Log every change to `aof` from now on (tests; the server attaches
+    /// its writer through [`load_persisted`](Self::load_persisted)).
+    pub fn with_aof(self, aof: AofWriter) -> Self {
+        self.shards.attach_aof(aof);
         self
     }
 
-    /// Point `SAVE`/`BGSAVE` at the server's configured `--dir` and
-    /// `--dbfilename` instead of the `data`/`dump` defaults.
-    pub fn with_rdb_path(mut self, dir: impl Into<PathBuf>, basename: impl Into<String>) -> Self {
-        self.rdb_dir = dir.into();
-        self.rdb_basename = basename.into();
+    /// Point `SAVE`/`BGSAVE` at `dir` and `basename` (`{dir}/{basename}.rdb`)
+    /// instead of the `data`/`dump` defaults, with no append-only log.
+    pub fn with_rdb_path(self, dir: impl Into<PathBuf>, basename: impl Into<String>) -> Self {
+        self.with_persistence(Arc::new(Persistence::new(PersistConfig {
+            dir: dir.into(),
+            dbfilename: basename.into(),
+            ..PersistConfig::default()
+        })))
+    }
+
+    /// Use the server's persistence configuration.
+    pub fn with_persistence(mut self, persistence: Arc<Persistence>) -> Self {
+        self.persistence = persistence;
         self
+    }
+
+    pub fn persistence(&self) -> &Arc<Persistence> {
+        &self.persistence
+    }
+
+    /// Resolves once a `SHUTDOWN` command has saved and the server should exit.
+    pub fn shutdown_requested(&self) -> Arc<tokio::sync::Notify> {
+        self.shutdown_requested.clone()
+    }
+
+    /// Writes counted since startup (for `rdb_changes_since_last_save`).
+    pub fn dirty(&self) -> u64 {
+        self.replication_offset.load(Ordering::Relaxed)
+    }
+
+    /// Stop accepting changes, make them durable, and snapshot if configured
+    /// (see [`Persistence::shutdown`]).
+    pub fn shutdown(&self, save: Option<bool>) -> std::io::Result<()> {
+        self.persistence.shutdown(&self.shards, self.dirty(), save)
+    }
+
+    /// Bracket a `MULTI`/`EXEC` batch so the log applies it whole or not at
+    /// all. Keep it alive across the batch's `execute` calls, with no
+    /// `.await` in between (the bracket is per thread).
+    pub fn aof_transaction(&self) -> crate::aof_log::TxGuard {
+        crate::aof_log::TxGuard::begin(&self.shards)
     }
 
     /// Execute a parsed command. Returns the response.
     pub fn execute(&self, name: &str, args: &[Bytes]) -> CommandResponse {
-        let response = self.dispatch(name, args);
+        let write = is_write_command(name);
+
+        // With the log on, tell the shards what this command logs as; they
+        // log it under their lock (see `aof_log`). The frame is set for every
+        // command so a read nested in a script never inherits a write's.
+        let response = if self.shards.aof().is_some() {
+            let mode = crate::aof_log::mode(name, write);
+            let cmd = crate::aof_log::AutoCmd::new(name, args, mode);
+            let _frame = crate::aof_log::FrameGuard::enter(mode, &cmd);
+            self.dispatch(name, args)
+        } else {
+            self.dispatch(name, args)
+        };
 
         if response.is_error() {
             return response;
         }
 
-        // Single write-classification check (used for AOF + replication offset).
-        let write = is_write_command(name);
-
-        // AOF: log write commands that succeeded (channel send, backpressured).
         if write {
-            if let Some(aof) = &self.aof {
-                if name == "EVALSHA" {
-                    // Convert EVALSHA to EVAL in AOF so replay works without script cache
-                    if let Some(sha) = args.first() {
-                        let sha_str = std::str::from_utf8(sha).unwrap_or("");
-                        if let Some(source) = self.script_cache.get(sha_str) {
-                            let mut eval_args = vec![Bytes::from(source)];
-                            eval_args.extend_from_slice(&args[1..]);
-                            aof.log("EVAL", &eval_args);
-                        }
-                    }
-                } else {
-                    aof.log(name, args);
-                }
-            }
             self.replication_offset.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -650,8 +680,9 @@ impl CommandEngine {
             "INFO" => {
                 let uptime = self.start_time.elapsed().as_secs();
                 let info = format!(
-                    "# Server\r\nsolikv_version:0.1.0\r\nuptime_in_seconds:{}\r\ntcp_port:6379\r\n\r\n# Keyspace\r\n",
-                    uptime
+                    "# Server\r\nsolikv_version:0.1.0\r\nuptime_in_seconds:{}\r\ntcp_port:6379\r\n\r\n{}\r\n# Keyspace\r\n",
+                    uptime,
+                    self.persistence.stats.info_section(self.dirty()),
                 );
                 CommandResponse::bulk(Bytes::from(info))
             }
@@ -677,8 +708,11 @@ impl CommandEngine {
                     let num = shards.num_shards();
                     for i in 0..num {
                         let shard = shards.shard(i).clone();
-                        shard.execute(|store| {
+                        shard.execute_with_effects(|store, fx| {
                             store.flush();
+                            // Replays as "empty this shard's keys": each old
+                            // shard is replayed into its own scratch store.
+                            fx.push("FLUSHALL", &[]);
                             CommandResponse::ok()
                         });
                     }
@@ -1115,9 +1149,16 @@ impl CommandEngine {
                 let mut total = 0i64;
                 for key in args {
                     let k = key.clone();
-                    let resp = self.shards.shard_for_key(&k).execute(move |store| {
-                        CommandResponse::integer(if store.del(&k) { 1 } else { 0 })
-                    });
+                    let resp =
+                        self.shards
+                            .shard_for_key(&k)
+                            .execute_with_effects(move |store, fx| {
+                                let deleted = store.del(&k);
+                                if deleted {
+                                    fx.push("DEL", &[&k]);
+                                }
+                                CommandResponse::integer(deleted as i64)
+                            });
                     if let CommandResponse::Integer(n) = resp {
                         total += n;
                     }
@@ -1132,9 +1173,16 @@ impl CommandEngine {
                 let mut total = 0i64;
                 for key in args {
                     let k = key.clone();
-                    let resp = self.shards.shard_for_key(&k).execute(move |store| {
-                        CommandResponse::integer(if store.del(&k) { 1 } else { 0 })
-                    });
+                    let resp =
+                        self.shards
+                            .shard_for_key(&k)
+                            .execute_with_effects(move |store, fx| {
+                                let deleted = store.del(&k);
+                                if deleted {
+                                    fx.push("DEL", &[&k]);
+                                }
+                                CommandResponse::integer(deleted as i64)
+                            });
                     if let CommandResponse::Integer(n) = resp {
                         total += n;
                     }
@@ -2238,8 +2286,11 @@ impl CommandEngine {
                     i += 1;
                 }
                 let shard = self.shards.shard_for_key(&dest).clone();
-                shard
-                    .execute(move |store| store.zset_zunionstore(&dest, &keys, &weights, aggregate))
+                shard.execute_with_effects(move |store, fx| {
+                    let r = store.zset_zunionstore(&dest, &keys, &weights, aggregate);
+                    fx.put_key(store, &dest);
+                    r
+                })
             }
             "ZINTERSTORE" => {
                 if args.len() < 3 {
@@ -2306,8 +2357,11 @@ impl CommandEngine {
                     i += 1;
                 }
                 let shard = self.shards.shard_for_key(&dest).clone();
-                shard
-                    .execute(move |store| store.zset_zinterstore(&dest, &keys, &weights, aggregate))
+                shard.execute_with_effects(move |store, fx| {
+                    let r = store.zset_zinterstore(&dest, &keys, &weights, aggregate);
+                    fx.put_key(store, &dest);
+                    r
+                })
             }
             "ZSCAN" => {
                 if args.len() < 2 {
@@ -2700,8 +2754,11 @@ impl CommandEngine {
 
                 // GEOSEARCHSTORE operates on two keys (src + dest), route to dest shard
                 let shard = self.shards.shard_for_key(&dest).clone();
-                shard.execute(move |store| {
-                    store.geo_search_store(&dest, &src, &from, &by, sort_asc, count, store_dist)
+                shard.execute_with_effects(move |store, fx| {
+                    let r = store
+                        .geo_search_store(&dest, &src, &from, &by, sort_asc, count, store_dist);
+                    fx.put_key(store, &dest);
+                    r
                 })
             }
 
@@ -3039,7 +3096,9 @@ impl CommandEngine {
             }
             "XREADGROUP" => {
                 // XREADGROUP GROUP group consumer [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]
-                if args.len() < 7 {
+                // Six arguments at least: GROUP g c STREAMS key id (the
+                // one-stream form is what the log records per shard).
+                if args.len() < 6 {
                     return CommandResponse::wrong_arity("xreadgroup");
                 }
                 let mut i = 0;
@@ -3104,9 +3163,26 @@ impl CommandEngine {
                     let k = key.clone();
                     let g = group.clone();
                     let c = consumer.clone();
-                    let resp = self.shards.shard_for_key(&k).execute(move |store| {
-                        store.stream_xreadgroup_single(&k, &g, &c, id_input, count)
-                    });
+                    let count_arg = count.map(|n| n.to_string());
+                    let id_arg = id_arg.clone();
+                    let resp =
+                        self.shards
+                            .shard_for_key(&k)
+                            .execute_with_effects(move |store, fx| {
+                                let r = store.stream_xreadgroup_single(&k, &g, &c, id_input, count);
+                                if !r.is_error() && fx.enabled() {
+                                    // This stream's part only: the others are on
+                                    // their own shards' logs.
+                                    let mut a: Vec<&[u8]> = vec![b"GROUP", &g, &c];
+                                    if let Some(n) = &count_arg {
+                                        a.push(b"COUNT");
+                                        a.push(n.as_bytes());
+                                    }
+                                    a.extend_from_slice(&[b"STREAMS", &k, &id_arg]);
+                                    fx.push("XREADGROUP", &a);
+                                }
+                                r
+                            });
 
                     if !matches!(resp, CommandResponse::Nil) {
                         results.push(CommandResponse::array(vec![
@@ -3236,44 +3312,65 @@ impl CommandEngine {
             }
 
             // ---- Persistence commands ----
-            "SAVE" | "BGSAVE" => {
-                // Disk I/O under shard locks — release the async worker while saving.
+            "SAVE" => {
+                if !args.is_empty() {
+                    return CommandResponse::wrong_arity("save");
+                }
+                // Disk I/O and a lock per shard — release the async worker.
                 self.maybe_block_in_place(|| {
-                    let dir = self.rdb_dir.as_path();
-                    let shards = self.shards.clone();
-                    let num = shards.num_shards();
-                    if let Err(e) =
-                        solikv_persist::save_all_shards(dir, &self.rdb_basename, num, |idx, f| {
-                            shards.shard(idx).with_store(|store| f(store))
-                        })
-                    {
-                        return CommandResponse::error(format!("ERR RDB save failed: {}", e));
+                    match self.persistence.save(&self.shards, self.dirty()) {
+                        Ok(()) => {
+                            tracing::info!("DB saved on disk");
+                            CommandResponse::ok()
+                        }
+                        Err(e) => CommandResponse::error(format!("ERR RDB save failed: {}", e)),
                     }
-                    tracing::info!("RDB saved {} shards to {:?}", num, dir);
-                    CommandResponse::ok()
                 })
             }
-            "BGREWRITEAOF" => {
-                // Report the truth instead of `+OK`.
-                //
-                // This has always been a no-op, so an operator who ran it —
-                // or a maintenance job that runs it on a schedule — was told
-                // the append log had been compacted when it had not. The AOF
-                // grows without bound either way; the difference is whether
-                // anyone finds out before the disk fills.
-                //
-                // Implementing it needs more than a snapshot-and-swap.
-                // `execute()` mutates the store and *then* enqueues to the AOF
-                // writer, so a rewrite that snapshots between those two steps
-                // captures a command that is also about to be appended to the
-                // new log — replaying it applies the command twice. That is
-                // harmless for SET and wrong for RPUSH/INCR. Closing the window
-                // means holding a shared guard across (mutate, append) on the
-                // write path and an exclusive one for the rewrite, which is a
-                // hot-path change worth benchmarking on its own.
-                CommandResponse::error(
-                    "ERR BGREWRITEAOF is not implemented; the append log is never compacted",
-                )
+            "BGSAVE" => {
+                // `BGSAVE SCHEDULE` is accepted for compatibility; there is
+                // no conflicting child process to wait for.
+                if args.len() > 1 {
+                    return CommandResponse::syntax_error();
+                }
+                match self.persistence.bgsave(&self.shards, self.dirty()) {
+                    Ok(()) => CommandResponse::simple("Background saving started"),
+                    Err(e) => CommandResponse::error(e),
+                }
+            }
+            "BGREWRITEAOF" => match self.persistence.bgrewrite(&self.shards) {
+                Ok(()) => CommandResponse::simple("Background append only file rewriting started"),
+                Err(e) => CommandResponse::error(e),
+            },
+            "LASTSAVE" => CommandResponse::integer(
+                self.persistence
+                    .stats
+                    .rdb_last_save_time
+                    .load(Ordering::Relaxed) as i64,
+            ),
+            "SHUTDOWN" => {
+                // SHUTDOWN [NOSAVE|SAVE] [NOW] [FORCE] [ABORT]
+                let mut save = None;
+                for a in args {
+                    match std::str::from_utf8(a).unwrap_or("").to_uppercase().as_str() {
+                        "NOSAVE" => save = Some(false),
+                        "SAVE" => save = Some(true),
+                        "NOW" | "FORCE" => {}
+                        "ABORT" => return CommandResponse::error("ERR No shutdown in progress."),
+                        _ => return CommandResponse::syntax_error(),
+                    }
+                }
+                let res = self.maybe_block_in_place(|| self.shutdown(save));
+                match res {
+                    Ok(()) => {
+                        self.shutdown_requested.notify_one();
+                        CommandResponse::ok()
+                    }
+                    Err(e) => CommandResponse::error(format!(
+                        "ERR Errors trying to SHUTDOWN. Check logs. ({})",
+                        e
+                    )),
+                }
             }
 
             // ---- Scripting commands ----
@@ -3509,10 +3606,15 @@ impl CommandEngine {
                     }
                 }
 
-                // Store merged result in dest's shard
+                // Store merged result in dest's shard; the sources may live on
+                // other shards, so the log gets the resulting value.
                 self.shards
                     .shard_for_key(&dest)
-                    .execute(move |store| store.pfset_registers(&dest, merged_registers))
+                    .execute_with_effects(move |store, fx| {
+                        let r = store.pfset_registers(&dest, merged_registers);
+                        fx.put_key(store, &dest);
+                        r
+                    })
             }
 
             // ---- Bloom Filter commands ----
@@ -3715,10 +3817,15 @@ impl CommandEngine {
                     }
                 }
 
-                // Store result in dest shard
+                // Store result in dest shard; the log gets the resulting value,
+                // computed from sources that may live on other shards.
                 self.shards
                     .shard_for_key(&dest)
-                    .execute(move |store| store.string_bitop(dest, &op, &sources))
+                    .execute_with_effects(move |store, fx| {
+                        let r = store.string_bitop(dest.clone(), &op, &sources);
+                        fx.put_key(store, &dest);
+                        r
+                    })
             }
 
             // ---- Catch-all ----
@@ -3814,6 +3921,17 @@ fn multi_shard_mget(shards: &crate::shard::ShardManager, keys: &[Bytes]) -> Comm
     CommandResponse::Array(results)
 }
 
+/// This shard's pairs of an `MSET`/`MSETNX`, as an `MSET` for its log.
+fn log_mset_part(fx: &mut crate::aof_log::Effects, pairs: &[(Bytes, Bytes)]) {
+    if fx.enabled() {
+        let flat: Vec<&[u8]> = pairs
+            .iter()
+            .flat_map(|(k, v)| [k.as_ref(), v.as_ref()])
+            .collect();
+        fx.push("MSET", &flat);
+    }
+}
+
 fn multi_shard_mset(
     shards: &crate::shard::ShardManager,
     pairs: Vec<(Bytes, Bytes)>,
@@ -3830,7 +3948,10 @@ fn multi_shard_mset(
         }
         shards
             .shard(shard_idx)
-            .execute(move |store| store.string_mset(group));
+            .execute_with_effects(move |store, fx| {
+                log_mset_part(fx, &group);
+                store.string_mset(group)
+            });
     }
     CommandResponse::ok()
 }
@@ -3872,7 +3993,10 @@ fn multi_shard_msetnx(
         }
         shards
             .shard(shard_idx)
-            .execute(move |store| store.string_mset(group));
+            .execute_with_effects(move |store, fx| {
+                log_mset_part(fx, &group);
+                store.string_mset(group)
+            });
     }
     CommandResponse::integer(1)
 }
@@ -4105,8 +4229,8 @@ mod sec_tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert!(
-            written.iter().any(|name| name.starts_with("snapshot-")),
-            "expected snapshot-*.rdb in the configured dir, found {:?}",
+            written.iter().any(|name| name == "snapshot.rdb"),
+            "expected snapshot.rdb in the configured dir, found {:?}",
             written
         );
         assert!(

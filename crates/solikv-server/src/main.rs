@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
 
-use solikv_persist::{AofPersistence, FsyncPolicy};
+use solikv_persist::FsyncPolicy;
 
 use solikv_cluster::{generate_stable_node_id, ClusterManager, GossipState};
 use solikv_server::cluster_dump;
@@ -100,17 +100,33 @@ struct Args {
     #[arg(long, default_value = "data")]
     dir: PathBuf,
 
-    /// RDB snapshot base filename (files will be {name}-{shard}.rdb)
+    /// Snapshot base filename: the snapshot is {dir}/{name}.rdb (per-shard
+    /// {name}-{shard}.rdb files from earlier versions are still loaded)
     #[arg(long, default_value = "dump")]
     dbfilename: String,
 
-    /// Enable append-only file persistence
+    /// Enable append-only file persistence. When on, startup loads the log
+    /// (in {dir}/appendonlydir) and not the snapshot, as Redis does.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     appendonly: bool,
 
     /// AOF fsync policy: always, everysec, no
     #[arg(long, default_value = "everysec")]
     appendfsync: String,
+
+    /// Seconds between background snapshots when the data changed (0 = no
+    /// periodic snapshots and no snapshot at shutdown)
+    #[arg(long, default_value = "300", value_name = "SECS")]
+    save_interval: u64,
+
+    /// Rewrite the append-only log once it has grown by this percentage since
+    /// the last rewrite (0 = only on BGREWRITEAOF)
+    #[arg(long, default_value = "100", value_name = "PERCENT")]
+    auto_aof_rewrite_percentage: u64,
+
+    /// ... and is at least this large (bytes; k/kb/m/mb/g/gb suffixes allowed)
+    #[arg(long, default_value = "64mb", value_name = "SIZE", value_parser = parse_size)]
+    auto_aof_rewrite_min_size: u64,
 
     /// Import a Redis RDB file (dump.rdb) at startup
     #[arg(long, value_name = "PATH")]
@@ -724,24 +740,38 @@ async fn async_main(args: Args) {
         )
     });
 
+    // --- Engine and persistence ---
+    let persistence = Arc::new(solikv_engine::Persistence::new(
+        solikv_engine::PersistConfig {
+            dir: args.dir.clone(),
+            dbfilename: args.dbfilename.clone(),
+            appendonly: args.appendonly,
+            fsync: fsync_policy,
+            auto_rewrite_percentage: args.auto_aof_rewrite_percentage,
+            auto_rewrite_min_size: args.auto_aof_rewrite_min_size,
+            save_interval: args.save_interval,
+        },
+    ));
+    let engine = solikv_engine::CommandEngine::new(shards.clone(), pubsub.clone())
+        .with_notify_flags(notify_flags)
+        .with_lua_memory_limit(args.lua_memory_limit)
+        .with_persistence(persistence.clone());
+    let engine = Arc::new(engine);
+    engine.init_self_ref(Arc::downgrade(&engine));
+
     // --- Import Redis RDB if requested ---
     if let Some(ref redis_rdb_path) = args.import_redis_rdb {
         tracing::info!("Importing Redis RDB from {:?}...", redis_rdb_path);
         match solikv_persist::redis_rdb::import_redis_rdb(redis_rdb_path, num_shards) {
             Ok((shard_data, stats)) => {
-                let mut total = 0usize;
-                for (idx, entries) in shard_data.into_iter().enumerate() {
-                    let count = entries.len();
-                    if count > 0 {
-                        shards.shard(idx).execute(|store| {
-                            for (key, entry) in entries {
-                                store.insert_entry(key, entry);
-                            }
-                            solikv_core::CommandResponse::ok()
-                        });
-                    }
-                    total += count;
-                }
+                // The importer buckets by cluster slot; the engine routes by
+                // its own hash, so every key is re-routed (bucket i is not
+                // shard i — keys used to land where no lookup found them).
+                let total = solikv_engine::persistence::insert_routed(
+                    &shards,
+                    shard_data.into_iter().flatten(),
+                );
+                persistence.mark_needs_rewrite();
                 tracing::info!("Redis RDB import complete: {stats} ({total} keys loaded into {num_shards} shards)");
             }
             Err(e) => {
@@ -755,21 +785,27 @@ async fn async_main(args: Args) {
         }
     }
 
-    // --- Load RDB snapshots ---
-    match solikv_persist::load_all_shards(&args.dir, &args.dbfilename, num_shards, |idx, f| {
-        shards.shard(idx).execute(|store| {
-            if let Err(e) = f(store) {
-                tracing::error!("Failed to load RDB for shard {}: {}", idx, e);
-            }
-            solikv_core::CommandResponse::ok()
-        });
-        Ok(())
-    }) {
-        Ok(n) if n > 0 => {
-            tracing::info!("Loaded RDB snapshots for {} shards from {:?}", n, args.dir)
+    // --- Load the snapshot or the append-only log, then start the log ---
+    match engine.load_persisted() {
+        Ok(report) => tracing::info!(
+            "Loaded {} keys from {} ({} log records) in {}",
+            report.keys,
+            report.source,
+            report.log_records,
+            abs_display(&args.dir)
+        ),
+        Err(e) => {
+            // Starting anyway would serve a partial dataset and then append
+            // new writes after the damage. Redis refuses too.
+            tracing::error!(
+                "Cannot load persisted data from {}: {}. Refusing to start: repair or move \
+                 the damaged file (a log cut off mid-record is loaded automatically; this \
+                 is not one).",
+                abs_display(&args.dir),
+                e
+            );
+            std::process::exit(1);
         }
-        Ok(_) => tracing::info!("No RDB snapshots found in {:?}, starting fresh", args.dir),
-        Err(e) => tracing::warn!("RDB load error: {}", e),
     }
 
     // --- Load cluster state from RDB ---
@@ -795,103 +831,35 @@ async fn async_main(args: Args) {
         }
     }
 
-    // --- Replay AOF ---
-    if args.appendonly {
-        let aof_path = args.dir.join("appendonly.aof");
-        if aof_path.exists() {
-            match AofPersistence::replay(&aof_path) {
-                Ok(commands) => {
-                    let count = commands.len();
-                    let replay_engine =
-                        solikv_engine::CommandEngine::new(shards.clone(), pubsub.clone());
-                    for cmd_args in commands {
-                        if cmd_args.is_empty() {
-                            continue;
-                        }
-                        let name = std::str::from_utf8(&cmd_args[0])
-                            .unwrap_or("")
-                            .to_uppercase();
-                        replay_engine.execute(&name, &cmd_args[1..]);
-                    }
-                    tracing::info!("Replayed {} AOF commands from {:?}", count, aof_path);
-                }
-                Err(e) => {
-                    // Starting anyway would serve a partial dataset and then
-                    // append new writes after the damage. Redis refuses too.
-                    tracing::error!(
-                        "AOF {} cannot be replayed: {}. Refusing to start: repair or move \
-                         the file (a truncated tail is loaded automatically; this is not one).",
-                        abs_display(&aof_path),
-                        e
-                    );
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
-
-    // --- Create lock-free AOF writer (channel-based, background task handles I/O + fsync) ---
-    let aof_writer = if args.appendonly {
-        if let Err(e) = solikv_persist::fsutil::create_private_dir_all(&args.dir) {
-            tracing::error!(
-                "Cannot create data directory {}: {} — pass --dir <writable path>",
-                abs_display(&args.dir),
-                e
-            );
-        }
-        let aof_path = args.dir.join("appendonly.aof");
-        match solikv_persist::spawn_aof_writer(&aof_path, fsync_policy) {
-            Ok(writer) => {
-                tracing::info!("AOF enabled ({:?} fsync) at {:?}", fsync_policy, aof_path);
-                // Solo: backpressure must wait on this thread, never hand the
-                // worker to another one (see `AofWriter::single_threaded`).
-                Some(writer.single_threaded(args.solo))
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Failed to open AOF file {}: {} — WRITES WILL NOT BE PERSISTED. \
-                     Pass --dir <writable path>, or --appendonly false to run in-memory only.",
-                    abs_display(&aof_path),
-                    e
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // --- Create engine with AOF ---
-    let mut engine = solikv_engine::CommandEngine::new(shards.clone(), pubsub.clone())
-        .with_notify_flags(notify_flags)
-        .with_lua_memory_limit(args.lua_memory_limit)
-        // Without this, an explicit SAVE/BGSAVE writes to ./data/dump-*.rdb
-        // regardless of --dir/--dbfilename, so it lands somewhere startup never
-        // reads from.
-        .with_rdb_path(args.dir.clone(), args.dbfilename.clone());
-    if let Some(writer) = aof_writer {
-        engine = engine.with_aof(writer);
-    }
-    let engine = Arc::new(engine);
-    engine.init_self_ref(Arc::downgrade(&engine));
-
-    // --- Spawn background RDB save task ---
+    // --- Periodic snapshots and automatic log rewrites ---
     {
-        let shards_rdb = shards.clone();
-        let dir = args.dir.clone();
-        let dbfilename = args.dbfilename.clone();
+        let engine_bg = engine.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_save = std::time::Instant::now();
             loop {
-                interval.tick().await;
-                let ns = shards_rdb.num_shards();
-                let shards_ref = &shards_rdb;
-                if let Err(e) = solikv_persist::save_all_shards(&dir, &dbfilename, ns, |idx, f| {
-                    shards_ref.shard(idx).with_store(|store| f(store))
-                }) {
-                    tracing::error!("Background RDB save to {} failed: {}", abs_display(&dir), e);
-                } else {
-                    tracing::debug!("Background RDB snapshot saved");
+                ticker.tick().await;
+                let p = engine_bg.persistence().clone();
+                if p.should_auto_rewrite() {
+                    tracing::info!("Append-only log has grown; rewriting it");
+                    if let Err(e) = p.bgrewrite(&engine_bg.shards) {
+                        tracing::warn!("Automatic log rewrite not started: {}", e);
+                    }
+                }
+                let every = p.config().save_interval;
+                if every > 0 && last_save.elapsed() >= std::time::Duration::from_secs(every) {
+                    last_save = std::time::Instant::now();
+                    let dirty = engine_bg.dirty();
+                    let saved_at = p
+                        .stats
+                        .rdb_dirty_at_last_save
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if dirty != saved_at {
+                        if let Err(e) = p.bgsave(&engine_bg.shards, dirty) {
+                            tracing::debug!("Periodic snapshot skipped: {}", e);
+                        }
+                    }
                 }
             }
         });
@@ -959,43 +927,87 @@ async fn async_main(args: Args) {
         }
     });
 
-    tokio::select! {
-        _ = resp_handle => {},
-        _ = rest_handle => {},
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Shutting down — saving final RDB snapshot...");
-            let ns = shards.num_shards();
-            if let Err(e) = solikv_persist::save_all_shards(&args.dir, &args.dbfilename, ns, |idx, f| {
-                shards.shard(idx).with_store(|store| f(store))
-            }) {
-                tracing::error!(
-                    "Shutdown RDB save to {} failed: {}",
-                    abs_display(&args.dir),
-                    e
-                );
-            } else {
-                tracing::info!("Final RDB snapshot saved to {:?}", args.dir);
-            }
+    // SIGTERM (docker stop, systemd, the daemon restart) and SIGINT shut down
+    // gracefully; SIGHUP no longer kills the process. Only Ctrl-C used to
+    // save: every other stop lost whatever the last snapshot did not hold.
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+    let shutdown_cmd = engine.shutdown_requested();
+    let mut resp_handle = resp_handle;
+    let mut rest_handle = rest_handle;
+    let reason = loop {
+        tokio::select! {
+            _ = &mut resp_handle => break "RESP server stopped",
+            _ = &mut rest_handle => break "REST server stopped",
+            _ = sigterm.recv() => break "SIGTERM",
+            _ = sigint.recv() => break "SIGINT",
+            _ = sighup.recv() => tracing::info!("SIGHUP received and ignored"),
+            _ = shutdown_cmd.notified() => break "SHUTDOWN",
+        }
+    };
 
-            // Save cluster state
-            if let Some(ref cluster) = cluster_manager {
-                let cluster_state = cluster.export_state();
-                let cluster_path = args.dir.join("cluster.json");
-                match serde_json::to_string_pretty(&cluster_state) {
-                    Ok(json) => {
-                        if let Err(e) = solikv_persist::fsutil::write_private(&cluster_path, json) {
-                            tracing::error!("Failed to save cluster state: {}", e);
-                        } else {
-                            tracing::info!("Cluster state saved to {:?}", cluster_path);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to serialize cluster state: {}", e);
-                    }
+    tracing::info!("Shutting down ({})", reason);
+    // SHUTDOWN already froze the shards, synced the log and saved.
+    if reason != "SHUTDOWN" {
+        match engine.shutdown(None) {
+            Ok(()) => tracing::info!("Data made durable in {}", abs_display(&args.dir)),
+            Err(e) => tracing::error!(
+                "Final save to {} failed: {} — data since the last successful save may be lost",
+                abs_display(&args.dir),
+                e
+            ),
+        }
+    }
+
+    // Save cluster state
+    if let Some(ref cluster) = cluster_manager {
+        let cluster_state = cluster.export_state();
+        let cluster_path = args.dir.join("cluster.json");
+        match serde_json::to_string_pretty(&cluster_state) {
+            Ok(json) => {
+                if let Err(e) = solikv_persist::fsutil::write_atomic(&cluster_path, json) {
+                    tracing::error!("Failed to save cluster state: {}", e);
+                } else {
+                    tracing::info!("Cluster state saved to {:?}", cluster_path);
                 }
+            }
+            Err(e) => {
+                tracing::error!("Failed to serialize cluster state: {}", e);
             }
         }
     }
+
+    // The pidfile names this process only in daemon mode; leave anyone
+    // else's alone.
+    let pidfile = args.dir.join("solikv.pid");
+    if fs::read_to_string(&pidfile).is_ok_and(|p| p.trim() == std::process::id().to_string()) {
+        let _ = fs::remove_file(&pidfile);
+    }
+    std::process::exit(0);
+}
+
+/// `64mb`, `1g`, `4096` → bytes.
+fn parse_size(s: &str) -> Result<u64, String> {
+    let lower = s.trim().to_ascii_lowercase();
+    let (num, mult) = [
+        ("gb", 1u64 << 30),
+        ("g", 1 << 30),
+        ("mb", 1 << 20),
+        ("m", 1 << 20),
+        ("kb", 1 << 10),
+        ("k", 1 << 10),
+        ("b", 1),
+    ]
+    .iter()
+    .find_map(|(suf, m)| lower.strip_suffix(suf).map(|n| (n.to_string(), *m)))
+    .unwrap_or((lower.clone(), 1));
+    num.trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .ok_or_else(|| format!("invalid size '{}'", s))
 }
 
 fn num_cpus() -> usize {

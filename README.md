@@ -82,9 +82,12 @@ curl -X POST -H "Content-Type: application/json" -d '{"value": "Hello"}' http://
 | `--bind` | 0.0.0.0 | Bind address |
 | `--log-level` | info | Log level |
 | `--dir` | data | Data directory for persistence |
-| `--dbfilename` | dump | RDB snapshot filename |
-| `--appendonly` | true | Enable AOF persistence |
+| `--dbfilename` | dump | Snapshot file base name (`<dir>/<name>.rdb`) |
+| `--appendonly` | true | Enable the append-only log (`<dir>/appendonlydir`); when on, startup loads the log, not the snapshot |
 | `--appendfsync` | everysec | AOF fsync policy: always, everysec, no |
+| `--save-interval` | 300 | Seconds between background snapshots when data changed (0 = none, and no snapshot at shutdown) |
+| `--auto-aof-rewrite-percentage` | 100 | Rewrite the log once it grew by this much since the last rewrite (0 = only on `BGREWRITEAOF`) |
+| `--auto-aof-rewrite-min-size` | 64mb | ... and is at least this large |
 | `--import-redis-rdb` | - | Path to a Redis `dump.rdb` file to import at startup |
 
 ## Migrating from Redis

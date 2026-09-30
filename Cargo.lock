@@ -1954,6 +1954,7 @@ dependencies = [
  "bytes",
  "libc",
  "lzf",
+ "parking_lot",
  "serde",
  "serde_json",
  "solikv-cluster",

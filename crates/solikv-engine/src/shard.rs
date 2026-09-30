@@ -1,15 +1,31 @@
 use bytes::Bytes;
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use solikv_core::ShardStore;
 use solikv_pubsub::PubSubBroker;
 
 use solikv_core::CommandResponse;
+use solikv_persist::AofWriter;
 
+use crate::aof_log::Effects;
 use crate::dispatch::{NOTIFY_EXPIRED, NOTIFY_KEYEVENT, NOTIFY_KEYSPACE};
+
+/// Reply to every command once the server has started shutting down.
+pub const SHUTTING_DOWN: &str = "ERR server is shutting down";
+
+/// State every shard handle shares.
+#[derive(Default)]
+struct Shared {
+    /// The append-only log, once startup has loaded the dataset. Set once;
+    /// commands replayed before it is set are, correctly, not logged again.
+    aof: OnceLock<AofWriter>,
+    /// Shutdown barrier: no command touches a store once this is set (see
+    /// `ShardManager::freeze`).
+    frozen: AtomicBool,
+}
 
 /// Unlocked store for **solo mode** (single Tokio worker — Redis-shaped).
 ///
@@ -97,77 +113,120 @@ pub struct ShardHandle {
     backend: Arc<StoreBackend>,
     pubsub: Option<Arc<PubSubBroker>>,
     notify_flags: Option<Arc<AtomicU16>>,
+    index: u32,
+    shared: Arc<Shared>,
 }
 
 impl ShardHandle {
-    fn new_locked(
-        store: Arc<Mutex<ShardStore>>,
+    fn new(
+        backend: StoreBackend,
         pubsub: Option<Arc<PubSubBroker>>,
         notify_flags: Option<Arc<AtomicU16>>,
+        index: u32,
+        shared: Arc<Shared>,
     ) -> Self {
         Self {
-            backend: Arc::new(StoreBackend::Locked {
-                store,
-                tick: Arc::new(AtomicU64::new(0)),
-            }),
+            backend: Arc::new(backend),
             pubsub,
             notify_flags,
+            index,
+            shared,
         }
     }
 
-    fn new_solo(
-        store: Arc<SoloStore>,
-        pubsub: Option<Arc<PubSubBroker>>,
-        notify_flags: Option<Arc<AtomicU16>>,
-    ) -> Self {
-        Self {
-            backend: Arc::new(StoreBackend::Solo {
-                store,
-                tick: AtomicU64::new(0),
-            }),
-            pubsub,
-            notify_flags,
+    /// Run `f` with the store, locked (or, solo, on the only thread).
+    #[inline]
+    fn locked<T>(&self, f: impl FnOnce(&mut ShardStore, &AtomicU64) -> T) -> T {
+        match self.backend.as_ref() {
+            StoreBackend::Locked { store, tick } => {
+                let mut guard = store.lock();
+                f(&mut guard, tick)
+            }
+            StoreBackend::Solo { store, tick } => store.with_mut(|s| f(s, tick)),
         }
     }
 
+    /// Run a command against the store.
+    ///
+    /// With the append-only log on, the command (see `aof_log`) and any key
+    /// expired along the way are logged before the lock is released, so this
+    /// shard's log holds its changes in the order they happened.
     #[inline]
     pub fn execute<F>(&self, f: F) -> CommandResponse
     where
         F: FnOnce(&mut ShardStore) -> CommandResponse,
     {
-        let (result, lazy_expired, active_expired) = match self.backend.as_ref() {
-            StoreBackend::Locked { store, tick } => {
-                let mut guard = store.lock();
-                let result = f(&mut guard);
-                let lazy_expired = std::mem::take(&mut guard.expired_buffer);
-                let t = tick.fetch_add(1, Ordering::Relaxed);
-                let active_expired = if t.is_multiple_of(100) {
-                    guard.run_active_expiry()
-                } else {
-                    Vec::new()
-                };
-                (result, lazy_expired, active_expired)
+        self.run(|store, _| f(store), false)
+    }
+
+    /// Run a command that logs its own effects on this shard (multi-key and
+    /// cross-shard writes; see `aof_log`), instead of being logged as itself.
+    #[inline]
+    pub fn execute_with_effects<F>(&self, f: F) -> CommandResponse
+    where
+        F: FnOnce(&mut ShardStore, &mut Effects) -> CommandResponse,
+    {
+        self.run(f, true)
+    }
+
+    #[inline]
+    fn run<F>(&self, f: F, explicit: bool) -> CommandResponse
+    where
+        F: FnOnce(&mut ShardStore, &mut Effects) -> CommandResponse,
+    {
+        let aof = self.shared.aof.get();
+        let (result, lazy_expired, active_expired) = self.locked(|store, tick| {
+            // Checked under the lock: once `freeze` has taken and released
+            // this lock, nothing changes the store again.
+            if self.shared.frozen.load(Ordering::Relaxed) {
+                return (
+                    CommandResponse::error(SHUTTING_DOWN),
+                    Vec::new(),
+                    Vec::new(),
+                );
             }
-            StoreBackend::Solo { store, tick } => store.with_mut(|s| {
-                let result = f(s);
-                let lazy_expired = std::mem::take(&mut s.expired_buffer);
-                // Relaxed atomic is enough; solo is single-threaded so this is
-                // essentially a plain load/store without cache-line contention.
-                let t = tick.fetch_add(1, Ordering::Relaxed);
-                let active_expired = if t.is_multiple_of(100) {
-                    s.run_active_expiry()
-                } else {
-                    Vec::new()
-                };
-                (result, lazy_expired, active_expired)
-            }),
-        };
+            let mut effects = Effects::new(aof.is_some());
+            let result = f(store, &mut effects);
+            let lazy_expired = std::mem::take(&mut store.expired_buffer);
+            // Relaxed atomic is enough; solo is single-threaded so this is
+            // essentially a plain load/store without cache-line contention.
+            let t = tick.fetch_add(1, Ordering::Relaxed);
+            let active_expired = if t.is_multiple_of(100) {
+                store.run_active_expiry()
+            } else {
+                Vec::new()
+            };
+            if let Some(w) = aof {
+                crate::aof_log::log_under_lock(
+                    w,
+                    self.index,
+                    &result,
+                    &lazy_expired,
+                    explicit.then_some(&mut effects),
+                    &active_expired,
+                );
+            }
+            (result, lazy_expired, active_expired)
+        });
 
         self.emit_expired_notifications(&lazy_expired);
         if !active_expired.is_empty() {
             self.emit_expired_notifications(&active_expired);
         }
         result
+    }
+
+    /// Append a record to this shard's log under its lock (transaction
+    /// markers).
+    pub(crate) fn log_marker(&self, record: &[u8]) {
+        if let Some(w) = self.shared.aof.get() {
+            self.with_store(|_| w.log_raw(self.index, record));
+        }
+    }
+
+    /// This shard's position, which is also its log's number.
+    pub fn index(&self) -> u32 {
+        self.index
     }
 
     fn emit_expired_notifications(&self, keys: &[Bytes]) {
@@ -207,6 +266,16 @@ impl ShardHandle {
         }
     }
 
+    /// Mutable access that is **not logged**: only for loading a dataset
+    /// before the append-only log is attached, or scratch stores that have
+    /// none. Anything else must go through [`execute`](Self::execute).
+    pub fn with_store_mut_unlogged<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut ShardStore) -> R,
+    {
+        self.locked(|store, _| f(store))
+    }
+
     pub fn is_solo(&self) -> bool {
         matches!(self.backend.as_ref(), StoreBackend::Solo { .. })
     }
@@ -217,9 +286,15 @@ pub struct ShardManager {
     shards: Vec<ShardHandle>,
     num_shards: usize,
     solo: bool,
+    shared: Arc<Shared>,
 }
 
 impl ShardManager {
+    /// Names the key → shard function below. Persisted with the append-only
+    /// log, whose per-shard files are only valid for a server that routes
+    /// keys the same way: change it whenever `shard_index_for_key` changes.
+    pub const HASH_SCHEME: &'static str = "fnv1a-64";
+
     pub fn new(num_shards: usize) -> Self {
         Self::with_notifications_inner(num_shards, None, None, false)
     }
@@ -251,29 +326,62 @@ impl ShardManager {
         solo: bool,
     ) -> Self {
         let num_shards = if solo { 1 } else { num_shards.max(1) };
+        let shared = Arc::new(Shared::default());
         let mut shards = Vec::with_capacity(num_shards);
 
-        if solo {
-            shards.push(ShardHandle::new_solo(
-                Arc::new(SoloStore::new()),
-                pubsub,
-                notify_flags,
+        for i in 0..num_shards {
+            let backend = if solo {
+                StoreBackend::Solo {
+                    store: Arc::new(SoloStore::new()),
+                    tick: AtomicU64::new(0),
+                }
+            } else {
+                StoreBackend::Locked {
+                    store: Arc::new(Mutex::new(ShardStore::new())),
+                    tick: Arc::new(AtomicU64::new(0)),
+                }
+            };
+            shards.push(ShardHandle::new(
+                backend,
+                pubsub.clone(),
+                notify_flags.clone(),
+                i as u32,
+                shared.clone(),
             ));
-        } else {
-            for _ in 0..num_shards {
-                shards.push(ShardHandle::new_locked(
-                    Arc::new(Mutex::new(ShardStore::new())),
-                    pubsub.clone(),
-                    notify_flags.clone(),
-                ));
-            }
         }
 
         ShardManager {
             shards,
             num_shards,
             solo,
+            shared,
         }
+    }
+
+    /// Start logging every change to `writer`. Once only: returns false if a
+    /// writer was already attached.
+    pub fn attach_aof(&self, writer: AofWriter) -> bool {
+        self.shared.aof.set(writer).is_ok()
+    }
+
+    pub fn aof(&self) -> Option<&AofWriter> {
+        self.shared.aof.get()
+    }
+
+    /// Stop every store from changing: set the flag each command checks under
+    /// its shard's lock, then take and release each lock. When this returns,
+    /// every change made so far has also been handed to the log writer (same
+    /// lock hold), and none can follow. Used by shutdown.
+    pub fn freeze(&self) {
+        self.shared.frozen.store(true, Ordering::SeqCst);
+        for shard in &self.shards {
+            shard.with_store(|_| ());
+        }
+    }
+
+    /// Undo [`freeze`](Self::freeze) (a `SHUTDOWN` whose final save failed).
+    pub fn unfreeze(&self) {
+        self.shared.frozen.store(false, Ordering::SeqCst);
     }
 
     pub fn is_solo(&self) -> bool {
