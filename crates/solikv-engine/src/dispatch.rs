@@ -4517,11 +4517,24 @@ impl CommandEngine {
         }
     }
 
+    /// Prepare command `name args` of a run, before its batch hold is
+    /// taken: what can be worked out ahead (its log record) is not then
+    /// done while every other client of the shard waits.
+    pub fn batch_prepare(&self, name: &str, args: &[Bytes]) {
+        if !self.shards.logging() {
+            return;
+        }
+        if let Some(spec) = crate::commands::lookup(name) {
+            crate::aof_log::prepare(name, args, crate::aof_log::mode(spec.id, spec.is_write()));
+        }
+    }
+
     /// Release a batch hold, then serve the clients its writes unblocked.
     pub fn end_batch(&self, hold: BatchHold<'_>) {
         let BatchHold { held, defer } = hold;
         drop(held);
         drop(defer);
+        crate::aof_log::clear_prepared();
         if self.blocking.is_active() && !crate::blocking::deferred() {
             self.serve_blocked();
         }

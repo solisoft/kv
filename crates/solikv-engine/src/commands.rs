@@ -582,10 +582,33 @@ fn table() -> &'static Table {
     T.get_or_init(|| SPECS.iter().map(|s| (s.name.as_bytes(), s)).collect())
 }
 
+thread_local! {
+    /// The spec this thread looked up last: a pipeline repeats one command,
+    /// and each command is looked up several times on its way (batching,
+    /// the session, the engine) — under a batch hold, inside the shard lock.
+    static LAST: std::cell::Cell<Option<&'static CommandSpec>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// The spec of `name` (upper case).
+///
+/// Names the decoder resolved are the table's own `&'static str`s, so a
+/// name with the same address and length as the last spec's name *is* that
+/// name (static memory never holds anything else) — no hashing needed.
 #[inline]
 pub fn lookup(name: &str) -> Option<&'static CommandSpec> {
-    table().get(name.as_bytes()).copied()
+    if let Some(last) = LAST.with(|l| l.get()) {
+        if std::ptr::eq(last.name.as_ptr(), name.as_ptr()) && last.name.len() == name.len() {
+            return Some(last);
+        }
+    }
+    let spec = table().get(name.as_bytes()).copied();
+    if let Some(s) = spec {
+        if std::ptr::eq(s.name.as_ptr(), name.as_ptr()) {
+            LAST.with(|l| l.set(Some(s)));
+        }
+    }
+    spec
 }
 
 /// The spec of a command name as a client sent it, in any case — no
@@ -622,6 +645,27 @@ pub fn keys_of(name: &str, args: &[Bytes]) -> Option<Vec<Bytes>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The last-spec cache answers only for the table's own static name;
+    /// any other string — same text on the heap, or other text — is looked
+    /// up, so a cached spec is never returned for the wrong name.
+    #[test]
+    fn lookup_cache_matches_only_the_static_name() {
+        let get = lookup("GET").unwrap();
+        let set = lookup_ci(b"set").unwrap();
+        assert_eq!(lookup(get.name).unwrap().id, Cmd::GET);
+        assert_eq!(lookup(get.name).unwrap().id, Cmd::GET);
+        // Same text, different memory: still GET, by hashing.
+        let heap = String::from("GET");
+        assert_eq!(lookup(&heap).unwrap().id, Cmd::GET);
+        // A heap string after a cached hit is not mistaken for it.
+        assert_eq!(lookup(get.name).unwrap().id, Cmd::GET);
+        let other = String::from("SET");
+        assert_eq!(lookup(&other).unwrap().id, set.id);
+        assert!(lookup("NOSUCHCOMMAND").is_none());
+        assert_eq!(lookup(set.name).unwrap().id, Cmd::SET);
+        assert_eq!(lookup(get.name).unwrap().id, Cmd::GET);
+    }
 
     fn b(s: &str) -> Bytes {
         Bytes::from(s.to_string())

@@ -344,3 +344,115 @@ async fn batched_writes_replay_in_order() {
     assert_eq!(got.len(), 4 * 25 * 16);
     assert_eq!(got, expected);
 }
+
+/// A batch's log records are encoded before its hold is taken, one per
+/// command, and each command picks up its own inside the hold. A command
+/// refused before it runs (here by ACL) never logs: its record is skipped,
+/// and the commands after it still log theirs — not their neighbour's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn records_prepared_for_a_batch_stay_with_their_commands() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = solikv_engine::persistence::PersistConfig {
+        dir: dir.path().to_path_buf(),
+        appendonly: true,
+        auto_rewrite_percentage: 0,
+        save: Vec::new(),
+        ..Default::default()
+    };
+    let engine_for = |cfg: &solikv_engine::persistence::PersistConfig,
+                      pubsub: Arc<solikv_pubsub::PubSubBroker>| {
+        let shards = Arc::new(solikv_engine::ShardManager::new(SHARDS));
+        let engine = Arc::new(
+            solikv_engine::CommandEngine::new(shards, pubsub).with_persistence(Arc::new(
+                solikv_engine::persistence::Persistence::new(cfg.clone()),
+            )),
+        );
+        engine.init_self_ref(Arc::downgrade(&engine));
+        engine.load_persisted().expect("load");
+        engine
+    };
+    {
+        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
+        let engine = engine_for(&cfg, pubsub.clone());
+        let port = next_port();
+        let addr = format!("127.0.0.1:{}", port);
+        let e2 = engine.clone();
+        let server = tokio::spawn(async move {
+            solikv_server::resp_server::run_with_limits(
+                &addr,
+                e2,
+                pubsub,
+                None,
+                None,
+                None,
+                ConnLimits::default(),
+            )
+            .await
+            .unwrap();
+        });
+        sleep(Duration::from_millis(100)).await;
+        let mut c = conn(port).await;
+        let _: () = cmd("ACL")
+            .arg(&["SETUSER", "limited", "on", "nopass", "~*", "+@all", "-set"])
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        let cmds: Vec<Vec<&str>> = vec![
+            vec!["AUTH", "limited", "x"],
+            vec!["RPUSH", "l", "a"],
+            vec!["SET", "l", "refused"],
+            vec!["RPUSH", "l", "b"],
+            vec!["SET", "l", "refused"],
+            vec!["SET", "l", "refused"],
+            vec!["RPUSH", "l", "c"],
+            vec!["RPUSH", "l", "d"],
+        ];
+        let mut req = Vec::new();
+        for c in &cmds {
+            req.extend_from_slice(format!("*{}\r\n", c.len()).as_bytes());
+            for a in c {
+                req.extend_from_slice(format!("${}\r\n{}\r\n", a.len(), a).as_bytes());
+            }
+        }
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        sock.write_all(&req).await.unwrap();
+        // AUTH, then 4 pushes and 3 refusals.
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        while got.iter().filter(|&&b| b == b'\n').count() < cmds.len() {
+            let n = timeout(Duration::from_secs(5), sock.read(&mut buf))
+                .await
+                .expect("replies did not arrive")
+                .unwrap();
+            assert!(n > 0, "connection closed");
+            got.extend_from_slice(&buf[..n]);
+        }
+        let got = String::from_utf8_lossy(&got).to_string();
+        assert!(got.starts_with("+OK\r\n:1\r\n-NOPERM"), "{got}");
+        assert!(got.ends_with(":3\r\n:4\r\n"), "{got}");
+        engine.shutdown(Some(false)).unwrap();
+        server.abort();
+    }
+    let engine = engine_for(&cfg, Arc::new(solikv_pubsub::PubSubBroker::new()));
+    let r = engine.execute(
+        "LRANGE",
+        &[
+            bytes::Bytes::from("l"),
+            bytes::Bytes::from("0"),
+            bytes::Bytes::from("-1"),
+        ],
+    );
+    assert_eq!(
+        format!("{:?}", r),
+        format!("{:?}", {
+            let items: Vec<solikv_core::CommandResponse> = ["a", "b", "c", "d"]
+                .iter()
+                .map(|v| solikv_core::CommandResponse::BulkString(bytes::Bytes::from(*v)))
+                .collect();
+            solikv_core::CommandResponse::Array(items)
+        })
+    );
+}

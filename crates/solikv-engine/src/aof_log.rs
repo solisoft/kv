@@ -137,11 +137,18 @@ pub(crate) struct AutoCmd<'a> {
     /// depend on the outcome — the lock is what a hot key's clients queue
     /// on, so the less done inside it the better.
     pre: Option<Vec<u8>>,
+    /// `pre` came from [`prepare`]: it goes back to that pool.
+    prepared: bool,
 }
 
 impl<'a> AutoCmd<'a> {
     pub(crate) fn new(name: &'a str, args: &'a [Bytes], mode: Mode) -> Self {
+        let mut prepared = false;
         let pre = (mode == Mode::Auto && logged_verbatim(name, args)).then(|| {
+            if let Some(buf) = take_prepared(args) {
+                prepared = true;
+                return buf;
+            }
             let mut buf = PRE_POOL.with(|p| p.take());
             buf.clear();
             Record::Verbatim(name, args).write(&mut buf);
@@ -152,6 +159,7 @@ impl<'a> AutoCmd<'a> {
             args,
             logged: Cell::new(false),
             pre,
+            prepared,
         }
     }
 }
@@ -159,13 +167,79 @@ impl<'a> AutoCmd<'a> {
 impl Drop for AutoCmd<'_> {
     fn drop(&mut self) {
         // Keep the buffer for the next command on this thread, unless a big
-        // value made it big.
+        // value made it big. (Never freed here: this runs under the lock.)
         if let Some(buf) = self.pre.take() {
             if buf.capacity() <= 64 * 1024 {
-                PRE_POOL.with(|p| p.set(buf));
+                if self.prepared {
+                    SPARE.with(|s| s.borrow_mut().push(buf));
+                } else {
+                    let old = PRE_POOL.with(|p| p.replace(buf));
+                    drop(old);
+                }
             }
         }
     }
+}
+
+thread_local! {
+    /// Records [`prepare`]d for the batch this thread is about to run, keyed
+    /// by the address of each command's argument slice, in run order.
+    static PREPARED: RefCell<std::collections::VecDeque<(usize, Vec<u8>)>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
+    /// Buffers of prepared records already logged, for the next batch.
+    static SPARE: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Encode, before a batch hold is taken, the record command `name args`
+/// will log as — when it logs as it came — for [`AutoCmd::new`] to find
+/// ready inside the hold: under a hot key, every client of the shard waits
+/// while the holder encodes.
+///
+/// Records are matched to their command by the address of its argument
+/// slice, which the batch keeps alive (and unmoved) until
+/// [`clear_prepared`]; a command that never reaches the log (refused by
+/// ACL, say) leaves its record to be skipped.
+pub(crate) fn prepare(name: &str, args: &[Bytes], mode: Mode) {
+    if args.is_empty() || mode != Mode::Auto || !logged_verbatim(name, args) {
+        return;
+    }
+    let mut buf = SPARE.with(|s| s.borrow_mut().pop()).unwrap_or_default();
+    buf.clear();
+    Record::Verbatim(name, args).write(&mut buf);
+    PREPARED.with(|p| p.borrow_mut().push_back((args.as_ptr() as usize, buf)));
+}
+
+fn take_prepared(args: &[Bytes]) -> Option<Vec<u8>> {
+    if args.is_empty() {
+        return None;
+    }
+    let key = args.as_ptr() as usize;
+    PREPARED.with(|p| {
+        let mut p = p.borrow_mut();
+        let i = p.iter().position(|(k, _)| *k == key)?;
+        // Entries before it belong to commands that logged nothing.
+        for (_, buf) in p.drain(..i) {
+            SPARE.with(|s| s.borrow_mut().push(buf));
+        }
+        p.pop_front().map(|(_, buf)| buf)
+    })
+}
+
+/// Forget records [`prepare`]d for a batch that has ended.
+pub(crate) fn clear_prepared() {
+    PREPARED.with(|p| {
+        let mut p = p.borrow_mut();
+        if !p.is_empty() {
+            for (_, buf) in p.drain(..) {
+                SPARE.with(|s| s.borrow_mut().push(buf));
+            }
+        }
+    });
+    SPARE.with(|s| {
+        let mut s = s.borrow_mut();
+        // A batch's worth is plenty; a big one's buffers are not kept.
+        s.truncate(crate::dispatch::BATCH_MAX);
+    });
 }
 
 /// Whether [`aof_form`] logs this command as it came.

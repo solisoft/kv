@@ -458,6 +458,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             let mut cmds = commands.into_iter().peekable();
             // The batch shard of `cmds.peek()`, when already worked out.
             let mut known: Option<Option<usize>> = None;
+            // A run being assembled for one shard, and its replies.
+            let mut run: Vec<ParsedCommand> = Vec::new();
+            let mut replies: Vec<CommandResponse> = Vec::new();
             while let Some(cmd) = cmds.next() {
                 // A run of pipelined commands for one shard runs under one
                 // hold of its lock (see `CommandEngine::batch_shard`).
@@ -468,64 +471,51 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     _ if batching => engine.batch_shard(&session, &cmd.name, &cmd.args),
                     _ => None,
                 };
-                if let Some(shard) = shard {
-                    let next = cmds
-                        .peek()
-                        .and_then(|n| engine.batch_shard(&session, &n.name, &n.args));
-                    if next == Some(shard) {
+                let cmd = if let Some(shard) = shard {
+                    // Gather the run before taking the lock: everything
+                    // done while holding it is time every other client of
+                    // this shard spends waiting.
+                    run.push(cmd);
+                    while run.len() < solikv_engine::dispatch::BATCH_MAX {
+                        let next = cmds
+                            .peek()
+                            .and_then(|n| engine.batch_shard(&session, &n.name, &n.args));
+                        if next != Some(shard) {
+                            known = Some(next);
+                            break;
+                        }
+                        run.extend(cmds.next());
+                    }
+                    if run.len() >= solikv_engine::dispatch::BATCH_MAX {
+                        // The next one has not been looked at.
+                        known = None;
+                    }
+                    if run.len() > 1 {
+                        for c in &run {
+                            engine.batch_prepare(&c.name, &c.args);
+                        }
                         let hold = engine.batch_hold(shard);
-                        let mut cmd = cmd;
-                        let mut run = 0;
-                        loop {
-                            let resp = engine.execute_session(&mut session, &cmd.name, &cmd.args);
-                            if session.reply_allowed() {
-                                encode_for(
-                                    session.resp,
-                                    &cmd.name,
-                                    &cmd.args,
-                                    resp,
-                                    &mut write_buf,
-                                );
-                            }
-                            run += 1;
-                            if run >= solikv_engine::dispatch::BATCH_MAX
-                                || write_buf.len() >= FLUSH_AT
-                            {
-                                // The next one is known to be for this shard.
-                                known = Some(Some(shard));
-                                break;
-                            }
-                            let Some(n) = cmds.next() else { break };
-                            cmd = n;
-                            let ns = cmds
-                                .peek()
-                                .and_then(|n| engine.batch_shard(&session, &n.name, &n.args));
-                            if ns != Some(shard) {
-                                // `cmd` is the run's last; run it, then stop.
-                                let resp =
-                                    engine.execute_session(&mut session, &cmd.name, &cmd.args);
-                                if session.reply_allowed() {
-                                    encode_for(
-                                        session.resp,
-                                        &cmd.name,
-                                        &cmd.args,
-                                        resp,
-                                        &mut write_buf,
-                                    );
-                                }
-                                known = Some(ns);
-                                break;
-                            }
+                        for c in &run {
+                            replies.push(engine.execute_session(&mut session, &c.name, &c.args));
                         }
                         engine.end_batch(hold);
+                        // Replies are encoded after the lock is released.
+                        for (c, resp) in run.drain(..).zip(replies.drain(..)) {
+                            if session.reply_allowed() {
+                                encode_for(session.resp, &c.name, &c.args, resp, &mut write_buf);
+                            }
+                        }
                         if write_buf.len() >= FLUSH_AT {
                             socket.write_all(&write_buf).await?;
                             write_buf.clear();
                         }
                         continue;
                     }
-                    known = Some(next);
-                }
+                    // A run of one: the command on its own.
+                    run.pop().expect("the run's command")
+                } else {
+                    cmd
+                };
                 // Cluster mode: MOVED, ASK, CROSSSLOT, CLUSTERDOWN.
                 if let Some(redirect) = cluster_redirect(
                     &cluster,

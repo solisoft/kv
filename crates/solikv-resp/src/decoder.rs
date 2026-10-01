@@ -87,6 +87,20 @@ fn line_end(buf: &[u8], from: usize) -> Result<Option<usize>, String> {
     Ok(None)
 }
 
+/// A copy of `data` in `Bytes`' shared representation.
+///
+/// `copy_from_slice` returns a Vec-backed `Bytes` whose first clone
+/// allocates the shared header it then switches to — and the engine clones
+/// a write's arguments (the key it stores, the values it keeps) while it
+/// holds the shard lock, where a pipeline of writes to one hot key queues.
+/// Cloning once here, on the connection's own thread, moves that allocation
+/// out of the lock: the engine's clones are then a reference-count bump.
+fn owned_copy(data: &[u8]) -> Bytes {
+    let b = Bytes::copy_from_slice(data);
+    drop(b.clone());
+    b
+}
+
 impl CommandDecoder {
     pub fn new() -> Self {
         Self::default()
@@ -220,7 +234,7 @@ impl CommandDecoder {
             } else {
                 let args = self.spans[1..]
                     .iter()
-                    .map(|&(s, e)| Bytes::copy_from_slice(&buf[s..e]))
+                    .map(|&(s, e)| owned_copy(&buf[s..e]))
                     .collect();
                 buf.advance(total);
                 args
@@ -248,7 +262,7 @@ impl CommandDecoder {
             // An empty line: nothing to run.
             return Ok(Inline::Blank);
         };
-        let args: Vec<Bytes> = words.map(Bytes::copy_from_slice).collect();
+        let args: Vec<Bytes> = words.map(owned_copy).collect();
         if !authenticated && args.len() + 1 > MAX_UNAUTH_ARRAY_LEN {
             return Err(format!(
                 "array count {} exceeds maximum {}",

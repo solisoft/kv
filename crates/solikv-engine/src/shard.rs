@@ -127,6 +127,59 @@ fn held_store(shared: &Arc<Shared>, idx: u32) -> Option<*mut ShardStore> {
     })
 }
 
+/// How long a waiter spins for a shard lock before parking.
+const SPIN_FOR: std::time::Duration = std::time::Duration::from_micros(50);
+
+/// Take a shard's lock, letting one waiter at a time spin for it.
+///
+/// parking_lot's mutex spins only while no thread is parked on it. Under a
+/// hot key every waiter soon is, and from then on each hand-over is a futex
+/// wake: the lock sits free until the woken thread is scheduled again —
+/// measured at a quarter of the time with six clients pipelining to one key.
+/// A thread spinning here instead takes the lock the moment it is released.
+/// One spinner is enough to bridge each hand-over; the others park, so a
+/// queue of waiters costs one core, not one per waiter. parking_lot still
+/// hands the lock to a parked thread now and then (its eventual fairness),
+/// so the spinner cannot starve them.
+#[inline]
+fn lock_store<'a>(
+    store: &'a Mutex<ShardStore>,
+    spinning: &AtomicBool,
+) -> MutexGuard<'a, ShardStore> {
+    if let Some(guard) = store.try_lock() {
+        return guard;
+    }
+    lock_store_slow(store, spinning)
+}
+
+#[cold]
+fn lock_store_slow<'a>(
+    store: &'a Mutex<ShardStore>,
+    spinning: &AtomicBool,
+) -> MutexGuard<'a, ShardStore> {
+    if !spinning.load(Ordering::Relaxed) && !spinning.swap(true, Ordering::Acquire) {
+        let start = std::time::Instant::now();
+        let mut spins = 0u32;
+        let got = loop {
+            if !store.is_locked() {
+                if let Some(guard) = store.try_lock() {
+                    break Some(guard);
+                }
+            }
+            std::hint::spin_loop();
+            spins = spins.wrapping_add(1);
+            if spins.is_multiple_of(256) && start.elapsed() >= SPIN_FOR {
+                break None;
+            }
+        };
+        spinning.store(false, Ordering::Release);
+        if let Some(guard) = got {
+            return guard;
+        }
+    }
+    store.lock()
+}
+
 /// Shards locked by [`ShardManager::lock_shards`]; released on drop.
 pub struct HeldShards<'a> {
     guards: Vec<(u32, MutexGuard<'a, ShardStore>)>,
@@ -231,7 +284,11 @@ impl Drop for SoloEntry<'_> {
 
 enum StoreBackend {
     /// Multi-threaded / multi-shard path (mutex per shard).
-    Locked { store: Arc<Mutex<ShardStore>> },
+    Locked {
+        store: Arc<Mutex<ShardStore>>,
+        /// Set while a thread spins for the lock (see [`lock_store`]).
+        spinning: AtomicBool,
+    },
     /// Redis-shaped single-thread path: no mutex on the hot path.
     Solo { store: Arc<SoloStore> },
 }
@@ -267,14 +324,14 @@ impl ShardHandle {
     #[inline]
     fn locked<T>(&self, f: impl FnOnce(&mut ShardStore, ()) -> T) -> T {
         match self.backend.as_ref() {
-            StoreBackend::Locked { store } => {
+            StoreBackend::Locked { store, spinning } => {
                 if let Some(p) = held_store(&self.shared, self.index) {
                     // SAFETY: this thread holds the shard's lock (a guard in
                     // a live `HeldShards`), and nothing else uses the store
                     // through that guard while the pointer is registered.
                     return f(unsafe { &mut *p }, ());
                 }
-                let mut guard = store.lock();
+                let mut guard = lock_store(store, spinning);
                 f(&mut guard, ())
             }
             StoreBackend::Solo { store } => store.with_mut(|s| f(s, ())),
@@ -528,12 +585,12 @@ impl ShardHandle {
         F: FnOnce(&ShardStore) -> R,
     {
         match self.backend.as_ref() {
-            StoreBackend::Locked { store } => {
+            StoreBackend::Locked { store, spinning } => {
                 if let Some(p) = held_store(&self.shared, self.index) {
                     // SAFETY: see `locked`.
                     return f(unsafe { &*p });
                 }
-                let guard = store.lock();
+                let guard = lock_store(store, spinning);
                 f(&guard)
             }
             StoreBackend::Solo { store, .. } => store.with_ref(f),
@@ -617,6 +674,7 @@ impl ShardManager {
             } else {
                 StoreBackend::Locked {
                     store: Arc::new(Mutex::new(ShardStore::new())),
+                    spinning: AtomicBool::new(false),
                 }
             };
             shards.push(ShardHandle::new(
@@ -785,10 +843,10 @@ impl ShardManager {
             if !outermost && held_store(&self.shared, i as u32).is_some() {
                 continue;
             }
-            let StoreBackend::Locked { store } = self.shards[i].backend.as_ref() else {
+            let StoreBackend::Locked { store, spinning } = self.shards[i].backend.as_ref() else {
                 continue;
             };
-            guards.push((i as u32, store.lock()));
+            guards.push((i as u32, lock_store(store, spinning)));
         }
         HELD.with(|h| {
             let mut h = h.borrow_mut();
