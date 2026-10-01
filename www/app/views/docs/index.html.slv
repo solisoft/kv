@@ -11,8 +11,8 @@
     <!-- Stats -->
     <div class="grid grid-cols-4 gap-3">
         <div class="p-5 rounded-lg bg-zinc-900 border border-zinc-800">
-            <div class="text-2xl font-bold font-mono text-teal-400">3.8M</div>
-            <div class="text-xs text-zinc-500 mt-1">SET/s on one hot key (AOF)</div>
+            <div class="text-2xl font-bold font-mono text-teal-400">3.6M</div>
+            <div class="text-xs text-zinc-500 mt-1">SET/s on one hot key (Redis 8: 1.35M)</div>
         </div>
         <div class="p-5 rounded-lg bg-zinc-900 border border-zinc-800">
             <div class="text-2xl font-bold font-mono text-teal-400">0.06ms</div>
@@ -48,7 +48,7 @@
                     </div>
                     <h3 class="font-semibold">Batched pipelines</h3>
                 </div>
-                <p class="text-sm text-zinc-500">Pipelined commands for one shard run under a single lock hold; one hot key takes 3.8M SET/s from six client threads with AOF on.</p>
+                <p class="text-sm text-zinc-500">Pipelined commands for one shard run under a single lock hold; one hot key takes 3.6M SET/s from six client threads with AOF on, against 1.35M for Redis 8.10.</p>
             </div>
             <div class="bg-zinc-950 p-5 hover:bg-zinc-900/50 transition-colors">
                 <div class="flex items-center gap-3 mb-2">
@@ -139,7 +139,7 @@
                     <svg class="w-5 h-5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
                 </div>
                 <h3 class="font-semibold mb-1">Benchmarks</h3>
-                <p class="text-sm text-zinc-500">Before and after the audit fixes &mdash; SETBIT &times;389, ZRANK &times;74</p>
+                <p class="text-sm text-zinc-500">Against Redis 7.4 and 8.10 &mdash; 1.4&ndash;2.7&times; Redis 8 on one hot key</p>
             </a>
         </div>
     </div>

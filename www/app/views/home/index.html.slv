@@ -49,8 +49,8 @@
                 <!-- Metric pills -->
                 <div class="flex flex-wrap gap-3 mb-10">
                     <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800">
-                        <span class="text-amber-400 font-mono font-semibold text-sm">3.8M</span>
-                        <span class="text-zinc-500 text-xs">SET/s on one hot key</span>
+                        <span class="text-amber-400 font-mono font-semibold text-sm">2.7&times;</span>
+                        <span class="text-zinc-500 text-xs">vs Redis 8, SET on one hot key</span>
                     </div>
                     <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800">
                         <span class="text-amber-400 font-mono font-semibold text-sm">0.06ms</span>
