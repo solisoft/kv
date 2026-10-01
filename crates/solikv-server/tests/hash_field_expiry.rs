@@ -172,7 +172,7 @@ async fn deadlines_and_expiries_survive_a_restart() {
         dir: dir.path().to_path_buf(),
         appendonly: true,
         auto_rewrite_percentage: 0,
-        save_interval: 0,
+        save: Vec::new(),
         ..Default::default()
     };
     let engine_for = |cfg: &solikv_engine::persistence::PersistConfig| {

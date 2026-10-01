@@ -198,6 +198,12 @@ struct Args {
     #[arg(long, default_value = "300", value_name = "SECS")]
     save_interval: u64,
 
+    /// Redis `save` points, overriding --save-interval: "3600 1 300 100"
+    /// snapshots once 1 change happened within 3600 s, or 100 within 300 s;
+    /// "" disables periodic snapshots (and the one at shutdown)
+    #[arg(long, value_name = "POINTS")]
+    save: Option<String>,
+
     /// Rewrite the append-only log once it has grown by this percentage since
     /// the last rewrite (0 = only on BGREWRITEAOF)
     #[arg(long, default_value = "100", value_name = "PERCENT")]
@@ -814,7 +820,17 @@ async fn async_main(args: Args) {
             fsync: fsync_policy,
             auto_rewrite_percentage: args.auto_aof_rewrite_percentage,
             auto_rewrite_min_size: args.auto_aof_rewrite_min_size,
-            save_interval: args.save_interval,
+            save: match &args.save {
+                Some(points) => match solikv_engine::PersistConfig::parse_save(points) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("ERROR: --save {:?}: {}", points, e);
+                        std::process::exit(1);
+                    }
+                },
+                None if args.save_interval > 0 => vec![(args.save_interval, 1)],
+                None => Vec::new(),
+            },
         },
     ));
     let engine = solikv_engine::CommandEngine::new(shards.clone(), pubsub.clone())
@@ -920,7 +936,7 @@ async fn async_main(args: Args) {
     // --- Import Redis RDB if requested ---
     if let Some(ref redis_rdb_path) = args.import_redis_rdb {
         tracing::info!("Importing Redis RDB from {:?}...", redis_rdb_path);
-        match solikv_persist::redis_rdb::import_redis_rdb(redis_rdb_path, num_shards) {
+        match solikv_persist::redis_rdb::import_redis_rdb_dbs(redis_rdb_path, num_shards) {
             Ok((shard_data, stats)) => {
                 // The importer buckets by cluster slot; the engine routes by
                 // its own hash, so every key is re-routed (bucket i is not
@@ -1056,7 +1072,10 @@ async fn async_main(args: Args) {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut last_save = std::time::Instant::now();
+            let started_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             loop {
                 ticker.tick().await;
                 // Channels whose last subscriber left.
@@ -1068,18 +1087,27 @@ async fn async_main(args: Args) {
                         tracing::warn!("Automatic log rewrite not started: {}", e);
                     }
                 }
-                let every = p.config().save_interval;
-                if every > 0 && last_save.elapsed() >= std::time::Duration::from_secs(every) {
-                    last_save = std::time::Instant::now();
-                    let dirty = engine_bg.dirty();
-                    let saved_at = p
-                        .stats
-                        .rdb_dirty_at_last_save
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    if dirty != saved_at {
-                        if let Err(e) = p.bgsave(&engine_bg.shards, dirty) {
-                            tracing::debug!("Periodic snapshot skipped: {}", e);
-                        }
+                // Save points, timed from the last snapshot of any kind
+                // (SAVE and BGSAVE count, as in Redis).
+                let last = p
+                    .stats
+                    .rdb_last_save_time
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .max(started_unix);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let dirty = engine_bg.dirty();
+                let saved_at = p
+                    .stats
+                    .rdb_dirty_at_last_save
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if p.config()
+                    .save_due(now.saturating_sub(last), dirty.saturating_sub(saved_at))
+                {
+                    if let Err(e) = p.bgsave(&engine_bg.shards, dirty) {
+                        tracing::debug!("Periodic snapshot skipped: {}", e);
                     }
                 }
             }

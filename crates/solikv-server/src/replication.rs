@@ -615,11 +615,9 @@ impl Replication {
         // not leave the replica half-flushed.
         let mut entries: Vec<(u32, Bytes, solikv_core::types::KeyEntry)> = Vec::new();
         if &magic == b"REDIS" {
-            let (buckets, _) = solikv_persist::redis_rdb::import_redis_rdb(path, 1)
+            let (buckets, _) = solikv_persist::redis_rdb::import_redis_rdb_dbs(path, 1)
                 .map_err(|e| format!("Redis snapshot: {e}"))?;
-            for (k, e) in buckets.into_iter().flatten() {
-                entries.push((0, k, e));
-            }
+            entries.extend(buckets.into_iter().flatten());
         } else {
             solikv_persist::rdb::load_snapshot_file(path, |_, db, k, e| {
                 entries.push((db, k, e));

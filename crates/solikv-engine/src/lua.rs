@@ -521,6 +521,8 @@ struct RunCtx {
     resp: u8,
     /// Loading a function library: only `register_function` is usable.
     loading: bool,
+    /// A script or function is running on this thread.
+    running: bool,
 }
 
 /// A registration collected while a library loads.
@@ -532,13 +534,21 @@ struct Registered {
 }
 
 thread_local! {
-    static RUN: Cell<RunCtx> = const { Cell::new(RunCtx { read_only: false, resp: 2, loading: false }) };
+    static RUN: Cell<RunCtx> = const {
+        Cell::new(RunCtx { read_only: false, resp: 2, loading: false, running: false })
+    };
     static REGISTERED: RefCell<Vec<Registered>> = const { RefCell::new(Vec::new()) };
     static LOAD_DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
 }
 
 fn run_ctx() -> RunCtx {
     RUN.with(|r| r.get())
+}
+
+/// Whether this thread is inside a script or function (commands that
+/// behave differently there, like `SORT … BY nosort` on a set).
+pub(crate) fn in_script() -> bool {
+    run_ctx().running
 }
 
 fn set_run_ctx(ctx: RunCtx) -> RunCtx {
@@ -881,6 +891,7 @@ pub fn execute_script_with(
                 read_only,
                 resp: 2,
                 loading: false,
+                running: true,
             });
             let r = setup_keys_argv(&vm, &keys, &argv)
                 .and_then(|()| vm.runner.call::<LuaMultiValue>(f).map(runner_result));
@@ -931,6 +942,7 @@ pub fn execute_function(
                 read_only,
                 resp: 2,
                 loading: false,
+                running: true,
             });
             let r = (|| -> LuaResult<CommandResponse> {
                 let k = bytes_table(&vm.lua, &keys)?;
@@ -1004,6 +1016,7 @@ fn load_library_into(vm: &PooledLua, code: &str) -> Result<Vec<Registered>, Stri
         read_only: true,
         resp: 2,
         loading: true,
+        running: false,
     });
     LOAD_DEADLINE.with(|d| {
         d.set(Some(

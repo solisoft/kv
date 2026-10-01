@@ -83,13 +83,29 @@ impl std::fmt::Display for ImportStats {
 
 /// Import a Redis RDB file, returning key-entry pairs bucketed by shard index.
 ///
-/// Keys from all Redis databases are flattened into a single namespace.
-/// Already-expired keys are filtered out.
+/// Keys from all Redis databases are flattened into a single namespace:
+/// see [`import_redis_rdb_dbs`] to keep them apart. Already-expired keys
+/// are filtered out.
 #[allow(clippy::type_complexity)]
 pub fn import_redis_rdb(
     path: &Path,
     num_shards: usize,
 ) -> io::Result<(Vec<Vec<(Bytes, KeyEntry)>>, ImportStats)> {
+    let (buckets, stats) = import_redis_rdb_dbs(path, num_shards)?;
+    let flat = buckets
+        .into_iter()
+        .map(|b| b.into_iter().map(|(_, k, e)| (k, e)).collect())
+        .collect();
+    Ok((flat, stats))
+}
+
+/// [`import_redis_rdb`], each key with the Redis database it was in
+/// (`SELECT n` before it in the file; 0 if the file never selects).
+#[allow(clippy::type_complexity)]
+pub fn import_redis_rdb_dbs(
+    path: &Path,
+    num_shards: usize,
+) -> io::Result<(Vec<Vec<(u32, Bytes, KeyEntry)>>, ImportStats)> {
     let file = std::fs::File::open(path)?;
     let mut reader = RdbReader::new(file);
 
@@ -101,7 +117,8 @@ pub fn import_redis_rdb(
         ..Default::default()
     };
 
-    let mut shards: Vec<Vec<(Bytes, KeyEntry)>> = (0..num_shards).map(|_| Vec::new()).collect();
+    let mut shards: Vec<Vec<(u32, Bytes, KeyEntry)>> =
+        (0..num_shards).map(|_| Vec::new()).collect();
     let mut current_expiry_ms: Option<u64> = None;
     let mut current_db: i64 = -1;
     let now = now_millis();
@@ -128,9 +145,6 @@ pub fn import_redis_rdb(
             }
             OP_SELECTDB => {
                 let db = reader.read_length()?;
-                if current_db != -1 && db as i64 != current_db {
-                    tracing::info!("RDB: switching to database {db} (all databases flattened into single namespace)");
-                }
                 current_db = db as i64;
                 stats.databases_seen += 1;
             }
@@ -179,7 +193,7 @@ pub fn import_redis_rdb(
                         };
 
                         let shard_idx = hash_slot(&key) as usize % num_shards;
-                        shards[shard_idx].push((key, entry));
+                        shards[shard_idx].push((current_db.max(0) as u32, key, entry));
                         stats.keys_imported += 1;
                     }
                     Ok(None) => {
@@ -930,5 +944,41 @@ mod tests {
         for (i, shard) in shards.iter().enumerate() {
             assert!(!shard.is_empty(), "shard {i} should have keys");
         }
+    }
+
+    #[test]
+    fn keys_keep_their_database() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"REDIS0009");
+        for (db, key) in [(0u8, "a"), (3, "b"), (3, "c"), (0, "d")] {
+            buf.push(OP_SELECTDB);
+            buf.push(db);
+            buf.push(TYPE_STRING);
+            write_rdb_string(&mut buf, key.as_bytes());
+            write_rdb_string(&mut buf, b"v");
+        }
+        buf.push(OP_EOF);
+        buf.extend_from_slice(&[0u8; 8]);
+        let dir = std::env::temp_dir().join(format!("solikv-rdb-dbs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dump.rdb");
+        std::fs::write(&path, &buf).unwrap();
+        let (buckets, _) = import_redis_rdb_dbs(&path, 2).unwrap();
+        let mut got: Vec<(u32, String)> = buckets
+            .into_iter()
+            .flatten()
+            .map(|(db, k, _)| (db, String::from_utf8_lossy(&k).to_string()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (0, "a".into()),
+                (0, "d".into()),
+                (3, "b".into()),
+                (3, "c".into())
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

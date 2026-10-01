@@ -104,6 +104,24 @@ pub enum FsyncPolicy {
     No,
 }
 
+impl FsyncPolicy {
+    fn to_u8(self) -> u8 {
+        match self {
+            FsyncPolicy::Always => 0,
+            FsyncPolicy::Everysec => 1,
+            FsyncPolicy::No => 2,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => FsyncPolicy::Always,
+            1 => FsyncPolicy::Everysec,
+            _ => FsyncPolicy::No,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Files and manifest
 // ---------------------------------------------------------------------------
@@ -326,12 +344,20 @@ struct Inner {
     /// Per shard, the sequence number its first record will carry (see
     /// [`AofWriter::start_shard`]).
     starts: Vec<std::sync::atomic::AtomicU64>,
-    policy: FsyncPolicy,
+    /// `appendfsync`, changeable at runtime (`CONFIG SET`).
+    policy: std::sync::atomic::AtomicU8,
     /// `sync()` requests waiting for the next fsync.
     syncs: parking_lot::Mutex<Vec<std::sync::mpsc::SyncSender<io::Result<()>>>>,
     thread: std::sync::OnceLock<std::thread::Thread>,
     /// Set when the last handle is dropped.
     closed: std::sync::atomic::AtomicBool,
+}
+
+impl Inner {
+    #[inline]
+    fn policy(&self) -> FsyncPolicy {
+        FsyncPolicy::from_u8(self.policy.load(Ordering::Relaxed))
+    }
 }
 
 thread_local! {
@@ -393,6 +419,14 @@ impl AofWriter {
     pub fn single_threaded(mut self, yes: bool) -> Self {
         self.single_threaded = yes;
         self
+    }
+
+    /// Change `appendfsync`; the writer applies it from its next pass.
+    pub fn set_policy(&self, policy: FsyncPolicy) {
+        self.inner.policy.store(policy.to_u8(), Ordering::Relaxed);
+        if let Some(t) = self.inner.thread.get() {
+            t.unpark();
+        }
     }
 
     /// Shard count this writer has logs for.
@@ -469,7 +503,7 @@ impl AofWriter {
             let len = (data.len() - at - ENTRY_HEADER) as u32;
             data[at + ENTRY_HEADER - 4..at + ENTRY_HEADER].copy_from_slice(&len.to_le_bytes());
         });
-        if self.inner.policy == FsyncPolicy::Always {
+        if self.inner.policy() == FsyncPolicy::Always {
             if let Some(t) = self.inner.thread.get() {
                 t.unpark();
             }
@@ -584,7 +618,7 @@ pub fn spawn_aof_writer(
         starts: (0..shards)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect(),
-        policy,
+        policy: std::sync::atomic::AtomicU8::new(policy.to_u8()),
         syncs: parking_lot::Mutex::new(Vec::new()),
         thread: std::sync::OnceLock::new(),
         closed: std::sync::atomic::AtomicBool::new(false),
@@ -834,9 +868,9 @@ fn writer_loop(inner: Arc<Inner>, mut logs: Vec<ShardLog>, dir: PathBuf, stats: 
 
         let fsync_now = !syncs.is_empty()
             || closing
-            || (wrote && inner.policy == FsyncPolicy::Always)
+            || (wrote && inner.policy() == FsyncPolicy::Always)
             || (last_sync.elapsed() >= Duration::from_secs(1)
-                && inner.policy == FsyncPolicy::Everysec);
+                && inner.policy() == FsyncPolicy::Everysec);
         if fsync_now || last_sync.elapsed() >= Duration::from_secs(1) {
             let res = flush_all(&mut logs, fsync_now);
             for ack in syncs {
@@ -851,7 +885,7 @@ fn writer_loop(inner: Arc<Inner>, mut logs: Vec<ShardLog>, dir: PathBuf, stats: 
         if closing {
             break;
         }
-        match inner.policy {
+        match inner.policy() {
             // Woken by each append; the timeout keeps the once-a-second flush.
             FsyncPolicy::Always => std::thread::park_timeout(Duration::from_millis(100)),
             // Poll: an append never has to wake this thread (see `AofWriter`).

@@ -814,6 +814,19 @@ pub mod access {
         }
     }
 
+    /// `access` for a key last touched `secs` ago (`RESTORE … IDLETIME`).
+    pub fn with_idle(secs: u64) -> u32 {
+        let now = lru_clock() as u64;
+        let span = CLOCK_MAX as u64 + 1;
+        ((now + span - secs % span) % span) as u32
+    }
+
+    /// `access` for a key with LFU counter `freq` as of now
+    /// (`RESTORE … FREQ`).
+    pub fn with_freq(freq: u32) -> u32 {
+        (lfu_minutes() << 8) | freq.min(255)
+    }
+
     /// Seconds since the last access (`OBJECT IDLETIME`, LRU ranking).
     pub fn idle_secs(access: u32) -> u64 {
         let now = lru_clock();

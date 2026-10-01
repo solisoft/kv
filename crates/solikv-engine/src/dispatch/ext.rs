@@ -1848,7 +1848,14 @@ impl CommandEngine {
             (t, false) => Some(now.saturating_add(t)),
         };
         let key = args[0].clone();
-        let _ = (idle, freq);
+        // As Redis' `objectSetLRUOrLFU`: IDLETIME counts under an LRU
+        // policy, FREQ under an LFU one; the other is ignored.
+        let lfu = solikv_core::access::is_lfu();
+        let access = match (idle, freq) {
+            (Some(secs), _) if !lfu => Some(solikv_core::access::with_idle(secs)),
+            (_, Some(f)) if lfu => Some(solikv_core::access::with_freq(f as u32)),
+            _ => None,
+        };
         self.shards
             .shard_for_key(&key)
             .execute_with_effects(move |s, fx| {
@@ -1863,10 +1870,13 @@ impl CommandEngine {
                     }
                     return CommandResponse::ok();
                 }
-                let entry = match expires_at {
+                let mut entry = match expires_at {
                     Some(at) => solikv_core::types::KeyEntry::with_expiry(value, at),
                     None => solikv_core::types::KeyEntry::new(value),
                 };
+                if let Some(a) = access {
+                    entry.access = a;
+                }
                 s.insert_entry(key.clone(), entry);
                 fx.put_key(s, &key);
                 CommandResponse::ok()
@@ -2237,12 +2247,16 @@ impl CommandEngine {
         // The elements, in the value's own order.
         let mut elems: Vec<Bytes> = Vec::new();
         let mut is_zset = false;
+        let mut is_set = false;
         let k = key.clone();
         let r = self.shards.shard_for_key(&key).execute(|s| {
             match s.get(&k).map(|e| &e.value) {
                 None => {}
                 Some(RedisValue::List(l)) => elems = l.iter().cloned().collect(),
-                Some(RedisValue::Set(st)) => elems = st.iter().cloned().collect(),
+                Some(RedisValue::Set(st)) => {
+                    is_set = true;
+                    elems = st.iter().cloned().collect()
+                }
                 Some(RedisValue::ZSet(z)) => {
                     is_zset = true;
                     elems = z.scores.iter().map(|(_, m)| m.clone()).collect();
@@ -2255,7 +2269,15 @@ impl CommandEngine {
             return r;
         }
         // BY without `*` means "don't sort" (a zset keeps its score order).
-        let dontsort = by.as_ref().is_some_and(|b| !b.contains(&b'*'));
+        // Except a set's order is its own: where the result must be the
+        // same everywhere — stored, or inside a script, whose effects are
+        // replayed — Redis sorts it lexicographically, and so does this.
+        let mut dontsort = by.as_ref().is_some_and(|b| !b.contains(&b'*'));
+        if dontsort && is_set && (store.is_some() || crate::lua::in_script()) {
+            dontsort = false;
+            alpha = true;
+            by = None;
+        }
         if !dontsort {
             enum SortKey {
                 Num(f64),

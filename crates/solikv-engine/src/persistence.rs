@@ -60,9 +60,10 @@ pub struct PersistConfig {
     pub auto_rewrite_percentage: u64,
     /// ... and is at least this many bytes.
     pub auto_rewrite_min_size: u64,
-    /// Seconds between periodic snapshots (0 = none). Also decides whether
-    /// shutdown takes a final snapshot, as Redis' `save` points do.
-    pub save_interval: u64,
+    /// Redis' `save` points: snapshot once `changes` writes have happened
+    /// within `seconds` of the last snapshot, for any `(seconds, changes)`.
+    /// Empty: no periodic snapshot, and none at shutdown.
+    pub save: Vec<(u64, u64)>,
 }
 
 impl Default for PersistConfig {
@@ -74,8 +75,43 @@ impl Default for PersistConfig {
             fsync: FsyncPolicy::Everysec,
             auto_rewrite_percentage: 100,
             auto_rewrite_min_size: 64 * 1024 * 1024,
-            save_interval: 300,
+            save: vec![(300, 1)],
         }
+    }
+}
+
+impl PersistConfig {
+    /// Parse a `save` value (`"3600 1 300 100"`, `""` for none).
+    pub fn parse_save(v: &str) -> Result<Vec<(u64, u64)>, String> {
+        let nums: Vec<&str> = v.split_whitespace().collect();
+        if !nums.len().is_multiple_of(2) {
+            return Err("Invalid save parameters".into());
+        }
+        nums.chunks(2)
+            .map(|p| match (p[0].parse::<u64>(), p[1].parse::<u64>()) {
+                (Ok(secs), Ok(changes)) => Ok((secs, changes)),
+                _ => Err("Invalid save parameters".into()),
+            })
+            .collect()
+    }
+
+    /// The `save` value as `CONFIG GET` reports it.
+    pub fn save_string(&self) -> String {
+        self.save
+            .iter()
+            .map(|(s, c)| format!("{} {}", s, c))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Whether a save point is met: `elapsed` seconds since the last
+    /// snapshot, `changes` writes since then.
+    pub fn save_due(&self, elapsed: u64, changes: u64) -> bool {
+        changes > 0
+            && self
+                .save
+                .iter()
+                .any(|&(secs, n)| elapsed >= secs && changes >= n)
     }
 }
 
@@ -88,7 +124,9 @@ pub struct LoadReport {
 }
 
 pub struct Persistence {
-    cfg: PersistConfig,
+    /// Settings; `appendfsync`, `save` and the rewrite thresholds change at
+    /// runtime (`CONFIG SET`).
+    cfg: parking_lot::RwLock<PersistConfig>,
     pub stats: Arc<PersistStats>,
     /// The log's manifest while the log is active.
     manifest: Mutex<Option<Manifest>>,
@@ -106,7 +144,7 @@ impl Persistence {
         let stats = Arc::new(PersistStats::new());
         stats.aof_enabled.store(cfg.appendonly, Ordering::Relaxed);
         Self {
-            cfg,
+            cfg: parking_lot::RwLock::new(cfg),
             stats,
             manifest: Mutex::new(None),
             needs_rewrite: AtomicBool::new(false),
@@ -121,16 +159,42 @@ impl Persistence {
         self.needs_rewrite.store(true, Ordering::Relaxed);
     }
 
-    pub fn config(&self) -> &PersistConfig {
-        &self.cfg
+    /// The settings now.
+    pub fn config(&self) -> PersistConfig {
+        self.cfg.read().clone()
+    }
+
+    /// `CONFIG SET appendfsync`: the policy and, with the log on, its writer.
+    pub fn set_fsync(&self, policy: FsyncPolicy, shards: &ShardManager) {
+        self.cfg.write().fsync = policy;
+        if let Some(w) = shards.aof() {
+            w.set_policy(policy);
+        }
+    }
+
+    /// `CONFIG SET save`.
+    pub fn set_save(&self, points: Vec<(u64, u64)>) {
+        self.cfg.write().save = points;
+    }
+
+    /// `CONFIG SET auto-aof-rewrite-percentage` / `-min-size`.
+    pub fn set_auto_rewrite(&self, percentage: Option<u64>, min_size: Option<u64>) {
+        let mut c = self.cfg.write();
+        if let Some(p) = percentage {
+            c.auto_rewrite_percentage = p;
+        }
+        if let Some(m) = min_size {
+            c.auto_rewrite_min_size = m;
+        }
     }
 
     pub fn aof_dir(&self) -> PathBuf {
-        self.cfg.dir.join(AOF_DIRNAME)
+        self.cfg.read().dir.join(AOF_DIRNAME)
     }
 
     pub fn rdb_path(&self) -> PathBuf {
-        rdb::rdb_path(&self.cfg.dir, &self.cfg.dbfilename)
+        let cfg = self.config();
+        rdb::rdb_path(&cfg.dir, &cfg.dbfilename)
     }
 
     // -----------------------------------------------------------------------
@@ -149,7 +213,7 @@ impl Persistence {
 
     fn load_inner(&self, shards: &ShardManager) -> io::Result<LoadReport> {
         let mut report = LoadReport::default();
-        if self.cfg.appendonly {
+        if self.cfg.read().appendonly {
             let aof_dir = self.aof_dir();
             if let Some(m) = Manifest::load(&aof_dir)? {
                 let (keys, records) = self.load_manifest(&aof_dir, &m, shards)?;
@@ -171,7 +235,7 @@ impl Persistence {
                 *self.manifest.lock() = Some(m);
                 return Ok(report);
             }
-            let legacy = self.cfg.dir.join(LEGACY_AOF_NAME);
+            let legacy = self.cfg.read().dir.join(LEGACY_AOF_NAME);
             if legacy.exists() {
                 tracing::info!(
                     "Loading {} (single-file log from an earlier version) — the snapshot \
@@ -193,7 +257,8 @@ impl Persistence {
         }
         let mut keys = 0u64;
         let mut batch = Router::new(shards);
-        let files = rdb::load_rdb(&self.cfg.dir, &self.cfg.dbfilename, |db, k, e| {
+        let cfg = self.config();
+        let files = rdb::load_rdb(&cfg.dir, &cfg.dbfilename, |db, k, e| {
             keys += 1;
             batch.push(db, k, e);
         })?;
@@ -253,7 +318,7 @@ impl Persistence {
     /// After `load`: make sure the log can be appended to (rewriting it if
     /// the load requires), then start the writer and attach it to `shards`.
     pub fn start_aof(&self, shards: &ShardManager) -> io::Result<()> {
-        if !self.cfg.appendonly {
+        if !self.cfg.read().appendonly {
             return Ok(());
         }
         let aof_dir = self.aof_dir();
@@ -298,8 +363,9 @@ impl Persistence {
         let size = m.disk_size(&aof_dir);
         self.stats.aof_base_size.store(size, Ordering::Relaxed);
         self.stats.aof_current_size.store(size, Ordering::Relaxed);
-        let writer = aof::spawn_aof_writer(&aof_dir, n, gen, self.cfg.fsync, self.stats.clone())?
-            .single_threaded(shards.is_solo());
+        let writer =
+            aof::spawn_aof_writer(&aof_dir, n, gen, self.cfg.read().fsync, self.stats.clone())?
+                .single_threaded(shards.is_solo());
         shards.attach_aof(writer);
         Ok(())
     }
@@ -328,7 +394,8 @@ impl Persistence {
         s.rdb_saves.fetch_add(1, Ordering::Relaxed);
         // Superseded per-shard files from before the single snapshot file:
         // left behind, they would be loaded if the new file ever went missing.
-        for old in rdb::legacy_shard_files(&self.cfg.dir, &self.cfg.dbfilename) {
+        let cfg = self.config();
+        for old in rdb::legacy_shard_files(&cfg.dir, &cfg.dbfilename) {
             if std::fs::remove_file(&old).is_ok() {
                 tracing::info!("Removed superseded snapshot {}", old.display());
             }
@@ -545,8 +612,8 @@ impl Persistence {
 
     /// Whether the log has grown enough to rewrite on its own.
     pub fn should_auto_rewrite(&self) -> bool {
-        let pct = self.cfg.auto_rewrite_percentage;
-        if pct == 0 || !self.cfg.appendonly {
+        let pct = self.cfg.read().auto_rewrite_percentage;
+        if pct == 0 || !self.cfg.read().appendonly {
             return false;
         }
         let s = &self.stats;
@@ -555,7 +622,7 @@ impl Persistence {
         }
         let current = s.aof_current_size.load(Ordering::Relaxed);
         let base = s.aof_base_size.load(Ordering::Relaxed).max(1);
-        current >= self.cfg.auto_rewrite_min_size
+        current >= self.cfg.read().auto_rewrite_min_size
             && current.saturating_sub(base).saturating_mul(100) / base >= pct
     }
 
@@ -578,7 +645,7 @@ impl Persistence {
             if let Some(w) = shards.aof() {
                 w.sync()?;
             }
-            if save.unwrap_or(self.cfg.save_interval > 0) {
+            if save.unwrap_or(!self.cfg.read().save.is_empty()) {
                 self.save(shards, dirty)?;
             }
             Ok(())
@@ -855,12 +922,12 @@ impl<'a> Router<'a> {
 /// which buckets by cluster slot) to the shards that own them.
 pub fn insert_routed(
     shards: &ShardManager,
-    entries: impl IntoIterator<Item = (Bytes, KeyEntry)>,
+    entries: impl IntoIterator<Item = (u32, Bytes, KeyEntry)>,
 ) -> u64 {
     let mut router = Router::new(shards);
     let mut n = 0;
-    for (k, e) in entries {
-        router.push(0, k, e);
+    for (db, k, e) in entries {
+        router.push(db, k, e);
         n += 1;
     }
     router.flush();
@@ -903,7 +970,7 @@ mod tests {
             fsync: FsyncPolicy::Everysec,
             auto_rewrite_percentage: 0,
             auto_rewrite_min_size: 0,
-            save_interval: 300,
+            save: vec![(300, 1)],
         }
     }
 
@@ -1453,5 +1520,71 @@ mod tests {
         assert!(dir.0.join("dump.rdb").exists());
         assert!(int(run(&e, &["LASTSAVE"])) >= before);
         assert!(run(&e, &["BGREWRITEAOF"]).is_error(), "no log to rewrite");
+    }
+
+    #[test]
+    fn save_points_parse_and_decide_like_redis() {
+        assert_eq!(
+            PersistConfig::parse_save("3600 1 300 100").unwrap(),
+            vec![(3600, 1), (300, 100)]
+        );
+        assert_eq!(PersistConfig::parse_save("").unwrap(), vec![]);
+        assert!(PersistConfig::parse_save("3600").is_err());
+        assert!(PersistConfig::parse_save("x 1").is_err());
+        let cfg = PersistConfig {
+            save: vec![(3600, 1), (300, 100)],
+            ..PersistConfig::default()
+        };
+        assert!(!cfg.save_due(10, 1_000)); // neither point reached yet
+        assert!(cfg.save_due(300, 100));
+        assert!(!cfg.save_due(300, 99));
+        assert!(cfg.save_due(3600, 1));
+        assert!(!cfg.save_due(7200, 0)); // nothing changed
+        assert_eq!(cfg.save_string(), "3600 1 300 100");
+    }
+
+    #[test]
+    fn config_set_changes_persistence_at_runtime() {
+        let dir = TmpDir::new("config-set");
+        let e = start(&dir.0, ShardManager::new(2), true);
+        let get = |e: &CommandEngine, p: &str| match run(e, &["CONFIG", "GET", p]) {
+            CommandResponse::Array(v) => match &v[1] {
+                CommandResponse::BulkString(b) => String::from_utf8_lossy(b).to_string(),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            run(&e, &["CONFIG", "SET", "save", "60 5 10 1000"]),
+            CommandResponse::Ok
+        ));
+        assert_eq!(get(&e, "save"), "60 5 10 1000");
+        assert_eq!(e.persistence().config().save, vec![(60, 5), (10, 1000)]);
+        assert!(matches!(
+            run(&e, &["CONFIG", "SET", "appendfsync", "always"]),
+            CommandResponse::Ok
+        ));
+        assert_eq!(get(&e, "appendfsync"), "always");
+        assert!(matches!(
+            run(&e, &["CONFIG", "SET", "auto-aof-rewrite-min-size", "1mb"]),
+            CommandResponse::Ok
+        ));
+        assert_eq!(e.persistence().config().auto_rewrite_min_size, 1024 * 1024);
+        // Writes still reach the log under the new policy.
+        run(&e, &["SET", "k", "v"]);
+        e.shards.aof().unwrap().sync().unwrap();
+        assert!(matches!(
+            run(&e, &["CONFIG", "SET", "appendfsync", "sometimes"]),
+            CommandResponse::Error(_)
+        ));
+        assert!(matches!(
+            run(&e, &["CONFIG", "SET", "save", "60"]),
+            CommandResponse::Error(_)
+        ));
+        assert_eq!(get(&e, "save"), "60 5 10 1000");
+        e.shutdown(Some(false)).unwrap();
+        let e = start(&dir.0, ShardManager::new(2), true);
+        assert_eq!(get(&e, "save"), "300 1");
+        assert_eq!(super::tests::get(&e, "k").as_deref(), Some("v"));
     }
 }

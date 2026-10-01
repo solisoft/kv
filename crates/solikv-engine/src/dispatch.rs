@@ -5193,7 +5193,7 @@ impl CommandEngine {
 
     /// Write the libraries out (after every change), atomically.
     fn save_functions(&self) {
-        if !self.persistence.config().appendonly && self.persistence.config().save_interval == 0 {
+        if !self.persistence.config().appendonly && self.persistence.config().save.is_empty() {
             return;
         }
         let path = self.functions_path();

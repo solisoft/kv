@@ -297,14 +297,22 @@ fn load_into(
         }
         match directive.as_str() {
             "save" => {
-                // `save <seconds> <changes> …` → the shortest interval;
-                // `save ""` → no snapshots.
-                let secs = values
-                    .chunks(2)
-                    .filter_map(|p| p.first()?.parse::<u64>().ok())
-                    .min()
-                    .unwrap_or(0);
-                out.push(format!("--save-interval={}", secs));
+                // `save <seconds> <changes> …`, possibly on several lines,
+                // which add up as in Redis; `save ""` → no snapshots.
+                let points: Vec<&str> = values
+                    .iter()
+                    .map(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+                    .collect();
+                let joined = points.join(" ");
+                match out.iter_mut().find(|a| a.starts_with("--save=")) {
+                    Some(prev) if !joined.is_empty() && prev.len() > "--save=".len() => {
+                        prev.push(' ');
+                        prev.push_str(&joined);
+                    }
+                    Some(prev) => *prev = format!("--save={}", joined),
+                    None => out.push(format!("--save={}", joined)),
+                }
             }
             "appendonly" => {
                 let v = values
@@ -382,7 +390,7 @@ mod tests {
         let main = dir.join("main.conf");
         std::fs::write(
             &main,
-            "# comment\nport 7000\nsave 900 1 300 10\nappendonly no\ntcp-keepalive 300\n\
+            "# comment\nport 7000\nsave 900 1\nsave 300 10\nappendonly no\ntcp-keepalive 300\n\
              include inc.conf\nloglevel notice\nbind 127.0.0.1 -::1\n",
         )
         .unwrap();
@@ -392,7 +400,7 @@ mod tests {
             flags,
             vec![
                 "--port=7000",
-                "--save-interval=300",
+                "--save=900 1 300 10",
                 "--appendonly=false",
                 "--maxmemory-policy=allkeys-lru",
                 "--log-level=info",

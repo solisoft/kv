@@ -259,6 +259,32 @@ impl CommandEngine {
     // DEBUG
     // -----------------------------------------------------------------------
 
+    /// `DEBUG RELOAD`: save a snapshot, empty the dataset and load that
+    /// snapshot back — Redis' check that what it saves loads to the same
+    /// data. One hold of every shard, so nothing runs in between (Redis is
+    /// single-threaded through it). The reload goes through the logged paths
+    /// (`FLUSHALL`, then each key's value), so the log and replicas stay
+    /// exact.
+    fn debug_reload(&self) -> CommandResponse {
+        let _all = self.shards.lock_all();
+        if let Err(e) = self.persistence.save(&self.shards, self.dirty()) {
+            return CommandResponse::error(format!("ERR Error trying to save the DB: {e}"));
+        }
+        let mut entries = Vec::new();
+        let path = self.persistence.rdb_path();
+        if let Err(e) = solikv_persist::rdb::load_snapshot_file(&path, |_, db, k, e| {
+            entries.push((db, k, e));
+            Ok(())
+        }) {
+            return CommandResponse::error(format!("ERR Error trying to load the RDB dump: {e}"));
+        }
+        self.execute_in_db(0, "FLUSHALL", &[]);
+        for (db, k, e) in entries {
+            self.put_entry(db, k, e);
+        }
+        CommandResponse::ok()
+    }
+
     pub(crate) fn debug_command(&self, session: &Session, args: &[Bytes]) -> CommandResponse {
         let local = session.info.addr.starts_with("127.")
             || session.info.addr.starts_with("[::1]")
@@ -318,14 +344,15 @@ impl CommandEngine {
                 ))
             }
             "CHANGE-REPL-ID" => CommandResponse::ok(),
-            "JMAP" | "RELOAD" | "LOADAOF" | "SEGFAULT" | "PANIC" | "RESTART"
-            | "CRASH-AND-RECOVER" => {
+            "RELOAD" => self.debug_reload(),
+            "JMAP" | "LOADAOF" | "SEGFAULT" | "PANIC" | "RESTART" | "CRASH-AND-RECOVER" => {
                 CommandResponse::error(format!("ERR DEBUG {} is not supported by this server", sub))
             }
             "HELP" => CommandResponse::array(
                 [
                     "DEBUG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
                     "OBJECT <key>",
+                    "RELOAD",
                     "SET-ACTIVE-EXPIRE <0|1>",
                     "SLEEP <seconds>",
                 ]
@@ -523,14 +550,7 @@ impl CommandEngine {
         let yes_no = |b: bool| if b { "yes" } else { "no" }.to_string();
         let mut v: Vec<(String, String)> = vec![
             ("databases".into(), self.databases.to_string()),
-            (
-                "save".into(),
-                if cfg.save_interval > 0 {
-                    format!("{} 1", cfg.save_interval)
-                } else {
-                    String::new()
-                },
-            ),
+            ("save".into(), cfg.save_string()),
             ("appendonly".into(), yes_no(cfg.appendonly)),
             (
                 "appendfsync".into(),
@@ -651,6 +671,10 @@ impl CommandEngine {
         "tracking-table-max-keys",
         "hz",
         "requirepass",
+        "save",
+        "appendfsync",
+        "auto-aof-rewrite-percentage",
+        "auto-aof-rewrite-min-size",
     ];
 
     fn config_validate(&self, param: &str, value: &str) -> Result<(), String> {
@@ -692,6 +716,25 @@ impl CommandEngine {
             "busy-reply-threshold" | "lua-time-limit" => int(0, i64::MAX),
             "tracking-table-max-keys" => int(0, i64::MAX),
             "hz" => int(1, 500),
+            "save" => solikv_engine_save_points(value).map(|_| ()).map_err(|e| {
+                format!(
+                    "ERR CONFIG SET failed (possibly related to argument 'save') - {}",
+                    e
+                )
+            }),
+            "appendfsync" => fsync_policy(value).map(|_| ()).ok_or_else(|| {
+                "ERR CONFIG SET failed (possibly related to argument 'appendfsync') - argument(s) \
+                 must be one of the following: always, everysec, no"
+                    .to_string()
+            }),
+            "auto-aof-rewrite-percentage" => int(0, i64::MAX),
+            "auto-aof-rewrite-min-size" => solikv_core::memory::parse_size(value)
+                .map(|_| ())
+                .ok_or_else(|| {
+                    "ERR CONFIG SET failed (possibly related to argument \
+                     'auto-aof-rewrite-min-size') - argument couldn't be parsed into an integer"
+                        .to_string()
+                }),
             _ => Ok(()),
         }
     }
@@ -733,6 +776,22 @@ impl CommandEngine {
                 .store(value.parse().unwrap_or(1_000_000), Ordering::Relaxed),
             "hz" => self.shards.set_hz(value.parse().unwrap_or(10)),
             "requirepass" => self.acl.set_requirepass(Some(value)),
+            "save" => {
+                if let Ok(points) = solikv_engine_save_points(value) {
+                    self.persistence.set_save(points);
+                }
+            }
+            "appendfsync" => {
+                if let Some(p) = fsync_policy(value) {
+                    self.persistence.set_fsync(p, &self.shards);
+                }
+            }
+            "auto-aof-rewrite-percentage" => {
+                self.persistence.set_auto_rewrite(value.parse().ok(), None)
+            }
+            "auto-aof-rewrite-min-size" => self
+                .persistence
+                .set_auto_rewrite(None, solikv_core::memory::parse_size(value)),
             _ => {}
         }
     }
@@ -1177,5 +1236,18 @@ fn cpu_times() -> (f64, f64) {
         }
         let t = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
         (t(r.ru_stime), t(r.ru_utime))
+    }
+}
+
+fn solikv_engine_save_points(v: &str) -> Result<Vec<(u64, u64)>, String> {
+    crate::persistence::PersistConfig::parse_save(v)
+}
+
+fn fsync_policy(v: &str) -> Option<solikv_persist::FsyncPolicy> {
+    match v.to_ascii_lowercase().as_str() {
+        "always" => Some(solikv_persist::FsyncPolicy::Always),
+        "everysec" => Some(solikv_persist::FsyncPolicy::Everysec),
+        "no" => Some(solikv_persist::FsyncPolicy::No),
+        _ => None,
     }
 }
