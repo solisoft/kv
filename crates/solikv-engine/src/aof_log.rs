@@ -101,7 +101,7 @@ const DELEGATING: &[&str] = &[
 ];
 
 pub(crate) fn mode(name: &str, is_write: bool) -> Mode {
-    if !is_write || name == "EVAL" || name == "EVALSHA" || DELEGATING.contains(&name) {
+    if !is_write || matches!(name, "EVAL" | "EVALSHA" | "FCALL") || DELEGATING.contains(&name) {
         Mode::Idle
     } else if EXPLICIT.contains(&name) {
         Mode::Explicit

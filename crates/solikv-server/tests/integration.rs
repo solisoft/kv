@@ -40,6 +40,14 @@ async fn start_test_server(port: u16) -> tokio::task::JoinHandle<()> {
                         }
                         CommandResponse::Error(msg) => RespFrame::Error(msg),
                         CommandResponse::Queued => RespFrame::SimpleString(Bytes::from("QUEUED")),
+                        other => {
+                            let mut buf = BytesMut::new();
+                            solikv_server::resp_server::encode_response(&other, &mut buf);
+                            match decode_frame(&buf) {
+                                Ok(Some((f, _))) => f,
+                                _ => RespFrame::Null,
+                            }
+                        }
                     }
                 }
 

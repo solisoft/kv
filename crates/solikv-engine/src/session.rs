@@ -41,6 +41,14 @@ pub struct ClientInfo {
     commands: AtomicU64,
     killed: AtomicBool,
     kill: tokio::sync::Notify,
+    /// Protocol version, for `CLIENT LIST`.
+    resp: AtomicU32,
+    /// ACL user, for `CLIENT LIST`.
+    user: Mutex<String>,
+    /// Out-of-band delivery (tracking invalidations) to the connection.
+    push: Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::tracking::Push>>>,
+    /// `CLIENT TRACKING … REDIRECT` target, for `CLIENT LIST` (-1: none).
+    redir: AtomicI64,
 }
 
 impl ClientInfo {
@@ -57,6 +65,15 @@ impl ClientInfo {
             c.clear();
             c.push_str(last_cmd);
         }
+    }
+
+    /// Where this connection receives pushes (set by the connection loop).
+    pub fn set_push(&self, tx: tokio::sync::mpsc::UnboundedSender<crate::tracking::Push>) {
+        *self.push.lock() = Some(tx);
+    }
+
+    pub fn user_name(&self) -> String {
+        self.user.lock().clone()
     }
 
     pub fn is_killed(&self) -> bool {
@@ -115,7 +132,7 @@ impl ClientInfo {
         format!(
             "id={} addr={} laddr={} fd=-1 name={} age={} idle={} flags={} db={} sub={} psub={} \
              ssub=0 multi={} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 obl=0 oll=0 omem=0 \
-             tot-mem=0 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={}",
+             tot-mem=0 events=r cmd={} user={} redir={} resp={} lib-name={} lib-ver={}",
             self.id,
             self.addr,
             self.laddr,
@@ -128,6 +145,9 @@ impl ClientInfo {
             psubs,
             multi,
             self.last_cmd.lock().to_lowercase(),
+            self.user.lock(),
+            self.redir.load(Ordering::Relaxed),
+            self.resp.load(Ordering::Relaxed),
             lib_name,
             lib_ver,
         )
@@ -164,6 +184,10 @@ impl ClientRegistry {
             commands: AtomicU64::new(0),
             killed: AtomicBool::new(false),
             kill: tokio::sync::Notify::new(),
+            resp: AtomicU32::new(2),
+            user: Mutex::new("default".to_string()),
+            push: Mutex::new(None),
+            redir: AtomicI64::new(-1),
         });
         self.clients.lock().insert(id, Arc::downgrade(&info));
         info
@@ -205,6 +229,28 @@ impl ClientRegistry {
     pub fn count(&self) -> usize {
         self.clients.lock().len()
     }
+
+    pub fn get(&self, id: u64) -> Option<Arc<ClientInfo>> {
+        self.clients.lock().get(&id).and_then(|w| w.upgrade())
+    }
+
+    /// Deliver `push` to client `id`, if it is connected and listening.
+    pub fn push(&self, id: u64, push: crate::tracking::Push) {
+        if let Some(c) = self.get(id) {
+            if let Some(tx) = c.push.lock().as_ref() {
+                let _ = tx.send(push);
+            }
+        }
+    }
+
+    /// Kill every client authenticated as `user` (`ACL DELUSER`).
+    pub fn kill_user(&self, user: &str) {
+        for c in self.list() {
+            if *c.user.lock() == user {
+                c.kill();
+            }
+        }
+    }
 }
 
 /// `CLIENT REPLY` state.
@@ -232,10 +278,26 @@ pub struct Session {
     pub(crate) reply: ReplyMode,
     /// The command just run must not be answered (`CLIENT REPLY OFF|SKIP`).
     pub(crate) suppress_current: bool,
+    /// Protocol version (`HELLO 2|3`).
+    pub resp: u8,
+    /// The ACL user this connection runs as, read at `acl_version`.
+    pub user: Arc<crate::acl::AclUser>,
+    pub(crate) acl_version: u64,
+    /// `CLIENT TRACKING` options, when on.
+    pub(crate) tracking: Option<crate::tracking::TrackingOpts>,
+    /// `CLIENT CACHING yes|no`, for the next command only.
+    pub(crate) caching: Option<bool>,
+    /// Stops tracking when the connection goes.
+    pub(crate) tracking_owner: Option<Arc<crate::tracking::Tracking>>,
 }
 
 impl Session {
-    pub(crate) fn new(info: Arc<ClientInfo>, registry: Arc<ClientRegistry>) -> Self {
+    pub(crate) fn new(
+        info: Arc<ClientInfo>,
+        registry: Arc<ClientRegistry>,
+        user: Arc<crate::acl::AclUser>,
+        acl_version: u64,
+    ) -> Self {
         Self {
             db: 0,
             info,
@@ -247,7 +309,32 @@ impl Session {
             watch_owner: None,
             reply: ReplyMode::On,
             suppress_current: false,
+            resp: 2,
+            user,
+            acl_version,
+            tracking: None,
+            caching: None,
+            tracking_owner: None,
         }
+    }
+
+    /// Run as `user` from now on (`AUTH`, `HELLO … AUTH`).
+    pub fn set_user(&mut self, user: Arc<crate::acl::AclUser>, version: u64) {
+        *self.info.user.lock() = user.name.clone();
+        self.user = user;
+        self.acl_version = version;
+    }
+
+    pub(crate) fn set_redir(&self, redir: Option<u64>) {
+        self.info
+            .redir
+            .store(redir.map_or(-1, |r| r as i64), Ordering::Relaxed);
+    }
+
+    /// Switch protocol (`HELLO`).
+    pub fn set_resp(&mut self, proto: u8) {
+        self.resp = proto;
+        self.info.resp.store(proto as u32, Ordering::Relaxed);
     }
 
     pub fn in_multi(&self) -> bool {
@@ -328,6 +415,11 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if self.tracking.take().is_some() {
+            if let Some(t) = &self.tracking_owner {
+                t.disable(self.info.id);
+            }
+        }
         self.unwatch_all();
         self.registry.unregister(&self.info);
     }

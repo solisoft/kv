@@ -20,5 +20,26 @@ pub fn response_to_json(resp: &CommandResponse) -> serde_json::Value {
         }
         CommandResponse::Error(msg) => serde_json::json!({"error": msg}),
         CommandResponse::Queued => serde_json::json!("QUEUED"),
+        CommandResponse::Double(d) => serde_json::json!(d),
+        CommandResponse::Bool(b) => serde_json::json!(b),
+        CommandResponse::Map(pairs) => {
+            let mut obj = serde_json::Map::new();
+            for (k, v) in pairs {
+                let key = match response_to_json(k) {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                obj.insert(key, response_to_json(v));
+            }
+            serde_json::Value::Object(obj)
+        }
+        CommandResponse::Set(items) | CommandResponse::Push(items) => {
+            serde_json::json!(items.iter().map(response_to_json).collect::<Vec<_>>())
+        }
+        CommandResponse::Pairs(pairs) => serde_json::json!(pairs
+            .iter()
+            .map(|(a, b)| serde_json::json!([response_to_json(a), response_to_json(b)]))
+            .collect::<Vec<_>>()),
+        CommandResponse::Verbatim(_, b) => serde_json::json!(String::from_utf8_lossy(b)),
     }
 }

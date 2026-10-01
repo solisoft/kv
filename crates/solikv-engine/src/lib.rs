@@ -1,12 +1,17 @@
+pub mod acl;
 pub mod aof_log;
 pub mod blocking;
 pub mod commands;
 pub mod dispatch;
 pub mod lua;
+pub mod lua_libs;
 pub mod persistence;
+pub mod resp3;
 pub mod response;
 pub mod session;
 pub mod shard;
+pub mod stats;
+pub mod tracking;
 pub mod watch;
 
 pub use aof_log::{Effects, TxGuard};

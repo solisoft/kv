@@ -31,7 +31,17 @@ struct Shared {
     /// `INFO stats` counters.
     expired_keys: std::sync::atomic::AtomicU64,
     evicted_keys: std::sync::atomic::AtomicU64,
+    /// Told about keys the server removes itself (expiry, eviction): client
+    /// caches that hold them must be invalidated.
+    removed_hook: OnceLock<RemovedHook>,
+    /// `DEBUG SET-ACTIVE-EXPIRE 0` stops the active expiry cycle.
+    active_expire_off: AtomicBool,
+    /// Active expiry cycles per second (`hz`; 0 = unset, meaning 10).
+    hz: std::sync::atomic::AtomicU32,
 }
+
+/// See `Shared::removed_hook`.
+pub type RemovedHook = Arc<dyn Fn(&[(u32, Bytes)]) + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // The database a command runs in
@@ -429,6 +439,9 @@ impl ShardHandle {
         if keys.is_empty() {
             return;
         }
+        if let Some(hook) = self.shared.removed_hook.get() {
+            hook(keys);
+        }
         let (Some(pubsub), Some(nf)) = (&self.pubsub, &self.notify_flags) else {
             return;
         };
@@ -606,6 +619,31 @@ impl ShardManager {
     }
 
     /// Keys expired so far (`INFO stats`).
+    /// See `Shared::removed_hook` (set once).
+    pub fn set_removed_hook(&self, hook: RemovedHook) {
+        let _ = self.shared.removed_hook.set(hook);
+    }
+
+    /// Active expiry cycles per second (`hz`).
+    pub fn hz(&self) -> u32 {
+        match self.shared.hz.load(Ordering::Relaxed) {
+            0 => 10,
+            n => n,
+        }
+    }
+
+    pub fn set_hz(&self, hz: u32) {
+        self.shared.hz.store(hz.clamp(1, 500), Ordering::Relaxed);
+    }
+
+    pub fn set_active_expire(&self, on: bool) {
+        self.shared.active_expire_off.store(!on, Ordering::Relaxed);
+    }
+
+    pub fn active_expire_enabled(&self) -> bool {
+        !self.shared.active_expire_off.load(Ordering::Relaxed)
+    }
+
     pub fn expired_keys(&self) -> u64 {
         self.shared.expired_keys.load(Ordering::Relaxed)
     }
@@ -763,14 +801,16 @@ impl ShardManager {
 /// the current Tokio runtime — in solo mode that is the only thread allowed
 /// to touch the store. Each shard gets at most 1 ms of its lock per cycle.
 pub fn spawn_active_expiry(shards: Arc<ShardManager>, hz: u32) -> tokio::task::JoinHandle<()> {
-    let hz = hz.clamp(1, 500);
+    shards.set_hz(hz);
     tokio::spawn(async move {
-        let period = std::time::Duration::from_millis(1000 / hz as u64);
-        let mut ticker = tokio::time::interval(period);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let budget = std::time::Duration::from_millis(1);
         loop {
-            ticker.tick().await;
+            // `hz` is read every cycle: `CONFIG SET hz` takes effect at once.
+            let period = std::time::Duration::from_millis(1000 / shards.hz() as u64);
+            tokio::time::sleep(period).await;
+            if !shards.active_expire_enabled() {
+                continue;
+            }
             for shard in shards.all_shards() {
                 shard.active_expire_cycle(budget);
                 // Let the connections this worker also serves run between

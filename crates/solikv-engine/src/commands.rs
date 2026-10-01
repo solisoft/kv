@@ -248,6 +248,15 @@ fn georadius_keys(args: &[Bytes]) -> Vec<usize> {
     v
 }
 
+/// `MEMORY USAGE key`: a key only for that subcommand.
+fn memory_keys(args: &[Bytes]) -> Vec<usize> {
+    if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"USAGE") {
+        vec![1]
+    } else {
+        Vec::new()
+    }
+}
+
 /// `OBJECT sub key` / `MEMORY USAGE key`: the key is the second argument.
 fn second_arg_key(args: &[Bytes]) -> Vec<usize> {
     if args.len() >= 2 {
@@ -293,7 +302,7 @@ commands! {
     HELLO = "HELLO", -1, CONN, NONE;
     QUIT = "QUIT", -1, CONN, NONE;
     RESET = "RESET", 1, CONN, NONE;
-    SELECT = "SELECT", 2, CONN, NONE;
+    SELECT = "SELECT", 2, &["loading", "stale", "fast"], NONE;
     CLIENT = "CLIENT", -2, &["admin", "noscript", "loading", "stale"], NONE;
     COMMAND = "COMMAND", -1, &["loading", "stale"], NONE;
     CONFIG = "CONFIG", -2, &["admin", "noscript", "loading", "stale"], NONE;
@@ -312,6 +321,12 @@ commands! {
     SHUTDOWN = "SHUTDOWN", -1, &["admin", "noscript", "loading", "stale"], NONE;
     WAIT = "WAIT", 3, &["noscript"], NONE;
     CLUSTER = "CLUSTER", -2, &["loading", "stale"], NONE;
+    ACL = "ACL", -2, &["admin", "noscript", "loading", "stale"], NONE;
+    SLOWLOG = "SLOWLOG", -2, &["admin", "loading", "stale"], NONE;
+    LATENCY = "LATENCY", -2, &["admin", "noscript", "loading", "stale"], NONE;
+    MEMORY = "MEMORY", -2, &["readonly"], Keys::Movable(memory_keys);
+    DEBUG = "DEBUG", -2, &["admin", "noscript", "loading", "stale"], NONE;
+    MONITOR = "MONITOR", 1, &["admin", "noscript", "loading", "stale"], NONE;
     // Transactions
     MULTI = "MULTI", 1, CONN, NONE;
     EXEC = "EXEC", 1, &["noscript", "loading", "stale"], NONE;
@@ -321,7 +336,12 @@ commands! {
     // Scripting
     EVAL = "EVAL", -3, SCRIPT, Keys::Movable(eval_keys);
     EVALSHA = "EVALSHA", -3, SCRIPT, Keys::Movable(eval_keys);
+    EVAL_RO = "EVAL_RO", -3, &["readonly", "noscript", "movablekeys"], Keys::Movable(eval_keys);
+    EVALSHA_RO = "EVALSHA_RO", -3, &["readonly", "noscript", "movablekeys"], Keys::Movable(eval_keys);
     SCRIPT = "SCRIPT", -2, &["noscript"], NONE;
+    FCALL = "FCALL", -3, SCRIPT, Keys::Movable(eval_keys);
+    FCALL_RO = "FCALL_RO", -3, &["readonly", "noscript", "movablekeys"], Keys::Movable(eval_keys);
+    FUNCTION = "FUNCTION", -2, &["noscript"], NONE;
     // Pub/sub
     PUBLISH = "PUBLISH", 3, &["pubsub", "loading", "stale", "fast"], NONE;
     PUBSUB = "PUBSUB", -2, &["pubsub", "loading", "stale"], NONE;
@@ -329,6 +349,9 @@ commands! {
     UNSUBSCRIBE = "UNSUBSCRIBE", -1, PUBSUB, NONE;
     PSUBSCRIBE = "PSUBSCRIBE", -2, PUBSUB, NONE;
     PUNSUBSCRIBE = "PUNSUBSCRIBE", -1, PUBSUB, NONE;
+    SSUBSCRIBE = "SSUBSCRIBE", -2, PUBSUB, ALL;
+    SUNSUBSCRIBE = "SUNSUBSCRIBE", -1, PUBSUB, ALL;
+    SPUBLISH = "SPUBLISH", 3, &["pubsub", "loading", "stale", "fast"], K1;
     // Generic keys
     DEL = "DEL", -2, W, ALL;
     UNLINK = "UNLINK", -2, WF, ALL;

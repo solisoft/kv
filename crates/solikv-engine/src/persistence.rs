@@ -597,6 +597,10 @@ impl CommandEngine {
         let p = self.persistence();
         let report = p.load(&self.shards)?;
         p.start_aof(&self.shards)?;
+        let libs = self.load_functions()?;
+        if libs > 0 {
+            tracing::info!("Loaded {} function libraries", libs);
+        }
         Ok(report)
     }
 }

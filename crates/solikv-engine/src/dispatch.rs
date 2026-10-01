@@ -1,3 +1,4 @@
+mod admin;
 mod ext;
 
 use bytes::Bytes;
@@ -207,6 +208,36 @@ thread_local! {
     static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// The connection whose command runs on this thread (tracking's NOLOOP,
+    /// scripts' ACL checks): its id, and its user when restricted.
+    static CURRENT_CLIENT: std::cell::RefCell<(u64, Option<Arc<crate::acl::AclUser>>)> =
+        const { std::cell::RefCell::new((0, None)) };
+}
+
+/// The client running the current command (0: none — replay, the server).
+pub(crate) fn current_client() -> u64 {
+    CURRENT_CLIENT.with(|c| c.borrow().0)
+}
+
+struct CurrentClient {
+    prev: (u64, Option<Arc<crate::acl::AclUser>>),
+}
+
+impl CurrentClient {
+    fn enter(id: u64, user: Option<Arc<crate::acl::AclUser>>) -> Self {
+        let prev = CURRENT_CLIENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), (id, user)));
+        Self { prev }
+    }
+}
+
+impl Drop for CurrentClient {
+    fn drop(&mut self) {
+        let prev = std::mem::take(&mut self.prev);
+        CURRENT_CLIENT.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
 /// Default number of logical databases (`--databases`).
 pub const DEFAULT_DATABASES: u32 = 16;
 
@@ -247,6 +278,30 @@ pub struct CommandEngine {
     maxmemory_samples: std::sync::atomic::AtomicUsize,
     /// Clients blocked in `BLPOP` & co (see `crate::blocking`).
     blocking: Arc<crate::blocking::BlockingRegistry>,
+    /// The script or function running now (`BUSY`, `SCRIPT KILL`).
+    script_state: Arc<crate::lua::RunState>,
+    /// `FUNCTION LOAD`ed libraries.
+    functions: Arc<crate::lua::FunctionRegistry>,
+    /// `busy-reply-threshold` (ms): how long a script runs before other
+    /// clients get `-BUSY`.
+    busy_threshold_ms: AtomicU64,
+    /// Users and permissions.
+    acl: Arc<crate::acl::Acl>,
+    /// Command statistics, slow log, latency monitor, `MONITOR`.
+    stats: Arc<crate::stats::Stats>,
+    /// Client-side caching.
+    tracking: Arc<crate::tracking::Tracking>,
+    /// `enable-debug-command`: 0 no, 1 local, 2 yes.
+    debug_mode: std::sync::atomic::AtomicU8,
+    /// `maxclients`.
+    maxclients: std::sync::atomic::AtomicUsize,
+    /// `timeout`: seconds an idle client is kept (0 = forever).
+    idle_timeout: AtomicU64,
+    /// The configuration file, for `CONFIG REWRITE`.
+    config_file: parking_lot::RwLock<Option<PathBuf>>,
+    /// Settings the engine does not act on but `CONFIG GET` reports (bind,
+    /// logfile, …), as the server started with them.
+    static_config: parking_lot::RwLock<Vec<(String, String)>>,
 }
 
 /// The `maxmemory-policy` values, in the order `maxmemory_policy` stores
@@ -270,6 +325,7 @@ pub const DEFAULT_LUA_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 
 impl CommandEngine {
     pub fn new(shards: Arc<ShardManager>, pubsub: Arc<PubSubBroker>) -> Self {
+        let clients = Arc::new(ClientRegistry::default());
         Self {
             shards,
             pubsub,
@@ -282,12 +338,140 @@ impl CommandEngine {
             shutdown_requested: Arc::new(tokio::sync::Notify::new()),
             lua_memory_limit: DEFAULT_LUA_MEMORY_LIMIT,
             databases: DEFAULT_DATABASES,
-            clients: Arc::new(ClientRegistry::default()),
+            clients: clients.clone(),
             tcp_port: std::sync::atomic::AtomicU32::new(6379),
             maxmemory: AtomicU64::new(0),
             maxmemory_policy: std::sync::atomic::AtomicU8::new(0),
             maxmemory_samples: std::sync::atomic::AtomicUsize::new(5),
             blocking: Arc::new(crate::blocking::BlockingRegistry::default()),
+            script_state: Arc::new(crate::lua::RunState::default()),
+            functions: Arc::new(crate::lua::FunctionRegistry::default()),
+            busy_threshold_ms: AtomicU64::new(5000),
+            acl: Arc::new(crate::acl::Acl::default()),
+            stats: Arc::new(crate::stats::Stats::default()),
+            tracking: Arc::new(crate::tracking::Tracking::new(clients)),
+            debug_mode: std::sync::atomic::AtomicU8::new(0),
+            maxclients: std::sync::atomic::AtomicUsize::new(10_000),
+            idle_timeout: AtomicU64::new(0),
+            config_file: parking_lot::RwLock::new(None),
+            static_config: parking_lot::RwLock::new(Vec::new()),
+        }
+    }
+
+    pub fn acl(&self) -> &Arc<crate::acl::Acl> {
+        &self.acl
+    }
+
+    pub fn stats(&self) -> &Arc<crate::stats::Stats> {
+        &self.stats
+    }
+
+    pub fn tracking(&self) -> &Arc<crate::tracking::Tracking> {
+        &self.tracking
+    }
+
+    /// `enable-debug-command`: `no`, `local` or `yes`.
+    pub fn set_debug_mode(&self, mode: &str) -> Result<(), String> {
+        let m = match mode.to_ascii_lowercase().as_str() {
+            "no" => 0,
+            "local" => 1,
+            "yes" => 2,
+            other => return Err(format!("invalid enable-debug-command '{}'", other)),
+        };
+        self.debug_mode.store(m, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn maxclients(&self) -> usize {
+        self.maxclients.load(Ordering::Relaxed)
+    }
+
+    pub fn set_maxclients(&self, n: usize) {
+        self.maxclients.store(n.max(1), Ordering::Relaxed);
+    }
+
+    /// `timeout` in seconds (0 = never).
+    pub fn idle_timeout(&self) -> u64 {
+        self.idle_timeout.load(Ordering::Relaxed)
+    }
+
+    pub fn set_idle_timeout(&self, secs: u64) {
+        self.idle_timeout.store(secs, Ordering::Relaxed);
+    }
+
+    pub fn set_config_file(&self, path: Option<PathBuf>) {
+        *self.config_file.write() = path;
+    }
+
+    pub fn config_file(&self) -> Option<PathBuf> {
+        self.config_file.read().clone()
+    }
+
+    /// Record a setting for `CONFIG GET` that the engine itself does not use.
+    pub fn set_static_config(&self, name: &str, value: impl Into<String>) {
+        let mut c = self.static_config.write();
+        let value = value.into();
+        match c.iter_mut().find(|(n, _)| n == name) {
+            Some(e) => e.1 = value,
+            None => c.push((name.to_string(), value)),
+        }
+    }
+
+    pub fn script_state(&self) -> &Arc<crate::lua::RunState> {
+        &self.script_state
+    }
+
+    pub fn functions(&self) -> &Arc<crate::lua::FunctionRegistry> {
+        &self.functions
+    }
+
+    pub fn busy_threshold_ms(&self) -> u64 {
+        self.busy_threshold_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn set_busy_threshold_ms(&self, ms: u64) {
+        self.busy_threshold_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Whether a script is running (one atomic load: the connection loop
+    /// asks before every command).
+    #[inline]
+    pub fn script_running(&self) -> bool {
+        self.script_state.is_running()
+    }
+
+    /// While a script runs, a command waits for it — asynchronously, so the
+    /// worker thread is free — until it ends or has run past
+    /// `busy-reply-threshold`, when the answer is `-BUSY`. `SCRIPT KILL` and
+    /// `FUNCTION KILL`/`STATS` go through at once. `None`: go ahead.
+    pub async fn script_gate(&self, name: &str, args: &[Bytes]) -> Option<CommandResponse> {
+        let allowed = |sub: &str| {
+            args.first()
+                .is_some_and(|a| a.eq_ignore_ascii_case(sub.as_bytes()))
+        };
+        if (name == "SCRIPT" && allowed("KILL"))
+            || (name == "FUNCTION" && (allowed("KILL") || allowed("STATS")))
+        {
+            return None;
+        }
+        loop {
+            let st = &self.script_state;
+            if !st.is_running() {
+                return None;
+            }
+            let threshold = self.busy_threshold_ms();
+            let elapsed = st.elapsed_ms();
+            if elapsed >= threshold {
+                return Some(CommandResponse::error(if st.is_function() {
+                    "BUSY Redis is busy running a function. You can only call FUNCTION KILL or \
+                     SHUTDOWN NOSAVE."
+                } else {
+                    "BUSY Redis is busy running a script. You can only call SCRIPT KILL or \
+                     SHUTDOWN NOSAVE."
+                }));
+            }
+            st.wait_done(std::time::Duration::from_millis(threshold - elapsed))
+                .await;
         }
     }
 
@@ -390,7 +574,14 @@ impl CommandEngine {
     /// State for a new connection from `addr` to `laddr`.
     pub fn new_session(&self, addr: String, laddr: String) -> Session {
         let info = self.clients.register(addr, laddr);
-        Session::new(info, self.clients.clone())
+        let mut session = Session::new(
+            info,
+            self.clients.clone(),
+            self.acl.default_user(),
+            self.acl.version(),
+        );
+        session.tracking_owner = Some(self.tracking.clone());
+        session
     }
 
     /// Cap the memory each Lua VM may use (bytes).
@@ -411,6 +602,16 @@ impl CommandEngine {
     /// Store a weak self-reference so dispatch() can obtain Arc<Self> for Lua closures.
     pub fn init_self_ref(&self, weak: Weak<CommandEngine>) {
         let _ = self.weak_self.set(weak);
+        // Keys the server removes on its own (expiry, eviction) invalidate
+        // client caches like writes do.
+        let t = self.tracking.clone();
+        self.shards
+            .set_removed_hook(Arc::new(move |keys: &[(u32, Bytes)]| {
+                if t.is_active() {
+                    let k: Vec<Bytes> = keys.iter().map(|(_, k)| k.clone()).collect();
+                    t.invalidate(&k, 0);
+                }
+            }));
     }
 
     fn get_self_arc(&self) -> Option<Arc<CommandEngine>> {
@@ -490,7 +691,8 @@ impl CommandEngine {
         // One hash lookup resolves the name: its arm, and its flags.
         let spec = crate::commands::lookup(name);
         let id = spec.map_or(Cmd::Unknown, |s| s.id);
-        let write = spec.is_some_and(|s| s.is_write()) || matches!(id, Cmd::EVAL | Cmd::EVALSHA);
+        let write = spec.is_some_and(|s| s.is_write())
+            || matches!(id, Cmd::EVAL | Cmd::EVALSHA | Cmd::FCALL);
 
         if self.maxmemory.load(Ordering::Relaxed) != 0
             && spec.is_some_and(|c| c.has(crate::commands::F_DENYOOM))
@@ -523,6 +725,13 @@ impl CommandEngine {
 
         if write {
             self.replication_offset.fetch_add(1, Ordering::Relaxed);
+            if self.tracking.is_active() {
+                if matches!(id, Cmd::FLUSHDB | Cmd::FLUSHALL | Cmd::SWAPDB) {
+                    self.tracking.flush();
+                } else if let Some(keys) = crate::commands::keys_of(name, args) {
+                    self.tracking.invalidate(&keys, current_client());
+                }
+            }
         }
 
         // Keyspace notifications (zero-cost when flags == 0).
@@ -1045,11 +1254,26 @@ impl CommandEngine {
             }
             Cmd::QUIT => CommandResponse::ok(),
             Cmd::RESET => CommandResponse::simple("RESET"),
-            Cmd::CLIENT | Cmd::MULTI | Cmd::EXEC | Cmd::DISCARD | Cmd::WATCH | Cmd::UNWATCH => {
-                CommandResponse::error(format!(
-                    "ERR {} is only available on a RESP connection",
-                    name
-                ))
+            Cmd::CLIENT
+            | Cmd::MULTI
+            | Cmd::EXEC
+            | Cmd::DISCARD
+            | Cmd::WATCH
+            | Cmd::UNWATCH
+            | Cmd::DEBUG
+            | Cmd::MONITOR
+            | Cmd::SSUBSCRIBE
+            | Cmd::SUNSUBSCRIBE => CommandResponse::error(format!(
+                "ERR {} is only available on a RESP connection",
+                name
+            )),
+            Cmd::ACL => self.acl.command(args, "default"),
+            Cmd::SLOWLOG => self.stats.slowlog_command(args),
+            Cmd::LATENCY => self.stats.latency_command(args),
+            Cmd::MEMORY => self.memory_command(args),
+            Cmd::SPUBLISH => {
+                let n = self.pubsub.publish_shard(&args[0], args[1].clone());
+                CommandResponse::integer(n as i64)
             }
 
             // ---- Replication commands ----
@@ -3381,6 +3605,7 @@ impl CommandEngine {
                             .into_iter()
                             .filter(|(ch, n)| {
                                 *n > 0
+                                    && !ch.starts_with(solikv_pubsub::broker::SHARD_PREFIX)
                                     && pattern.as_ref().is_none_or(|p| {
                                         solikv_core::store::glob_match_pub(
                                             p,
@@ -3400,6 +3625,39 @@ impl CommandEngine {
                             result.push(CommandResponse::bulk(ch.clone()));
                             result.push(CommandResponse::integer(
                                 self.pubsub.subscriber_count(ch) as i64
+                            ));
+                        }
+                        CommandResponse::array(result)
+                    }
+                    "SHARDCHANNELS" => {
+                        let pattern = args.get(1).map(|p| String::from_utf8_lossy(p).to_string());
+                        let channels = self
+                            .pubsub
+                            .numsub()
+                            .into_iter()
+                            .filter(|(_, n)| *n > 0)
+                            .filter_map(|(ch, _)| {
+                                let (name, shard) = solikv_pubsub::broker::split_shard(&ch);
+                                (shard
+                                    && pattern.as_ref().is_none_or(|p| {
+                                        solikv_core::store::glob_match_pub(
+                                            p,
+                                            &String::from_utf8_lossy(&name),
+                                        )
+                                    }))
+                                .then(|| CommandResponse::bulk(name))
+                            })
+                            .collect();
+                        CommandResponse::array(channels)
+                    }
+                    "SHARDNUMSUB" => {
+                        let mut result = Vec::with_capacity((args.len() - 1) * 2);
+                        for ch in &args[1..] {
+                            result.push(CommandResponse::bulk(ch.clone()));
+                            result.push(CommandResponse::integer(
+                                self.pubsub
+                                    .subscriber_count(&solikv_pubsub::broker::shard_channel(ch))
+                                    as i64,
                             ));
                         }
                         CommandResponse::array(result)
@@ -3486,93 +3744,51 @@ impl CommandEngine {
             }
 
             // ---- Scripting commands ----
-            Cmd::EVAL => {
+            Cmd::EVAL | Cmd::EVAL_RO => {
                 // EVAL script numkeys [key ...] [arg ...]
-                if args.len() < 2 {
-                    return CommandResponse::wrong_arity("eval");
-                }
                 let script = match std::str::from_utf8(&args[0]) {
                     Ok(s) => s,
                     Err(_) => return CommandResponse::error("ERR invalid script encoding"),
                 };
-                let numkeys: usize = match std::str::from_utf8(&args[1])
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                {
-                    Some(n) => n,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR value is not an integer or out of range",
-                        )
-                    }
+                let (keys, argv) = match split_numkeys(args) {
+                    Ok(v) => v,
+                    Err(e) => return e,
                 };
-                let keys_start = match numkeys.checked_add(2) {
-                    Some(start) => start,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR Number of keys can't be greater than number of args",
-                        )
-                    }
-                };
-                if args.len() < keys_start {
-                    return CommandResponse::error(
-                        "ERR Number of keys can't be greater than number of args",
-                    );
-                }
-                let keys: Vec<Bytes> = args[2..keys_start].to_vec();
-                let argv: Vec<Bytes> = args[keys_start..].to_vec();
-
-                // Cache the script
+                // Cached, as Redis does, so EVALSHA works after an EVAL.
                 self.script_cache.load(script);
-                self.run_script(script, keys, argv)
+                self.run_eval(script, keys, argv, id == Cmd::EVAL_RO)
             }
-            Cmd::EVALSHA => {
+            Cmd::EVALSHA | Cmd::EVALSHA_RO => {
                 // EVALSHA sha1 numkeys [key ...] [arg ...]
-                if args.len() < 2 {
-                    return CommandResponse::wrong_arity("evalsha");
-                }
-                let sha = match std::str::from_utf8(&args[0]) {
-                    Ok(s) => s.to_lowercase(),
-                    Err(_) => return CommandResponse::error("ERR invalid SHA encoding"),
+                let sha = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
+                let Some(script) = self.script_cache.get(&sha) else {
+                    return CommandResponse::error("NOSCRIPT No matching script. Please use EVAL.");
                 };
-                let script = match self.script_cache.get(&sha) {
-                    Some(s) => s,
-                    None => {
-                        return CommandResponse::error("NOSCRIPT No matching script. Use EVAL.")
-                    }
+                let (keys, argv) = match split_numkeys(args) {
+                    Ok(v) => v,
+                    Err(e) => return e,
                 };
-                let numkeys: usize = match std::str::from_utf8(&args[1])
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                {
-                    Some(n) => n,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR value is not an integer or out of range",
-                        )
-                    }
+                self.run_eval(&script, keys, argv, id == Cmd::EVALSHA_RO)
+            }
+            Cmd::FCALL | Cmd::FCALL_RO => {
+                let name = String::from_utf8_lossy(&args[0]).to_string();
+                let (keys, argv) = match split_numkeys(args) {
+                    Ok(v) => v,
+                    Err(e) => return e,
                 };
-                let keys_start = match numkeys.checked_add(2) {
-                    Some(start) => start,
-                    None => {
-                        return CommandResponse::error(
-                            "ERR Number of keys can't be greater than number of args",
-                        )
-                    }
+                let Some(meta) = self.functions.function(&name) else {
+                    return CommandResponse::error("ERR Function not found");
                 };
-                if args.len() < keys_start {
+                let ro = id == Cmd::FCALL_RO;
+                if ro && !meta.flags.no_writes {
                     return CommandResponse::error(
-                        "ERR Number of keys can't be greater than number of args",
+                        "ERR Can not execute a script with write flag using *_ro command.",
                     );
                 }
-                let keys: Vec<Bytes> = args[2..keys_start].to_vec();
-                let argv: Vec<Bytes> = args[keys_start..].to_vec();
-                self.run_script(&script, keys, argv)
+                self.run_function(&name, keys, argv, ro || meta.flags.no_writes)
             }
+            Cmd::FUNCTION => self.function_command(args),
             Cmd::SCRIPT => {
-                if args.is_empty() {
-                    return CommandResponse::wrong_arity("script");
-                }
                 let sub = Upper::new(&args[0]);
                 match sub.as_str() {
                     "LOAD" => {
@@ -3581,6 +3797,11 @@ impl CommandEngine {
                         }
                         match std::str::from_utf8(&args[1]) {
                             Ok(script) => {
+                                // A shebang with unknown flags is refused at
+                                // load time, as Redis does.
+                                if let Err(e) = crate::lua::parse_script(script) {
+                                    return CommandResponse::error(e);
+                                }
                                 let sha = self.script_cache.load(script);
                                 CommandResponse::BulkString(Bytes::from(sha))
                             }
@@ -3604,10 +3825,38 @@ impl CommandEngine {
                         )
                     }
                     "FLUSH" => {
+                        match args.get(1).map(|a| Upper::new(a)) {
+                            None => {}
+                            Some(m) if m == "ASYNC" || m == "SYNC" => {}
+                            Some(_) => {
+                                return CommandResponse::error(
+                                    "ERR SCRIPT FLUSH only support SYNC|ASYNC option",
+                                )
+                            }
+                        }
+                        if args.len() > 2 {
+                            return CommandResponse::wrong_arity("script|flush");
+                        }
                         self.script_cache.flush();
                         CommandResponse::ok()
                     }
-                    _ => CommandResponse::error(format!("ERR Unknown SCRIPT subcommand '{}'", sub)),
+                    "KILL" => self.script_state.kill(false),
+                    "HELP" => CommandResponse::array(
+                        [
+                            "SCRIPT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                            "EXISTS <sha1> [<sha1> ...]",
+                            "FLUSH [ASYNC|SYNC]",
+                            "KILL",
+                            "LOAD <script>",
+                        ]
+                        .iter()
+                        .map(|l| CommandResponse::simple(l))
+                        .collect(),
+                    ),
+                    _ => CommandResponse::error(format!(
+                        "ERR unknown subcommand '{}'. Try SCRIPT HELP.",
+                        sub.to_lowercase()
+                    )),
                 }
             }
 
@@ -3931,6 +4180,162 @@ impl CommandEngine {
         name: &str,
         args: &[Bytes],
     ) -> CommandResponse {
+        // An `ACL SETUSER`/`DELUSER` since this connection last looked: pick
+        // up its user's new rules (or lose them).
+        if session.acl_version != self.acl.version() {
+            self.refresh_session_user(session);
+        }
+        let spec = crate::commands::lookup(name);
+        let id = spec.map_or(Cmd::Unknown, |s| s.id);
+        if !session.user.unrestricted() {
+            if let Some(denied) = self.acl_deny(session, spec, args) {
+                return denied;
+            }
+        }
+        if self.stats.monitoring() && !matches!(name, "MONITOR" | "EXEC") {
+            self.stats
+                .feed_monitor(session.db, &session.info.addr, name, args);
+        }
+        let _client = CurrentClient::enter(
+            session.info.id,
+            (!session.user.unrestricted()).then(|| session.user.clone()),
+        );
+        let t0 = crate::stats::stamp();
+        let resp = self.execute_session_inner(session, name, args);
+        if matches!(resp, CommandResponse::Queued) {
+            return resp;
+        }
+        let us = crate::stats::elapsed_us(t0);
+        self.stats.record(id, us, resp.is_error());
+        if let CommandResponse::Error(e) = &resp {
+            self.stats.record_error(e);
+        }
+        if self.stats.is_slow(us) {
+            let client = session
+                .info
+                .name()
+                .map(|n| String::from_utf8_lossy(&n).to_string())
+                .unwrap_or_default();
+            self.stats
+                .maybe_slowlog(us, name, args, &session.info.addr, &client);
+        }
+        self.stats.maybe_latency("command", us / 1000);
+        if let Some(spec) = spec {
+            if spec.has(crate::commands::F_READONLY)
+                && matches!(spec.keys, crate::commands::Keys::Range { .. })
+            {
+                self.count_keyspace_hits(id, &resp);
+                if session.tracking.is_some() {
+                    self.track_read(session, spec, args);
+                }
+            }
+        }
+        resp
+    }
+
+    /// The ACL check of a command the connection handles itself
+    /// (`SUBSCRIBE`, `MONITOR`, blocking commands): `Some(error)` when the
+    /// session's user may not run it.
+    pub fn acl_gate(
+        &self,
+        session: &mut Session,
+        name: &str,
+        args: &[Bytes],
+    ) -> Option<CommandResponse> {
+        if session.acl_version != self.acl.version() {
+            self.refresh_session_user(session);
+        }
+        if session.user.unrestricted() {
+            return None;
+        }
+        self.acl_deny(session, crate::commands::lookup(name), args)
+    }
+
+    fn acl_deny(
+        &self,
+        session: &mut Session,
+        spec: Option<&'static crate::commands::CommandSpec>,
+        args: &[Bytes],
+    ) -> Option<CommandResponse> {
+        let spec = spec?;
+        let denied = self.acl.check(&session.user, spec, args).err()?;
+        let ctx = if session.in_multi() {
+            crate::acl::Context::Multi
+        } else {
+            crate::acl::Context::TopLevel
+        };
+        self.acl
+            .log_denial(&session.user.name, &denied, ctx, session.info.describe());
+        self.stats.record_rejected(spec.id);
+        if session.in_multi() {
+            session.multi_failed = true;
+        }
+        let msg = denied.message(&session.user.name);
+        self.stats.record_error(&msg);
+        Some(CommandResponse::Error(msg))
+    }
+
+    /// Re-read the session's user after an ACL change; a deleted or
+    /// disabled user's connection is closed.
+    fn refresh_session_user(&self, session: &mut Session) {
+        let version = self.acl.version();
+        match self.acl.user(&session.user.name) {
+            Some(u) if u.enabled() => session.set_user(u, version),
+            _ => {
+                session.acl_version = version;
+                session.kill_matching(|c| c.id == session.info.id, false);
+            }
+        }
+    }
+
+    fn count_keyspace_hits(&self, id: Cmd, resp: &CommandResponse) {
+        match (resp, id) {
+            (CommandResponse::Error(_), _) => {}
+            (CommandResponse::Nil | CommandResponse::NilArray, _) => self.stats.keyspace_hit(false),
+            (CommandResponse::Integer(0), Cmd::EXISTS) => self.stats.keyspace_hit(false),
+            (CommandResponse::Array(items), Cmd::MGET) => {
+                for i in items {
+                    self.stats.keyspace_hit(!matches!(i, CommandResponse::Nil));
+                }
+            }
+            _ => self.stats.keyspace_hit(true),
+        }
+    }
+
+    /// Remember the keys a tracking client read (default mode).
+    fn track_read(
+        &self,
+        session: &mut Session,
+        spec: &crate::commands::CommandSpec,
+        args: &[Bytes],
+    ) {
+        let Some(t) = &session.tracking else {
+            return;
+        };
+        if t.bcast {
+            return;
+        }
+        let caching = session.caching.take();
+        let track = if t.optin {
+            caching == Some(true)
+        } else if t.optout {
+            caching != Some(false)
+        } else {
+            true
+        };
+        if track {
+            let target = t.redirect.unwrap_or(session.info.id);
+            self.tracking
+                .remember(session.info.id, target, t.noloop, &spec.keys_of(args));
+        }
+    }
+
+    fn execute_session_inner(
+        &self,
+        session: &mut Session,
+        name: &str,
+        args: &[Bytes],
+    ) -> CommandResponse {
         // Inside MULTI, everything but the transaction's own commands queues.
         if session.multi.is_some()
             && !matches!(
@@ -4006,9 +4411,20 @@ impl CommandEngine {
                 session.set_db(0);
                 session.set_name(None);
                 session.reply = ReplyMode::On;
+                session.set_resp(2);
                 CommandResponse::simple("RESET")
             }
             "CLIENT" => self.client_command(session, args),
+            "ACL" => {
+                let r = self.acl.command(args, &session.user.name);
+                if args[0].eq_ignore_ascii_case(b"DELUSER") && !r.is_error() {
+                    for u in &args[1..] {
+                        self.clients.kill_user(&String::from_utf8_lossy(u));
+                    }
+                }
+                r
+            }
+            "DEBUG" => self.debug_command(session, args),
             _ => {
                 let _db = DbGuard::enter(session.db);
                 self.execute(name, args)
@@ -4091,7 +4507,10 @@ impl CommandEngine {
         let mut all = false;
         let mut idx: Vec<usize> = Vec::new();
         for (name, args) in &queue {
-            if name == "EVAL" || name == "EVALSHA" {
+            if matches!(
+                name.as_str(),
+                "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" | "FCALL_RO"
+            ) {
                 all = true;
                 break;
             }
@@ -4272,11 +4691,10 @@ impl CommandEngine {
                 }
                 _ => CommandResponse::syntax_error(),
             },
-            // Client-side caching is not implemented. Saying OK here made
-            // clients serve stale cached values forever.
-            "TRACKING" | "CACHING" | "GETREDIR" | "TRACKINGINFO" => CommandResponse::error(
-                "ERR client-side caching (CLIENT TRACKING) is not supported by this server",
-            ),
+            "TRACKING" => self.client_tracking(session, rest),
+            "CACHING" => self.client_caching(session, rest),
+            "GETREDIR" => self.client_getredir(session),
+            "TRACKINGINFO" => self.client_trackinginfo(session),
             "PAUSE" | "UNPAUSE" => CommandResponse::error(format!(
                 "ERR CLIENT {} is not supported by this server",
                 sub
@@ -4426,13 +4844,337 @@ impl CommandEngine {
     /// script may touch keys it did not declare, as Redis allows outside
     /// cluster mode), and its writes are bracketed in the log so replay
     /// applies all of them or none.
-    fn run_script(&self, script: &str, keys: Vec<Bytes>, argv: Vec<Bytes>) -> CommandResponse {
+    fn run_eval(
+        &self,
+        script: &str,
+        keys: Vec<Bytes>,
+        argv: Vec<Bytes>,
+        ro_command: bool,
+    ) -> CommandResponse {
+        let (flags, body) = match crate::lua::parse_script(script) {
+            Ok(v) => v,
+            Err(e) => return CommandResponse::error(e),
+        };
+        if ro_command && flags.shebang && !flags.no_writes {
+            return CommandResponse::error(
+                "ERR Can not execute a script with write flag using *_ro command.",
+            );
+        }
+        self.run_script(&body, keys, argv, ro_command || flags.no_writes)
+    }
+
+    fn run_script(
+        &self,
+        script: &str,
+        keys: Vec<Bytes>,
+        argv: Vec<Bytes>,
+        read_only: bool,
+    ) -> CommandResponse {
         let Some(arc) = self.get_self_arc() else {
             return CommandResponse::error("ERR scripting not initialized (call init_self_ref)");
         };
-        let _held = self.shards.lock_all();
-        let _tx = self.aof_transaction();
-        crate::lua::execute_script(&arc, script, keys, argv)
+        // A script can run for long (until SCRIPT KILL): off the async
+        // worker, so the tasks queued on it — the connection that will send
+        // the kill among them — move to another worker first.
+        self.maybe_block_in_place(|| {
+            let _held = self.shards.lock_all();
+            let _tx = self.aof_transaction();
+            let _run = self.script_state.enter(false, "", "eval");
+            crate::lua::execute_script_with(&arc, script, keys, argv, read_only)
+        })
+    }
+
+    fn run_function(
+        &self,
+        name: &str,
+        keys: Vec<Bytes>,
+        argv: Vec<Bytes>,
+        read_only: bool,
+    ) -> CommandResponse {
+        let Some(arc) = self.get_self_arc() else {
+            return CommandResponse::error("ERR scripting not initialized (call init_self_ref)");
+        };
+        self.maybe_block_in_place(|| {
+            let _held = self.shards.lock_all();
+            let _tx = self.aof_transaction();
+            let _run = self.script_state.enter(true, name, "fcall");
+            crate::lua::execute_function(&arc, name, keys, argv, read_only)
+        })
+    }
+
+    /// Where `FUNCTION LOAD`ed libraries are kept between runs.
+    fn functions_path(&self) -> PathBuf {
+        self.persistence.config().dir.join("functions.lib")
+    }
+
+    /// Write the libraries out (after every change), atomically.
+    fn save_functions(&self) {
+        if !self.persistence.config().appendonly && self.persistence.config().save_interval == 0 {
+            return;
+        }
+        let path = self.functions_path();
+        let result = if self.functions.counts().0 == 0 {
+            match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        } else {
+            solikv_persist::fsutil::write_atomic(&path, self.functions.dump())
+        };
+        if let Err(e) = result {
+            tracing::warn!("could not save function libraries to {:?}: {}", path, e);
+        }
+    }
+
+    /// Load the libraries saved by [`save_functions`](Self::save_functions).
+    pub fn load_functions(&self) -> std::io::Result<usize> {
+        let path = self.functions_path();
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let Some(arc) = self.get_self_arc() else {
+            return Ok(0);
+        };
+        let codes = crate::lua::parse_function_dump(&data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let n = codes.len();
+        for code in codes {
+            crate::lua::load_library(&arc, &code, true)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        }
+        Ok(n)
+    }
+
+    fn function_command(&self, args: &[Bytes]) -> CommandResponse {
+        let Some(arc) = self.get_self_arc() else {
+            return CommandResponse::error("ERR scripting not initialized (call init_self_ref)");
+        };
+        let sub = Upper::new(&args[0]);
+        let rest = &args[1..];
+        match sub.as_str() {
+            "LOAD" => {
+                let (replace, code) = match rest {
+                    [code] => (false, code),
+                    [r, code] if r.eq_ignore_ascii_case(b"REPLACE") => (true, code),
+                    _ => return CommandResponse::wrong_arity("function|load"),
+                };
+                let Ok(code) = std::str::from_utf8(code) else {
+                    return CommandResponse::error("ERR library code must be valid UTF-8");
+                };
+                match crate::lua::load_library(&arc, code, replace) {
+                    Ok(name) => {
+                        self.save_functions();
+                        CommandResponse::bulk(Bytes::from(name))
+                    }
+                    Err(e) => CommandResponse::error(e),
+                }
+            }
+            "DELETE" => {
+                let [name] = rest else {
+                    return CommandResponse::wrong_arity("function|delete");
+                };
+                if self.functions.delete(&String::from_utf8_lossy(name)) {
+                    self.save_functions();
+                    CommandResponse::ok()
+                } else {
+                    CommandResponse::error("ERR Library not found")
+                }
+            }
+            "FLUSH" => {
+                if rest.len() > 1
+                    || rest.first().is_some_and(|m| {
+                        !m.eq_ignore_ascii_case(b"ASYNC") && !m.eq_ignore_ascii_case(b"SYNC")
+                    })
+                {
+                    return CommandResponse::syntax_error();
+                }
+                self.functions.flush();
+                self.save_functions();
+                CommandResponse::ok()
+            }
+            "KILL" => self.script_state.kill(true),
+            "STATS" => {
+                let st = &self.script_state;
+                let running = if st.is_running() && st.is_function() {
+                    let (name, cmd) = st.describe();
+                    CommandResponse::array(vec![
+                        CommandResponse::bulk_string("name"),
+                        CommandResponse::bulk(Bytes::from(name)),
+                        CommandResponse::bulk_string("command"),
+                        CommandResponse::array(vec![CommandResponse::bulk(Bytes::from(cmd))]),
+                        CommandResponse::bulk_string("duration_ms"),
+                        CommandResponse::integer(st.elapsed_ms() as i64),
+                    ])
+                } else {
+                    CommandResponse::Nil
+                };
+                let (libs, fns) = self.functions.counts();
+                CommandResponse::array(vec![
+                    CommandResponse::bulk_string("running_script"),
+                    running,
+                    CommandResponse::bulk_string("engines"),
+                    CommandResponse::array(vec![
+                        CommandResponse::bulk_string("LUA"),
+                        CommandResponse::array(vec![
+                            CommandResponse::bulk_string("libraries_count"),
+                            CommandResponse::integer(libs as i64),
+                            CommandResponse::bulk_string("functions_count"),
+                            CommandResponse::integer(fns as i64),
+                        ]),
+                    ]),
+                ])
+            }
+            "LIST" => {
+                let mut pattern: Option<String> = None;
+                let mut with_code = false;
+                let mut i = 0;
+                while i < rest.len() {
+                    if rest[i].eq_ignore_ascii_case(b"WITHCODE") {
+                        with_code = true;
+                        i += 1;
+                    } else if rest[i].eq_ignore_ascii_case(b"LIBRARYNAME") && i + 1 < rest.len() {
+                        pattern = Some(String::from_utf8_lossy(&rest[i + 1]).to_string());
+                        i += 2;
+                    } else {
+                        return CommandResponse::error(format!(
+                            "ERR Unknown argument {}",
+                            String::from_utf8_lossy(&rest[i])
+                        ));
+                    }
+                }
+                let mut out = Vec::new();
+                for lib in self.functions.libraries() {
+                    if pattern
+                        .as_ref()
+                        .is_some_and(|p| !solikv_core::store::glob_match_pub(p, &lib.name))
+                    {
+                        continue;
+                    }
+                    let fns = lib
+                        .functions
+                        .iter()
+                        .map(|f| {
+                            CommandResponse::array(vec![
+                                CommandResponse::bulk_string("name"),
+                                CommandResponse::bulk(Bytes::from(f.name.clone())),
+                                CommandResponse::bulk_string("description"),
+                                f.description
+                                    .as_ref()
+                                    .map(|d| CommandResponse::bulk(Bytes::from(d.clone())))
+                                    .unwrap_or(CommandResponse::Nil),
+                                CommandResponse::bulk_string("flags"),
+                                CommandResponse::Set(
+                                    f.flags
+                                        .names()
+                                        .into_iter()
+                                        .map(CommandResponse::bulk_string)
+                                        .collect(),
+                                ),
+                            ])
+                        })
+                        .collect();
+                    let mut entry = vec![
+                        CommandResponse::bulk_string("library_name"),
+                        CommandResponse::bulk(Bytes::from(lib.name.clone())),
+                        CommandResponse::bulk_string("engine"),
+                        CommandResponse::bulk_string("LUA"),
+                        CommandResponse::bulk_string("functions"),
+                        CommandResponse::array(fns),
+                    ];
+                    if with_code {
+                        entry.push(CommandResponse::bulk_string("library_code"));
+                        entry.push(CommandResponse::bulk(Bytes::from(lib.code.clone())));
+                    }
+                    out.push(CommandResponse::array(entry));
+                }
+                CommandResponse::array(out)
+            }
+            "DUMP" => CommandResponse::bulk(Bytes::from(self.functions.dump())),
+            "RESTORE" => {
+                let (payload, policy) = match rest {
+                    [p] => (p, "APPEND".to_string()),
+                    [p, pol] => (p, Upper::new(pol).to_string()),
+                    _ => return CommandResponse::wrong_arity("function|restore"),
+                };
+                let codes = match crate::lua::parse_function_dump(payload) {
+                    Ok(c) => c,
+                    Err(e) => return CommandResponse::error(e),
+                };
+                match policy.as_str() {
+                    "FLUSH" => self.functions.flush(),
+                    "APPEND" | "REPLACE" => {}
+                    _ => {
+                        return CommandResponse::error(
+                            "ERR Wrong restore policy given, value should be either FLUSH, \
+                             APPEND or REPLACE.",
+                        )
+                    }
+                }
+                for code in codes {
+                    if let Err(e) = crate::lua::load_library(&arc, &code, policy == "REPLACE") {
+                        self.save_functions();
+                        return CommandResponse::error(e);
+                    }
+                }
+                self.save_functions();
+                CommandResponse::ok()
+            }
+            "HELP" => CommandResponse::array(
+                [
+                    "FUNCTION <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                    "LOAD [REPLACE] <FUNCTION CODE>",
+                    "DELETE <LIBRARY NAME>",
+                    "LIST [LIBRARYNAME PATTERN] [WITHCODE]",
+                    "KILL",
+                    "STATS",
+                    "FLUSH [ASYNC|SYNC]",
+                    "DUMP",
+                    "RESTORE <PAYLOAD> [FLUSH|APPEND|REPLACE]",
+                ]
+                .iter()
+                .map(|l| CommandResponse::simple(l))
+                .collect(),
+            ),
+            _ => CommandResponse::error(format!(
+                "ERR unknown subcommand '{}'. Try FUNCTION HELP.",
+                sub.to_lowercase()
+            )),
+        }
+    }
+
+    /// ACL check of a command a script runs (see `crate::acl`).
+    pub(crate) fn script_acl_check(
+        &self,
+        spec: &crate::commands::CommandSpec,
+        args: &[Bytes],
+    ) -> Result<(), String> {
+        let user = CURRENT_CLIENT.with(|c| c.borrow().1.clone());
+        let Some(user) = user else {
+            return Ok(());
+        };
+        self.acl.check(&user, spec, args).map_err(|d| {
+            self.acl
+                .log_denial(&user.name, &d, crate::acl::Context::Lua, String::new());
+            let msg = d.message(&user.name);
+            // Redis' wording from a script.
+            match d {
+                crate::acl::Denied::Command(_) => format!(
+                    "NOPERM User {} has no permissions to run the '{}' command",
+                    user.name,
+                    spec.name.to_lowercase()
+                ),
+                _ => msg,
+            }
+        })
+    }
+
+    /// Feed a command a script runs to `MONITOR` clients.
+    pub(crate) fn feed_monitor_script(&self, name: &str, args: &[Bytes]) {
+        if self.stats.monitoring() {
+            self.stats.feed_monitor(current_db(), "lua", name, args);
+        }
     }
 }
 
@@ -4526,281 +5268,6 @@ impl CommandEngine {
             )),
         }
     }
-
-    /// Every parameter `CONFIG GET` reports, with its current value.
-    fn config_params(&self) -> Vec<(&'static str, String)> {
-        let cfg = self.persistence.config();
-        let yes_no = |b: bool| if b { "yes" } else { "no" }.to_string();
-        vec![
-            ("databases", self.databases.to_string()),
-            (
-                "save",
-                if cfg.save_interval > 0 {
-                    format!("{} 1", cfg.save_interval)
-                } else {
-                    String::new()
-                },
-            ),
-            ("appendonly", yes_no(cfg.appendonly)),
-            (
-                "appendfsync",
-                match cfg.fsync {
-                    solikv_persist::FsyncPolicy::Always => "always",
-                    solikv_persist::FsyncPolicy::Everysec => "everysec",
-                    solikv_persist::FsyncPolicy::No => "no",
-                }
-                .to_string(),
-            ),
-            ("dir", cfg.dir.display().to_string()),
-            ("dbfilename", format!("{}.rdb", cfg.dbfilename)),
-            (
-                "appenddirname",
-                solikv_persist::aof::AOF_DIRNAME.to_string(),
-            ),
-            (
-                "auto-aof-rewrite-percentage",
-                cfg.auto_rewrite_percentage.to_string(),
-            ),
-            (
-                "auto-aof-rewrite-min-size",
-                cfg.auto_rewrite_min_size.to_string(),
-            ),
-            (
-                "notify-keyspace-events",
-                flags_to_string(self.notify_flags.load(Ordering::Relaxed)),
-            ),
-            ("port", self.tcp_port.load(Ordering::Relaxed).to_string()),
-            (
-                "maxmemory",
-                self.maxmemory.load(Ordering::Relaxed).to_string(),
-            ),
-            (
-                "maxmemory-policy",
-                self.maxmemory_policy().name().to_string(),
-            ),
-            (
-                "maxmemory-samples",
-                self.maxmemory_samples.load(Ordering::Relaxed).to_string(),
-            ),
-        ]
-    }
-
-    fn config_command(&self, args: &[Bytes]) -> CommandResponse {
-        let Some(sub) = args.first() else {
-            return CommandResponse::wrong_arity("config");
-        };
-        let sub = Upper::new(sub);
-        match sub.as_str() {
-            "GET" => {
-                if args.len() < 2 {
-                    return CommandResponse::wrong_arity("config|get");
-                }
-                let params = self.config_params();
-                let mut out = Vec::new();
-                let mut seen = std::collections::HashSet::new();
-                for pat in &args[1..] {
-                    let pat = String::from_utf8_lossy(pat);
-                    for (name, value) in &params {
-                        if config_glob(&pat, name) && seen.insert(*name) {
-                            out.push(CommandResponse::bulk_string(name));
-                            out.push(CommandResponse::bulk(Bytes::from(value.clone())));
-                        }
-                    }
-                }
-                CommandResponse::array(out)
-            }
-            "SET" => {
-                if args.len() < 3 || args.len().is_multiple_of(2) {
-                    return CommandResponse::wrong_arity("config|set");
-                }
-                let known: Vec<&str> = self.config_params().iter().map(|(n, _)| *n).collect();
-                // Validate all first: Redis applies all or none.
-                for pair in args[1..].chunks(2) {
-                    let param = String::from_utf8_lossy(&pair[0]).to_ascii_lowercase();
-                    let value = String::from_utf8_lossy(&pair[1]);
-                    let bad_value = match param.as_str() {
-                        "notify-keyspace-events" => false,
-                        "maxmemory" => solikv_core::memory::parse_size(&value).is_none(),
-                        "maxmemory-policy" => EvictionPolicy::parse(&value).is_none(),
-                        "maxmemory-samples" => {
-                            !matches!(value.parse::<usize>(), Ok(n) if (1..=64).contains(&n))
-                        }
-                        p if known.contains(&p) => {
-                            return CommandResponse::error(format!(
-                                "ERR CONFIG SET failed (possibly related to argument '{}') - \
-                                 can't set immutable config",
-                                param
-                            ));
-                        }
-                        _ => {
-                            return CommandResponse::error(format!(
-                                "ERR Unknown option or number of arguments for CONFIG SET - '{}'",
-                                param
-                            ));
-                        }
-                    };
-                    if bad_value {
-                        return CommandResponse::error(format!(
-                            "ERR CONFIG SET failed (possibly related to argument '{}') - \
-                             argument couldn't be parsed into an integer or is invalid",
-                            param
-                        ));
-                    }
-                }
-                for pair in args[1..].chunks(2) {
-                    let param = String::from_utf8_lossy(&pair[0]).to_ascii_lowercase();
-                    let value = String::from_utf8_lossy(&pair[1]);
-                    match param.as_str() {
-                        "notify-keyspace-events" => self
-                            .notify_flags
-                            .store(parse_notify_flags(&value), Ordering::Relaxed),
-                        "maxmemory" => {
-                            self.set_maxmemory(solikv_core::memory::parse_size(&value).unwrap_or(0))
-                        }
-                        "maxmemory-policy" => {
-                            if let Some(p) = EvictionPolicy::parse(&value) {
-                                self.set_maxmemory_policy(p);
-                            }
-                        }
-                        "maxmemory-samples" => self
-                            .maxmemory_samples
-                            .store(value.parse().unwrap_or(5), Ordering::Relaxed),
-                        _ => {}
-                    }
-                }
-                CommandResponse::ok()
-            }
-            "RESETSTAT" => {
-                self.clients.reset_stats();
-                CommandResponse::ok()
-            }
-            "REWRITE" => CommandResponse::error("ERR The server is running without a config file"),
-            _ => CommandResponse::error(format!(
-                "ERR unknown subcommand '{}'. Try CONFIG HELP.",
-                sub.to_lowercase()
-            )),
-        }
-    }
-
-    fn info(&self, args: &[Bytes]) -> CommandResponse {
-        const DEFAULT: &[&str] = &[
-            "server",
-            "clients",
-            "memory",
-            "persistence",
-            "stats",
-            "replication",
-            "cpu",
-            "keyspace",
-        ];
-        let mut wanted: Vec<String> = args
-            .iter()
-            .map(|a| String::from_utf8_lossy(a).to_ascii_lowercase())
-            .collect();
-        if wanted.is_empty()
-            || wanted
-                .iter()
-                .any(|w| w == "all" || w == "everything" || w == "default")
-        {
-            wanted = DEFAULT.iter().map(|s| s.to_string()).collect();
-        }
-        let mut out = String::new();
-        for section in DEFAULT {
-            if !wanted.iter().any(|w| w == section) {
-                continue;
-            }
-            if !out.is_empty() {
-                out.push_str("\r\n");
-            }
-            out.push_str(&self.info_section(section));
-        }
-        CommandResponse::bulk(Bytes::from(out))
-    }
-
-    fn info_section(&self, section: &str) -> String {
-        let uptime = self.start_time.elapsed().as_secs();
-        match section {
-            "server" => format!(
-                "# Server\r\n\
-                 redis_version:7.2.0\r\n\
-                 solikv_version:{}\r\n\
-                 redis_mode:standalone\r\n\
-                 os:{} {}\r\n\
-                 arch_bits:{}\r\n\
-                 process_id:{}\r\n\
-                 tcp_port:{}\r\n\
-                 uptime_in_seconds:{}\r\n\
-                 uptime_in_days:{}\r\n\
-                 executable:solikv\r\n",
-                env!("CARGO_PKG_VERSION"),
-                std::env::consts::OS,
-                std::env::consts::ARCH,
-                usize::BITS,
-                std::process::id(),
-                self.tcp_port.load(Ordering::Relaxed),
-                uptime,
-                uptime / 86400,
-            ),
-            "clients" => format!(
-                "# Clients\r\nconnected_clients:{}\r\nblocked_clients:{}\r\n\
-                 total_blocking_keys:{}\r\n",
-                self.clients.count(),
-                self.blocking.blocked_clients(),
-                self.blocking.blocking_keys(),
-            ),
-            "memory" => {
-                let used = solikv_core::memory::used() as u64;
-                let max = self.maxmemory.load(Ordering::Relaxed);
-                format!(
-                    "# Memory\r\n\
-                     used_memory:{}\r\n\
-                     used_memory_human:{}\r\n\
-                     maxmemory:{}\r\n\
-                     maxmemory_human:{}\r\n\
-                     maxmemory_policy:{}\r\n\
-                     mem_allocator:mimalloc\r\n",
-                    used,
-                    solikv_core::memory::human(used),
-                    max,
-                    solikv_core::memory::human(max),
-                    self.maxmemory_policy().name(),
-                )
-            }
-            "persistence" => self.persistence.stats.info_section(self.dirty()),
-            "stats" => format!(
-                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
-                 expired_keys:{}\r\nevicted_keys:{}\r\n",
-                self.clients.connections_received(),
-                self.clients.commands_processed(),
-                self.shards.expired_keys(),
-                self.shards.evicted_keys(),
-            ),
-            "replication" => format!(
-                "# Replication\r\nrole:master\r\nconnected_slaves:0\r\nmaster_repl_offset:{}\r\n",
-                self.replication_offset.load(Ordering::Relaxed)
-            ),
-            "cpu" => "# CPU\r\n".to_string(),
-            "keyspace" => {
-                let mut out = String::from("# Keyspace\r\n");
-                for db in 0..self.databases {
-                    let (mut keys, mut expires) = (0usize, 0usize);
-                    for shard in self.shards.all_shards() {
-                        let (k, e) = shard.with_store(|s| (s.dbsize_of(db), s.expires_of(db)));
-                        keys += k;
-                        expires += e;
-                    }
-                    if keys > 0 {
-                        out.push_str(&format!(
-                            "db{}:keys={},expires={},avg_ttl=0\r\n",
-                            db, keys, expires
-                        ));
-                    }
-                }
-                out
-            }
-            _ => String::new(),
-        }
-    }
 }
 
 /// An argument upper-cased for matching an option or subcommand name,
@@ -4858,6 +5325,36 @@ fn args_preview(args: &[Bytes]) -> String {
         .map(|a| format!("'{}'", String::from_utf8_lossy(a)))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// `EVAL`/`FCALL`'s `<script|name> numkeys key… arg…` → (keys, args).
+fn split_numkeys(args: &[Bytes]) -> Result<(Vec<Bytes>, Vec<Bytes>), CommandResponse> {
+    let text = std::str::from_utf8(&args[1]).unwrap_or("");
+    let too_many =
+        || CommandResponse::error("ERR Number of keys can't be greater than number of args");
+    let numkeys = match text.parse::<u64>() {
+        Ok(n) => n,
+        Err(_) if text.parse::<i64>().is_ok_and(|n| n < 0) => {
+            return Err(CommandResponse::error(
+                "ERR Number of keys can't be negative",
+            ))
+        }
+        // All digits but past u64: too many keys, not "not a number".
+        Err(_) if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) => {
+            return Err(too_many())
+        }
+        Err(_) => {
+            return Err(CommandResponse::error(
+                "ERR value is not an integer or out of range",
+            ))
+        }
+    };
+    let keys_start = usize::try_from(numkeys)
+        .ok()
+        .and_then(|n| n.checked_add(2))
+        .filter(|&s| s <= args.len())
+        .ok_or_else(too_many)?;
+    Ok((args[2..keys_start].to_vec(), args[keys_start..].to_vec()))
 }
 
 fn parse_i64_arg(b: &[u8]) -> Option<i64> {

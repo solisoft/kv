@@ -23,8 +23,21 @@ use solikv_resp::{CommandDecoder, Resolved};
 use solikv_cluster::ClusterManager;
 use solikv_core::CommandResponse;
 
-/// Maximum number of concurrent client connections.
-const MAX_CONNECTIONS: usize = 10_000;
+/// One open connection, counted against `maxclients` while it lives.
+struct LiveConn(Arc<std::sync::atomic::AtomicUsize>);
+
+impl LiveConn {
+    fn new(live: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        live.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(live)
+    }
+}
+
+impl Drop for LiveConn {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 const MAX_AUTH_FAILURES: u32 = 10;
 const AUTH_COOLDOWN_SECS: u64 = 30;
@@ -144,25 +157,39 @@ pub async fn run_with_limits(
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("RESP server listening on {}", addr);
     let tls_acceptor = tls_config.map(|c| TlsAcceptor::from(Arc::new(c)));
+    // `requirepass` is the default user's password.
+    if let Some(p) = &password {
+        engine.acl().set_requirepass(Some(p.as_str()));
+    }
 
-    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let auth_tracker = Arc::new(AuthFailureTracker::default());
 
     loop {
         let (socket, peer_addr) = listener.accept().await?;
 
-        let permit = match conn_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                tracing::warn!(
-                    "Connection limit reached ({}), rejecting {}",
-                    MAX_CONNECTIONS,
-                    peer_addr
-                );
-                drop(socket);
-                continue;
-            }
-        };
+        // `maxclients` (CONFIG SET-able), answered as Redis does.
+        if live.load(std::sync::atomic::Ordering::Relaxed) >= engine.maxclients() {
+            tracing::warn!(
+                "Connection limit reached ({}), rejecting {}",
+                engine.maxclients(),
+                peer_addr
+            );
+            engine
+                .stats()
+                .rejected_connections
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::spawn(async move {
+                let mut socket = socket;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    socket.write_all(b"-ERR max number of clients reached\r\n"),
+                )
+                .await;
+            });
+            continue;
+        }
+        let permit = LiveConn::new(live.clone());
 
         // TCP_NODELAY: disable Nagle's algorithm for lower latency. Set on
         // the underlying TcpStream before any TLS wrap.
@@ -242,10 +269,13 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
     let mut read_buf = BytesMut::with_capacity(65536);
     let mut write_buf = BytesMut::with_capacity(65536);
-    let mut conn = ClientConnection::new(peer_addr, password.is_some());
+    let mut conn = ClientConnection::new(peer_addr, !engine.acl().default_auto_auth());
     // Database, MULTI queue, watches, CLIENT metadata: engine-side state.
     let mut session = engine.new_session(peer_addr.to_string(), local_addr);
     let info = session.info.clone();
+    // Out-of-band messages for this connection (tracking invalidations).
+    let (push_tx, mut push_rx) = mpsc::unbounded_channel::<solikv_engine::tracking::Push>();
+    info.set_push(push_tx);
 
     let mut decoder = CommandDecoder::new();
     loop {
@@ -287,15 +317,20 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 return Ok(());
             }
             prepare_read_buf(&mut read_buf, decoder.missing().min(cap));
+            let idle_timeout = limits.idle_timeout.or_else(|| {
+                let t = engine.idle_timeout();
+                (t > 0).then(|| std::time::Duration::from_secs(t))
+            });
             let read = async {
                 // `CLIENT KILL` from another connection ends this one even
-                // while it waits for input.
+                // while it waits for input; a push is written as it comes.
                 tokio::select! {
-                    r = socket.read_buf(&mut read_buf) => Some(r),
-                    _ = info.killed() => None,
+                    r = socket.read_buf(&mut read_buf) => Waited::Read(r),
+                    _ = info.killed() => Waited::Killed,
+                    p = push_rx.recv() => Waited::Push(p),
                 }
             };
-            let n = match (conn.authenticated, auth_deadline, limits.idle_timeout) {
+            let n = match (conn.authenticated, auth_deadline, idle_timeout) {
                 // Not yet authenticated: the whole connection has until the
                 // deadline, not each read — a byte every few seconds must not
                 // keep a slot forever.
@@ -311,6 +346,22 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     Err(_) => return Ok(()),
                 },
                 _ => read.await,
+            };
+            let n = match n {
+                Waited::Read(r) => Some(r),
+                Waited::Killed => None,
+                Waited::Push(Some(p)) => {
+                    encode_push(&p, session.resp, false, &mut write_buf);
+                    while let Ok(p) = push_rx.try_recv() {
+                        encode_push(&p, session.resp, false, &mut write_buf);
+                    }
+                    if !write_buf.is_empty() {
+                        socket.write_all(&write_buf).await?;
+                        write_buf.clear();
+                    }
+                    continue;
+                }
+                Waited::Push(None) => continue,
             };
             let Some(n) = n else {
                 return Ok(()); // killed
@@ -343,7 +394,21 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     encode_frame(&moved_frame, &mut write_buf);
                     continue;
                 }
+                if engine.script_running() {
+                    if !write_buf.is_empty() {
+                        socket.write_all(&write_buf).await?;
+                        write_buf.clear();
+                    }
+                    if let Some(busy) = engine.script_gate(&cmd.name, &cmd.args).await {
+                        encode_response(&busy, &mut write_buf);
+                        continue;
+                    }
+                }
                 let resp = if engine.is_blocking_form(&cmd.name, &cmd.args) {
+                    if let Some(denied) = engine.acl_gate(&mut session, &cmd.name, &cmd.args) {
+                        encode_response(&denied, &mut write_buf);
+                        continue;
+                    }
                     match run_blocking(
                         &mut socket,
                         &mut read_buf,
@@ -363,10 +428,10 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 } else {
                     engine.execute_session(&mut session, &cmd.name, &cmd.args)
                 };
-                drop(cmd);
                 if session.reply_allowed() {
-                    encode_response(&resp, &mut write_buf);
+                    encode_for(session.resp, &cmd.name, &cmd.args, resp, &mut write_buf);
                 }
+                drop(cmd);
                 // A long pipeline's replies go out as they accumulate
                 // instead of all being held until the batch ends.
                 if write_buf.len() >= FLUSH_AT {
@@ -389,9 +454,10 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         socket.write_all(&write_buf).await?;
                         return Ok(());
                     }
-                    let frame = match check_auth(&password, &cmd.args) {
-                        Ok(()) => {
+                    let frame = match acl_auth(&engine, &cmd.args) {
+                        Ok(user) => {
                             conn.authenticated = true;
+                            session.set_user(user, engine.acl().version());
                             auth_tracker.record_success(&ip);
                             RespFrame::ok()
                         }
@@ -405,6 +471,12 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         Err(AuthError::Wrong) => {
                             auth_tracker.record_failure(&ip);
                             tracing::warn!("Failed AUTH attempt from {}", ip);
+                            let who = if cmd.args.len() == 2 {
+                                String::from_utf8_lossy(&cmd.args[0]).to_string()
+                            } else {
+                                "default".to_string()
+                            };
+                            engine.acl().log_auth_failure(&who, info.describe());
                             RespFrame::error(WRONGPASS)
                         }
                     };
@@ -423,7 +495,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         socket.write_all(&write_buf).await?;
                         return Ok(());
                     }
-                    let frame = hello(
+                    let reply = hello(
                         &cmd.args,
                         &password,
                         &mut conn.authenticated,
@@ -433,7 +505,11 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         &mut session,
                         cluster.is_some(),
                     );
-                    encode_frame(&frame, &mut write_buf);
+                    if session.resp >= 3 {
+                        encode_response3(&reply, &mut write_buf);
+                    } else {
+                        encode_response(&reply, &mut write_buf);
+                    }
                     continue;
                 }
 
@@ -446,13 +522,75 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     continue;
                 }
 
+                if !session.in_multi()
+                    && matches!(
+                        cmd.name.as_str(),
+                        "SUBSCRIBE" | "PSUBSCRIBE" | "SSUBSCRIBE" | "MONITOR"
+                    )
+                {
+                    if let Some(denied) = engine.acl_gate(&mut session, &cmd.name, &cmd.args) {
+                        encode_response(&denied, &mut write_buf);
+                        continue;
+                    }
+                }
                 match cmd.name.as_str() {
+                    "SSUBSCRIBE" if !session.in_multi() => {
+                        for channel in &cmd.args {
+                            let key = solikv_pubsub::broker::shard_channel(channel);
+                            if !conn.ssubscriptions.contains(&key) {
+                                conn.ssubscriptions.push(key);
+                            }
+                            encode_frame_p(
+                                session.resp,
+                                &RespFrame::Array(vec![
+                                    RespFrame::BulkString(Bytes::from("ssubscribe")),
+                                    RespFrame::BulkString(channel.clone()),
+                                    RespFrame::Integer(conn.ssubscriptions.len() as i64),
+                                ]),
+                                &mut write_buf,
+                            );
+                        }
+                        if !write_buf.is_empty() {
+                            socket.write_all(&write_buf).await?;
+                            write_buf.clear();
+                        }
+                        return handle_pubsub_mode(
+                            &mut socket,
+                            &pubsub,
+                            &engine,
+                            &mut conn,
+                            &mut read_buf,
+                            &mut session,
+                            &info,
+                            &mut push_rx,
+                        )
+                        .await;
+                    }
+                    "SUNSUBSCRIBE" if !session.in_multi() => {
+                        encode_frame_p(
+                            session.resp,
+                            &RespFrame::Array(vec![
+                                RespFrame::BulkString(Bytes::from("sunsubscribe")),
+                                RespFrame::Null,
+                                RespFrame::Integer(0),
+                            ]),
+                            &mut write_buf,
+                        );
+                        continue;
+                    }
+                    "MONITOR" if !session.in_multi() => {
+                        encode_frame(&RespFrame::ok(), &mut write_buf);
+                        socket.write_all(&write_buf).await?;
+                        write_buf.clear();
+                        return monitor_loop(&mut socket, &engine, &info, &mut read_buf).await;
+                    }
                     "SUBSCRIBE" if !session.in_multi() => {
                         // Enter pubsub mode — send confirmations, then enter delivery loop
                         for channel in &cmd.args {
                             conn.subscriptions.push(channel.clone());
                             let count = conn.subscriptions.len() + conn.psubscriptions.len();
-                            encode_frame(
+                            encode_frame_p(
+                                session.resp,
                                 &RespFrame::Array(vec![
                                     RespFrame::BulkString(Bytes::from("subscribe")),
                                     RespFrame::BulkString(channel.clone()),
@@ -474,8 +612,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                             &engine,
                             &mut conn,
                             &mut read_buf,
-                            &password,
+                            &mut session,
                             &info,
+                            &mut push_rx,
                         )
                         .await;
                     }
@@ -485,7 +624,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                                 std::str::from_utf8(pattern_bytes).unwrap_or("").to_string();
                             conn.psubscriptions.push(pattern.clone());
                             let count = conn.subscriptions.len() + conn.psubscriptions.len();
-                            encode_frame(
+                            encode_frame_p(
+                                session.resp,
                                 &RespFrame::Array(vec![
                                     RespFrame::BulkString(Bytes::from("psubscribe")),
                                     RespFrame::BulkString(pattern_bytes.clone()),
@@ -506,8 +646,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                             &engine,
                             &mut conn,
                             &mut read_buf,
-                            &password,
+                            &mut session,
                             &info,
+                            &mut push_rx,
                         )
                         .await;
                     }
@@ -519,7 +660,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                                 conn.subscriptions.retain(|s| s != ch);
                             }
                         }
-                        encode_frame(
+                        encode_frame_p(
+                            session.resp,
                             &RespFrame::Array(vec![
                                 RespFrame::BulkString(Bytes::from("unsubscribe")),
                                 RespFrame::Null,
@@ -540,7 +682,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                                 conn.psubscriptions.retain(|s| s != &pat);
                             }
                         }
-                        encode_frame(
+                        encode_frame_p(
+                            session.resp,
                             &RespFrame::Array(vec![
                                 RespFrame::BulkString(Bytes::from("punsubscribe")),
                                 RespFrame::Null,
@@ -767,6 +910,22 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         continue;
                     }
                 }
+                if engine.script_running() {
+                    if !write_buf.is_empty() {
+                        socket.write_all(&write_buf).await?;
+                        write_buf.clear();
+                    }
+                    if let Some(busy) = engine.script_gate(&cmd.name, &cmd.args).await {
+                        encode_response(&busy, &mut write_buf);
+                        continue;
+                    }
+                }
+                if !session.in_multi() && engine.is_blocking_form(&cmd.name, &cmd.args) {
+                    if let Some(denied) = engine.acl_gate(&mut session, &cmd.name, &cmd.args) {
+                        encode_response(&denied, &mut write_buf);
+                        continue;
+                    }
+                }
                 let response =
                     if !session.in_multi() && engine.is_blocking_form(&cmd.name, &cmd.args) {
                         match run_blocking(
@@ -791,10 +950,11 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 if cmd.name == "RESET" {
                     // Back to the default user: with a password, that is
                     // unauthenticated.
-                    conn.authenticated = password.is_none();
+                    conn.authenticated = engine.acl().default_auto_auth();
+                    session.set_user(engine.acl().default_user(), engine.acl().version());
                 }
                 if session.reply_allowed() {
-                    encode_response(&response, &mut write_buf);
+                    encode_for(session.resp, &cmd.name, &cmd.args, response, &mut write_buf);
                 }
                 if write_buf.len() >= FLUSH_AT {
                     socket.write_all(&write_buf).await?;
@@ -804,6 +964,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         }
 
         // ── Phase 4: Single flush for all responses ──
+        while let Ok(p) = push_rx.try_recv() {
+            encode_push(&p, session.resp, false, &mut write_buf);
+        }
         if !write_buf.is_empty() {
             socket.write_all(&write_buf).await?;
             write_buf.clear();
@@ -813,6 +976,94 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             shrink_after_spike(&mut read_buf);
         }
     }
+}
+
+/// What a connection waiting for input got.
+enum Waited {
+    Read(std::io::Result<usize>),
+    Killed,
+    Push(Option<solikv_engine::tracking::Push>),
+}
+
+/// A tracking invalidation: a RESP3 `invalidate` push, or — for a RESP2
+/// client in pub/sub mode (a `REDIRECT` target) — a message on
+/// `__redis__:invalidate`. A RESP2 client outside pub/sub mode cannot take
+/// out-of-band data; it gets nothing.
+fn encode_push(p: &solikv_engine::tracking::Push, proto: u8, pubsub: bool, dst: &mut BytesMut) {
+    let solikv_engine::tracking::Push::Invalidate(keys) = p;
+    let keys_frame = |dst: &mut BytesMut| match keys {
+        None => dst.extend_from_slice(if proto >= 3 { b"_\r\n" } else { b"$-1\r\n" }),
+        Some(keys) => {
+            array_header(b'*', keys.len(), dst);
+            for k in keys {
+                encode_bulk(k, dst);
+            }
+        }
+    };
+    if proto >= 3 {
+        dst.extend_from_slice(b">2\r\n");
+        encode_bulk(b"invalidate", dst);
+        keys_frame(dst);
+    } else if pubsub {
+        dst.extend_from_slice(b"*3\r\n");
+        encode_bulk(b"message", dst);
+        encode_bulk(b"__redis__:invalidate", dst);
+        keys_frame(dst);
+    }
+}
+
+/// `MONITOR`: every command the server runs, until the client leaves.
+async fn monitor_loop<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut S,
+    engine: &Arc<CommandEngine>,
+    info: &Arc<solikv_engine::session::ClientInfo>,
+    read_buf: &mut BytesMut,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut feed = engine.stats().subscribe_monitor();
+    loop {
+        tokio::select! {
+            line = feed.rx.recv() => match line {
+                Ok(line) => socket.write_all(&line).await?,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return Ok(()),
+            },
+            n = socket.read_buf(read_buf) => {
+                if n? == 0 {
+                    return Ok(());
+                }
+                // Only QUIT/RESET mean anything here.
+                while let Ok(Some((frame, consumed))) = decode_frame(read_buf) {
+                    read_buf.advance(consumed);
+                    if let Ok(cmd) = ParsedCommand::from_frame(frame) {
+                        if cmd.name == "QUIT" || cmd.name == "RESET" {
+                            let _ = socket.write_all(b"+OK\r\n").await;
+                            return Ok(());
+                        }
+                    }
+                }
+                if read_buf.len() > MAX_PUBSUB_READ_BUF {
+                    return Ok(());
+                }
+            }
+            _ = info.killed() => return Ok(()),
+        }
+    }
+}
+
+/// `AUTH [username] password` against the ACL users.
+fn acl_auth(
+    engine: &CommandEngine,
+    args: &[Bytes],
+) -> Result<Arc<solikv_engine::acl::AclUser>, AuthError> {
+    let (user, pass) = match args {
+        [pass] => (None, pass),
+        [user, pass] => (Some(user.as_ref()), pass),
+        _ => return Err(AuthError::Arity),
+    };
+    engine.acl().authenticate(user, pass).map_err(|e| match e {
+        solikv_engine::acl::AuthFailure::NoPassword => AuthError::NoPassword,
+        solikv_engine::acl::AuthFailure::Wrong => AuthError::Wrong,
+    })
 }
 
 /// Replies are written out once this many bytes are pending.
@@ -885,6 +1136,9 @@ fn needs_connection_state(name: &str) -> bool {
             | "CLUSTER"
             | "SELECT"
             | "RESET"
+            | "MONITOR"
+            | "SSUBSCRIBE"
+            | "SUNSUBSCRIBE"
     )
 }
 
@@ -912,7 +1166,8 @@ fn shrink_after_spike(buf: &mut BytesMut) {
 }
 
 /// Encode a reply straight into the output buffer (no intermediate frame
-/// tree).
+/// tree), in RESP2. RESP3-typed replies are flattened the way Redis shows
+/// them to a RESP2 client.
 pub fn encode_response(resp: &CommandResponse, dst: &mut BytesMut) {
     match resp {
         CommandResponse::Ok => dst.extend_from_slice(b"+OK\r\n"),
@@ -923,34 +1178,127 @@ pub fn encode_response(resp: &CommandResponse, dst: &mut BytesMut) {
             write_decimal(dst, *n);
             dst.extend_from_slice(b"\r\n");
         }
-        CommandResponse::BulkString(b) => {
-            dst.reserve(b.len() + 16);
-            dst.extend_from_slice(b"$");
-            write_decimal(dst, b.len() as i64);
-            dst.extend_from_slice(b"\r\n");
-            dst.extend_from_slice(b);
-            dst.extend_from_slice(b"\r\n");
-        }
+        CommandResponse::BulkString(b) => encode_bulk(b, dst),
         CommandResponse::SimpleString(s) => {
             dst.extend_from_slice(b"+");
             dst.extend_from_slice(s);
             dst.extend_from_slice(b"\r\n");
         }
-        CommandResponse::Error(msg) => {
-            dst.extend_from_slice(b"-");
-            dst.extend_from_slice(msg.as_bytes());
-            dst.extend_from_slice(b"\r\n");
-        }
-        CommandResponse::Array(items) => {
-            dst.extend_from_slice(b"*");
-            write_decimal(dst, items.len() as i64);
-            dst.extend_from_slice(b"\r\n");
+        CommandResponse::Error(msg) => encode_error(msg, dst),
+        CommandResponse::Array(items)
+        | CommandResponse::Set(items)
+        | CommandResponse::Push(items) => {
+            array_header(b'*', items.len(), dst);
             for item in items {
                 encode_response(item, dst);
             }
         }
         CommandResponse::Queued => dst.extend_from_slice(b"+QUEUED\r\n"),
+        CommandResponse::Double(d) => encode_bulk(solikv_core::format_double(*d).as_bytes(), dst),
+        CommandResponse::Bool(b) => dst.extend_from_slice(if *b { b":1\r\n" } else { b":0\r\n" }),
+        CommandResponse::Map(pairs) | CommandResponse::Pairs(pairs) => {
+            array_header(b'*', pairs.len() * 2, dst);
+            for (k, v) in pairs {
+                encode_response(k, dst);
+                encode_response(v, dst);
+            }
+        }
+        CommandResponse::Verbatim(_, b) => encode_bulk(b, dst),
     }
+}
+
+/// The same reply in RESP3 (`HELLO 3`): nulls are `_`, and maps, sets,
+/// doubles, booleans and pushes have their own types.
+pub fn encode_response3(resp: &CommandResponse, dst: &mut BytesMut) {
+    match resp {
+        CommandResponse::Nil | CommandResponse::NilArray => dst.extend_from_slice(b"_\r\n"),
+        CommandResponse::Array(items) => {
+            array_header(b'*', items.len(), dst);
+            for item in items {
+                encode_response3(item, dst);
+            }
+        }
+        CommandResponse::Set(items) => {
+            array_header(b'~', items.len(), dst);
+            for item in items {
+                encode_response3(item, dst);
+            }
+        }
+        CommandResponse::Push(items) => {
+            array_header(b'>', items.len(), dst);
+            for item in items {
+                encode_response3(item, dst);
+            }
+        }
+        CommandResponse::Double(d) => {
+            dst.extend_from_slice(b",");
+            dst.extend_from_slice(solikv_core::format_double(*d).as_bytes());
+            dst.extend_from_slice(b"\r\n");
+        }
+        CommandResponse::Bool(b) => dst.extend_from_slice(if *b { b"#t\r\n" } else { b"#f\r\n" }),
+        CommandResponse::Map(pairs) => {
+            array_header(b'%', pairs.len(), dst);
+            for (k, v) in pairs {
+                encode_response3(k, dst);
+                encode_response3(v, dst);
+            }
+        }
+        CommandResponse::Pairs(pairs) => {
+            array_header(b'*', pairs.len(), dst);
+            for (a, b) in pairs {
+                dst.extend_from_slice(b"*2\r\n");
+                encode_response3(a, dst);
+                encode_response3(b, dst);
+            }
+        }
+        CommandResponse::Verbatim(fmt, b) => {
+            dst.extend_from_slice(b"=");
+            write_decimal(dst, (b.len() + 4) as i64);
+            dst.extend_from_slice(b"\r\n");
+            dst.extend_from_slice(fmt.as_bytes());
+            dst.extend_from_slice(b":");
+            dst.extend_from_slice(b);
+            dst.extend_from_slice(b"\r\n");
+        }
+        other => encode_response(other, dst),
+    }
+}
+
+/// Encode `resp`, the reply to `name args…`, for a client speaking `proto`.
+#[inline]
+pub fn encode_for(
+    proto: u8,
+    name: &str,
+    args: &[Bytes],
+    resp: CommandResponse,
+    dst: &mut BytesMut,
+) {
+    if proto >= 3 {
+        encode_response3(&solikv_engine::resp3::shape(name, args, resp), dst);
+    } else {
+        encode_response(&resp, dst);
+    }
+}
+
+fn array_header(kind: u8, n: usize, dst: &mut BytesMut) {
+    dst.extend_from_slice(&[kind]);
+    write_decimal(dst, n as i64);
+    dst.extend_from_slice(b"\r\n");
+}
+
+fn encode_bulk(b: &[u8], dst: &mut BytesMut) {
+    dst.reserve(b.len() + 16);
+    dst.extend_from_slice(b"$");
+    write_decimal(dst, b.len() as i64);
+    dst.extend_from_slice(b"\r\n");
+    dst.extend_from_slice(b);
+    dst.extend_from_slice(b"\r\n");
+}
+
+fn encode_error(msg: &str, dst: &mut BytesMut) {
+    dst.extend_from_slice(b"-");
+    dst.extend_from_slice(msg.as_bytes());
+    dst.extend_from_slice(b"\r\n");
 }
 
 fn write_decimal(dst: &mut BytesMut, n: i64) {
@@ -980,15 +1328,18 @@ const MAX_PUBSUB_READ_BUF: usize = 1024 * 1024;
 /// Uses a fan-in mpsc channel: each subscription spawns a forwarding task from
 /// broadcast::Receiver -> mpsc::UnboundedSender. The main loop select!s between
 /// the fan-in receiver and new frames from the socket.
+#[allow(clippy::too_many_arguments)]
 async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
     socket: &mut S,
     pubsub: &Arc<PubSubBroker>,
-    _engine: &Arc<CommandEngine>,
+    engine: &Arc<CommandEngine>,
     conn: &mut ClientConnection,
     read_buf: &mut BytesMut,
-    _password: &Option<Arc<String>>,
+    session: &mut solikv_engine::Session,
     info: &Arc<solikv_engine::session::ClientInfo>,
+    push_rx: &mut mpsc::UnboundedReceiver<solikv_engine::tracking::Push>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let proto = session.resp;
     // `CLIENT LIST` shows the subscription counts; zeroed when this returns.
     struct SubCounts<'a>(&'a solikv_engine::session::ClientInfo);
     impl Drop for SubCounts<'_> {
@@ -1033,6 +1384,12 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
         let handle = tokio::spawn(forward_broadcast(rx, tx, outbuf.clone()));
         pattern_tasks.insert(pat.clone(), handle);
     }
+    for ch in &conn.ssubscriptions {
+        let rx = pubsub.subscribe(ch.clone());
+        let tx = fan_tx.clone();
+        let handle = tokio::spawn(forward_broadcast(rx, tx, outbuf.clone()));
+        channel_tasks.insert(ch.clone(), handle);
+    }
 
     loop {
         tokio::select! {
@@ -1056,12 +1413,12 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                 let Some(msg) = msg else { break; };
                 // Everything already queued goes out in the same write.
                 let mut drained = msg.size();
-                encode_pubsub_message(&msg, &mut write_buf);
+                encode_pubsub_message(&msg, proto, &mut write_buf);
                 while write_buf.len() < BUF_SIZE {
                     match fan_rx.try_recv() {
                         Ok(m) => {
                             drained += m.size();
-                            encode_pubsub_message(&m, &mut write_buf);
+                            encode_pubsub_message(&m, proto, &mut write_buf);
                         }
                         Err(_) => break,
                     }
@@ -1093,6 +1450,17 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 shrink_after_spike(&mut write_buf);
             }
+            // Tracking invalidations (this client may be a REDIRECT target).
+            p = push_rx.recv() => {
+                if let Some(p) = p {
+                    encode_push(&p, proto, true, &mut write_buf);
+                    while let Ok(p) = push_rx.try_recv() {
+                        encode_push(&p, proto, true, &mut write_buf);
+                    }
+                    socket.write_all(&write_buf).await?;
+                    write_buf.clear();
+                }
+            }
             // Branch 2: new data from the client socket
             n = socket.read_buf(read_buf) => {
                 let n = n?;
@@ -1123,6 +1491,10 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
 
                             match cmd.name.as_str() {
                                 "SUBSCRIBE" => {
+                                    if let Some(denied) = engine.acl_gate(session, "SUBSCRIBE", &cmd.args) {
+                                        encode_response(&denied, &mut write_buf);
+                                        continue;
+                                    }
                                     for channel in &cmd.args {
                                         if !conn.subscriptions.contains(channel) {
                                             conn.subscriptions.push(channel.clone());
@@ -1132,7 +1504,8 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                             channel_tasks.insert(channel.clone(), handle);
                                         }
                                         let count = conn.subscriptions.len() + conn.psubscriptions.len();
-                                        encode_frame(
+                                        encode_frame_p(
+                                            proto,
                                             &RespFrame::Array(vec![
                                                 RespFrame::BulkString(Bytes::from("subscribe")),
                                                 RespFrame::BulkString(channel.clone()),
@@ -1162,7 +1535,8 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                     }
                                     let count = conn.subscriptions.len() + conn.psubscriptions.len();
                                     for ch in &channels_to_remove {
-                                        encode_frame(
+                                        encode_frame_p(
+                                            proto,
                                             &RespFrame::Array(vec![
                                                 RespFrame::BulkString(Bytes::from("unsubscribe")),
                                                 RespFrame::BulkString(ch.clone()),
@@ -1172,7 +1546,8 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                         );
                                     }
                                     if channels_to_remove.is_empty() {
-                                        encode_frame(
+                                        encode_frame_p(
+                                            proto,
                                             &RespFrame::Array(vec![
                                                 RespFrame::BulkString(Bytes::from("unsubscribe")),
                                                 RespFrame::Null,
@@ -1182,7 +1557,83 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                         );
                                     }
                                     // Exit pubsub mode if no subscriptions remain
-                                    if count == 0 {
+                                    if !conn.is_subscribed() {
+                                        if !write_buf.is_empty() {
+                                            socket.write_all(&write_buf).await?;
+                                            write_buf.clear();
+                                        }
+                                        return Ok(());
+                                    }
+                                }
+                                "SSUBSCRIBE" => {
+                                    if let Some(denied) = engine.acl_gate(session, "SSUBSCRIBE", &cmd.args) {
+                                        encode_response(&denied, &mut write_buf);
+                                        continue;
+                                    }
+                                    for channel in &cmd.args {
+                                        let key = solikv_pubsub::broker::shard_channel(channel);
+                                        if !conn.ssubscriptions.contains(&key) {
+                                            conn.ssubscriptions.push(key.clone());
+                                            let rx = pubsub.subscribe(key.clone());
+                                            let tx = fan_tx.clone();
+                                            let handle = tokio::spawn(forward_broadcast(rx, tx, outbuf.clone()));
+                                            channel_tasks.insert(key, handle);
+                                        }
+                                        encode_frame_p(
+                                            proto,
+                                            &RespFrame::Array(vec![
+                                                RespFrame::BulkString(Bytes::from("ssubscribe")),
+                                                RespFrame::BulkString(channel.clone()),
+                                                RespFrame::Integer(conn.ssubscriptions.len() as i64),
+                                            ]),
+                                            &mut write_buf,
+                                        );
+                                    }
+                                }
+                                "SUNSUBSCRIBE" => {
+                                    let removed: Vec<Bytes> = if cmd.args.is_empty() {
+                                        std::mem::take(&mut conn.ssubscriptions)
+                                    } else {
+                                        let mut removed = Vec::new();
+                                        for ch in &cmd.args {
+                                            let key = solikv_pubsub::broker::shard_channel(ch);
+                                            if conn.ssubscriptions.contains(&key) {
+                                                conn.ssubscriptions.retain(|s| s != &key);
+                                                removed.push(key);
+                                            }
+                                        }
+                                        removed
+                                    };
+                                    for key in &removed {
+                                        if let Some(h) = channel_tasks.remove(key) {
+                                            h.abort();
+                                        }
+                                    }
+                                    let n = conn.ssubscriptions.len() as i64;
+                                    if removed.is_empty() {
+                                        encode_frame_p(
+                                            proto,
+                                            &RespFrame::Array(vec![
+                                                RespFrame::BulkString(Bytes::from("sunsubscribe")),
+                                                RespFrame::Null,
+                                                RespFrame::Integer(n),
+                                            ]),
+                                            &mut write_buf,
+                                        );
+                                    }
+                                    for key in &removed {
+                                        let (name, _) = solikv_pubsub::broker::split_shard(key);
+                                        encode_frame_p(
+                                            proto,
+                                            &RespFrame::Array(vec![
+                                                RespFrame::BulkString(Bytes::from("sunsubscribe")),
+                                                RespFrame::BulkString(name),
+                                                RespFrame::Integer(n),
+                                            ]),
+                                            &mut write_buf,
+                                        );
+                                    }
+                                    if !conn.is_subscribed() {
                                         if !write_buf.is_empty() {
                                             socket.write_all(&write_buf).await?;
                                             write_buf.clear();
@@ -1191,6 +1642,10 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                     }
                                 }
                                 "PSUBSCRIBE" => {
+                                    if let Some(denied) = engine.acl_gate(session, "PSUBSCRIBE", &cmd.args) {
+                                        encode_response(&denied, &mut write_buf);
+                                        continue;
+                                    }
                                     for pat_bytes in &cmd.args {
                                         let pat = std::str::from_utf8(pat_bytes).unwrap_or("").to_string();
                                         if !conn.psubscriptions.contains(&pat) {
@@ -1201,7 +1656,8 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                             pattern_tasks.insert(pat.clone(), handle);
                                         }
                                         let count = conn.subscriptions.len() + conn.psubscriptions.len();
-                                        encode_frame(
+                                        encode_frame_p(
+                                            proto,
                                             &RespFrame::Array(vec![
                                                 RespFrame::BulkString(Bytes::from("psubscribe")),
                                                 RespFrame::BulkString(pat_bytes.clone()),
@@ -1232,7 +1688,8 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                     }
                                     let count = conn.subscriptions.len() + conn.psubscriptions.len();
                                     for pat in &pats_to_remove {
-                                        encode_frame(
+                                        encode_frame_p(
+                                            proto,
                                             &RespFrame::Array(vec![
                                                 RespFrame::BulkString(Bytes::from("punsubscribe")),
                                                 RespFrame::BulkString(Bytes::from(pat.clone())),
@@ -1242,7 +1699,8 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                         );
                                     }
                                     if pats_to_remove.is_empty() {
-                                        encode_frame(
+                                        encode_frame_p(
+                                            proto,
                                             &RespFrame::Array(vec![
                                                 RespFrame::BulkString(Bytes::from("punsubscribe")),
                                                 RespFrame::Null,
@@ -1251,7 +1709,7 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                             &mut write_buf,
                                         );
                                     }
-                                    if count == 0 {
+                                    if !conn.is_subscribed() {
                                         if !write_buf.is_empty() {
                                             socket.write_all(&write_buf).await?;
                                             write_buf.clear();
@@ -1259,9 +1717,14 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                         return Ok(());
                                     }
                                 }
+                                "PING" if proto >= 3 => {
+                                    let r = engine.execute_session(session, "PING", &cmd.args);
+                                    encode_response3(&r, &mut write_buf);
+                                }
                                 "PING" => {
                                     if cmd.args.is_empty() {
-                                        encode_frame(
+                                        encode_frame_p(
+                                            proto,
                                             &RespFrame::Array(vec![
                                                 RespFrame::BulkString(Bytes::from("pong")),
                                                 RespFrame::BulkString(Bytes::from("")),
@@ -1269,7 +1732,8 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                             &mut write_buf,
                                         );
                                     } else {
-                                        encode_frame(
+                                        encode_frame_p(
+                                            proto,
                                             &RespFrame::Array(vec![
                                                 RespFrame::BulkString(Bytes::from("pong")),
                                                 RespFrame::BulkString(cmd.args[0].clone()),
@@ -1284,6 +1748,7 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                     for (_, h) in pattern_tasks.drain() { h.abort(); }
                                     conn.subscriptions.clear();
                                     conn.psubscriptions.clear();
+                                    conn.ssubscriptions.clear();
                                     if cmd.name == "QUIT" {
                                         encode_frame(&RespFrame::ok(), &mut write_buf);
                                         if !write_buf.is_empty() {
@@ -1297,6 +1762,13 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                         write_buf.clear();
                                     }
                                     return Ok(());
+                                }
+                                // RESP3 lets a subscribed client run any command.
+                                _ if proto >= 3 => {
+                                    let r = engine.execute_session(session, &cmd.name, &cmd.args);
+                                    if session.reply_allowed() {
+                                        encode_for(proto, &cmd.name, &cmd.args, r, &mut write_buf);
+                                    }
                                 }
                                 _ => {
                                     encode_frame(
@@ -1385,8 +1857,25 @@ async fn forward_broadcast(
     }
 }
 
+/// A frame as a RESP3 push when the client speaks RESP3 (pub/sub replies
+/// are pushes there), otherwise as is.
+fn encode_frame_p(proto: u8, frame: &RespFrame, dst: &mut BytesMut) {
+    match frame {
+        RespFrame::Array(items) if proto >= 3 => {
+            array_header(b'>', items.len(), dst);
+            for item in items {
+                match item {
+                    RespFrame::Null => dst.extend_from_slice(b"_\r\n"),
+                    other => encode_frame(other, dst),
+                }
+            }
+        }
+        other => encode_frame(other, dst),
+    }
+}
+
 /// `message` / `pmessage` push, encoded directly.
-fn encode_pubsub_message(msg: &PubSubMessage, dst: &mut BytesMut) {
+fn encode_pubsub_message(msg: &PubSubMessage, proto: u8, dst: &mut BytesMut) {
     fn bulk(dst: &mut BytesMut, b: &[u8]) {
         dst.extend_from_slice(b"$");
         write_decimal(dst, b.len() as i64);
@@ -1396,13 +1885,17 @@ fn encode_pubsub_message(msg: &PubSubMessage, dst: &mut BytesMut) {
     }
     match &msg.pattern {
         Some(p) => {
-            dst.extend_from_slice(b"*4\r\n");
+            dst.extend_from_slice(if proto >= 3 { b">4\r\n" } else { b"*4\r\n" });
             bulk(dst, b"pmessage");
             bulk(dst, p);
         }
         None => {
-            dst.extend_from_slice(b"*3\r\n");
-            bulk(dst, b"message");
+            dst.extend_from_slice(if proto >= 3 { b">3\r\n" } else { b"*3\r\n" });
+            let (channel, shard) = solikv_pubsub::broker::split_shard(&msg.channel);
+            bulk(dst, if shard { b"smessage" } else { b"message" });
+            bulk(dst, &channel);
+            bulk(dst, &msg.message);
+            return;
         }
     }
     bulk(dst, &msg.channel);
@@ -1491,18 +1984,6 @@ fn parse_slot_range(text: &str) -> Option<(u16, u16)> {
     (start <= end && end < 16384).then_some((start, end))
 }
 
-/// Constant-time byte comparison to prevent timing side-channel attacks on password checks.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 /// Convert our CommandResponse to a RESP frame for the wire.
 /// Redis 6+'s reply to a failed AUTH.
 const WRONGPASS: &str = "WRONGPASS invalid username-password pair or user is disabled.";
@@ -1513,52 +1994,33 @@ enum AuthError {
     Wrong,
 }
 
-/// `AUTH password` or `AUTH username password`. There is one user,
-/// `default` (ACLs are not implemented): any other name is refused like a
-/// wrong password, so URLs of the form `redis://default:pw@host` work.
-fn check_auth(password: &Option<Arc<String>>, args: &[Bytes]) -> Result<(), AuthError> {
-    let (user, pass) = match args {
-        [pass] => (None, pass),
-        [user, pass] => (Some(user), pass),
-        _ => return Err(AuthError::Arity),
-    };
-    if user.is_some_and(|u| u.as_ref() != b"default") {
-        return Err(AuthError::Wrong);
-    }
-    match password {
-        // No password: `AUTH pw` is an error; `AUTH default <anything>`
-        // succeeds, as for Redis' passwordless default user.
-        None if user.is_none() => Err(AuthError::NoPassword),
-        None => Ok(()),
-        Some(expected) if constant_time_eq(pass, expected.as_bytes()) => Ok(()),
-        Some(_) => Err(AuthError::Wrong),
-    }
-}
-
-/// `HELLO [protover [AUTH username password] [SETNAME clientname]]`.
-/// Only RESP2 is spoken: `HELLO 3` gets `NOPROTO`, which clients take as
-/// "fall back to RESP2".
+/// `HELLO [protover [AUTH username password] [SETNAME clientname]]`:
+/// switch the connection to RESP2 or RESP3, optionally authenticating and
+/// naming it, and describe the server.
 #[allow(clippy::too_many_arguments)]
 fn hello(
     args: &[Bytes],
-    password: &Option<Arc<String>>,
+    _password: &Option<Arc<String>>,
     authenticated: &mut bool,
     tracker: &AuthFailureTracker,
     ip: &str,
     engine: &CommandEngine,
     session: &mut solikv_engine::Session,
     cluster: bool,
-) -> RespFrame {
+) -> CommandResponse {
     let mut i = 0;
+    let mut proto = session.resp;
     if let Some(v) = args.first() {
         match std::str::from_utf8(v)
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
         {
-            Some(2) => {}
-            Some(_) => return RespFrame::error("NOPROTO unsupported protocol version"),
+            Some(p @ (2 | 3)) => proto = p as u8,
+            Some(_) => return CommandResponse::error("NOPROTO unsupported protocol version"),
             None => {
-                return RespFrame::error("ERR Protocol version is not an integer or out of range")
+                return CommandResponse::error(
+                    "ERR Protocol version is not an integer or out of range",
+                )
             }
         }
         i = 1;
@@ -1568,17 +2030,18 @@ fn hello(
         let opt = String::from_utf8_lossy(&args[i]).to_ascii_uppercase();
         match opt.as_str() {
             "AUTH" if i + 2 < args.len() => {
-                match check_auth(password, &args[i + 1..i + 3]) {
-                    Ok(()) => {
+                match acl_auth(engine, &args[i + 1..i + 3]) {
+                    Ok(user) => {
                         *authenticated = true;
+                        session.set_user(user, engine.acl().version());
                         tracker.record_success(ip);
                     }
                     Err(AuthError::Wrong) => {
                         tracker.record_failure(ip);
                         tracing::warn!("Failed AUTH attempt from {}", ip);
-                        return RespFrame::error(WRONGPASS);
+                        return CommandResponse::error(WRONGPASS);
                     }
-                    Err(_) => return RespFrame::error(WRONGPASS),
+                    Err(_) => return CommandResponse::error(WRONGPASS),
                 }
                 i += 3;
             }
@@ -1587,7 +2050,7 @@ fn hello(
                 i += 2;
             }
             _ => {
-                return RespFrame::error(format!(
+                return CommandResponse::error(format!(
                     "ERR Syntax error in HELLO option '{}'",
                     opt.to_lowercase()
                 ))
@@ -1595,7 +2058,7 @@ fn hello(
         }
     }
     if !*authenticated {
-        return RespFrame::error(
+        return CommandResponse::error(
             "NOAUTH HELLO must be called with the client already authenticated, otherwise the \
              HELLO <proto> AUTH <user> <pass> option can be used to authenticate the client and \
              select the RESP protocol version at the same time",
@@ -1603,26 +2066,23 @@ fn hello(
     }
     if let Some(name) = setname {
         let r = engine.execute_session(session, "CLIENT", &[Bytes::from_static(b"SETNAME"), name]);
-        if let CommandResponse::Error(e) = r {
-            return RespFrame::Error(e);
+        if r.is_error() {
+            return r;
         }
     }
-    let bulk = |s: &str| RespFrame::BulkString(Bytes::from(s.to_string()));
-    RespFrame::Array(vec![
-        bulk("server"),
-        bulk("redis"),
-        bulk("version"),
-        bulk("7.2.0"),
-        bulk("proto"),
-        RespFrame::Integer(2),
-        bulk("id"),
-        RespFrame::Integer(session.info.id as i64),
-        bulk("mode"),
-        bulk(if cluster { "cluster" } else { "standalone" }),
-        bulk("role"),
-        bulk("master"),
-        bulk("modules"),
-        RespFrame::Array(vec![]),
+    session.set_resp(proto);
+    let bulk = |s: &str| CommandResponse::bulk(Bytes::from(s.to_string()));
+    CommandResponse::Map(vec![
+        (bulk("server"), bulk("redis")),
+        (bulk("version"), bulk("7.2.0")),
+        (bulk("proto"), CommandResponse::Integer(proto as i64)),
+        (bulk("id"), CommandResponse::Integer(session.info.id as i64)),
+        (
+            bulk("mode"),
+            bulk(if cluster { "cluster" } else { "standalone" }),
+        ),
+        (bulk("role"), bulk("master")),
+        (bulk("modules"), CommandResponse::array(vec![])),
     ])
 }
 

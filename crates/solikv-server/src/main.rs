@@ -26,9 +26,63 @@ use solikv_server::rest_server;
 #[command(
     name = "solikv",
     version,
-    about = "SoliKV - High-Performance In-Memory Database"
+    about = "SoliKV - High-Performance In-Memory Database",
+    args_override_self = true
 )]
 struct Args {
+    /// Configuration file (redis.conf syntax). Also accepted as the first
+    /// argument (`solikv /etc/solikv.conf`). Flags on the command line
+    /// override the file.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// A configuration file given as the first argument.
+    #[arg(value_name = "CONFIG_FILE", hide = true)]
+    config_positional: Option<PathBuf>,
+
+    /// ACL users file (`ACL LOAD` / `ACL SAVE`); loaded at startup if present
+    #[arg(long, value_name = "PATH")]
+    aclfile: Option<PathBuf>,
+
+    /// DEBUG command: no, local (loopback clients only) or yes
+    #[arg(long, default_value = "no")]
+    enable_debug_command: String,
+
+    /// Most clients connected at once (Redis `maxclients`)
+    #[arg(long, default_value = "10000")]
+    maxclients: usize,
+
+    /// Commands slower than this many microseconds go to the slow log
+    /// (negative disables, 0 logs every command)
+    #[arg(long, default_value = "10000", allow_hyphen_values = true)]
+    slowlog_log_slower_than: i64,
+
+    /// Slow log entries kept
+    #[arg(long, default_value = "128")]
+    slowlog_max_len: usize,
+
+    /// Latency monitor threshold in milliseconds (0 = off)
+    #[arg(long, default_value = "0")]
+    latency_monitor_threshold: u64,
+
+    /// Milliseconds a script may run before other clients get -BUSY and
+    /// SCRIPT KILL applies (Redis `busy-reply-threshold` / `lua-time-limit`)
+    #[arg(long, default_value = "5000")]
+    busy_reply_threshold: u64,
+
+    /// Keys remembered for client-side caching (0 = unbounded)
+    #[arg(long, default_value = "1000000")]
+    tracking_table_max_keys: usize,
+
+    /// Log output: text or json
+    #[arg(long, default_value = "text")]
+    log_format: String,
+
+    /// Require the REST token for /metrics (yes/no; default: yes when a
+    /// token or password is set)
+    #[arg(long)]
+    metrics_auth: Option<String>,
+
     /// Redis protocol port
     #[arg(long, default_value = "6379")]
     port: u16,
@@ -233,9 +287,50 @@ struct Args {
     cluster_password_seed_only: bool,
 }
 
+/// The command line with a configuration file's settings in front: the
+/// file's flags come first, so the command line's own override them.
+fn args_with_config_file() -> Vec<std::ffi::OsString> {
+    use clap::CommandFactory;
+    let argv: Vec<String> = std::env::args().collect();
+    let mut path: Option<PathBuf> = None;
+    let mut i = 1;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--config" {
+            path = argv.get(i + 1).map(PathBuf::from);
+            break;
+        }
+        if let Some(p) = a.strip_prefix("--config=") {
+            path = Some(PathBuf::from(p));
+            break;
+        }
+        if i == 1 && !a.starts_with('-') {
+            path = Some(PathBuf::from(a));
+            break;
+        }
+        i += 1;
+    }
+    let Some(path) = path else {
+        return argv.into_iter().map(Into::into).collect();
+    };
+    let cmd = Args::command();
+    let known = |flag: &str| cmd.get_arguments().any(|a| a.get_long() == Some(flag));
+    let file_flags = match solikv_server::config_file::load(&path, &known) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let mut out: Vec<std::ffi::OsString> = vec![argv[0].clone().into()];
+    out.extend(file_flags.into_iter().map(Into::into));
+    out.extend(argv.into_iter().skip(1).map(Into::into));
+    out
+}
+
 fn main() {
     solikv_core::memory::enable();
-    let args = Args::parse();
+    let args = Args::parse_from(args_with_config_file());
 
     if args.solo && args.cluster_enabled {
         eprintln!("ERROR: --solo is incompatible with --cluster-enabled");
@@ -434,11 +529,16 @@ async fn async_main(args: Args) {
         return;
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
-        )
-        .init();
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+    if args.log_format.eq_ignore_ascii_case("json") {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
     for w in &early_warnings {
         tracing::warn!("{}", w);
     }
@@ -791,6 +891,92 @@ async fn async_main(args: Args) {
     let engine = Arc::new(engine);
     engine.init_self_ref(Arc::downgrade(&engine));
     engine.set_tcp_port(args.port);
+    if let Err(e) = engine.set_debug_mode(&args.enable_debug_command) {
+        eprintln!("ERROR: {e}");
+        std::process::exit(1);
+    }
+    engine.set_maxclients(args.maxclients);
+    engine.set_idle_timeout(args.timeout);
+    engine.set_busy_threshold_ms(args.busy_reply_threshold);
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let st = engine.stats();
+        st.slowlog_threshold_us
+            .store(args.slowlog_log_slower_than, Relaxed);
+        st.slowlog_max_len.store(args.slowlog_max_len, Relaxed);
+        st.latency_threshold_ms
+            .store(args.latency_monitor_threshold, Relaxed);
+        engine
+            .tracking()
+            .max_keys
+            .store(args.tracking_table_max_keys, Relaxed);
+    }
+    solikv_engine::stats::calibrate();
+    let config_path = args.config.clone().or(args.config_positional.clone());
+    engine.set_config_file(
+        config_path
+            .as_ref()
+            .map(|p| std::path::absolute(p).unwrap_or(p.clone())),
+    );
+    for (k, v) in [
+        ("bind", args.bind.clone()),
+        ("loglevel", args.log_level.clone()),
+        (
+            "logfile",
+            args.logfile
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
+        ("protected-mode", args.protected_mode.clone()),
+        (
+            "cluster-enabled",
+            if args.cluster_enabled { "yes" } else { "no" }.to_string(),
+        ),
+        ("rest-port", args.rest_port.to_string()),
+        (
+            "aclfile",
+            args.aclfile
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "daemonize",
+            if args.daemon { "yes" } else { "no" }.to_string(),
+        ),
+        ("io-threads", "1".to_string()),
+    ] {
+        engine.set_static_config(k, v);
+    }
+    // `requirepass` is the default user's password.
+    if let Some(pw) = &password {
+        engine.acl().set_requirepass(Some(pw.as_str()));
+    }
+    if let Some(path) = &args.aclfile {
+        engine.acl().set_file(Some(path.clone()));
+        if path.exists() {
+            if let Err(e) = engine.acl().load_file() {
+                eprintln!("ERROR: {e}");
+                std::process::exit(1);
+            }
+            tracing::info!("Loaded ACL users from {}", abs_display(path));
+        }
+    }
+    // Throughput and peak memory for INFO, sampled ten times a second.
+    {
+        let engine_stats = engine.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                ticker.tick().await;
+                engine_stats.stats().sample(
+                    engine_stats.clients().commands_processed(),
+                    solikv_core::memory::used() as u64,
+                );
+            }
+        });
+    }
 
     // --- Import Redis RDB if requested ---
     if let Some(ref redis_rdb_path) = args.import_redis_rdb {
@@ -952,6 +1138,10 @@ async fn async_main(args: Args) {
             None
         },
         handshake_timeout: std::time::Duration::from_secs(args.tls_handshake_timeout.max(1)),
+        metrics_auth: match args.metrics_auth.as_deref() {
+            Some(v) => matches!(v.to_ascii_lowercase().as_str(), "yes" | "true" | "1"),
+            None => rest_token.is_some(),
+        },
     };
     let engine_rest = engine.clone();
     let rest_enabled = args.rest_port != 0;

@@ -103,6 +103,8 @@ pub struct RestConfig {
     pub allowed_hosts: Option<Vec<String>>,
     /// Longest a TLS handshake may take.
     pub handshake_timeout: std::time::Duration,
+    /// `/metrics` requires the token (when one is set).
+    pub metrics_auth: bool,
 }
 
 /// Host names that always reach a loopback listener legitimately.
@@ -141,7 +143,14 @@ pub async fn run_with(
             .map(|hosts| hosts.into_iter().map(|h| h.to_ascii_lowercase()).collect()),
     );
 
-    let app = Router::new()
+    let metrics_auth = config.metrics_auth;
+    let app = Router::new();
+    let app = if metrics_auth {
+        app.route("/metrics", get(metrics))
+    } else {
+        app
+    };
+    let app = app
         // Key-value operations
         .route("/kv/{key}", get(get_key))
         .route("/kv/{key}", put(set_key))
@@ -191,6 +200,15 @@ pub async fn run_with(
             state.clone(),
             auth_middleware,
         ))
+        // Probes need no credentials (and say nothing about the data).
+        .route("/health", get(health))
+        .route("/ready", get(ready));
+    let app = if metrics_auth {
+        app
+    } else {
+        app.route("/metrics", get(metrics))
+    };
+    let app = app
         // Outermost: a request for a foreign Host is refused before anything
         // else, including the auth failure accounting.
         .layer(axum::middleware::from_fn_with_state(
@@ -324,6 +342,111 @@ async fn host_middleware(
         }
     }
     Ok(next.run(req).await)
+}
+
+/// Liveness: the process answers.
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status": "ok"}))
+}
+
+/// Readiness: the dataset is loaded (the REST listener only starts once it
+/// is) and no script holds the server.
+async fn ready(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    if state.engine.script_running()
+        && state.engine.script_state().elapsed_ms() >= state.engine.busy_threshold_ms()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "busy"})),
+        );
+    }
+    (StatusCode::OK, Json(serde_json::json!({"status": "ready"})))
+}
+
+/// Prometheus text exposition: every numeric `INFO` field as a gauge
+/// `solikv_<field>`, the keyspace per database, and per-command counters.
+async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResponse {
+    let engine = state.engine.clone();
+    let body = tokio::task::spawn_blocking(move || render_metrics(&engine))
+        .await
+        .unwrap_or_default();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+}
+
+pub fn render_metrics(engine: &CommandEngine) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "# TYPE solikv_up gauge\nsolikv_up 1");
+    let info = match engine.execute("INFO", &[Bytes::from_static(b"default")]) {
+        solikv_core::CommandResponse::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
+        _ => String::new(),
+    };
+    let mut section = String::new();
+    for line in info.lines() {
+        let line = line.trim();
+        if let Some(name) = line.strip_prefix("# ") {
+            section = name.to_ascii_lowercase();
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if section == "keyspace" {
+            // db0:keys=1,expires=0,avg_ttl=0
+            for part in value.split(',') {
+                if let Some((k, v)) = part.split_once('=') {
+                    let _ = writeln!(
+                        out,
+                        "solikv_keyspace_{}{{db=\"{}\"}} {}",
+                        k,
+                        key.trim_start_matches("db"),
+                        v
+                    );
+                }
+            }
+            continue;
+        }
+        if value.parse::<f64>().is_ok() {
+            let metric: String = key
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            let _ = writeln!(out, "solikv_{} {}", metric, value);
+        }
+    }
+    let _ = writeln!(out, "# TYPE solikv_command_calls_total counter");
+    let _ = writeln!(out, "# TYPE solikv_command_duration_seconds_total counter");
+    for (name, calls, usec, rejected, failed) in engine.stats().command_totals() {
+        let cmd = name.to_ascii_lowercase();
+        let _ = writeln!(
+            out,
+            "solikv_command_calls_total{{cmd=\"{}\"}} {}",
+            cmd, calls
+        );
+        let _ = writeln!(
+            out,
+            "solikv_command_duration_seconds_total{{cmd=\"{}\"}} {:.6}",
+            cmd,
+            usec as f64 / 1e6
+        );
+        let _ = writeln!(
+            out,
+            "solikv_command_rejected_total{{cmd=\"{}\"}} {}",
+            cmd, rejected
+        );
+        let _ = writeln!(
+            out,
+            "solikv_command_failed_total{{cmd=\"{}\"}} {}",
+            cmd, failed
+        );
+    }
+    out
 }
 
 async fn auth_middleware(

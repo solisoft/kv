@@ -17,6 +17,8 @@ fnv = "1.0"
 glob-match = "0.2"
 mlua = { workspace = true }
 sha1 = { workspace = true }
+sha2 = { workspace = true }
+libc = "0.2"
 dashmap = { workspace = true }
 tokio = { workspace = true }
 

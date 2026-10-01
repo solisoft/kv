@@ -461,9 +461,9 @@ async fn client_commands_are_real() {
     assert_eq!(name, "worker-2");
     let list: String = q(&mut c1, &["CLIENT", "LIST"]).await.unwrap();
     assert!(list.contains("name=worker-2"), "{list}");
-    assert!(
-        err_text(q::<()>(&mut c1, &["CLIENT", "TRACKING", "ON"]).await).contains("not supported")
-    );
+    // Client-side caching is implemented: tracking turns on.
+    let ok: String = q(&mut c1, &["CLIENT", "TRACKING", "ON"]).await.unwrap();
+    assert_eq!(ok, "OK");
     let killed: i64 = q(&mut c1, &["CLIENT", "KILL", "ID", &id2.to_string()])
         .await
         .unwrap();
@@ -543,7 +543,10 @@ async fn auth_takes_a_username_and_hello_negotiates_resp2() {
     }
     let r = roundtrip(&mut raw, b"*3\r\n$4\r\nAUTH\r\n$5\r\nalice\r\n$2\r\npw\r\n").await;
     assert!(r.starts_with("-WRONGPASS"), "{r}");
+    // RESP3 is spoken, but HELLO without AUTH needs an authenticated client.
     let r = roundtrip(&mut raw, b"*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n").await;
+    assert!(r.starts_with("-NOAUTH"), "{r}");
+    let r = roundtrip(&mut raw, b"*2\r\n$5\r\nHELLO\r\n$1\r\n4\r\n").await;
     assert!(r.starts_with("-NOPROTO"), "{r}");
     let r = roundtrip(
         &mut raw,

@@ -1,8 +1,46 @@
+//! Lua scripting: `EVAL`/`EVALSHA` (and their `_RO` forms), `FUNCTION` /
+//! `FCALL`, and the `redis.*` API scripts call.
+//!
+//! # Compatibility
+//!
+//! Scripts written for Redis assume Redis' Lua: **Lua 5.1** (numbers are
+//! doubles, `unpack` is a global, `tostring(3)` is `"3"`), with `cjson`,
+//! `cmsgpack`, `bit` and `struct` loaded ([`crate::lua_libs`]). Values cross
+//! the boundary with Redis' conversion rules: a Lua number becomes an
+//! integer reply (truncated), `false` a nil, `{ok=…}` a status, `{err=…}` an
+//! error; a nil reply becomes `false`, a status `{ok=…}`.
+//!
+//! # Isolation (Redis 7's read-only globals)
+//!
+//! A script runs with an environment that is an empty proxy: reading a
+//! global looks it up in a view of the allowed globals (and raises
+//! "Script attempted to access nonexistent global variable" for anything
+//! else), writing one raises "Attempt to modify a readonly table". The
+//! libraries (`string`, `table`, `math`, `redis`, `cjson`, …) are read-only
+//! proxies of the real tables too, so `string.rep = nil` fails instead of
+//! changing the next script's `string`. The real tables are unreachable:
+//! `getfenv`/`setfenv`/`debug` are not exposed and the string metatable is
+//! protected. What `rawset` can still put into a proxy is wiped after the
+//! script (or the VM discarded).
+//!
+//! # Long scripts
+//!
+//! A script holds every shard for its duration, as Redis' single thread
+//! would. Once it has run for `busy-reply-threshold` (5 s), other clients
+//! get `-BUSY` instead of queueing behind it, and `SCRIPT KILL` (a script
+//! that has not written) or `FUNCTION KILL` stops it: an instruction hook
+//! sees the flag and raises an error that the script's own `pcall` cannot
+//! swallow.
+
 use bytes::Bytes;
 use dashmap::DashMap;
 use mlua::prelude::*;
+use parking_lot::RwLock;
 use sha1::{Digest, Sha1};
-use std::cell::RefCell;
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing;
 
@@ -49,12 +87,22 @@ impl ScriptCache {
 
     /// Check existence of one or more SHA1 digests. Returns vec of booleans.
     pub fn exists(&self, shas: &[&str]) -> Vec<bool> {
-        shas.iter().map(|s| self.scripts.contains_key(*s)).collect()
+        shas.iter()
+            .map(|s| self.scripts.contains_key(&s.to_ascii_lowercase()))
+            .collect()
     }
 
     /// Clear the entire cache.
     pub fn flush(&self) {
         self.scripts.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.scripts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.scripts.is_empty()
     }
 }
 
@@ -63,38 +111,438 @@ impl ScriptCache {
 // ---------------------------------------------------------------------------
 
 pub fn sha1_hex(input: &str) -> String {
+    sha1_hex_bytes(input.as_bytes())
+}
+
+pub fn sha1_hex_bytes(input: &[u8]) -> String {
     let mut hasher = Sha1::new();
-    hasher.update(input.as_bytes());
+    hasher.update(input);
     format!("{:x}", hasher.finalize())
 }
 
 // ---------------------------------------------------------------------------
-// Blocked commands inside scripts
+// Script flags (`#!lua flags=…`) and function flags
 // ---------------------------------------------------------------------------
 
-const BLOCKED_COMMANDS: &[&str] = &[
-    "MULTI",
-    "EXEC",
-    "DISCARD",
-    "WATCH",
-    "UNWATCH",
-    "SUBSCRIBE",
-    "UNSUBSCRIBE",
-    "PSUBSCRIBE",
-    "PUNSUBSCRIBE",
-    "EVAL",
-    "EVALSHA",
-    "SCRIPT",
-    // Server control: a script must not stop the server or block it on disk
-    // I/O (Redis marks these `noscript` too).
-    "SHUTDOWN",
-    "SAVE",
-    "BGSAVE",
-    "BGREWRITEAOF",
-];
+/// Flags declared by a script's shebang or a function's registration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScriptFlags {
+    pub no_writes: bool,
+    pub allow_oom: bool,
+    pub allow_stale: bool,
+    pub no_cluster: bool,
+    pub allow_cross_slot_keys: bool,
+    /// The script had a shebang (new-style semantics).
+    pub shebang: bool,
+}
 
-fn is_blocked_in_script(cmd: &str) -> bool {
-    BLOCKED_COMMANDS.iter().any(|b| b.eq_ignore_ascii_case(cmd))
+impl ScriptFlags {
+    fn set(&mut self, flag: &str) -> Result<(), String> {
+        match flag {
+            "no-writes" => self.no_writes = true,
+            "allow-oom" => self.allow_oom = true,
+            "allow-stale" => self.allow_stale = true,
+            "no-cluster" => self.no_cluster = true,
+            "allow-cross-slot-keys" => self.allow_cross_slot_keys = true,
+            _ => return Err(flag.to_string()),
+        }
+        Ok(())
+    }
+
+    pub fn names(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.no_writes {
+            v.push("no-writes");
+        }
+        if self.allow_oom {
+            v.push("allow-oom");
+        }
+        if self.allow_stale {
+            v.push("allow-stale");
+        }
+        if self.no_cluster {
+            v.push("no-cluster");
+        }
+        if self.allow_cross_slot_keys {
+            v.push("allow-cross-slot-keys");
+        }
+        v
+    }
+}
+
+/// Split an `EVAL` script into its flags and the Lua to compile. A shebang
+/// line (`#!lua flags=no-writes,allow-oom`) is replaced by an empty line so
+/// error line numbers still match the source.
+pub fn parse_script(src: &str) -> Result<(ScriptFlags, Cow<'_, str>), String> {
+    if !src.starts_with("#!") {
+        return Ok((ScriptFlags::default(), Cow::Borrowed(src)));
+    }
+    let (line, rest) = match src.find('\n') {
+        Some(i) => (&src[2..i], &src[i..]),
+        None => (&src[2..], ""),
+    };
+    let mut parts = line.split_ascii_whitespace();
+    let engine = parts.next().unwrap_or("");
+    if !engine.eq_ignore_ascii_case("lua") {
+        return Err(format!("ERR Could not find engine '{}'", engine));
+    }
+    let mut flags = ScriptFlags {
+        shebang: true,
+        ..Default::default()
+    };
+    for part in parts {
+        let Some(list) = part.strip_prefix("flags=") else {
+            return Err(format!("ERR Unknown lua shebang option: {}", part));
+        };
+        for f in list.split(',').filter(|f| !f.is_empty()) {
+            flags
+                .set(f)
+                .map_err(|f| format!("ERR Unexpected flag in script shebang: {}", f))?;
+        }
+    }
+    Ok((flags, Cow::Owned(rest.to_string())))
+}
+
+// ---------------------------------------------------------------------------
+// The script running now (BUSY, SCRIPT KILL)
+// ---------------------------------------------------------------------------
+
+/// State of the script or function currently running. One at a time: a
+/// script holds every shard.
+#[derive(Default)]
+pub struct RunState {
+    running: AtomicBool,
+    started_ms: AtomicU64,
+    kill: AtomicBool,
+    wrote: AtomicBool,
+    function: AtomicBool,
+    name: parking_lot::Mutex<(String, String)>,
+    done: tokio::sync::Notify,
+}
+
+/// Error a killed script ends with.
+const KILLED: &str = "ERR Script killed by user with SCRIPT KILL...";
+const FN_KILLED: &str = "ERR Script killed by user with FUNCTION KILL...";
+
+impl RunState {
+    #[inline]
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+
+    pub fn is_function(&self) -> bool {
+        self.function.load(Ordering::Relaxed)
+    }
+
+    pub fn elapsed_ms(&self) -> u64 {
+        now_ms().saturating_sub(self.started_ms.load(Ordering::Relaxed))
+    }
+
+    /// `(name, command)` of what runs, for `FUNCTION STATS`.
+    pub fn describe(&self) -> (String, String) {
+        self.name.lock().clone()
+    }
+
+    pub(crate) fn enter(&self, function: bool, name: &str, cmd: &str) -> RunGuard<'_> {
+        self.kill.store(false, Ordering::Relaxed);
+        self.wrote.store(false, Ordering::Relaxed);
+        self.function.store(function, Ordering::Relaxed);
+        *self.name.lock() = (name.to_string(), cmd.to_string());
+        self.started_ms.store(now_ms(), Ordering::Relaxed);
+        self.running.store(true, Ordering::Release);
+        RunGuard(self)
+    }
+
+    /// `SCRIPT KILL` / `FUNCTION KILL`.
+    pub fn kill(&self, function_kill: bool) -> CommandResponse {
+        if !self.is_running() {
+            return CommandResponse::error("NOTBUSY No scripts in execution right now.");
+        }
+        if self.is_function() != function_kill {
+            return CommandResponse::error(if self.is_function() {
+                "BUSY Redis is busy running a function. You can only call FUNCTION KILL or \
+                 SHUTDOWN NOSAVE."
+            } else {
+                "BUSY Redis is busy running a script. You can only call SCRIPT KILL or \
+                 SHUTDOWN NOSAVE."
+            });
+        }
+        if self.wrote.load(Ordering::Relaxed) {
+            return CommandResponse::error(
+                "UNKILLABLE Sorry the script already executed write commands against the \
+                 dataset. You can either wait the script termination or kill the server in a \
+                 hard way using the SHUTDOWN NOSAVE command.",
+            );
+        }
+        self.kill.store(true, Ordering::Release);
+        CommandResponse::ok()
+    }
+
+    pub(crate) fn note_write(&self) {
+        self.wrote.store(true, Ordering::Relaxed);
+    }
+
+    fn killed(&self) -> bool {
+        self.kill.load(Ordering::Acquire)
+    }
+
+    /// Resolves when the running script ends (or at once if none runs).
+    pub async fn wait_done(&self, max: std::time::Duration) {
+        let notified = self.done.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_running() {
+            return;
+        }
+        let _ = tokio::time::timeout(max, notified).await;
+    }
+}
+
+pub(crate) struct RunGuard<'a>(&'a RunState);
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::Release);
+        self.0.kill.store(false, Ordering::Relaxed);
+        self.0.done.notify_waiters();
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Functions (FUNCTION LOAD / FCALL)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct FunctionMeta {
+    pub name: String,
+    pub library: String,
+    pub flags: ScriptFlags,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Library {
+    pub name: String,
+    pub code: String,
+    pub functions: Vec<FunctionMeta>,
+}
+
+#[derive(Default)]
+struct FnInner {
+    libs: BTreeMap<String, Library>,
+    fns: HashMap<String, FunctionMeta>,
+}
+
+/// Loaded function libraries. Each pooled VM loads them lazily and reloads
+/// when [`version`](Self::version) moves.
+#[derive(Default)]
+pub struct FunctionRegistry {
+    inner: RwLock<FnInner>,
+    version: AtomicU64,
+}
+
+/// Serialized libraries (`FUNCTION DUMP`, the functions file).
+const FN_DUMP_MAGIC: &[u8] = b"SOLIKVFN1";
+
+impl FunctionRegistry {
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    pub fn function(&self, name: &str) -> Option<FunctionMeta> {
+        self.inner.read().fns.get(name).cloned()
+    }
+
+    pub fn libraries(&self) -> Vec<Library> {
+        self.inner.read().libs.values().cloned().collect()
+    }
+
+    pub fn counts(&self) -> (usize, usize) {
+        let g = self.inner.read();
+        (g.libs.len(), g.fns.len())
+    }
+
+    /// Validate and add `lib` (already loaded once to learn its functions).
+    fn install(&self, lib: Library, replace: bool) -> Result<(), String> {
+        let mut g = self.inner.write();
+        if g.libs.contains_key(&lib.name) && !replace {
+            return Err(format!("ERR Library '{}' already exists", lib.name));
+        }
+        for f in &lib.functions {
+            if let Some(existing) = g.fns.get(&f.name) {
+                if existing.library != lib.name {
+                    return Err(format!("ERR Function {} already exists", f.name));
+                }
+            }
+        }
+        if let Some(old) = g.libs.remove(&lib.name) {
+            for f in old.functions {
+                g.fns.remove(&f.name);
+            }
+        }
+        for f in &lib.functions {
+            g.fns.insert(f.name.clone(), f.clone());
+        }
+        g.libs.insert(lib.name.clone(), lib);
+        drop(g);
+        self.version.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    pub fn delete(&self, name: &str) -> bool {
+        let mut g = self.inner.write();
+        let Some(old) = g.libs.remove(name) else {
+            return false;
+        };
+        for f in old.functions {
+            g.fns.remove(&f.name);
+        }
+        drop(g);
+        self.version.fetch_add(1, Ordering::AcqRel);
+        true
+    }
+
+    pub fn flush(&self) {
+        let mut g = self.inner.write();
+        g.libs.clear();
+        g.fns.clear();
+        drop(g);
+        self.version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Every library's code, serialized.
+    pub fn dump(&self) -> Vec<u8> {
+        let g = self.inner.read();
+        let mut out = FN_DUMP_MAGIC.to_vec();
+        out.extend_from_slice(&(g.libs.len() as u32).to_le_bytes());
+        for lib in g.libs.values() {
+            out.extend_from_slice(&(lib.code.len() as u32).to_le_bytes());
+            out.extend_from_slice(lib.code.as_bytes());
+        }
+        let crc = crc32(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+}
+
+/// Library sources in a `dump`.
+pub fn parse_function_dump(payload: &[u8]) -> Result<Vec<String>, String> {
+    let bad = || "ERR payload version or checksum are wrong".to_string();
+    if payload.len() < FN_DUMP_MAGIC.len() + 8 || !payload.starts_with(FN_DUMP_MAGIC) {
+        return Err(bad());
+    }
+    let (body, crc) = payload.split_at(payload.len() - 4);
+    if crc32(body).to_le_bytes() != crc {
+        return Err(bad());
+    }
+    let mut i = FN_DUMP_MAGIC.len();
+    let count = u32::from_le_bytes(body[i..i + 4].try_into().map_err(|_| bad())?) as usize;
+    i += 4;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let len = u32::from_le_bytes(
+            body.get(i..i + 4)
+                .ok_or_else(bad)?
+                .try_into()
+                .map_err(|_| bad())?,
+        ) as usize;
+        i += 4;
+        let code = body.get(i..i + len).ok_or_else(bad)?;
+        i += len;
+        out.push(String::from_utf8(code.to_vec()).map_err(|_| bad())?);
+    }
+    Ok(out)
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+fn valid_function_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// `#!lua name=<lib>` → library name, and the code with the shebang blanked.
+fn parse_library_header(code: &str) -> Result<String, String> {
+    if !code.starts_with("#!") {
+        return Err("ERR Missing library metadata".into());
+    }
+    let line = code[2..].lines().next().unwrap_or("");
+    let mut parts = line.split_ascii_whitespace();
+    let engine = parts.next().unwrap_or("");
+    if !engine.eq_ignore_ascii_case("lua") {
+        return Err(format!("ERR Engine '{}' not found", engine));
+    }
+    let mut name = None;
+    for p in parts {
+        match p.split_once('=') {
+            Some(("name", v)) => name = Some(v.to_string()),
+            _ => return Err(format!("ERR Invalid metadata value given: {}", p)),
+        }
+    }
+    let name = name.ok_or_else(|| "ERR Library name was not given".to_string())?;
+    if !valid_function_name(&name) {
+        return Err(
+            "ERR Library names can only contain letters, numbers, or underscores(_) and must \
+             be at least one character long"
+                .into(),
+        );
+    }
+    Ok(name)
+}
+
+// ---------------------------------------------------------------------------
+// Per-run context (thread-local: a script runs on one thread)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Default)]
+struct RunCtx {
+    /// Write commands refused (`EVAL_RO`, `FCALL_RO`, `no-writes`).
+    read_only: bool,
+    /// Protocol the script sees replies in (`redis.setresp`).
+    resp: u8,
+    /// Loading a function library: only `register_function` is usable.
+    loading: bool,
+}
+
+/// A registration collected while a library loads.
+struct Registered {
+    name: String,
+    callback: Option<LuaFunction>,
+    flags: ScriptFlags,
+    description: Option<String>,
+}
+
+thread_local! {
+    static RUN: Cell<RunCtx> = const { Cell::new(RunCtx { read_only: false, resp: 2, loading: false }) };
+    static REGISTERED: RefCell<Vec<Registered>> = const { RefCell::new(Vec::new()) };
+    static LOAD_DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+fn run_ctx() -> RunCtx {
+    RUN.with(|r| r.get())
+}
+
+fn set_run_ctx(ctx: RunCtx) -> RunCtx {
+    RUN.with(|r| r.replace(ctx))
 }
 
 // ---------------------------------------------------------------------------
@@ -102,30 +550,23 @@ fn is_blocked_in_script(cmd: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// A pooled Lua VM tagged with its owning engine's identity.
-///
-/// `baseline_globals` is the set of global names present immediately after
-/// the VM has been sandboxed and the redis.* module installed. On reuse,
-/// any global key NOT in this snapshot is wiped — so a previous script
-/// cannot leak `_G.foo = 'secret'` or monkey-patch new entries onto the
-/// global table for the next script that lands on this thread (SEC-014).
-/// Mutations to the *contents* of pre-existing tables (e.g. replacing
-/// `string.upper`) are not protected by this; full isolation requires a
-/// fresh `_ENV`, which we reserve for a follow-up if it becomes load-bearing.
-///
-/// The VM is set up once. `redis` is a read-only proxy (writes raise an
-/// error, as in Redis 7), and after every script the VM is checked: if the
-/// proxy was bypassed (`rawset`) or `redis` replaced, the VM is not reused.
-/// That replaces re-running the sandbox and re-creating the whole `redis`
-/// module — a table and five closures — on every call.
 struct PooledLua {
     lua: Lua,
     engine_id: usize,
-    baseline_globals: std::collections::HashSet<String>,
-    redis: LuaTable,
-    redis_meta: LuaTable,
+    /// The allowed globals (read through `env`). `KEYS`/`ARGV` are set here.
+    view: LuaTable,
+    /// The environment scripts run in: an empty read-only proxy of `view`.
+    env: LuaTable,
+    /// Read-only proxies of the libraries; must stay empty.
+    proxies: Vec<LuaTable>,
+    /// `pcall(f, …)` in Lua, turning any error into `(false, kind, msg)`.
+    runner: LuaFunction,
     /// Compiled scripts, by source: `EVAL`/`EVALSHA` of a script this VM ran
     /// before calls the function instead of parsing and compiling it again.
-    compiled: std::collections::HashMap<String, LuaFunction, solikv_core::FastHasher>,
+    compiled: HashMap<String, LuaFunction, solikv_core::FastHasher>,
+    /// Function libraries loaded into this VM, at registry version `fn_version`.
+    fn_version: u64,
+    fns: HashMap<String, LuaFunction>,
 }
 
 /// Most compiled scripts one VM keeps (then it starts over).
@@ -133,39 +574,6 @@ const COMPILED_MAX: usize = 512;
 
 thread_local! {
     static LUA_POOL: RefCell<Vec<PooledLua>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Snapshot every key currently present on `_G`.
-fn snapshot_globals(lua: &Lua) -> std::collections::HashSet<String> {
-    let mut keys = std::collections::HashSet::new();
-    let globals = lua.globals();
-    for pair in globals.pairs::<LuaValue, LuaValue>().flatten() {
-        if let LuaValue::String(s) = pair.0 {
-            if let Ok(name) = s.to_str() {
-                keys.insert(name.to_string());
-            }
-        }
-    }
-    keys
-}
-
-/// Remove any global key not present in `baseline`.
-fn reset_globals_to(lua: &Lua, baseline: &std::collections::HashSet<String>) {
-    let globals = lua.globals();
-    let mut to_remove: Vec<String> = Vec::new();
-    for pair in globals.pairs::<LuaValue, LuaValue>().flatten() {
-        if let LuaValue::String(s) = pair.0 {
-            if let Ok(name) = s.to_str() {
-                let name: &str = &name;
-                if !baseline.contains(name) {
-                    to_remove.push(name.to_string());
-                }
-            }
-        }
-    }
-    for name in to_remove {
-        let _ = globals.set(name, LuaValue::Nil);
-    }
 }
 
 /// Take a pre-sandboxed Lua VM from the thread-local pool, or create one.
@@ -177,62 +585,234 @@ fn take_lua(engine: &Arc<CommandEngine>) -> LuaResult<PooledLua> {
             .rposition(|p| p.engine_id == engine_id)
             .map(|idx| pool.swap_remove(idx))
     });
-
     if let Some(vm) = cached {
-        // Wipe any stray globals the previous script left behind.
-        reset_globals_to(&vm.lua, &vm.baseline_globals);
         return Ok(vm);
     }
+    new_vm(engine)
+}
 
-    // Cold path: create, sandbox, register redis.*, then snapshot the
-    // post-setup global key set.
+/// Globals a script may read, as Redis 7 allows them.
+const ALLOWED_GLOBALS: &[&str] = &[
+    "assert",
+    "error",
+    "ipairs",
+    "next",
+    "pairs",
+    "rawequal",
+    "rawget",
+    "rawset",
+    "select",
+    "setmetatable",
+    "getmetatable",
+    "tonumber",
+    "tostring",
+    "type",
+    "unpack",
+    "gcinfo",
+    "_VERSION",
+];
+
+/// Libraries exposed read-only.
+const ALLOWED_LIBS: &[&str] = &["string", "table", "math", "coroutine"];
+
+fn readonly_proxy(lua: &Lua, target: &LuaTable) -> LuaResult<LuaTable> {
+    let proxy = lua.create_table()?;
+    let meta = lua.create_table()?;
+    meta.set("__index", target.clone())?;
+    meta.set(
+        "__newindex",
+        lua.create_function(|_, _: LuaMultiValue| -> LuaResult<()> {
+            Err(LuaError::RuntimeError(
+                "Attempt to modify a readonly table".into(),
+            ))
+        })?,
+    )?;
+    meta.set("__metatable", false)?;
+    proxy.set_metatable(Some(meta));
+    Ok(proxy)
+}
+
+fn new_vm(engine: &Arc<CommandEngine>) -> LuaResult<PooledLua> {
     let lua = Lua::new();
-    sandbox_lua(&lua);
-    let (redis, redis_meta) = setup_redis_module(&lua, engine)?;
-    let baseline = snapshot_globals(&lua);
+    let globals = lua.globals();
+    let view = lua.create_table()?;
+    let mut proxies = Vec::new();
+
+    for name in ALLOWED_GLOBALS {
+        let v: LuaValue = globals.raw_get(*name)?;
+        view.raw_set(*name, v)?;
+    }
+    for name in ALLOWED_LIBS {
+        let t: LuaTable = globals.raw_get(*name)?;
+        let p = readonly_proxy(&lua, &t)?;
+        view.raw_set(*name, p.clone())?;
+        proxies.push(p);
+    }
+    // `os.clock` only, as in Redis.
+    {
+        let os_real: LuaTable = globals.raw_get("os")?;
+        let os = lua.create_table()?;
+        os.raw_set("clock", os_real.raw_get::<LuaValue>("clock")?)?;
+        let p = readonly_proxy(&lua, &os)?;
+        view.raw_set("os", p.clone())?;
+        proxies.push(p);
+    }
+    for (name, t) in crate::lua_libs::install(&lua)? {
+        let p = readonly_proxy(&lua, &t)?;
+        view.raw_set(name, p.clone())?;
+        proxies.push(p);
+    }
+    let redis = setup_redis_module(&lua, engine)?;
+    let redis_proxy = readonly_proxy(&lua, &redis)?;
+    view.raw_set("redis", redis_proxy.clone())?;
+    proxies.push(redis_proxy);
+
+    // `pcall`/`xpcall` that do not swallow SCRIPT KILL.
+    let state = engine.script_state().clone();
+    let killed = lua.create_function(move |_, ()| Ok(state.killed()))?;
+    let wrap: LuaTable = lua
+        .load(
+            r#"
+            local pcall, xpcall, select, unpack, error, killed = ...
+            local function pack(...) return { n = select('#', ...), ... } end
+            local function check(r)
+                if not r[1] and killed() then error(r[2], 0) end
+                return unpack(r, 1, r.n)
+            end
+            return {
+                pcall = function(...) return check(pack(pcall(...))) end,
+                xpcall = function(f, h) return check(pack(xpcall(f, h))) end,
+            }
+            "#,
+        )
+        .set_name("=wrappers")
+        .call((
+            globals.raw_get::<LuaValue>("pcall")?,
+            globals.raw_get::<LuaValue>("xpcall")?,
+            globals.raw_get::<LuaValue>("select")?,
+            globals.raw_get::<LuaValue>("unpack")?,
+            globals.raw_get::<LuaValue>("error")?,
+            killed,
+        ))?;
+    view.raw_set("pcall", wrap.raw_get::<LuaValue>("pcall")?)?;
+    view.raw_set("xpcall", wrap.raw_get::<LuaValue>("xpcall")?)?;
+
+    // The environment: `_G` is the proxy itself; unknown names raise.
+    let env = lua.create_table()?;
+    view.raw_set("_G", env.clone())?;
+    let view_meta = lua.create_table()?;
+    view_meta.set(
+        "__index",
+        lua.create_function(|_, (_, k): (LuaValue, LuaValue)| -> LuaResult<LuaValue> {
+            let name = match &k {
+                LuaValue::String(s) => s.to_string_lossy().to_string(),
+                other => format!("{:?}", other),
+            };
+            Err(LuaError::RuntimeError(format!(
+                "Script attempted to access nonexistent global variable '{}'",
+                name
+            )))
+        })?,
+    )?;
+    view.set_metatable(Some(view_meta));
+    let env_meta = lua.create_table()?;
+    env_meta.set("__index", view.clone())?;
+    env_meta.set(
+        "__newindex",
+        lua.create_function(|_, _: LuaMultiValue| -> LuaResult<()> {
+            Err(LuaError::RuntimeError(
+                "Attempt to modify a readonly table".into(),
+            ))
+        })?,
+    )?;
+    env_meta.set("__metatable", false)?;
+    env.set_metatable(Some(env_meta));
+
+    // The string metatable (`("x"):upper()`) reaches the real `string`
+    // table: protect it, or `getmetatable("").__index.upper = …` would
+    // change every later script's strings.
+    lua.load(r#"local mt = getmetatable(""); mt.__metatable = false"#)
+        .exec()?;
+
+    let runner: LuaFunction = lua
+        .load(
+            r#"
+            local pcall, type, tostring, rawget = pcall, type, tostring, rawget
+            return function(f, ...)
+                local ok, r = pcall(f, ...)
+                if ok then return true, r end
+                if type(r) == 'table' then
+                    local e = rawget(r, 'err')
+                    if type(e) == 'string' then return false, 'T', e end
+                    return false, 'S', 'Unknown error'
+                end
+                return false, 'S', tostring(r)
+            end
+            "#,
+        )
+        .set_name("=runner")
+        .call(())?;
+
+    // SCRIPT KILL / FUNCTION KILL, and a library load's time limit.
+    let state = engine.script_state().clone();
+    lua.set_hook(
+        mlua::HookTriggers::new().every_nth_instruction(10_000),
+        move |_lua, _debug| {
+            if state.killed() {
+                return Err(LuaError::RuntimeError(
+                    if state.is_function() {
+                        FN_KILLED
+                    } else {
+                        KILLED
+                    }
+                    .into(),
+                ));
+            }
+            if LOAD_DEADLINE
+                .with(|d| d.get())
+                .is_some_and(|d| std::time::Instant::now() > d)
+            {
+                return Err(LuaError::RuntimeError("ERR FUNCTION LOAD timeout".into()));
+            }
+            Ok(mlua::VmState::Continue)
+        },
+    );
+
     // After setup, so the limit bounds what scripts allocate, not the VM's
     // own tables.
     let limit = engine.lua_memory_limit.max(lua.used_memory() + 1024 * 1024);
     if let Err(e) = lua.set_memory_limit(limit) {
         tracing::warn!("could not set the Lua memory limit: {}", e);
     }
+
     Ok(PooledLua {
         lua,
-        engine_id,
-        baseline_globals: baseline,
-        redis,
-        redis_meta,
+        engine_id: Arc::as_ptr(engine) as usize,
+        view,
+        env,
+        proxies,
+        runner,
         compiled: Default::default(),
+        fn_version: u64::MAX,
+        fns: HashMap::new(),
     })
 }
 
-/// Whether a script left the VM as it found it: `redis` still the
-/// read-only proxy, with nothing written into the proxy itself.
+/// Whether a script left the VM as it found it: nothing written into the
+/// environment or a library proxy (`rawset` goes around their guards).
 fn vm_intact(vm: &PooledLua) -> bool {
-    let globals = vm.lua.globals();
-    let same_redis = matches!(
-        globals.raw_get::<LuaValue>("redis"),
-        Ok(LuaValue::Table(t)) if t.to_pointer() == vm.redis.to_pointer()
-    );
-    let proxy_empty = vm
-        .redis
-        .clone()
-        .pairs::<LuaValue, LuaValue>()
-        .next()
-        .is_none();
-    let meta_same = vm
-        .redis
-        .metatable()
-        .is_some_and(|m| m.to_pointer() == vm.redis_meta.to_pointer());
-    same_redis && proxy_empty && meta_same
+    let empty = |t: &LuaTable| t.clone().pairs::<LuaValue, LuaValue>().next().is_none();
+    empty(&vm.env) && vm.proxies.iter().all(empty)
 }
 
 /// Return a Lua VM to the thread-local pool.
 fn return_lua(mut vm: PooledLua, engine: &Arc<CommandEngine>) {
     if !vm_intact(&vm) {
-        tracing::warn!("a script tampered with the redis module; its Lua VM is discarded");
+        tracing::warn!("a script wrote around the read-only globals; its Lua VM is discarded");
         return;
     }
+    let _ = vm.view.raw_set("KEYS", LuaValue::Nil);
+    let _ = vm.view.raw_set("ARGV", LuaValue::Nil);
     // Free what the script left behind, and retire a VM that is still close
     // to its memory limit: reusing it could fail to allocate.
     let _ = vm.lua.gc_collect();
@@ -247,45 +827,35 @@ fn return_lua(mut vm: PooledLua, engine: &Arc<CommandEngine>) {
         if pool.len() < LUA_POOL_MAX {
             pool.push(vm);
         }
-        // else: drop the VM (pool full)
     });
 }
 
 // ---------------------------------------------------------------------------
-// Script execution entry point
+// Script execution entry points
 // ---------------------------------------------------------------------------
 
-/// Maximum number of Lua VM instructions before a script is killed.
-const LUA_INSTRUCTION_LIMIT: u32 = 1_000_000;
-
+/// Run `script` (an `EVAL` body, shebang already parsed) with writes allowed.
 pub fn execute_script(
     engine: &Arc<CommandEngine>,
     script: &str,
     keys: Vec<Bytes>,
     argv: Vec<Bytes>,
 ) -> CommandResponse {
+    execute_script_with(engine, script, keys, argv, false)
+}
+
+/// Run an `EVAL` body. `read_only`: `EVAL_RO` or a `no-writes` script.
+pub fn execute_script_with(
+    engine: &Arc<CommandEngine>,
+    script: &str,
+    keys: Vec<Bytes>,
+    argv: Vec<Bytes>,
+    read_only: bool,
+) -> CommandResponse {
     let mut vm = match take_lua(engine) {
         Ok(vm) => vm,
         Err(e) => return CommandResponse::Error(format!("ERR {}", e)),
     };
-
-    // Set instruction limit to prevent infinite loops / DoS
-    vm.lua
-        .set_hook(mlua::HookTriggers::new().every_nth_instruction(10_000), {
-            let limit = std::cell::Cell::new(LUA_INSTRUCTION_LIMIT);
-            move |_lua, _debug| {
-                let remaining = limit.get();
-                if remaining == 0 {
-                    Err(LuaError::RuntimeError(
-                        "ERR script exceeded maximum allowed execution time".into(),
-                    ))
-                } else {
-                    limit.set(remaining.saturating_sub(10_000));
-                    Ok(mlua::VmState::Continue)
-                }
-            }
-        });
-
     // Text only. A precompiled (binary) chunk is not verified by Lua and is
     // a known way to corrupt the VM's memory from inside a script.
     let func = match vm.compiled.get(script) {
@@ -293,281 +863,682 @@ pub fn execute_script(
         None => vm
             .lua
             .load(script)
+            .set_name("@user_script")
             .set_mode(mlua::ChunkMode::Text)
+            .set_environment(vm.env.clone())
             .into_function()
             .inspect(|f| {
                 vm.compiled.insert(script.to_owned(), f.clone());
             }),
     };
-    let result = match func.and_then(|f| {
-        setup_keys_argv(&vm.lua, &keys, &argv)?;
-        f.call::<LuaValue>(())
-    }) {
-        Ok(val) => lua_to_response(val),
-        Err(e) => {
-            let msg = e.to_string();
-            CommandResponse::Error(format!("ERR {}", msg))
+    let result = match func {
+        Err(e) => CommandResponse::Error(format!(
+            "ERR Error compiling script (new function): {}",
+            clean_error(&e.to_string())
+        )),
+        Ok(f) => {
+            let prev = set_run_ctx(RunCtx {
+                read_only,
+                resp: 2,
+                loading: false,
+            });
+            let r = setup_keys_argv(&vm, &keys, &argv)
+                .and_then(|()| vm.runner.call::<LuaMultiValue>(f).map(runner_result));
+            set_run_ctx(prev);
+            r.unwrap_or_else(|e| {
+                CommandResponse::Error(format!("ERR {}", clean_error(&e.to_string())))
+            })
         }
     };
-
-    // Remove the hook before returning to pool
-    vm.lua.remove_hook();
-
     return_lua(vm, engine);
     result
 }
 
-// ---------------------------------------------------------------------------
-// Sandbox: remove dangerous globals
-// ---------------------------------------------------------------------------
+/// Run function `name` (`FCALL`), its library loaded into this thread's VM.
+pub fn execute_function(
+    engine: &Arc<CommandEngine>,
+    name: &str,
+    keys: Vec<Bytes>,
+    argv: Vec<Bytes>,
+    read_only: bool,
+) -> CommandResponse {
+    let mut vm = match take_lua(engine) {
+        Ok(vm) => vm,
+        Err(e) => return CommandResponse::Error(format!("ERR {}", e)),
+    };
+    let registry = engine.functions();
+    let version = registry.version();
+    if vm.fn_version != version {
+        vm.fns.clear();
+        for lib in registry.libraries() {
+            match load_library_into(&vm, &lib.code) {
+                Ok(regs) => {
+                    for r in regs {
+                        if let Some(cb) = r.callback {
+                            vm.fns.insert(r.name, cb);
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("function library {} failed to load: {}", lib.name, e),
+            }
+        }
+        vm.fn_version = version;
+    }
+    let result = match vm.fns.get(name).cloned() {
+        None => CommandResponse::error("ERR Function not found"),
+        Some(f) => {
+            let prev = set_run_ctx(RunCtx {
+                read_only,
+                resp: 2,
+                loading: false,
+            });
+            let r = (|| -> LuaResult<CommandResponse> {
+                let k = bytes_table(&vm.lua, &keys)?;
+                let a = bytes_table(&vm.lua, &argv)?;
+                let out = vm.runner.call::<LuaMultiValue>((f, k, a))?;
+                Ok(runner_result(out))
+            })();
+            set_run_ctx(prev);
+            r.unwrap_or_else(|e| {
+                CommandResponse::Error(format!("ERR {}", clean_error(&e.to_string())))
+            })
+        }
+    };
+    return_lua(vm, engine);
+    result
+}
 
-fn sandbox_lua(lua: &Lua) {
-    let globals = lua.globals();
-    let remove = [
-        "os",
-        "io",
-        "debug",
-        "loadfile",
-        "dofile",
-        "package",
-        "require",
-        "load",           // can load bytecode — sandbox escape vector
-        "loadstring",     // alias in some Lua versions
-        "collectgarbage", // DoS vector
-    ];
-    for name in &remove {
-        let _ = globals.set(*name, LuaValue::Nil);
+/// Load a library's code in a throwaway VM to validate it and learn its
+/// functions (`FUNCTION LOAD`), then add it to the registry.
+pub fn load_library(
+    engine: &Arc<CommandEngine>,
+    code: &str,
+    replace: bool,
+) -> Result<String, String> {
+    let name = parse_library_header(code)?;
+    let vm = new_vm(engine).map_err(|e| format!("ERR {}", e))?;
+    let regs = load_library_into(&vm, code)?;
+    if regs.is_empty() {
+        return Err("ERR No functions registered".into());
+    }
+    let lib = Library {
+        name: name.clone(),
+        code: code.to_string(),
+        functions: regs
+            .into_iter()
+            .map(|r| FunctionMeta {
+                name: r.name,
+                library: name.clone(),
+                flags: r.flags,
+                description: r.description,
+            })
+            .collect(),
+    };
+    engine.functions().install(lib, replace)?;
+    Ok(name)
+}
+
+/// Run a library's body in `vm` with `register_function` enabled, returning
+/// what it registered.
+fn load_library_into(vm: &PooledLua, code: &str) -> Result<Vec<Registered>, String> {
+    // The shebang is not Lua: blank it, keeping line numbers.
+    let body = match code.find('\n') {
+        Some(i) => &code[i..],
+        None => "",
+    };
+    let f = vm
+        .lua
+        .load(body)
+        .set_name("@user_function")
+        .set_mode(mlua::ChunkMode::Text)
+        .set_environment(vm.env.clone())
+        .into_function()
+        .map_err(|e| {
+            format!(
+                "ERR Error compiling function: {}",
+                clean_error(&e.to_string())
+            )
+        })?;
+    REGISTERED.with(|r| r.borrow_mut().clear());
+    let prev = set_run_ctx(RunCtx {
+        read_only: true,
+        resp: 2,
+        loading: true,
+    });
+    LOAD_DEADLINE.with(|d| {
+        d.set(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(500),
+        ))
+    });
+    let out = vm.runner.call::<LuaMultiValue>(f);
+    LOAD_DEADLINE.with(|d| d.set(None));
+    set_run_ctx(prev);
+    let regs = REGISTERED.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    match out {
+        Err(e) => Err(format!(
+            "ERR Error registering functions: {}",
+            clean_error(&e.to_string())
+        )),
+        Ok(out) => match runner_result(out) {
+            CommandResponse::Error(e) => Err(format!("ERR Error registering functions: {}", e)),
+            _ => Ok(regs),
+        },
     }
 }
 
-// ---------------------------------------------------------------------------
-// Set up KEYS and ARGV tables
-// ---------------------------------------------------------------------------
+/// `(true, value)` or `(false, kind, message)` from the runner.
+fn runner_result(out: LuaMultiValue) -> CommandResponse {
+    let mut it = out.into_iter();
+    match it.next() {
+        Some(LuaValue::Boolean(true)) => lua_to_response(it.next().unwrap_or(LuaValue::Nil)),
+        _ => {
+            let kind = it.next();
+            let msg = match it.next() {
+                Some(LuaValue::String(s)) => s.to_string_lossy().to_string(),
+                _ => "Unknown error".to_string(),
+            };
+            match kind {
+                // An error reply raised by `redis.call` or returned as
+                // `{err=…}`: the reply is that error, as it was.
+                Some(LuaValue::String(k)) if k.as_bytes().as_ref() == b"T" => {
+                    CommandResponse::Error(msg.strip_prefix('-').unwrap_or(&msg).to_string())
+                }
+                _ => {
+                    let msg = clean_error(&msg);
+                    if msg.starts_with("ERR ") {
+                        CommandResponse::Error(msg)
+                    } else {
+                        CommandResponse::Error(format!("ERR {}", msg))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An error message without mlua's decorations ("runtime error: ",
+/// "callback error", the traceback).
+fn clean_error(msg: &str) -> String {
+    let msg = match msg.rfind("runtime error: ") {
+        Some(i) => &msg[i + "runtime error: ".len()..],
+        None => msg,
+    };
+    let msg = msg.strip_prefix("syntax error: ").unwrap_or(msg);
+    let first = msg.lines().next().unwrap_or(msg);
+    first.trim_end().to_string()
+}
+
+fn bytes_table(lua: &Lua, items: &[Bytes]) -> LuaResult<LuaTable> {
+    let t = lua.create_table_with_capacity(items.len(), 0)?;
+    for (i, item) in items.iter().enumerate() {
+        t.raw_set(i + 1, lua.create_string(item.as_ref())?)?;
+    }
+    Ok(t)
+}
 
 /// Fallible: under the memory limit, building the tables can fail, and that
 /// is an error for this script — not a panic in the server.
-fn setup_keys_argv(lua: &Lua, keys: &[Bytes], argv: &[Bytes]) -> LuaResult<()> {
-    fn bytes_to_table(lua: &Lua, items: &[Bytes]) -> LuaResult<LuaTable> {
-        let t = lua.create_table()?;
-        for (i, item) in items.iter().enumerate() {
-            let s = String::from_utf8_lossy(item);
-            t.set(i + 1, s.as_ref().to_owned())?;
-        }
-        Ok(t)
-    }
-
-    let globals = lua.globals();
-    globals.set("KEYS", bytes_to_table(lua, keys)?)?;
-    globals.set("ARGV", bytes_to_table(lua, argv)?)?;
+fn setup_keys_argv(vm: &PooledLua, keys: &[Bytes], argv: &[Bytes]) -> LuaResult<()> {
+    vm.view.raw_set("KEYS", bytes_table(&vm.lua, keys)?)?;
+    vm.view.raw_set("ARGV", bytes_table(&vm.lua, argv)?)?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Set up the redis.* module
+// The redis.* module
 // ---------------------------------------------------------------------------
 
-/// Install `redis.*`, as a read-only proxy; returns the proxy and its
-/// metatable (see [`PooledLua`]).
-fn setup_redis_module(lua: &Lua, engine: &Arc<CommandEngine>) -> LuaResult<(LuaTable, LuaTable)> {
+fn err_table(lua: &Lua, msg: impl Into<String>) -> LuaResult<LuaValue> {
+    let t = lua.create_table()?;
+    t.raw_set("err", msg.into())?;
+    Ok(LuaValue::Table(t))
+}
+
+/// Run one `redis.call`/`redis.pcall`: the reply, or an `{err=…}` table.
+fn redis_call(lua: &Lua, engine: &Arc<CommandEngine>, args: LuaMultiValue) -> LuaResult<LuaValue> {
+    let ctx = run_ctx();
+    if ctx.loading {
+        return err_table(
+            lua,
+            "ERR redis.call can only be called inside a script invocation",
+        );
+    }
+    let (name, cmd_args) = match parse_redis_call_args(&args) {
+        Ok(v) => v,
+        Err(e) => return err_table(lua, e),
+    };
+    let Some(spec) = crate::commands::lookup(&name) else {
+        return err_table(lua, "ERR Unknown Redis command called from script");
+    };
+    if spec.has(crate::commands::F_NOSCRIPT) {
+        return err_table(lua, "ERR This Redis command is not allowed from script");
+    }
+    if !spec.arity_ok(cmd_args.len()) {
+        return err_table(
+            lua,
+            "ERR Wrong number of args calling Redis command from script",
+        );
+    }
+    if spec.is_write() {
+        if ctx.read_only {
+            return err_table(
+                lua,
+                "ERR Write commands are not allowed from read-only scripts.",
+            );
+        }
+        engine.script_state().note_write();
+    }
+    if let Err(e) = engine.script_acl_check(spec, &cmd_args) {
+        return err_table(lua, e);
+    }
+    engine.feed_monitor_script(&name, &cmd_args);
+    let resp = engine.execute(spec.name, &cmd_args);
+    if let CommandResponse::Error(msg) = resp {
+        return err_table(lua, msg);
+    }
+    response_to_lua(lua, resp, ctx.resp)
+}
+
+/// Install `redis.*`; returns the real table (callers expose a read-only
+/// proxy of it).
+fn setup_redis_module(lua: &Lua, engine: &Arc<CommandEngine>) -> LuaResult<LuaTable> {
     let redis = lua.create_table()?;
 
-    // redis.call(cmd, ...) — execute command, raise on error
-    {
-        let eng = engine.clone();
-        let call = lua
-            .create_function(move |lua, args: LuaMultiValue| {
-                let (cmd_name, cmd_args) = parse_redis_call_args(&args)?;
-                if is_blocked_in_script(&cmd_name) {
-                    return Err(LuaError::RuntimeError(format!(
-                        "ERR command '{}' not allowed from script",
-                        cmd_name
-                    )));
-                }
-                let resp = eng.execute(&cmd_name, &cmd_args);
-                if let CommandResponse::Error(ref msg) = resp {
-                    return Err(LuaError::RuntimeError(msg.clone()));
-                }
-                response_to_lua(lua, resp)
-            })
-            .expect("create redis.call");
-        redis.set("call", call).expect("set redis.call");
-    }
+    let eng = engine.clone();
+    let rpcall =
+        lua.create_function(move |lua, args: LuaMultiValue| redis_call(lua, &eng, args))?;
+    redis.raw_set("pcall", rpcall.clone())?;
+    // `redis.call`: the same, raising the error table (Redis 7 raises a
+    // table with `err`, which `pcall` hands back as such).
+    let call: LuaFunction = lua
+        .load(
+            r#"
+            local rpcall, error, type, rawget = ...
+            return function(...)
+                local r = rpcall(...)
+                if type(r) == 'table' and rawget(r, 'err') ~= nil then error(r) end
+                return r
+            end
+            "#,
+        )
+        .set_name("=redis.call")
+        .call((
+            rpcall,
+            lua.globals().raw_get::<LuaValue>("error")?,
+            lua.globals().raw_get::<LuaValue>("type")?,
+            lua.globals().raw_get::<LuaValue>("rawget")?,
+        ))?;
+    redis.raw_set("call", call)?;
 
-    // redis.pcall(cmd, ...) — execute command, return error as table {err=msg}
-    {
-        let eng = engine.clone();
-        let pcall = lua
-            .create_function(move |lua, args: LuaMultiValue| {
-                let (cmd_name, cmd_args) = parse_redis_call_args(&args)?;
-                if is_blocked_in_script(&cmd_name) {
-                    let t = lua.create_table()?;
-                    t.set(
-                        "err",
-                        format!("ERR command '{}' not allowed from script", cmd_name),
-                    )?;
-                    return Ok(LuaValue::Table(t));
-                }
-                let resp = eng.execute(&cmd_name, &cmd_args);
-                if let CommandResponse::Error(ref msg) = resp {
-                    let t = lua.create_table()?;
-                    t.set("err", msg.clone())?;
-                    return Ok(LuaValue::Table(t));
-                }
-                response_to_lua(lua, resp)
-            })
-            .expect("create redis.pcall");
-        redis.set("pcall", pcall).expect("set redis.pcall");
-    }
-
-    // redis.error_reply(msg) — create {err=msg} table
-    {
-        let error_reply = lua
-            .create_function(|lua, msg: String| {
-                let t = lua.create_table()?;
-                t.set("err", msg)?;
-                Ok(LuaValue::Table(t))
-            })
-            .expect("create redis.error_reply");
-        redis
-            .set("error_reply", error_reply)
-            .expect("set redis.error_reply");
-    }
-
-    // redis.status_reply(msg) — create {ok=msg} table
-    {
-        let status_reply = lua
-            .create_function(|lua, msg: String| {
-                let t = lua.create_table()?;
-                t.set("ok", msg)?;
-                Ok(LuaValue::Table(t))
-            })
-            .expect("create redis.status_reply");
-        redis
-            .set("status_reply", status_reply)
-            .expect("set redis.status_reply");
-    }
-
-    // redis.log(level, msg)
-    {
-        let log_fn = lua
-            .create_function(|_lua, (level, msg): (i64, String)| {
-                match level {
-                    0 => tracing::debug!("[Lua] {}", msg),
-                    1 => tracing::debug!("[Lua] {}", msg),
-                    2 => tracing::info!("[Lua] {}", msg),
-                    _ => tracing::warn!("[Lua] {}", msg),
-                }
-                Ok(())
-            })
-            .expect("create redis.log");
-        redis.set("log", log_fn).expect("set redis.log");
-    }
-
-    // Log level constants
-    redis.set("LOG_DEBUG", 0i64).expect("set LOG_DEBUG");
-    redis.set("LOG_VERBOSE", 1i64).expect("set LOG_VERBOSE");
-    redis.set("LOG_NOTICE", 2i64).expect("set LOG_NOTICE");
-    redis.set("LOG_WARNING", 3i64).expect("set LOG_WARNING");
-
-    let proxy = lua.create_table()?;
-    let meta = lua.create_table()?;
-    meta.set("__index", redis)?;
-    meta.set(
-        "__newindex",
-        lua.create_function(|_, _: LuaMultiValue| -> LuaResult<()> {
-            Err(LuaError::RuntimeError(
-                "Attempt to modify a readonly table".into(),
-            ))
+    redis.raw_set(
+        "error_reply",
+        lua.create_function(|lua, msg: LuaString| {
+            let t = lua.create_table()?;
+            t.raw_set("err", msg)?;
+            Ok(LuaValue::Table(t))
         })?,
     )?;
-    meta.set("__metatable", false)?;
-    proxy.set_metatable(Some(meta.clone()));
-    lua.globals().set("redis", proxy.clone())?;
-    Ok((proxy, meta))
+    redis.raw_set(
+        "status_reply",
+        lua.create_function(|lua, msg: LuaString| {
+            let t = lua.create_table()?;
+            t.raw_set("ok", msg)?;
+            Ok(LuaValue::Table(t))
+        })?,
+    )?;
+    redis.raw_set(
+        "log",
+        lua.create_function(|_lua, args: LuaMultiValue| {
+            let mut it = args.into_iter();
+            let level = match it.next() {
+                Some(LuaValue::Integer(l)) => l,
+                Some(LuaValue::Number(l)) => l as i64,
+                _ => {
+                    return Err(LuaError::RuntimeError(
+                        "First argument must be a number (log level).".into(),
+                    ))
+                }
+            };
+            let msg = it
+                .map(|v| match v {
+                    LuaValue::String(s) => s.to_string_lossy().to_string(),
+                    LuaValue::Integer(i) => i.to_string(),
+                    LuaValue::Number(n) => crate::lua_libs::format_g(n, 14),
+                    other => format!("{:?}", other),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            match level {
+                0 | 1 => tracing::debug!("[Lua] {}", msg),
+                2 => tracing::info!("[Lua] {}", msg),
+                _ => tracing::warn!("[Lua] {}", msg),
+            }
+            Ok(())
+        })?,
+    )?;
+    redis.raw_set(
+        "sha1hex",
+        lua.create_function(|_, s: LuaString| Ok(sha1_hex_bytes(&s.as_bytes())))?,
+    )?;
+    redis.raw_set(
+        "setresp",
+        lua.create_function(|_, v: i64| {
+            if v != 2 && v != 3 {
+                return Err(LuaError::RuntimeError(
+                    "RESP version must be 2 or 3.".into(),
+                ));
+            }
+            let mut c = run_ctx();
+            c.resp = v as u8;
+            set_run_ctx(c);
+            Ok(())
+        })?,
+    )?;
+    redis.raw_set(
+        "set_repl",
+        lua.create_function(|_, v: i64| {
+            if !(0..=3).contains(&v) {
+                return Err(LuaError::RuntimeError(
+                    "Invalid replication flags. Use REPL_AOF, REPL_REPLICA, REPL_ALL or REPL_NONE."
+                        .into(),
+                ));
+            }
+            Ok(())
+        })?,
+    )?;
+    redis.raw_set("replicate_commands", lua.create_function(|_, ()| Ok(true))?)?;
+    redis.raw_set("breakpoint", lua.create_function(|_, ()| Ok(false))?)?;
+    redis.raw_set("debug", lua.create_function(|_, _: LuaMultiValue| Ok(()))?)?;
+    let eng = engine.clone();
+    redis.raw_set(
+        "acl_check_cmd",
+        lua.create_function(move |_, args: LuaMultiValue| {
+            let (name, cmd_args) = parse_redis_call_args(&args).map_err(LuaError::RuntimeError)?;
+            let Some(spec) = crate::commands::lookup(&name) else {
+                return Err(LuaError::RuntimeError(
+                    "Invalid command passed to redis.acl_check_cmd()".into(),
+                ));
+            };
+            Ok(eng.script_acl_check(spec, &cmd_args).is_ok())
+        })?,
+    )?;
+    redis.raw_set(
+        "register_function",
+        lua.create_function(|_, args: LuaMultiValue| register_function(args))?,
+    )?;
+
+    for (k, v) in [
+        ("LOG_DEBUG", 0i64),
+        ("LOG_VERBOSE", 1),
+        ("LOG_NOTICE", 2),
+        ("LOG_WARNING", 3),
+        ("REPL_NONE", 0),
+        ("REPL_AOF", 1),
+        ("REPL_SLAVE", 2),
+        ("REPL_REPLICA", 2),
+        ("REPL_ALL", 3),
+        ("REDIS_VERSION_NUM", 0x0007_0200),
+    ] {
+        redis.raw_set(k, v)?;
+    }
+    redis.raw_set("REDIS_VERSION", "7.2.0")?;
+    Ok(redis)
+}
+
+/// `redis.register_function(name, callback)` or
+/// `redis.register_function{function_name=…, callback=…, flags={…}, description=…}`.
+fn register_function(args: LuaMultiValue) -> LuaResult<()> {
+    if !run_ctx().loading {
+        return Err(LuaError::RuntimeError(
+            "redis.register_function can only be called on FUNCTION LOAD command".into(),
+        ));
+    }
+    let bad = |m: &str| LuaError::RuntimeError(m.to_string());
+    let mut it = args.into_iter();
+    let (name, callback, flags, description) = match (it.next(), it.next()) {
+        (Some(LuaValue::String(n)), Some(LuaValue::Function(f))) => (
+            n.to_string_lossy().to_string(),
+            f,
+            ScriptFlags::default(),
+            None,
+        ),
+        (Some(LuaValue::Table(t)), None) => {
+            let mut flags = ScriptFlags::default();
+            let mut name = None;
+            let mut cb = None;
+            let mut desc = None;
+            for pair in t.pairs::<LuaValue, LuaValue>() {
+                let (k, v) = pair?;
+                let LuaValue::String(k) = k else {
+                    return Err(bad(
+                        "named argument key given to redis.register_function is not a string",
+                    ));
+                };
+                match (k.to_string_lossy().as_ref(), v) {
+                    ("function_name", LuaValue::String(s)) => {
+                        name = Some(s.to_string_lossy().to_string())
+                    }
+                    ("callback", LuaValue::Function(f)) => cb = Some(f),
+                    ("description", LuaValue::String(s)) => {
+                        desc = Some(s.to_string_lossy().to_string())
+                    }
+                    ("flags", LuaValue::Table(fl)) => {
+                        for f in fl.sequence_values::<LuaString>() {
+                            let f = f?;
+                            flags
+                                .set(&f.to_string_lossy())
+                                .map_err(|_| bad("unknown flag given"))?;
+                        }
+                    }
+                    (other, _) => {
+                        return Err(LuaError::RuntimeError(format!(
+                            "unknown argument given to redis.register_function: {}",
+                            other
+                        )))
+                    }
+                }
+            }
+            (
+                name.ok_or_else(|| {
+                    bad("redis.register_function must get a function name argument")
+                })?,
+                cb.ok_or_else(|| bad("redis.register_function must get a callback argument"))?,
+                flags,
+                desc,
+            )
+        }
+        _ => return Err(bad("wrong number of arguments to redis.register_function")),
+    };
+    if !valid_function_name(&name) {
+        return Err(bad(
+            "Function names can only contain letters, numbers, or underscores(_) and must be at \
+             least one character long",
+        ));
+    }
+    REGISTERED.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.iter().any(|x| x.name == name) {
+            return Err(bad("Function already exists in the library"));
+        }
+        r.push(Registered {
+            name,
+            callback: Some(callback),
+            flags,
+            description,
+        });
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Parse variadic Lua arguments into (command_name, args)
 // ---------------------------------------------------------------------------
 
-fn parse_redis_call_args(args: &LuaMultiValue) -> LuaResult<(String, Vec<Bytes>)> {
+fn parse_redis_call_args(args: &LuaMultiValue) -> Result<(String, Vec<Bytes>), String> {
     let mut iter = args.iter();
-    let cmd_val = iter.next().ok_or_else(|| {
-        LuaError::RuntimeError("ERR wrong number of arguments for redis.call/pcall".into())
-    })?;
-
-    let cmd_name = match cmd_val {
-        LuaValue::String(s) => s.to_str()?.to_uppercase(),
-        _ => {
-            return Err(LuaError::RuntimeError(
-                "ERR first argument to redis.call/pcall must be a string".into(),
-            ))
+    let cmd_name = match iter.next() {
+        None => {
+            return Err("ERR Please specify at least one argument for this redis lib call".into())
+        }
+        Some(LuaValue::String(s)) => s.to_string_lossy().to_ascii_uppercase(),
+        Some(_) => {
+            return Err("ERR Lua redis lib command arguments must be strings or integers".into())
         }
     };
-
-    let mut cmd_args = Vec::new();
+    let mut cmd_args = Vec::with_capacity(args.len().saturating_sub(1));
     for val in iter {
         match val {
-            LuaValue::String(s) => {
-                cmd_args.push(Bytes::from(s.as_bytes().to_vec()));
-            }
-            LuaValue::Integer(n) => {
-                cmd_args.push(Bytes::from(n.to_string()));
-            }
-            LuaValue::Number(n) => {
-                // Truncate to integer like Redis does
-                cmd_args.push(Bytes::from((*n as i64).to_string()));
-            }
-            LuaValue::Boolean(b) => {
-                cmd_args.push(Bytes::from(if *b { "1" } else { "0" }));
-            }
+            LuaValue::String(s) => cmd_args.push(Bytes::copy_from_slice(&s.as_bytes())),
+            LuaValue::Integer(n) => cmd_args.push(Bytes::from(n.to_string())),
+            LuaValue::Number(n) => cmd_args.push(Bytes::from(format_number_arg(*n))),
             _ => {
-                return Err(LuaError::RuntimeError(
-                    "ERR invalid argument type for redis.call/pcall".into(),
-                ));
+                return Err(
+                    "ERR Lua redis lib command arguments must be strings or integers".into(),
+                )
             }
         }
     }
-
     Ok((cmd_name, cmd_args))
+}
+
+/// A Lua number passed to `redis.call`, as Redis 7 prints it (the shortest
+/// representation that reads back the same; whole numbers without a
+/// fraction).
+fn format_number_arg(n: f64) -> String {
+    if n.fract() == 0.0 && n.abs() < 1e17 {
+        format!("{}", n as i64)
+    } else if n.is_nan() {
+        "nan".into()
+    } else if n.is_infinite() {
+        if n > 0.0 { "inf" } else { "-inf" }.into()
+    } else {
+        format!("{}", n)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // CommandResponse → Lua value
 // ---------------------------------------------------------------------------
 
-fn response_to_lua(lua: &Lua, resp: CommandResponse) -> LuaResult<LuaValue> {
+fn response_to_lua(lua: &Lua, resp: CommandResponse, proto: u8) -> LuaResult<LuaValue> {
     match resp {
-        CommandResponse::Nil | CommandResponse::NilArray => Ok(LuaValue::Boolean(false)),
+        CommandResponse::Nil | CommandResponse::NilArray => Ok(if proto == 3 {
+            LuaValue::Nil
+        } else {
+            LuaValue::Boolean(false)
+        }),
         CommandResponse::Ok => {
             let t = lua.create_table()?;
-            t.set("ok", "OK")?;
+            t.raw_set("ok", "OK")?;
             Ok(LuaValue::Table(t))
         }
         CommandResponse::Integer(n) => Ok(LuaValue::Integer(n)),
-        CommandResponse::BulkString(b) => {
-            let s = lua.create_string(b.as_ref())?;
-            Ok(LuaValue::String(s))
-        }
+        CommandResponse::BulkString(b) => Ok(LuaValue::String(lua.create_string(b.as_ref())?)),
         CommandResponse::SimpleString(s) => {
             let t = lua.create_table()?;
-            t.set("ok", String::from_utf8_lossy(s.as_ref()).to_string())?;
+            t.raw_set("ok", lua.create_string(s.as_ref())?)?;
             Ok(LuaValue::Table(t))
         }
         CommandResponse::Array(items) => {
-            let t = lua.create_table()?;
+            let t = lua.create_table_with_capacity(items.len(), 0)?;
             for (i, item) in items.into_iter().enumerate() {
-                let lua_val = response_to_lua(lua, item)?;
-                t.set(i + 1, lua_val)?;
+                t.raw_set(i + 1, response_to_lua(lua, item, proto)?)?;
             }
             Ok(LuaValue::Table(t))
         }
-        CommandResponse::Error(msg) => Err(LuaError::RuntimeError(msg)),
+        CommandResponse::Error(msg) => err_table(lua, msg),
         CommandResponse::Queued => {
             let t = lua.create_table()?;
-            t.set("ok", "QUEUED")?;
+            t.raw_set("ok", "QUEUED")?;
             Ok(LuaValue::Table(t))
         }
+        other => resp3_to_lua(lua, other, proto),
+    }
+}
+
+/// The RESP3-typed replies: flattened as RESP2 shows them, or Redis'
+/// `{map=…}`, `{set=…}`, `{double=…}` tables under `redis.setresp(3)`.
+fn resp3_to_lua(lua: &Lua, resp: CommandResponse, proto: u8) -> LuaResult<LuaValue> {
+    match resp {
+        CommandResponse::Double(d) => {
+            if proto == 3 {
+                let t = lua.create_table()?;
+                t.raw_set("double", d)?;
+                Ok(LuaValue::Table(t))
+            } else {
+                Ok(LuaValue::String(
+                    lua.create_string(solikv_core::format_double(d))?,
+                ))
+            }
+        }
+        CommandResponse::Bool(b) => Ok(if proto == 3 {
+            LuaValue::Boolean(b)
+        } else {
+            LuaValue::Integer(b as i64)
+        }),
+        CommandResponse::Map(pairs) => {
+            if proto == 3 {
+                let m = lua.create_table()?;
+                for (k, v) in pairs {
+                    m.raw_set(
+                        response_to_lua(lua, k, proto)?,
+                        response_to_lua(lua, v, proto)?,
+                    )?;
+                }
+                let t = lua.create_table()?;
+                t.raw_set("map", m)?;
+                Ok(LuaValue::Table(t))
+            } else {
+                let t = lua.create_table_with_capacity(pairs.len() * 2, 0)?;
+                let mut i = 1;
+                for (k, v) in pairs {
+                    t.raw_set(i, response_to_lua(lua, k, proto)?)?;
+                    t.raw_set(i + 1, response_to_lua(lua, v, proto)?)?;
+                    i += 2;
+                }
+                Ok(LuaValue::Table(t))
+            }
+        }
+        CommandResponse::Set(items) => {
+            if proto == 3 {
+                let s = lua.create_table()?;
+                for item in items {
+                    s.raw_set(response_to_lua(lua, item, proto)?, true)?;
+                }
+                let t = lua.create_table()?;
+                t.raw_set("set", s)?;
+                Ok(LuaValue::Table(t))
+            } else {
+                response_to_lua(lua, CommandResponse::Array(items), proto)
+            }
+        }
+        CommandResponse::Pairs(items) => {
+            // RESP2: flat; RESP3: an array of 2-element arrays.
+            if proto == 3 {
+                let t = lua.create_table_with_capacity(items.len(), 0)?;
+                for (i, (a, b)) in items.into_iter().enumerate() {
+                    let pair = lua.create_table()?;
+                    pair.raw_set(1, response_to_lua(lua, a, proto)?)?;
+                    pair.raw_set(2, response_to_lua(lua, b, proto)?)?;
+                    t.raw_set(i + 1, pair)?;
+                }
+                Ok(LuaValue::Table(t))
+            } else {
+                let t = lua.create_table_with_capacity(items.len() * 2, 0)?;
+                let mut i = 1;
+                for (a, b) in items {
+                    t.raw_set(i, response_to_lua(lua, a, proto)?)?;
+                    t.raw_set(i + 1, response_to_lua(lua, b, proto)?)?;
+                    i += 2;
+                }
+                Ok(LuaValue::Table(t))
+            }
+        }
+        CommandResponse::Verbatim(_, text) => {
+            Ok(LuaValue::String(lua.create_string(text.as_ref())?))
+        }
+        CommandResponse::Push(items) => response_to_lua(lua, CommandResponse::Array(items), proto),
+        other => response_to_lua(lua, other, proto),
     }
 }
 
@@ -582,25 +1553,44 @@ fn lua_to_response(val: LuaValue) -> CommandResponse {
         LuaValue::Boolean(false) => CommandResponse::Nil,
         LuaValue::Integer(n) => CommandResponse::Integer(n),
         LuaValue::Number(n) => CommandResponse::Integer(n as i64),
-        LuaValue::String(s) => CommandResponse::BulkString(Bytes::from(s.as_bytes().to_vec())),
+        LuaValue::String(s) => CommandResponse::BulkString(Bytes::copy_from_slice(&s.as_bytes())),
         LuaValue::Table(t) => {
-            // Check for {err=...}
-            if let Ok(err) = t.get::<String>("err") {
-                return CommandResponse::Error(err);
+            if let Ok(LuaValue::String(err)) = t.raw_get::<LuaValue>("err") {
+                let e = err.to_string_lossy();
+                return CommandResponse::Error(e.strip_prefix('-').unwrap_or(&e).to_string());
             }
-            // Check for {ok=...}
-            if let Ok(ok) = t.get::<String>("ok") {
-                return CommandResponse::SimpleString(Bytes::from(ok));
+            if let Ok(LuaValue::String(ok)) = t.raw_get::<LuaValue>("ok") {
+                return CommandResponse::SimpleString(Bytes::copy_from_slice(&ok.as_bytes()));
             }
-            // Otherwise treat as array
-            let mut items = Vec::new();
-            let len = t.len().unwrap_or(0);
-            for i in 1..=len {
-                if let Ok(v) = t.get::<LuaValue>(i) {
-                    items.push(lua_to_response(v));
-                } else {
-                    break;
+            match t.raw_get::<LuaValue>("double") {
+                Ok(LuaValue::Number(d)) => return CommandResponse::Double(d),
+                Ok(LuaValue::Integer(d)) => return CommandResponse::Double(d as f64),
+                _ => {}
+            }
+            if let Ok(LuaValue::Table(m)) = t.raw_get::<LuaValue>("map") {
+                let mut pairs = Vec::new();
+                for (k, v) in m.pairs::<LuaValue, LuaValue>().flatten() {
+                    pairs.push((lua_to_response(k), lua_to_response(v)));
                 }
+                return CommandResponse::Map(pairs);
+            }
+            if let Ok(LuaValue::Table(s)) = t.raw_get::<LuaValue>("set") {
+                let items = s
+                    .pairs::<LuaValue, LuaValue>()
+                    .flatten()
+                    .map(|(k, _)| lua_to_response(k))
+                    .collect();
+                return CommandResponse::Set(items);
+            }
+            // An array, up to the first nil.
+            let mut items = Vec::new();
+            let mut i = 1;
+            loop {
+                match t.raw_get::<LuaValue>(i) {
+                    Ok(LuaValue::Nil) | Err(_) => break,
+                    Ok(v) => items.push(lua_to_response(v)),
+                }
+                i += 1;
             }
             CommandResponse::Array(items)
         }
@@ -616,14 +1606,19 @@ fn lua_to_response(val: LuaValue) -> CommandResponse {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_sha1_hex() {
-        let sha = sha1_hex("return 1");
-        assert_eq!(sha.len(), 40);
-        // Consistent hash
-        assert_eq!(sha, sha1_hex("return 1"));
-        // Different inputs produce different hashes
-        assert_ne!(sha, sha1_hex("return 2"));
+    fn engine(shards: usize) -> Arc<CommandEngine> {
+        let shards = Arc::new(crate::ShardManager::new(shards));
+        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
+        let engine = Arc::new(CommandEngine::new(shards, pubsub));
+        engine.init_self_ref(Arc::downgrade(&engine));
+        engine
+    }
+
+    fn bulk(r: &CommandResponse) -> String {
+        match r {
+            CommandResponse::BulkString(b) => String::from_utf8_lossy(b).to_string(),
+            other => panic!("expected BulkString, got {:?}", other),
+        }
     }
 
     #[test]
@@ -644,16 +1639,6 @@ mod tests {
     }
 
     #[test]
-    fn test_blocked_commands() {
-        assert!(is_blocked_in_script("EVAL"));
-        assert!(is_blocked_in_script("eval"));
-        assert!(is_blocked_in_script("MULTI"));
-        assert!(is_blocked_in_script("SUBSCRIBE"));
-        assert!(!is_blocked_in_script("GET"));
-        assert!(!is_blocked_in_script("SET"));
-    }
-
-    #[test]
     fn test_lua_to_response_primitives() {
         assert!(matches!(
             lua_to_response(LuaValue::Nil),
@@ -671,11 +1656,6 @@ mod tests {
             lua_to_response(LuaValue::Integer(42)),
             CommandResponse::Integer(42)
         ));
-    }
-
-    #[test]
-    fn test_lua_to_response_number_truncation() {
-        // Lua numbers (floats) should be truncated to integers
         assert!(matches!(
             lua_to_response(LuaValue::Number(3.7)),
             CommandResponse::Integer(3)
@@ -683,326 +1663,313 @@ mod tests {
     }
 
     #[test]
-    fn test_response_to_lua_and_back() {
-        let lua = Lua::new();
-
-        // Nil -> false -> Nil
-        let v = response_to_lua(&lua, CommandResponse::Nil).unwrap();
-        assert!(matches!(v, LuaValue::Boolean(false)));
-        assert!(matches!(lua_to_response(v), CommandResponse::Nil));
-
-        // Integer round-trips
-        let v = response_to_lua(&lua, CommandResponse::Integer(42)).unwrap();
-        assert!(matches!(v, LuaValue::Integer(42)));
-        assert!(matches!(lua_to_response(v), CommandResponse::Integer(42)));
-
-        // BulkString round-trips
-        let v = response_to_lua(&lua, CommandResponse::BulkString(Bytes::from("hello"))).unwrap();
-        if let LuaValue::String(s) = &v {
-            assert_eq!(s.to_str().unwrap(), "hello");
-        } else {
-            panic!("expected string");
-        }
-        match lua_to_response(v) {
-            CommandResponse::BulkString(b) => assert_eq!(b.as_ref(), b"hello"),
-            other => panic!("expected BulkString, got {:?}", other),
-        }
+    fn shebang_flags_are_parsed() {
+        let (f, body) = parse_script("#!lua flags=no-writes,allow-oom\nreturn 1").unwrap();
+        assert!(f.no_writes && f.allow_oom && f.shebang);
+        assert_eq!(body, "\nreturn 1");
+        assert!(parse_script("#!lua flags=bogus\nreturn 1")
+            .unwrap_err()
+            .contains("Unexpected flag"));
+        assert!(parse_script("#!python\nreturn 1")
+            .unwrap_err()
+            .contains("Could not find engine"));
+        let (f, body) = parse_script("return 1").unwrap();
+        assert!(!f.shebang);
+        assert_eq!(body, "return 1");
     }
 
     #[test]
-    fn test_sandbox() {
-        let lua = Lua::new();
-        sandbox_lua(&lua);
-
-        let globals = lua.globals();
-        assert!(globals.get::<LuaValue>("os").unwrap().is_nil());
-        assert!(globals.get::<LuaValue>("io").unwrap().is_nil());
-        assert!(globals.get::<LuaValue>("debug").unwrap().is_nil());
-        assert!(globals.get::<LuaValue>("loadfile").unwrap().is_nil());
-        assert!(globals.get::<LuaValue>("dofile").unwrap().is_nil());
-        assert!(globals.get::<LuaValue>("package").unwrap().is_nil());
-        assert!(globals.get::<LuaValue>("require").unwrap().is_nil());
-
-        // Standard safe functions still available
-        assert!(!globals.get::<LuaValue>("tostring").unwrap().is_nil());
-        assert!(!globals.get::<LuaValue>("tonumber").unwrap().is_nil());
-        assert!(!globals.get::<LuaValue>("table").unwrap().is_nil());
-        assert!(!globals.get::<LuaValue>("string").unwrap().is_nil());
-        assert!(!globals.get::<LuaValue>("math").unwrap().is_nil());
+    fn scripts_see_lua_5_1_and_redis_libraries() {
+        let e = engine(2);
+        let r = execute_script(
+            &e,
+            "return tostring(3) .. '/' .. tostring(1.5) .. '/' .. type(unpack)",
+            vec![],
+            vec![],
+        );
+        assert_eq!(bulk(&r), "3/1.5/function");
+        let r = execute_script(&e, "return 7 / 2", vec![], vec![]);
+        assert!(matches!(r, CommandResponse::Integer(3)), "{r:?}");
+        let r = execute_script(
+            &e,
+            "return cjson.encode(cmsgpack.unpack(cmsgpack.pack({a = {1, 2}})))",
+            vec![],
+            vec![],
+        );
+        assert_eq!(bulk(&r), r#"{"a":[1,2]}"#);
+        let r = execute_script(
+            &e,
+            "return bit.band(12, 10) + struct.size('>i')",
+            vec![],
+            vec![],
+        );
+        assert!(matches!(r, CommandResponse::Integer(12)), "{r:?}");
+        let r = execute_script(&e, "return redis.sha1hex('')", vec![], vec![]);
+        assert_eq!(bulk(&r), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
     }
 
     #[test]
     fn test_execute_script_basic() {
-        let shards = Arc::new(crate::ShardManager::new(4));
-        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
-        let engine = Arc::new(CommandEngine::new(shards, pubsub));
-        engine.init_self_ref(Arc::downgrade(&engine));
-
-        // Return integer
-        let resp = execute_script(&engine, "return 42", vec![], vec![]);
-        assert!(matches!(resp, CommandResponse::Integer(42)));
-
-        // Return string
-        let resp = execute_script(&engine, "return 'hello'", vec![], vec![]);
-        match resp {
-            CommandResponse::BulkString(b) => assert_eq!(b.as_ref(), b"hello"),
-            other => panic!("expected BulkString, got {:?}", other),
-        }
-
-        // Return nil
-        let resp = execute_script(&engine, "return nil", vec![], vec![]);
-        assert!(matches!(resp, CommandResponse::Nil));
-
-        // Return boolean true → 1
-        let resp = execute_script(&engine, "return true", vec![], vec![]);
-        assert!(matches!(resp, CommandResponse::Integer(1)));
-
-        // Return boolean false → Nil
-        let resp = execute_script(&engine, "return false", vec![], vec![]);
-        assert!(matches!(resp, CommandResponse::Nil));
+        let e = engine(4);
+        assert!(matches!(
+            execute_script(&e, "return 42", vec![], vec![]),
+            CommandResponse::Integer(42)
+        ));
+        assert_eq!(
+            bulk(&execute_script(&e, "return 'hello'", vec![], vec![])),
+            "hello"
+        );
+        assert!(matches!(
+            execute_script(&e, "return nil", vec![], vec![]),
+            CommandResponse::Nil
+        ));
+        assert!(matches!(
+            execute_script(&e, "return true", vec![], vec![]),
+            CommandResponse::Integer(1)
+        ));
+        assert!(matches!(
+            execute_script(&e, "return false", vec![], vec![]),
+            CommandResponse::Nil
+        ));
     }
 
     #[test]
-    fn test_execute_script_keys_argv() {
-        let shards = Arc::new(crate::ShardManager::new(4));
-        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
-        let engine = Arc::new(CommandEngine::new(shards, pubsub));
-        engine.init_self_ref(Arc::downgrade(&engine));
-
-        let resp = execute_script(
-            &engine,
-            "return KEYS[1]",
-            vec![Bytes::from("mykey")],
-            vec![],
+    fn test_execute_script_keys_argv_are_binary_safe() {
+        let e = engine(4);
+        assert_eq!(
+            bulk(&execute_script(
+                &e,
+                "return KEYS[1]",
+                vec![Bytes::from("mykey")],
+                vec![]
+            )),
+            "mykey"
         );
-        match resp {
-            CommandResponse::BulkString(b) => assert_eq!(b.as_ref(), b"mykey"),
-            other => panic!("expected BulkString, got {:?}", other),
-        }
-
-        let resp = execute_script(
-            &engine,
-            "return ARGV[1]",
+        let r = execute_script(
+            &e,
+            "return #ARGV[1]",
             vec![],
-            vec![Bytes::from("myarg")],
+            vec![Bytes::from_static(b"\xff\x00\xfe")],
         );
-        match resp {
-            CommandResponse::BulkString(b) => assert_eq!(b.as_ref(), b"myarg"),
-            other => panic!("expected BulkString, got {:?}", other),
-        }
+        assert!(matches!(r, CommandResponse::Integer(3)), "{r:?}");
     }
 
     #[test]
     fn test_execute_script_redis_call() {
-        let shards = Arc::new(crate::ShardManager::new(4));
-        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
-        let engine = Arc::new(CommandEngine::new(shards, pubsub));
-        engine.init_self_ref(Arc::downgrade(&engine));
-
-        // SET via redis.call
-        let resp = execute_script(
-            &engine,
+        let e = engine(4);
+        let r = execute_script(
+            &e,
             "redis.call('SET', KEYS[1], ARGV[1]) return redis.call('GET', KEYS[1])",
             vec![Bytes::from("luakey")],
             vec![Bytes::from("luaval")],
         );
-        match resp {
-            CommandResponse::BulkString(b) => assert_eq!(b.as_ref(), b"luaval"),
-            other => panic!("expected BulkString, got {:?}", other),
-        }
+        assert_eq!(bulk(&r), "luaval");
+        // A float argument keeps its fraction (Redis 7).
+        let r = execute_script(
+            &e,
+            "redis.call('ZADD', 'z', 1.5, 'm') return redis.call('ZSCORE', 'z', 'm')",
+            vec![],
+            vec![],
+        );
+        assert_eq!(bulk(&r), "1.5");
     }
 
     #[test]
-    fn test_execute_script_pcall_error() {
-        let shards = Arc::new(crate::ShardManager::new(4));
-        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
-        let engine = Arc::new(CommandEngine::new(shards, pubsub));
-        engine.init_self_ref(Arc::downgrade(&engine));
-
-        // pcall returns error table instead of raising
-        let resp = execute_script(
-            &engine,
+    fn redis_call_errors_are_tables_and_reach_the_client_verbatim() {
+        let e = engine(1);
+        execute_script(&e, "redis.call('SET', 'str', 'x')", vec![], vec![]);
+        let r = execute_script(&e, "return redis.call('LPUSH', 'str', 'a')", vec![], vec![]);
+        assert!(
+            matches!(&r, CommandResponse::Error(m) if m.starts_with("WRONGTYPE")),
+            "{r:?}"
+        );
+        let r = execute_script(
+            &e,
+            "local ok, err = pcall(redis.call, 'LPUSH', 'str', 'a') return err.err",
+            vec![],
+            vec![],
+        );
+        assert!(bulk(&r).starts_with("WRONGTYPE"));
+        let r = execute_script(
+            &e,
             "local r = redis.pcall('EVAL', 'return 1', '0') return r.err",
             vec![],
             vec![],
         );
-        match resp {
-            CommandResponse::BulkString(b) => {
-                let s = String::from_utf8_lossy(b.as_ref());
-                assert!(s.contains("not allowed from script"), "got: {}", s);
-            }
-            other => panic!("expected BulkString with error, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_execute_script_table_return() {
-        let shards = Arc::new(crate::ShardManager::new(4));
-        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
-        let engine = Arc::new(CommandEngine::new(shards, pubsub));
-        engine.init_self_ref(Arc::downgrade(&engine));
-
-        // Return array table
-        let resp = execute_script(&engine, "return {1, 2, 3}", vec![], vec![]);
-        match resp {
-            CommandResponse::Array(items) => {
-                assert_eq!(items.len(), 3);
-                assert!(matches!(items[0], CommandResponse::Integer(1)));
-                assert!(matches!(items[1], CommandResponse::Integer(2)));
-                assert!(matches!(items[2], CommandResponse::Integer(3)));
-            }
-            other => panic!("expected Array, got {:?}", other),
-        }
-
-        // Return error table
-        let resp = execute_script(
-            &engine,
+        assert!(bulk(&r).contains("not allowed from script"));
+        let r = execute_script(
+            &e,
             "return redis.error_reply('ERR custom error')",
             vec![],
             vec![],
         );
-        match resp {
-            CommandResponse::Error(msg) => assert_eq!(msg, "ERR custom error"),
-            other => panic!("expected Error, got {:?}", other),
-        }
-
-        // Return status table
-        let resp = execute_script(&engine, "return redis.status_reply('PONG')", vec![], vec![]);
-        match resp {
-            CommandResponse::SimpleString(s) => assert_eq!(s.as_ref(), b"PONG"),
-            other => panic!("expected SimpleString, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_execute_script_syntax_error() {
-        let shards = Arc::new(crate::ShardManager::new(4));
-        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
-        let engine = Arc::new(CommandEngine::new(shards, pubsub));
-        engine.init_self_ref(Arc::downgrade(&engine));
-
-        let resp = execute_script(&engine, "invalid lua !!!", vec![], vec![]);
-        match resp {
-            CommandResponse::Error(msg) => assert!(msg.starts_with("ERR")),
-            other => panic!("expected Error, got {:?}", other),
-        }
-    }
-
-    // SEC-014: a global set by one script must not be visible to a later
-    // script that lands on the same pooled VM.
-    #[test]
-    fn test_pooled_vm_globals_cleared_between_scripts() {
-        let shards = Arc::new(crate::ShardManager::new(4));
-        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
-        let engine = Arc::new(CommandEngine::new(shards, pubsub));
-        engine.init_self_ref(Arc::downgrade(&engine));
-
-        // Script 1: poison a global.
-        let r1 = execute_script(
-            &engine,
-            "_G.leaked_secret = 'badness'; return 1",
-            vec![],
-            vec![],
-        );
-        assert!(matches!(r1, CommandResponse::Integer(1)));
-
-        // Script 2: should observe a fresh global table — leaked_secret is gone.
-        let r2 = execute_script(
-            &engine,
-            "if _G.leaked_secret == nil then return 'clean' else return _G.leaked_secret end",
-            vec![],
-            vec![],
-        );
-        match r2 {
-            CommandResponse::BulkString(b) => assert_eq!(b.as_ref(), b"clean"),
-            other => panic!("expected BulkString('clean'), got {:?}", other),
-        }
-    }
-
-    // SEC-014: redis.* must be reinstalled on every VM reuse, so a script
-    // that overwrites redis.call cannot break the next script.
-    #[test]
-    fn test_pooled_vm_redis_module_restored() {
-        let shards = Arc::new(crate::ShardManager::new(4));
-        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
-        let engine = Arc::new(CommandEngine::new(shards, pubsub));
-        engine.init_self_ref(Arc::downgrade(&engine));
-
-        // Script 1: clobber redis.call.
-        let _ = execute_script(
-            &engine,
-            "redis.call = function() return 'pwned' end; return 1",
-            vec![],
-            vec![],
-        );
-
-        // Script 2: redis.call must work as expected.
-        let r = execute_script(
-            &engine,
-            "redis.call('SET', KEYS[1], ARGV[1]); return redis.call('GET', KEYS[1])",
-            vec![Bytes::from("k")],
-            vec![Bytes::from("v")],
-        );
-        match r {
-            CommandResponse::BulkString(b) => assert_eq!(b.as_ref(), b"v"),
-            other => panic!("expected BulkString('v'), got {:?}", other),
-        }
-    }
-
-    /// The proxy refuses writes; a script that goes around it (`rawset`,
-    /// or replacing the global) gets its VM thrown away, so the next script
-    /// still sees the real module.
-    #[test]
-    fn redis_module_is_read_only_and_bypasses_retire_the_vm() {
-        let shards = Arc::new(crate::ShardManager::new(1));
-        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
-        let engine = Arc::new(CommandEngine::new(shards, pubsub));
-        engine.init_self_ref(Arc::downgrade(&engine));
-
-        let r = execute_script(&engine, "redis.call = 1; return 1", vec![], vec![]);
         assert!(
-            matches!(&r, CommandResponse::Error(e) if e.contains("readonly")),
+            matches!(&r, CommandResponse::Error(m) if m == "ERR custom error"),
             "{r:?}"
         );
-        for evil in [
-            "rawset(redis, 'call', function() return 'pwned' end); return 1",
-            "redis = {call = function() return 'pwned' end}; return 1",
+        let r = execute_script(&e, "return {err='My Error'}", vec![], vec![]);
+        assert!(
+            matches!(&r, CommandResponse::Error(m) if m == "My Error"),
+            "{r:?}"
+        );
+        let r = execute_script(&e, "return redis.status_reply('PONG')", vec![], vec![]);
+        assert!(matches!(&r, CommandResponse::SimpleString(s) if s.as_ref() == b"PONG"));
+        let r = execute_script(&e, "invalid lua !!!", vec![], vec![]);
+        assert!(matches!(&r, CommandResponse::Error(m) if m.starts_with("ERR")));
+        let r = execute_script(&e, "return {1, 2, 3, nil, 5}", vec![], vec![]);
+        assert!(matches!(&r, CommandResponse::Array(v) if v.len() == 3));
+    }
+
+    #[test]
+    fn globals_and_libraries_are_read_only() {
+        let e = engine(1);
+        for (script, want) in [
+            ("x = 5 return 1", "readonly"),
+            ("_G.leaked = 1 return 1", "readonly"),
+            ("string.rep = nil return 1", "readonly"),
+            ("redis.call = 1 return 1", "readonly"),
+            ("return undefined_thing", "nonexistent global"),
         ] {
-            let _ = execute_script(&engine, evil, vec![], vec![]);
-            let r = execute_script(
-                &engine,
-                "redis.call('SET', 'k', 'v'); return redis.call('GET', 'k')",
-                vec![],
-                vec![],
-            );
+            let r = execute_script(&e, script, vec![], vec![]);
             assert!(
-                matches!(&r, CommandResponse::BulkString(b) if b.as_ref() == b"v"),
-                "{evil}: {r:?}"
+                matches!(&r, CommandResponse::Error(m) if m.contains(want)),
+                "{script}: {r:?}"
             );
+        }
+        // Going around the guards does not reach the next script.
+        for evil in [
+            "rawset(_G, 'leaked', 'x') return 1",
+            "rawset(string, 'upper', function() return 'pwned' end) return 1",
+            "rawset(redis, 'call', function() return 'pwned' end) return 1",
+        ] {
+            let _ = execute_script(&e, evil, vec![], vec![]);
+            let r = execute_script(
+                &e,
+                "redis.call('SET', 'k', 'v') return string.upper(redis.call('GET', 'k'))",
+                vec![],
+                vec![],
+            );
+            assert_eq!(bulk(&r), "V", "{evil}");
+            let r = execute_script(
+                &e,
+                "return rawget(_G, 'leaked') == nil and 1 or 0",
+                vec![],
+                vec![],
+            );
+            assert!(matches!(r, CommandResponse::Integer(1)), "{evil}: {r:?}");
+        }
+        let r = execute_script(&e, "return getmetatable('')", vec![], vec![]);
+        assert!(matches!(r, CommandResponse::Nil), "{r:?}");
+        for gone in [
+            "loadstring",
+            "setfenv",
+            "getfenv",
+            "dofile",
+            "debug",
+            "io",
+            "require",
+            "print",
+        ] {
+            let r = execute_script(&e, &format!("return {gone}"), vec![], vec![]);
+            assert!(matches!(&r, CommandResponse::Error(_)), "{gone}: {r:?}");
         }
     }
 
-    /// A script compiled once runs again with new KEYS/ARGV.
+    #[test]
+    fn read_only_scripts_refuse_writes() {
+        let e = engine(1);
+        let r = execute_script_with(
+            &e,
+            "return redis.call('SET', 'k', 'v')",
+            vec![],
+            vec![],
+            true,
+        );
+        assert!(
+            matches!(&r, CommandResponse::Error(m) if m.contains("read-only scripts")),
+            "{r:?}"
+        );
+        let r = execute_script_with(&e, "return redis.call('GET', 'k')", vec![], vec![], true);
+        assert!(matches!(r, CommandResponse::Nil), "{r:?}");
+    }
+
     #[test]
     fn compiled_scripts_are_reused_with_fresh_arguments() {
-        let shards = Arc::new(crate::ShardManager::new(1));
-        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
-        let engine = Arc::new(CommandEngine::new(shards, pubsub));
-        engine.init_self_ref(Arc::downgrade(&engine));
+        let e = engine(1);
         let script = "return KEYS[1] .. ':' .. ARGV[1]";
         for i in 0..5 {
             let r = execute_script(
-                &engine,
+                &e,
                 script,
                 vec![Bytes::from(format!("k{i}"))],
                 vec![Bytes::from(format!("a{i}"))],
             );
-            match r {
-                CommandResponse::BulkString(b) => {
-                    assert_eq!(b.as_ref(), format!("k{i}:a{i}").as_bytes())
-                }
-                other => panic!("{other:?}"),
-            }
+            assert_eq!(bulk(&r), format!("k{i}:a{i}"));
         }
+    }
+
+    #[test]
+    fn script_kill_is_not_swallowed_by_pcall() {
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            eprintln!("WATCHDOG: script was never killed");
+            std::process::exit(3);
+        });
+        for script in [
+            "while true do end",
+            "while true do pcall(function() while true do end end) end",
+        ] {
+            let e = engine(1);
+            let e2 = e.clone();
+            let h = std::thread::spawn(move || {
+                e2.execute("EVAL", &[Bytes::from(script), Bytes::from("0")])
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let k = e.script_state().kill(false);
+            eprintln!("kill -> {k:?} running={}", e.script_state().is_running());
+            let r = h.join().unwrap();
+            assert!(
+                matches!(&r, CommandResponse::Error(m) if m.contains("killed")),
+                "{script}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn functions_load_and_run() {
+        let e = engine(2);
+        let code = "#!lua name=mylib\n\
+                    redis.register_function('myset', function(keys, args) return redis.call('SET', keys[1], args[1]) end)\n\
+                    redis.register_function{function_name='myget', callback=function(keys) return redis.call('GET', keys[1]) end, flags={'no-writes'}}";
+        assert_eq!(load_library(&e, code, false).unwrap(), "mylib");
+        assert!(load_library(&e, code, false)
+            .unwrap_err()
+            .contains("already exists"));
+        assert_eq!(load_library(&e, code, true).unwrap(), "mylib");
+        let r = execute_function(
+            &e,
+            "myset",
+            vec![Bytes::from("k")],
+            vec![Bytes::from("v")],
+            false,
+        );
+        assert!(matches!(r, CommandResponse::SimpleString(_)), "{r:?}");
+        let r = execute_function(&e, "myget", vec![Bytes::from("k")], vec![], true);
+        assert_eq!(bulk(&r), "v");
+        assert!(e.functions().function("myget").unwrap().flags.no_writes);
+        assert!(load_library(&e, "return 1", false)
+            .unwrap_err()
+            .contains("Missing library metadata"));
+        assert!(load_library(&e, "#!lua name=empty\nlocal x = 1", false)
+            .unwrap_err()
+            .contains("No functions registered"));
+        let dump = e.functions().dump();
+        assert_eq!(parse_function_dump(&dump).unwrap().len(), 1);
+        assert!(e.functions().delete("mylib"));
+        let r = execute_function(&e, "myget", vec![Bytes::from("k")], vec![], true);
+        assert!(
+            matches!(&r, CommandResponse::Error(m) if m.contains("Function not found")),
+            "{r:?}"
+        );
     }
 }

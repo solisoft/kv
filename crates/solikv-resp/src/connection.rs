@@ -11,6 +11,8 @@ pub struct ClientConnection {
     pub watch_keys: Vec<bytes::Bytes>,
     pub subscriptions: Vec<bytes::Bytes>,
     pub psubscriptions: Vec<String>,
+    /// Shard channels (`SSUBSCRIBE`), by their broker name.
+    pub ssubscriptions: Vec<bytes::Bytes>,
     pub name: Option<String>,
 }
 
@@ -25,12 +27,15 @@ impl ClientConnection {
             watch_keys: Vec::new(),
             subscriptions: Vec::new(),
             psubscriptions: Vec::new(),
+            ssubscriptions: Vec::new(),
             name: None,
         }
     }
 
     pub fn is_subscribed(&self) -> bool {
-        !self.subscriptions.is_empty() || !self.psubscriptions.is_empty()
+        !self.subscriptions.is_empty()
+            || !self.psubscriptions.is_empty()
+            || !self.ssubscriptions.is_empty()
     }
 
     pub fn reset_transaction(&mut self) {

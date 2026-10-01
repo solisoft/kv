@@ -814,6 +814,41 @@ pub enum CommandResponse {
     Array(Vec<CommandResponse>),
     Error(String),
     Queued,
+    // RESP3 types. Commands produce the RESP2 shapes above; a connection
+    // that said `HELLO 3` gets them re-typed as these (see the engine's
+    // `resp3` module), and an encoder for RESP2 flattens them back.
+    /// `,1.5` — a bulk string in RESP2.
+    Double(f64),
+    /// `#t` — `:1`/`:0` in RESP2.
+    Bool(bool),
+    /// `%n` — a flat array of key, value, … in RESP2.
+    Map(Vec<(CommandResponse, CommandResponse)>),
+    /// `~n` — an array in RESP2.
+    Set(Vec<CommandResponse>),
+    /// Member/score pairs (`ZRANGE … WITHSCORES`): an array of 2-element
+    /// arrays in RESP3, flat in RESP2.
+    Pairs(Vec<(CommandResponse, CommandResponse)>),
+    /// `=n\r\ntxt:…` — a bulk string in RESP2.
+    Verbatim(&'static str, Bytes),
+    /// `>n` — out-of-band data (pub/sub, invalidations); an array in RESP2.
+    Push(Vec<CommandResponse>),
+}
+
+/// A double as Redis prints it in a reply (`ZSCORE`, `INCRBYFLOAT`, RESP3
+/// `,` doubles): whole numbers without a fraction, otherwise the shortest
+/// representation that reads back the same.
+pub fn format_double(d: f64) -> String {
+    if d.is_infinite() {
+        return if d > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    if d.is_nan() {
+        return "nan".to_string();
+    }
+    if d == d.trunc() && d.abs() < 1e15 {
+        format!("{}", d as i64)
+    } else {
+        format!("{}", d)
+    }
 }
 
 impl CommandResponse {

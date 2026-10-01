@@ -23,6 +23,30 @@ impl PubSubMessage {
     }
 }
 
+/// Shard channels (`SSUBSCRIBE`/`SPUBLISH`) live in the same map under this
+/// prefix: a namespace of their own that no client-visible channel name can
+/// reach (it starts with a NUL byte), and that pattern subscriptions never
+/// see.
+pub const SHARD_PREFIX: &[u8] = b"\x00shard\x00";
+
+/// The broker's name for shard channel `ch`.
+pub fn shard_channel(ch: &[u8]) -> Bytes {
+    let mut v = Vec::with_capacity(SHARD_PREFIX.len() + ch.len());
+    v.extend_from_slice(SHARD_PREFIX);
+    v.extend_from_slice(ch);
+    Bytes::from(v)
+}
+
+/// The client-visible name of a broker channel, and whether it is a shard
+/// channel.
+pub fn split_shard(ch: &Bytes) -> (Bytes, bool) {
+    if ch.starts_with(SHARD_PREFIX) {
+        (ch.slice(SHARD_PREFIX.len()..), true)
+    } else {
+        (ch.clone(), false)
+    }
+}
+
 /// Central pub/sub broker using broadcast channels per topic.
 #[derive(Debug, Clone)]
 pub struct PubSubBroker {
@@ -96,6 +120,21 @@ impl PubSubBroker {
         }
 
         count
+    }
+
+    /// `SPUBLISH`: to the shard channel's subscribers only (no patterns).
+    pub fn publish_shard(&self, channel: &[u8], message: Bytes) -> usize {
+        let key = shard_channel(channel);
+        match self.channels.get(&key) {
+            Some(tx) => tx
+                .send(PubSubMessage {
+                    channel: key.clone(),
+                    message,
+                    pattern: None,
+                })
+                .unwrap_or(0),
+            None => 0,
+        }
     }
 
     /// Get the number of subscribers for a channel.
