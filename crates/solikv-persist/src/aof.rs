@@ -344,6 +344,10 @@ struct Inner {
     /// Per shard, the sequence number its first record will carry (see
     /// [`AofWriter::start_shard`]).
     starts: Vec<std::sync::atomic::AtomicU64>,
+    /// Per shard, whether its changes are logged (`CONFIG SET appendonly`
+    /// turns shards on one at a time, each at its rewrite's cut; see
+    /// [`AofWriter::shard_on`]).
+    on: Vec<std::sync::atomic::AtomicBool>,
     /// `appendfsync`, changeable at runtime (`CONFIG SET`).
     policy: std::sync::atomic::AtomicU8,
     /// `sync()` requests waiting for the next fsync.
@@ -441,6 +445,31 @@ impl AofWriter {
         if let Some(s) = self.inner.starts.get(shard as usize) {
             s.store(seq, Ordering::Release);
         }
+    }
+
+    /// Whether `shard`'s changes are logged. Read under the shard's lock by
+    /// every write, and changed only under it ([`set_shard_on`]), so a shard
+    /// turns on or off between two of its commands, never inside one.
+    ///
+    /// [`set_shard_on`]: Self::set_shard_on
+    #[inline]
+    pub fn shard_on(&self, shard: u32) -> bool {
+        self.inner
+            .on
+            .get(shard as usize)
+            .is_some_and(|o| o.load(Ordering::Relaxed))
+    }
+
+    /// See [`shard_on`](Self::shard_on). Call with the shard's lock held.
+    pub fn set_shard_on(&self, shard: u32, on: bool) {
+        if let Some(o) = self.inner.on.get(shard as usize) {
+            o.store(on, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether any shard is logged: the log is on.
+    pub fn any_on(&self) -> bool {
+        self.inner.on.iter().any(|o| o.load(Ordering::Relaxed))
     }
 
     /// Log a command for `shard`. `seq` is the shard's counter; call with the
@@ -617,6 +646,9 @@ pub fn spawn_aof_writer(
         threads: parking_lot::Mutex::new(Vec::new()),
         starts: (0..shards)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect(),
+        on: (0..shards)
+            .map(|_| std::sync::atomic::AtomicBool::new(true))
             .collect(),
         policy: std::sync::atomic::AtomicU8::new(policy.to_u8()),
         syncs: parking_lot::Mutex::new(Vec::new()),

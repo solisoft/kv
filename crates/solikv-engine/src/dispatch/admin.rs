@@ -695,6 +695,7 @@ impl CommandEngine {
         "hz",
         "requirepass",
         "save",
+        "appendonly",
         "appendfsync",
         "auto-aof-rewrite-percentage",
         "auto-aof-rewrite-min-size",
@@ -748,6 +749,30 @@ impl CommandEngine {
                     e
                 )
             }),
+            "appendonly" => {
+                match value.to_ascii_lowercase().as_str() {
+                    "yes" | "no" => {
+                        let on = value.eq_ignore_ascii_case("yes");
+                        let st = &self.persistence.stats;
+                        // Turning the log on or off while a rewrite runs: Redis
+                        // waits for it too.
+                        if on != self.persistence.config().appendonly
+                            && st.aof_rewrite_in_progress.load(Ordering::Acquire)
+                        {
+                            Err("ERR CONFIG SET failed (possibly related to argument 'appendonly') \
+                             - background append only file rewriting in progress"
+                            .to_string())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    _ => Err(
+                        "ERR CONFIG SET failed (possibly related to argument 'appendonly') - \
+                          argument must be 'yes' or 'no'"
+                            .to_string(),
+                    ),
+                }
+            }
             "appendfsync" => fsync_policy(value).map(|_| ()).ok_or_else(|| {
                 "ERR CONFIG SET failed (possibly related to argument 'appendfsync') - argument(s) \
                  must be one of the following: always, everysec, no"
@@ -815,6 +840,16 @@ impl CommandEngine {
             "save" => {
                 if let Ok(points) = solikv_engine_save_points(value) {
                     self.persistence.set_save(points);
+                }
+            }
+            "appendonly" => {
+                let res = if value.eq_ignore_ascii_case("yes") {
+                    self.persistence.enable_aof(&self.shards)
+                } else {
+                    self.persistence.disable_aof(&self.shards)
+                };
+                if let Err(e) = res {
+                    tracing::warn!("CONFIG SET appendonly {}: {}", value, e);
                 }
             }
             "appendfsync" => {

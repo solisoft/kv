@@ -486,7 +486,7 @@ pub struct TxGuard {
 impl TxGuard {
     pub(crate) fn begin(shards: &Arc<ShardManager>) -> Self {
         // Nested (a script inside EXEC): the outer bracket covers it.
-        if shards.aof().is_none() || TX.with(|tx| tx.borrow().is_some()) {
+        if shards.aof_on().is_none() || TX.with(|tx| tx.borrow().is_some()) {
             return Self { shards: None };
         }
         TX.with(|tx| *tx.borrow_mut() = Some(Vec::new()));

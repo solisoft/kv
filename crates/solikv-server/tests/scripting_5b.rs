@@ -418,3 +418,36 @@ async fn resp3_types_on_the_wire() {
     let e = send(&mut s2, &["HELLO", "4"]).await;
     assert!(e.starts_with("-NOPROTO"), "{e:?}");
 }
+
+/// Inside `EXEC`, each reply has the RESP3 type its command's has on its
+/// own (a map for HGETALL, a double for ZSCORE, null for a missing key);
+/// RESP2 clients get the flat forms.
+#[tokio::test]
+async fn resp3_exec_replies_are_typed_per_command() {
+    let port = start().await;
+    let mut s = raw(port).await;
+    send(&mut s, &["HELLO", "3"]).await;
+    send(&mut s, &["HSET", "eh", "f", "v"]).await;
+    send(&mut s, &["ZADD", "ez", "2.5", "m"]).await;
+    assert_eq!(send(&mut s, &["MULTI"]).await, "+OK\r\n");
+    for cmd in [
+        &["HGETALL", "eh"][..],
+        &["ZSCORE", "ez", "m"],
+        &["GET", "missing"],
+    ] {
+        assert_eq!(send(&mut s, cmd).await, "+QUEUED\r\n");
+    }
+    assert_eq!(
+        send(&mut s, &["EXEC"]).await,
+        "*3\r\n%1\r\n$1\r\nf\r\n$1\r\nv\r\n,2.5\r\n_\r\n"
+    );
+
+    let mut s2 = raw(port).await;
+    send(&mut s2, &["MULTI"]).await;
+    send(&mut s2, &["HGETALL", "eh"]).await;
+    send(&mut s2, &["ZSCORE", "ez", "m"]).await;
+    assert_eq!(
+        send(&mut s2, &["EXEC"]).await,
+        "*2\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n$3\r\n2.5\r\n"
+    );
+}

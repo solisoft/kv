@@ -384,7 +384,7 @@ impl ShardHandle {
     where
         F: FnOnce(&mut ShardStore, &mut Effects) -> CommandResponse,
     {
-        let aof = self.shared.aof.get();
+        let aof = self.aof_on();
         let repl = self.repl_sink();
         let db = current_db();
         let (result, lazy_expired, expired_fields) = self.locked(|store, _| {
@@ -453,7 +453,7 @@ impl ShardHandle {
         &self,
         remove: impl FnOnce(&mut ShardStore) -> Vec<(u32, Bytes)>,
     ) -> Vec<(u32, Bytes)> {
-        let aof = self.shared.aof.get();
+        let aof = self.aof_on();
         let repl = self.repl_sink();
         let (removed, fields) = self.locked(|store, _| {
             if self.shared.frozen.load(Ordering::Relaxed) {
@@ -533,8 +533,19 @@ impl ShardHandle {
     /// markers).
     pub(crate) fn log_marker(&self, record: &[u8]) {
         if let Some(w) = self.shared.aof.get() {
-            self.locked(|store, _| w.log_raw(self.index, &mut store.log_seq, record));
+            self.locked(|store, _| {
+                if w.shard_on(self.index) {
+                    w.log_raw(self.index, &mut store.log_seq, record)
+                }
+            });
         }
+    }
+
+    /// The log writer, when this shard's changes are logged (see
+    /// `AofWriter::shard_on`). Read under the shard's lock.
+    #[inline]
+    fn aof_on(&self) -> Option<&AofWriter> {
+        self.shared.aof.get().filter(|w| w.shard_on(self.index))
     }
 
     /// This shard's position, which is also its log's number.
@@ -714,8 +725,15 @@ impl ShardManager {
         self.shared.aof.set(writer).is_ok()
     }
 
+    /// The log writer, attached or not logging (`CONFIG SET appendonly no`
+    /// keeps it, every shard off).
     pub fn aof(&self) -> Option<&AofWriter> {
         self.shared.aof.get()
+    }
+
+    /// The log writer while the log is on.
+    pub fn aof_on(&self) -> Option<&AofWriter> {
+        self.shared.aof.get().filter(|w| w.any_on())
     }
 
     /// The replication stream.
@@ -726,7 +744,7 @@ impl ShardManager {
     /// Whether writes produce effect records (for the log or replicas).
     #[inline]
     pub fn logging(&self) -> bool {
-        self.shared.aof.get().is_some() || self.shared.repl.producing()
+        self.shared.aof.get().is_some_and(|w| w.any_on()) || self.shared.repl.producing()
     }
 
     /// Replica expiry semantics on every store: an expired key reads as

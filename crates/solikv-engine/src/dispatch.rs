@@ -4609,8 +4609,27 @@ impl CommandEngine {
         // the keys' LRU/LFU as they were — except `TOUCH`, whose point that is.
         let _no_touch = (session.info.no_touch() && id != Cmd::TOUCH)
             .then(|| solikv_core::access::no_touch(true));
+        // A tracking client's script: the keys its `redis.call`s read are
+        // tracked as if the client had read them (Redis does the same).
+        let script_reads = (session.tracking.as_ref().is_some_and(|t| !t.bcast)
+            && matches!(
+                id,
+                Cmd::EVAL
+                    | Cmd::EVALSHA
+                    | Cmd::EVAL_RO
+                    | Cmd::EVALSHA_RO
+                    | Cmd::FCALL
+                    | Cmd::FCALL_RO
+            ))
+        .then(crate::lua::ScriptReads::collect);
         let t0 = crate::stats::stamp();
         let resp = self.execute_session_inner(session, name, args);
+        if let Some(reads) = script_reads {
+            let keys = reads.finish();
+            if !keys.is_empty() && !matches!(resp, CommandResponse::Queued) {
+                self.track_keys(session, &keys);
+            }
+        }
         if matches!(resp, CommandResponse::Queued) {
             return resp;
         }
@@ -4718,6 +4737,11 @@ impl CommandEngine {
         spec: &crate::commands::CommandSpec,
         args: &[Bytes],
     ) {
+        self.track_keys(session, &spec.keys_of(args));
+    }
+
+    /// [`track_read`](Self::track_read) for keys already worked out.
+    fn track_keys(&self, session: &mut Session, keys: &[Bytes]) {
         let Some(t) = &session.tracking else {
             return;
         };
@@ -4735,7 +4759,7 @@ impl CommandEngine {
         if track {
             let target = t.redirect.unwrap_or(session.info.id);
             self.tracking
-                .remember(session.info.id, target, t.noloop, &spec.keys_of(args));
+                .remember(session.info.id, target, t.noloop, keys);
         }
     }
 
@@ -4966,6 +4990,13 @@ impl CommandEngine {
             } else {
                 let _db = DbGuard::enter(session.db);
                 self.execute(&name, &args)
+            };
+            // Each reply typed as its command's would be on its own (the
+            // array around them is EXEC's).
+            let resp = if session.resp >= 3 {
+                crate::resp3::shape(&name, &args, resp)
+            } else {
+                resp
             };
             results.push(resp);
         }

@@ -371,3 +371,64 @@ fn acknowledged_writes_survive_a_killed_process() {
     assert_eq!(c.cmd(&["DBSIZE"]), ":51");
     assert_eq!(c.cmd(&["GET", "n"]), "$7");
 }
+
+/// `CONFIG SET appendonly yes` starts a log from the dataset as it is (a
+/// rewrite: what was written before is in its base, what follows in its
+/// log); `no` stops it, keeping what it had, as Redis does.
+#[test]
+fn config_set_appendonly_turns_the_log_on_and_off() {
+    let dir = TmpDir::new("aof-toggle");
+    let off = ["--appendonly", "false", "--save", ""];
+    let on = ["--appendonly", "true", "--save", ""];
+    let s = Server::start(&dir.0, &off);
+    let mut c = s.client();
+    c.cmd(&["SET", "a", "1"]);
+    assert_eq!(c.cmd(&["CONFIG", "SET", "appendonly", "yes"]), "+OK");
+    c.wait_rewrite_done();
+    assert!(c.cmd(&["INFO", "persistence"]).contains("aof_enabled:1"));
+    assert_eq!(c.cmd(&["CONFIG", "GET", "appendonly"]), "*$appendonly,$yes");
+    c.cmd(&["SET", "b", "2"]);
+    for _ in 0..3 {
+        c.cmd(&["INCR", "n"]);
+    }
+    kill_hard(s);
+
+    let s = Server::start(&dir.0, &on);
+    let mut c = s.client();
+    assert_eq!(c.cmd(&["GET", "a"]), "$1", "written before: in the base");
+    assert_eq!(c.cmd(&["GET", "b"]), "$2", "written after: in the log");
+    assert_eq!(c.cmd(&["GET", "n"]), "$3");
+    // Off: nothing more is logged; what was stays.
+    assert_eq!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]), "+OK");
+    assert!(c.cmd(&["INFO", "persistence"]).contains("aof_enabled:0"));
+    c.cmd(&["SET", "c", "3"]);
+    kill_hard(s);
+
+    let s = Server::start(&dir.0, &on);
+    let mut c = s.client();
+    assert_eq!(c.cmd(&["GET", "c"]), "nil", "written with the log off");
+    assert_eq!(c.cmd(&["GET", "b"]), "$2");
+    // Off, a write, on again: the new log starts from the dataset as it is.
+    assert_eq!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]), "+OK");
+    c.cmd(&["SET", "e", "5"]);
+    assert_eq!(c.cmd(&["CONFIG", "SET", "appendonly", "yes"]), "+OK");
+    c.wait_rewrite_done();
+    c.cmd(&["SET", "d", "4"]);
+    kill_hard(s);
+
+    let s = Server::start(&dir.0, &on);
+    let mut c = s.client();
+    for (k, v) in [
+        ("a", "$1"),
+        ("b", "$2"),
+        ("n", "$3"),
+        ("e", "$5"),
+        ("d", "$4"),
+    ] {
+        assert_eq!(c.cmd(&["GET", k]), v, "{k}");
+    }
+    assert_eq!(
+        c.cmd(&["CONFIG", "SET", "appendonly", "maybe"]).get(..4),
+        Some("-ERR")
+    );
+}

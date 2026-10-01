@@ -398,3 +398,38 @@ async fn metrics_render_info_and_commands() {
     );
     assert!(text.contains("solikv_keyspace_keys{db=\"0\"} 1"), "{text}");
 }
+
+/// Keys a script reads are tracked for the client that ran it, as if it had
+/// read them itself; keys it only writes are not.
+#[tokio::test]
+async fn client_tracking_covers_keys_read_by_scripts() {
+    let (port, _) = start_engine(None).await;
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    send(&mut s, &["HELLO", "3"]).await;
+    assert_eq!(send(&mut s, &["CLIENT", "TRACKING", "ON"]).await, "+OK\r\n");
+    let mut w = conn(port).await;
+    let _: String = q(&mut w, &["SET", "sk", "1"]).await.unwrap();
+    let r = send(
+        &mut s,
+        &[
+            "EVAL",
+            "redis.call('SET', KEYS[2], 'w') return redis.call('GET', KEYS[1])",
+            "2",
+            "sk",
+            "written",
+        ],
+    )
+    .await;
+    assert_eq!(r, "$1\r\n1\r\n");
+    let _: String = q(&mut w, &["SET", "written", "2"]).await.unwrap();
+    let _: String = q(&mut w, &["SET", "sk", "2"]).await.unwrap();
+    sleep(Duration::from_millis(80)).await;
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+        .await
+        .expect("no invalidation for a key the script read")
+        .unwrap();
+    assert_eq!(&buf[..n], b">2\r\n$10\r\ninvalidate\r\n*1\r\n$2\r\nsk\r\n");
+}

@@ -578,7 +578,7 @@ impl Persistence {
 
     /// `BGREWRITEAOF`: compact the log in the background.
     pub fn bgrewrite(self: &Arc<Self>, shards: &Arc<ShardManager>) -> Result<(), String> {
-        let Some(writer) = shards.aof().cloned() else {
+        let Some(writer) = shards.aof_on().cloned() else {
             return Err("ERR append-only file is disabled (--appendonly false)".into());
         };
         if self
@@ -591,7 +591,7 @@ impl Persistence {
         }
         let aof_dir = self.aof_dir();
         // List the next generation before any record can go to it.
-        let prepared = (|| -> io::Result<(Manifest, u64)> {
+        let prepared = (|| -> io::Result<u64> {
             let old = self
                 .manifest
                 .lock()
@@ -603,13 +603,137 @@ impl Persistence {
             mid.incrs.push(g);
             mid.store(&aof_dir)?;
             *self.manifest.lock() = Some(mid);
-            Ok((old, g))
+            Ok(g)
         })();
-        let (old, g) = match prepared {
+        let g = match prepared {
             Ok(v) => v,
             Err(e) => {
                 self.finish_rewrite(Err(e));
                 return Err("ERR could not start the append-only file rewrite".into());
+            }
+        };
+        self.run_rewrite(shards, writer, g, false)
+    }
+
+    /// `CONFIG SET appendonly yes`: start a log from the dataset as it is.
+    ///
+    /// The writes made while the log was off are in no log, so nothing an
+    /// old manifest names can be appended to: the log starts over, at a
+    /// generation no file on disk has used, from a rewrite. The manifest is
+    /// removed first and written again only once that rewrite's base is on
+    /// disk — a crash in between restarts from the snapshot, as Redis does.
+    /// Each shard is logged from its cut in the rewrite on
+    /// (`begin_capture`), so its base and its log meet exactly.
+    pub fn enable_aof(self: &Arc<Self>, shards: &Arc<ShardManager>) -> Result<(), String> {
+        if shards.aof_on().is_some() {
+            self.cfg.write().appendonly = true;
+            return Ok(());
+        }
+        if self
+            .stats
+            .aof_rewrite_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err("ERR Background append only file rewriting already in progress".into());
+        }
+        let aof_dir = self.aof_dir();
+        let n = shards.num_shards() as u32;
+        let prepared = (|| -> io::Result<(AofWriter, u64)> {
+            let previous = self.manifest.lock().take();
+            match std::fs::remove_file(aof::manifest_path(&aof_dir)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+            let g = previous
+                .as_ref()
+                .map_or(1, max_gen_plus_one)
+                .max(max_gen_on_disk(&aof_dir) + 1);
+            aof::create_incr_files(&aof_dir, g, n)?;
+            let writer = match shards.aof() {
+                Some(w) => w.clone(),
+                None => {
+                    let w = aof::spawn_aof_writer(
+                        &aof_dir,
+                        n,
+                        g,
+                        self.cfg.read().fsync,
+                        self.stats.clone(),
+                    )?
+                    .single_threaded(shards.is_solo());
+                    // Attached with every shard off; each comes on at its cut.
+                    for i in 0..n {
+                        w.set_shard_on(i, false);
+                    }
+                    shards.attach_aof(w.clone());
+                    w
+                }
+            };
+            Ok((writer, g))
+        })();
+        let (writer, g) = match prepared {
+            Ok(v) => v,
+            Err(e) => {
+                self.finish_rewrite(Err(e));
+                return Err("ERR could not start the append-only file".into());
+            }
+        };
+        self.cfg.write().appendonly = true;
+        self.stats.aof_enabled.store(true, Ordering::Relaxed);
+        self.run_rewrite(shards, writer, g, true)
+    }
+
+    /// `CONFIG SET appendonly no`: stop logging. Each shard stops between
+    /// two of its commands; what was logged is made durable. The log is
+    /// kept, as Redis keeps it: restarting with the log on loads it as it
+    /// was when it stopped.
+    pub fn disable_aof(&self, shards: &ShardManager) -> Result<(), String> {
+        if self.stats.aof_rewrite_in_progress.load(Ordering::Acquire) {
+            return Err(
+                "ERR Background append only file rewriting in progress, try again when it ends"
+                    .into(),
+            );
+        }
+        if let Some(w) = shards.aof() {
+            for i in 0..shards.num_shards() {
+                shards
+                    .shard(i)
+                    .with_store_mut_unlogged(|_| w.set_shard_on(i as u32, false));
+            }
+            w.sync().map_err(|e| format!("ERR {}", e))?;
+        }
+        self.cfg.write().appendonly = false;
+        self.stats.aof_enabled.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The rewrite into generation `g` (listed already, unless `fresh`: a
+    /// log being turned on, whose manifest is written here at the end).
+    fn run_rewrite(
+        self: &Arc<Self>,
+        shards: &Arc<ShardManager>,
+        writer: AofWriter,
+        g: u64,
+        fresh: bool,
+    ) -> Result<(), String> {
+        let aof_dir = self.aof_dir();
+        let n = shards.num_shards() as u32;
+        let failed = {
+            let this = self.clone();
+            let shards = shards.clone();
+            let writer = writer.clone();
+            move |e: io::Error| {
+                if fresh {
+                    // No log after all: every shard off again.
+                    for i in 0..shards.num_shards() {
+                        shards
+                            .shard(i)
+                            .with_store_mut_unlogged(|_| writer.set_shard_on(i as u32, false));
+                    }
+                    this.cfg.write().appendonly = false;
+                    this.stats.aof_enabled.store(false, Ordering::Relaxed);
+                }
+                this.finish_rewrite(Err(e));
             }
         };
 
@@ -618,7 +742,7 @@ impl Persistence {
             match solo_capture(shards, Some((&writer, g)), cut.clone()) {
                 Ok(c) => Some(c),
                 Err(e) => {
-                    self.finish_rewrite(Err(e));
+                    failed(e);
                     return Ok(());
                 }
             }
@@ -627,6 +751,7 @@ impl Persistence {
         };
         let this = self.clone();
         let shards = shards.clone();
+        let failed_in_thread = failed.clone();
         let spawned = std::thread::Builder::new()
             .name("solikv-aofrw".into())
             .spawn(move || {
@@ -654,8 +779,8 @@ impl Persistence {
                     // new base before it starts to.
                     writer.sync()?;
                     let new = Manifest {
-                        shards: old.shards,
-                        hash: old.hash.clone(),
+                        shards: n,
+                        hash: ShardManager::HASH_SCHEME.to_string(),
                         base: Some(g),
                         incrs: vec![g],
                     };
@@ -668,10 +793,13 @@ impl Persistence {
                     this.stats.aof_current_size.store(size, Ordering::Relaxed);
                     Ok(())
                 })();
-                this.finish_rewrite(res);
+                match res {
+                    Ok(()) => this.finish_rewrite(Ok(())),
+                    Err(e) => failed_in_thread(e),
+                }
             });
         if spawned.is_err() {
-            self.finish_rewrite(Err(io::Error::other("could not spawn")));
+            failed(io::Error::other("could not spawn"));
             return Err("ERR could not start the append-only file rewrite".into());
         }
         Ok(())
@@ -805,6 +933,9 @@ fn capture_shard(
         rdb::serialize_store(store, &mut body)?;
         if let Some((w, g)) = rotate {
             w.rotate(i as u32, &mut store.log_seq, g);
+            // From here on its changes go to generation `g`, after this cut
+            // — and are logged, if the log was just turned on.
+            w.set_shard_on(i as u32, true);
         }
         if i == 0 {
             if let Some(cut) = cut {
@@ -913,6 +1044,9 @@ fn begin_capture(
     }
     if let Some((w, g)) = rotate {
         w.rotate(i as u32, &mut store.log_seq, g);
+        // From here on its changes go to generation `g`, after this cut —
+        // and are logged, if the log was just turned on.
+        w.set_shard_on(i as u32, true);
     }
     // Shard 0's cut is the libraries' (see `FunctionsCut`).
     if i == 0 {
@@ -1033,6 +1167,26 @@ fn remove_legacy_functions(dir: &Path) {
             path.display()
         );
     }
+}
+
+/// The highest generation any `appendonly.<gen>.…` file in `aof_dir` has
+/// (0 for none): a new log must not append to a file left from an old one.
+fn max_gen_on_disk(aof_dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(aof_dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.strip_prefix("appendonly.")?
+                .split('.')
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn max_gen_plus_one(m: &Manifest) -> u64 {

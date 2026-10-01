@@ -1162,6 +1162,40 @@ fn err_table(lua: &Lua, msg: impl Into<String>) -> LuaResult<LuaValue> {
     Ok(LuaValue::Table(t))
 }
 
+thread_local! {
+    /// Keys read by `redis.call` during a tracking client's script (see
+    /// [`ScriptReads`]); `None` when nobody collects.
+    static SCRIPT_READS: std::cell::RefCell<Option<Vec<Bytes>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Collects the keys a script reads on this thread, for client-side
+/// caching: a script runs on the thread of the command that started it.
+pub struct ScriptReads(());
+
+impl ScriptReads {
+    pub fn collect() -> Self {
+        SCRIPT_READS.with(|r| *r.borrow_mut() = Some(Vec::new()));
+        ScriptReads(())
+    }
+
+    /// The keys read, deduplicated; collection stops.
+    pub fn finish(self) -> Vec<Bytes> {
+        let mut keys = SCRIPT_READS
+            .with(|r| r.borrow_mut().take())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+}
+
+impl Drop for ScriptReads {
+    fn drop(&mut self) {
+        SCRIPT_READS.with(|r| *r.borrow_mut() = None);
+    }
+}
+
 /// Run one `redis.call`/`redis.pcall`: the reply, or an `{err=…}` table.
 fn redis_call(lua: &Lua, engine: &Arc<CommandEngine>, args: LuaMultiValue) -> LuaResult<LuaValue> {
     let ctx = run_ctx();
@@ -1200,6 +1234,13 @@ fn redis_call(lua: &Lua, engine: &Arc<CommandEngine>, args: LuaMultiValue) -> Lu
         return err_table(lua, e);
     }
     engine.feed_monitor_script(&name, &cmd_args);
+    if spec.has(crate::commands::F_READONLY) {
+        SCRIPT_READS.with(|r| {
+            if let Some(keys) = r.borrow_mut().as_mut() {
+                keys.extend(spec.keys_of(&cmd_args));
+            }
+        });
+    }
     let resp = engine.execute(spec.name, &cmd_args);
     if let CommandResponse::Error(msg) = resp {
         return err_table(lua, msg);
