@@ -4,7 +4,7 @@
 
 use bytes::Bytes;
 
-use solikv_core::types::{RedisValue, StreamId};
+use solikv_core::types::{FieldExpiry, RedisValue, SetExpiry, StreamId};
 use solikv_core::CommandResponse;
 
 use super::{CommandEngine, Upper};
@@ -983,6 +983,124 @@ impl CommandEngine {
             .execute(move |s| s.hash_field_persist(&key, &fields))
     }
 
+    /// `HGETDEL key FIELDS numfields field…` (Redis 8).
+    pub(super) fn hgetdel(&self, args: &[Bytes]) -> CommandResponse {
+        if args.len() < 4 {
+            return CommandResponse::wrong_arity("hgetdel");
+        }
+        let key = args[0].clone();
+        let fields = match parse_fields(&args[1..]) {
+            Ok(f) => f,
+            Err(e) => return e,
+        };
+        self.shards
+            .shard_for_key(&key)
+            .execute_with_effects(move |s, fx| {
+                let (resp, deleted) = s.hash_hgetdel(&key, &fields);
+                log_hdel(fx, &key, &deleted);
+                resp
+            })
+    }
+
+    /// `HGETEX key [EX s | PX ms | EXAT s | PXAT ms | PERSIST] FIELDS
+    /// numfields field…` (Redis 8).
+    pub(super) fn hgetex(&self, args: &[Bytes]) -> CommandResponse {
+        if args.len() < 4 {
+            return CommandResponse::wrong_arity("hgetex");
+        }
+        let key = args[0].clone();
+        let mut op = FieldExpiry::Keep;
+        let mut i = 1;
+        while i < args.len() && !args[i].eq_ignore_ascii_case(b"FIELDS") {
+            if op != FieldExpiry::Keep {
+                return CommandResponse::syntax_error();
+            }
+            let o = Upper::new(&args[i]);
+            if o.as_str() == "PERSIST" {
+                op = FieldExpiry::Persist;
+                i += 1;
+                continue;
+            }
+            match deadline_arg(o.as_str(), args.get(i + 1), "hgetex") {
+                Ok(at) => op = FieldExpiry::At(at),
+                Err(e) => return e,
+            }
+            i += 2;
+        }
+        let fields = match parse_fields(&args[i..]) {
+            Ok(f) => f,
+            Err(e) => return e,
+        };
+        self.shards
+            .shard_for_key(&key)
+            .execute_with_effects(move |s, fx| {
+                let (resp, ch) = s.hash_hgetex(&key, &fields, op);
+                log_field_changes(fx, &key, &ch);
+                resp
+            })
+    }
+
+    /// `HSETEX key [FNX | FXX] [EX s | PX ms | EXAT s | PXAT ms | KEEPTTL]
+    /// FIELDS numfields field value…` (Redis 8).
+    pub(super) fn hsetex(&self, args: &[Bytes]) -> CommandResponse {
+        if args.len() < 5 {
+            return CommandResponse::wrong_arity("hsetex");
+        }
+        let key = args[0].clone();
+        let mut only: Option<bool> = None;
+        let mut ttl: Option<SetExpiry> = None;
+        let mut i = 1;
+        while i < args.len() && !args[i].eq_ignore_ascii_case(b"FIELDS") {
+            let o = Upper::new(&args[i]);
+            match o.as_str() {
+                "FNX" | "FXX" if only.is_none() => {
+                    only = Some(o.as_str() == "FNX");
+                    i += 1;
+                }
+                "KEEPTTL" if ttl.is_none() => {
+                    ttl = Some(SetExpiry::Keep);
+                    i += 1;
+                }
+                "EX" | "PX" | "EXAT" | "PXAT" if ttl.is_none() => {
+                    match deadline_arg(o.as_str(), args.get(i + 1), "hsetex") {
+                        Ok(at) => ttl = Some(SetExpiry::At(at)),
+                        Err(e) => return e,
+                    }
+                    i += 2;
+                }
+                _ => return CommandResponse::syntax_error(),
+            }
+        }
+        // `FIELDS numfields` then the pairs.
+        let rest = &args[i..];
+        if rest.len() < 2 || !rest[0].eq_ignore_ascii_case(b"FIELDS") {
+            return CommandResponse::error(
+                "ERR Mandatory argument FIELDS is missing or not at the right position",
+            );
+        }
+        let n = match std::str::from_utf8(&rest[1])
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            Some(n) if n > 0 => n as usize,
+            _ => return CommandResponse::error("ERR invalid number of fields"),
+        };
+        let kv = &rest[2..];
+        if kv.len() != n * 2 {
+            return CommandResponse::wrong_arity("hsetex");
+        }
+        let pairs: Vec<(Bytes, Bytes)> =
+            kv.chunks(2).map(|p| (p[0].clone(), p[1].clone())).collect();
+        let ttl = ttl.unwrap_or(SetExpiry::Discard);
+        self.shards
+            .shard_for_key(&key)
+            .execute_with_effects(move |s, fx| {
+                let (resp, ch) = s.hash_hsetex(&key, pairs, only, ttl);
+                log_field_changes(fx, &key, &ch);
+                resp
+            })
+    }
+
     pub(super) fn hstrlen(&self, args: &[Bytes]) -> CommandResponse {
         if args.len() != 2 {
             return CommandResponse::wrong_arity("hstrlen");
@@ -993,6 +1111,89 @@ impl CommandEngine {
             .shard_for_key(&key)
             .execute(move |s| s.hash_hstrlen(&key, &field))
     }
+}
+
+/// `EX s | PX ms | EXAT s | PXAT ms` (`opt` upper-cased, its value next)
+/// as a deadline in unix ms, for `HGETEX`/`HSETEX` (`name`, for errors).
+fn deadline_arg(opt: &str, value: Option<&Bytes>, name: &str) -> Result<u64, CommandResponse> {
+    let invalid =
+        || CommandResponse::error(format!("ERR invalid expire time in '{}' command", name));
+    let Some(n) = value
+        .and_then(|v| std::str::from_utf8(v).ok())
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
+        return Err(if value.is_none() {
+            CommandResponse::syntax_error()
+        } else {
+            CommandResponse::error("ERR value is not an integer or out of range")
+        });
+    };
+    let now = solikv_core::now_millis() as i128;
+    let at: i128 = match opt {
+        // A relative time must be positive; an absolute one may be past
+        // (the fields then go at once).
+        "EX" | "PX" if n <= 0 => return Err(invalid()),
+        "EX" => now + n as i128 * 1000,
+        "PX" => now + n as i128,
+        "EXAT" | "PXAT" if n < 0 => return Err(invalid()),
+        "EXAT" => n as i128 * 1000,
+        "PXAT" => n as i128,
+        _ => return Err(CommandResponse::syntax_error()),
+    };
+    if at > (i64::MAX / 2) as i128 {
+        return Err(invalid());
+    }
+    Ok(at as u64)
+}
+
+/// `HDEL key field…` into the log, when any field went.
+fn log_hdel(fx: &mut crate::aof_log::Effects, key: &Bytes, fields: &[Bytes]) {
+    if fields.is_empty() {
+        return;
+    }
+    let mut a: Vec<&[u8]> = Vec::with_capacity(1 + fields.len());
+    a.push(key);
+    a.extend(fields.iter().map(|f| f.as_ref()));
+    fx.push("HDEL", &a);
+}
+
+/// What an `HGETEX`/`HSETEX` did, as the plain commands that redo it:
+/// `HSET`, then the expiries as absolute `HPEXPIREAT`s (one per kept
+/// deadline), `HPERSIST`, `HDEL`.
+fn log_field_changes(
+    fx: &mut crate::aof_log::Effects,
+    key: &Bytes,
+    ch: &solikv_core::FieldChanges,
+) {
+    if !ch.set.is_empty() {
+        let mut a: Vec<&[u8]> = Vec::with_capacity(1 + 2 * ch.set.len());
+        a.push(key);
+        for (f, v) in &ch.set {
+            a.push(f);
+            a.push(v);
+        }
+        fx.push("HSET", &a);
+    }
+    let expire = |fx: &mut crate::aof_log::Effects, at: u64, fields: &[&Bytes]| {
+        let at = at.to_string();
+        let n = fields.len().to_string();
+        let mut a: Vec<&[u8]> = vec![key, at.as_bytes(), b"FIELDS", n.as_bytes()];
+        a.extend(fields.iter().map(|f| f.as_ref()));
+        fx.push("HPEXPIREAT", &a);
+    };
+    if let Some((at, fields)) = &ch.expire_at {
+        expire(fx, *at, &fields.iter().collect::<Vec<_>>());
+    }
+    for (f, at) in &ch.kept {
+        expire(fx, *at, &[f]);
+    }
+    if !ch.persisted.is_empty() {
+        let n = ch.persisted.len().to_string();
+        let mut a: Vec<&[u8]> = vec![key, b"FIELDS", n.as_bytes()];
+        a.extend(ch.persisted.iter().map(|f| f.as_ref()));
+        fx.push("HPERSIST", &a);
+    }
+    log_hdel(fx, key, &ch.deleted);
 }
 
 /// `FIELDS numfields field…`, as the hash field expiry commands take it.

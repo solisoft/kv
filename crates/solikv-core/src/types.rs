@@ -420,12 +420,64 @@ pub enum StreamIdInput {
     Partial(u64),
 }
 
-/// Trim strategy for streams.
+/// What `HGETEX` does to the fields' expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldExpiry {
+    /// No option: nothing.
+    Keep,
+    /// `PERSIST`: removed.
+    Persist,
+    /// A deadline, unix ms.
+    At(u64),
+}
+
+/// What `HSETEX` does to the fields' expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetExpiry {
+    /// No option: the fields lose any expiry, as with `HSET`.
+    Discard,
+    /// `KEEPTTL`: each field keeps the one it had.
+    Keep,
+    /// A deadline, unix ms.
+    At(u64),
+}
+
+/// What `HGETDEL`/`HGETEX`/`HSETEX` changed, for the log and replicas.
+#[derive(Debug, Default)]
+pub struct FieldChanges {
+    pub set: Vec<(Bytes, Bytes)>,
+    pub deleted: Vec<Bytes>,
+    /// Fields given one deadline.
+    pub expire_at: Option<(u64, Vec<Bytes>)>,
+    /// `KEEPTTL`: fields whose expiry was kept, each with its own.
+    pub kept: Vec<(Bytes, u64)>,
+    pub persisted: Vec<Bytes>,
+}
+
+/// Trim strategy for streams. Not `exact` (`~`): only whole nodes of
+/// [`STREAM_NODE_ENTRIES`] go, so the stream may keep more than asked, and
+/// at most `limit` entries per call (0: no limit) — Redis' semantics, which
+/// trims its radix tree's listpack nodes whole.
 #[derive(Debug, Clone, Copy)]
 pub enum StreamTrim {
-    MaxLen { exact: bool, threshold: usize },
-    MinId { exact: bool, threshold: StreamId },
+    MaxLen {
+        exact: bool,
+        threshold: usize,
+        limit: usize,
+    },
+    MinId {
+        exact: bool,
+        threshold: StreamId,
+        limit: usize,
+    },
 }
+
+/// Entries per node of a stream, for `~` trimming: Redis'
+/// `stream-node-max-entries` default.
+pub const STREAM_NODE_ENTRIES: usize = 100;
+
+/// `~` without `LIMIT`: Redis' default, a hundred nodes' worth.
+pub const STREAM_DEFAULT_TRIM_LIMIT: usize = 100 * STREAM_NODE_ENTRIES;
 
 /// A pending entry in a consumer group.
 #[derive(Debug, Clone)]

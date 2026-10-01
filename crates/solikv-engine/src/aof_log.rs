@@ -81,6 +81,9 @@ const EXPLICIT: &[&str] = &[
     "RESTORE",
     "RESTORE-ASKING",
     "SORT",
+    "HGETDEL",
+    "HGETEX",
+    "HSETEX",
 ];
 
 /// Write commands that are never records themselves: each runs the plain

@@ -481,6 +481,9 @@ commands! {
     HEXPIRETIME = "HEXPIRETIME", -5, ROF, K1;
     HPEXPIRETIME = "HPEXPIRETIME", -5, ROF, K1;
     HPERSIST = "HPERSIST", -5, WF, K1;
+    HGETDEL = "HGETDEL", -5, WF, K1;
+    HGETEX = "HGETEX", -5, WF, K1;
+    HSETEX = "HSETEX", -6, WDF, K1;
     SSCAN = "SSCAN", -3, RO, K1;
     // Sets
     SADD = "SADD", -3, WDF, K1;

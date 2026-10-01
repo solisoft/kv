@@ -53,32 +53,36 @@ fn generate_stream_id(
 }
 
 fn apply_trim(stream: &mut StreamValue, trim: &StreamTrim) -> i64 {
-    let mut trimmed = 0i64;
-    match trim {
-        StreamTrim::MaxLen { threshold, .. } => {
-            while stream.entries.len() > *threshold {
-                if let Some((id, _)) = stream.entries.pop_first() {
-                    stream.max_deleted_id = stream.max_deleted_id.max(id);
-                    trimmed += 1;
-                } else {
-                    break;
-                }
-            }
-        }
-        StreamTrim::MinId { threshold, .. } => {
-            let to_remove: Vec<StreamId> = stream
-                .entries
-                .range(..(*threshold))
-                .map(|(&id, _)| id)
-                .collect();
-            for id in to_remove {
-                stream.entries.remove(&id);
-                stream.max_deleted_id = stream.max_deleted_id.max(id);
-                trimmed += 1;
-            }
+    // How many of the oldest entries the exact form removes.
+    let (due, exact, limit) = match *trim {
+        StreamTrim::MaxLen {
+            exact,
+            threshold,
+            limit,
+        } => (stream.entries.len().saturating_sub(threshold), exact, limit),
+        StreamTrim::MinId {
+            exact,
+            threshold,
+            limit,
+        } => (stream.entries.range(..threshold).count(), exact, limit),
+    };
+    let n = if exact {
+        due
+    } else {
+        // Whole nodes only, and no more than `limit` entries: never more
+        // than the exact form, possibly less (see `StreamTrim`). Nodes are
+        // counted from the oldest entry, so the same stream always trims
+        // the same way — a replayed log reproduces it.
+        let cap = if limit == 0 { usize::MAX } else { limit };
+        due.min(cap) / STREAM_NODE_ENTRIES * STREAM_NODE_ENTRIES
+    };
+    for _ in 0..n {
+        match stream.entries.pop_first() {
+            Some((id, _)) => stream.max_deleted_id = stream.max_deleted_id.max(id),
+            None => break,
         }
     }
-    trimmed
+    n as i64
 }
 
 fn format_stream_entries(entries: &[(&StreamId, &Vec<(Bytes, Bytes)>)]) -> CommandResponse {
@@ -992,6 +996,7 @@ mod tests {
             StreamTrim::MaxLen {
                 exact: true,
                 threshold: 5,
+                limit: 0,
             },
         );
         assert!(matches!(r, CommandResponse::Integer(5)));
@@ -1020,6 +1025,7 @@ mod tests {
             StreamTrim::MinId {
                 exact: true,
                 threshold: StreamId::new(6000, 0),
+                limit: 0,
             },
         );
         assert!(matches!(r, CommandResponse::Integer(5)));
@@ -1027,6 +1033,73 @@ mod tests {
             store.stream_xlen(&key),
             CommandResponse::Integer(5)
         ));
+    }
+
+    /// `~`: whole nodes of a hundred entries, never more than the exact
+    /// form, at most `limit` entries (0: no limit).
+    #[test]
+    fn approximate_trim_removes_whole_nodes_within_the_limit() {
+        let fill = |store: &mut ShardStore, key: &Bytes, n: u64| {
+            for i in 1..=n {
+                store.stream_xadd(
+                    key,
+                    StreamIdInput::Explicit(StreamId::new(i, 0)),
+                    vec![(Bytes::from("f"), Bytes::from("v"))],
+                    false,
+                    None,
+                );
+            }
+        };
+        let maxlen = |exact, threshold, limit| StreamTrim::MaxLen {
+            exact,
+            threshold,
+            limit,
+        };
+        let mut store = ShardStore::new();
+        let key = Bytes::from("s");
+        fill(&mut store, &key, 1000);
+        // 450 due: four whole nodes.
+        let r = store.stream_xtrim(&key, maxlen(false, 550, STREAM_DEFAULT_TRIM_LIMIT));
+        assert!(matches!(r, CommandResponse::Integer(400)), "{r:?}");
+        assert!(matches!(
+            store.stream_xlen(&key),
+            CommandResponse::Integer(600)
+        ));
+        // Under a node due: nothing.
+        let r = store.stream_xtrim(&key, maxlen(false, 550, 0));
+        assert!(matches!(r, CommandResponse::Integer(0)), "{r:?}");
+        // LIMIT caps it, in whole nodes.
+        let r = store.stream_xtrim(&key, maxlen(false, 0, 250));
+        assert!(matches!(r, CommandResponse::Integer(200)), "{r:?}");
+        // LIMIT 0: no limit.
+        let r = store.stream_xtrim(&key, maxlen(false, 0, 0));
+        assert!(matches!(r, CommandResponse::Integer(400)), "{r:?}");
+        assert!(matches!(
+            store.stream_xlen(&key),
+            CommandResponse::Integer(0)
+        ));
+
+        // MINID ~ the same way; exact unchanged.
+        let key = Bytes::from("m");
+        fill(&mut store, &key, 1000);
+        let r = store.stream_xtrim(
+            &key,
+            StreamTrim::MinId {
+                exact: false,
+                threshold: StreamId::new(351, 0),
+                limit: STREAM_DEFAULT_TRIM_LIMIT,
+            },
+        );
+        assert!(matches!(r, CommandResponse::Integer(300)), "{r:?}");
+        let r = store.stream_xtrim(
+            &key,
+            StreamTrim::MinId {
+                exact: true,
+                threshold: StreamId::new(351, 0),
+                limit: 0,
+            },
+        );
+        assert!(matches!(r, CommandResponse::Integer(50)), "{r:?}");
     }
 
     #[test]
@@ -1042,6 +1115,7 @@ mod tests {
                 Some(StreamTrim::MaxLen {
                     exact: true,
                     threshold: 5,
+                    limit: 0,
                 }),
             );
         }

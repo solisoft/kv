@@ -235,3 +235,195 @@ async fn deadlines_and_expiries_survive_a_restart() {
         other => panic!("{other:?}"),
     }
 }
+
+/// Redis 8's HGETDEL, HGETEX and HSETEX: replies, conditions and expiries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hgetdel_hgetex_hsetex_reply_like_redis() {
+    let port = start().await;
+    let mut c = conn(port).await;
+    let _: i64 = q(&mut c, &["HSET", "h", "a", "1", "b", "2", "c", "3"])
+        .await
+        .unwrap();
+
+    // HGETDEL: values, nil for an absent field; the key goes once empty.
+    let r: Vec<Option<String>> = q(&mut c, &["HGETDEL", "h", "FIELDS", "2", "a", "zz"])
+        .await
+        .unwrap();
+    assert_eq!(r, vec![Some("1".into()), None]);
+    let n: i64 = q(&mut c, &["HLEN", "h"]).await.unwrap();
+    assert_eq!(n, 2);
+    let _: Vec<Option<String>> = q(&mut c, &["HGETDEL", "h", "FIELDS", "2", "b", "c"])
+        .await
+        .unwrap();
+    let n: i64 = q(&mut c, &["EXISTS", "h"]).await.unwrap();
+    assert_eq!(n, 0);
+    let e = q::<Vec<Option<String>>>(&mut c, &["HGETDEL", "h", "FIELDS", "2", "a"]).await;
+    assert!(e.is_err());
+
+    // HGETEX: values, then the expiry changed.
+    let _: i64 = q(&mut c, &["HSET", "g", "a", "1", "b", "2"]).await.unwrap();
+    let r: Vec<Option<String>> = q(&mut c, &["HGETEX", "g", "EX", "100", "FIELDS", "1", "a"])
+        .await
+        .unwrap();
+    assert_eq!(r, vec![Some("1".into())]);
+    let t: Vec<i64> = q(&mut c, &["HTTL", "g", "FIELDS", "2", "a", "b"])
+        .await
+        .unwrap();
+    assert!(t[0] > 90 && t[0] <= 100 && t[1] == -1, "{t:?}");
+    let _: Vec<Option<String>> = q(&mut c, &["HGETEX", "g", "PERSIST", "FIELDS", "1", "a"])
+        .await
+        .unwrap();
+    let t: Vec<i64> = q(&mut c, &["HTTL", "g", "FIELDS", "1", "a"]).await.unwrap();
+    assert_eq!(t, vec![-1]);
+    // A deadline already past: returned, then gone.
+    let r: Vec<Option<String>> = q(&mut c, &["HGETEX", "g", "PXAT", "1", "FIELDS", "1", "b"])
+        .await
+        .unwrap();
+    assert_eq!(r, vec![Some("2".into())]);
+    let n: i64 = q(&mut c, &["HEXISTS", "g", "b"]).await.unwrap();
+    assert_eq!(n, 0);
+    assert!(
+        q::<Vec<Option<String>>>(&mut c, &["HGETEX", "g", "EX", "0", "FIELDS", "1", "a"])
+            .await
+            .is_err()
+    );
+
+    // HSETEX: FNX / FXX all or nothing; KEEPTTL; no option drops expiries.
+    let r: i64 = q(
+        &mut c,
+        &[
+            "HSETEX", "s", "FNX", "EX", "100", "FIELDS", "2", "x", "1", "y", "2",
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(r, 1);
+    let r: i64 = q(
+        &mut c,
+        &["HSETEX", "s", "FNX", "FIELDS", "2", "y", "9", "z", "9"],
+    )
+    .await
+    .unwrap();
+    assert_eq!(r, 0, "y exists: nothing set");
+    let r: i64 = q(
+        &mut c,
+        &["HSETEX", "s", "FXX", "FIELDS", "2", "y", "9", "z", "9"],
+    )
+    .await
+    .unwrap();
+    assert_eq!(r, 0, "z does not: nothing set");
+    let v: Option<String> = q(&mut c, &["HGET", "s", "z"]).await.unwrap();
+    assert_eq!(v, None);
+    let r: i64 = q(
+        &mut c,
+        &["HSETEX", "s", "FXX", "KEEPTTL", "FIELDS", "1", "x", "10"],
+    )
+    .await
+    .unwrap();
+    assert_eq!(r, 1);
+    let t: Vec<i64> = q(&mut c, &["HTTL", "s", "FIELDS", "2", "x", "y"])
+        .await
+        .unwrap();
+    assert!(t[0] > 90 && t[1] > 90, "KEEPTTL kept x's: {t:?}");
+    let _: i64 = q(&mut c, &["HSETEX", "s", "FIELDS", "1", "y", "3"])
+        .await
+        .unwrap();
+    let t: Vec<i64> = q(&mut c, &["HTTL", "s", "FIELDS", "1", "y"]).await.unwrap();
+    assert_eq!(t, vec![-1], "no option: expiry dropped, as HSET");
+    let v: Option<String> = q(&mut c, &["HGET", "s", "x"]).await.unwrap();
+    assert_eq!(v.as_deref(), Some("10"));
+    assert!(q::<i64>(&mut c, &["HSETEX", "s", "FIELDS", "2", "x", "1"])
+        .await
+        .is_err());
+}
+
+/// What HGETDEL/HGETEX/HSETEX did comes back from the log: values, the
+/// fields they removed, and the deadlines they set or kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hgetdel_hgetex_hsetex_replay_from_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = solikv_engine::persistence::PersistConfig {
+        dir: dir.path().to_path_buf(),
+        appendonly: true,
+        auto_rewrite_percentage: 0,
+        save: Vec::new(),
+        ..Default::default()
+    };
+    let engine_for = |cfg: &solikv_engine::persistence::PersistConfig| {
+        let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
+        let shards = Arc::new(solikv_engine::ShardManager::new(SHARDS));
+        let engine = Arc::new(
+            solikv_engine::CommandEngine::new(shards, pubsub.clone()).with_persistence(Arc::new(
+                solikv_engine::persistence::Persistence::new(cfg.clone()),
+            )),
+        );
+        engine.init_self_ref(Arc::downgrade(&engine));
+        engine.load_persisted().expect("load");
+        (engine, pubsub)
+    };
+    let run = |e: &solikv_engine::CommandEngine, args: &[&str]| {
+        e.execute(
+            args[0],
+            &args[1..]
+                .iter()
+                .map(|a| bytes::Bytes::from(a.to_string()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let (x_at, kept_at);
+    {
+        let (engine, _) = engine_for(&cfg);
+        run(&engine, &["HSET", "h", "a", "1", "b", "2", "c", "3"]);
+        run(&engine, &["HGETDEL", "h", "FIELDS", "1", "a"]);
+        run(
+            &engine,
+            &["HGETEX", "h", "PX", "500000", "FIELDS", "1", "b"],
+        );
+        run(&engine, &["HGETEX", "h", "PXAT", "1", "FIELDS", "1", "c"]);
+        run(
+            &engine,
+            &[
+                "HSETEX", "k", "EX", "3600", "FIELDS", "2", "x", "1", "y", "2",
+            ],
+        );
+        run(
+            &engine,
+            &["HSETEX", "k", "KEEPTTL", "FIELDS", "1", "x", "9"],
+        );
+        run(&engine, &["HSETEX", "k", "FIELDS", "1", "y", "8"]);
+        kept_at = match run(&engine, &["HPEXPIRETIME", "k", "FIELDS", "1", "x"]) {
+            solikv_core::CommandResponse::Array(v) => match &v[0] {
+                solikv_core::CommandResponse::Integer(n) => *n,
+                o => panic!("{o:?}"),
+            },
+            o => panic!("{o:?}"),
+        };
+        x_at = match run(&engine, &["HPEXPIRETIME", "h", "FIELDS", "1", "b"]) {
+            solikv_core::CommandResponse::Array(v) => format!("{:?}", v[0]),
+            o => panic!("{o:?}"),
+        };
+        engine.shutdown(Some(false)).unwrap();
+    }
+    let (engine, _) = engine_for(&cfg);
+    let all = |key: &str| format!("{:?}", run(&engine, &["HGETALL", key]));
+    let h = all("h");
+    assert!(
+        h.contains("\"b\"") && !h.contains("\"a\"") && !h.contains("\"c\""),
+        "{h}"
+    );
+    let k = all("k");
+    assert!(k.contains("\"9\"") && k.contains("\"8\""), "{k}");
+    let at = |key: &str, f: &str| match run(&engine, &["HPEXPIRETIME", key, "FIELDS", "1", f]) {
+        solikv_core::CommandResponse::Array(v) => format!("{:?}", v[0]),
+        o => panic!("{o:?}"),
+    };
+    assert_eq!(at("h", "b"), x_at, "HGETEX's deadline, as it was");
+    assert_eq!(
+        at("k", "x"),
+        format!("{:?}", solikv_core::CommandResponse::Integer(kept_at))
+    );
+    assert_eq!(
+        at("k", "y"),
+        format!("{:?}", solikv_core::CommandResponse::Integer(-1))
+    );
+}

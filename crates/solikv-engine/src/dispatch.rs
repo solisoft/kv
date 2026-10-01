@@ -129,10 +129,9 @@ fn parse_stream_trim(
             if *start >= args.len() {
                 return Err(CommandResponse::syntax_error());
             }
-            // `LIMIT n` bounds how much one call trims; only with `~`, where
-            // trimming more exactly than asked is allowed, so it is accepted
-            // and the trim stays exact.
-            let limit = |start: &mut usize| -> Result<(), CommandResponse> {
+            // `LIMIT n` bounds how many entries one call trims; only with
+            // `~` (see `StreamTrim`), whose default is a hundred nodes'.
+            let limit = |start: &mut usize| -> Result<usize, CommandResponse> {
                 if args
                     .get(*start)
                     .is_some_and(|a| a.eq_ignore_ascii_case(b"LIMIT"))
@@ -142,18 +141,23 @@ fn parse_stream_trim(
                             "ERR syntax error, LIMIT cannot be used without the special ~ option",
                         ));
                     }
-                    let ok = args
+                    let n = args
                         .get(*start + 1)
                         .and_then(|a| std::str::from_utf8(a).ok()?.parse::<i64>().ok())
-                        .is_some_and(|n| n >= 0);
-                    if !ok {
+                        .filter(|&n| n >= 0);
+                    let Some(n) = n else {
                         return Err(CommandResponse::error(
                             "ERR The LIMIT argument must be >= 0.",
                         ));
-                    }
+                    };
                     *start += 2;
+                    return Ok(usize::try_from(n).unwrap_or(usize::MAX));
                 }
-                Ok(())
+                Ok(if exact {
+                    0
+                } else {
+                    solikv_core::types::STREAM_DEFAULT_TRIM_LIMIT
+                })
             };
             if opt == "MAXLEN" {
                 let threshold = match std::str::from_utf8(&args[*start])
@@ -173,8 +177,12 @@ fn parse_stream_trim(
                     }
                 };
                 *start += 1;
-                limit(start)?;
-                Ok(Some(StreamTrim::MaxLen { exact, threshold }))
+                let limit = limit(start)?;
+                Ok(Some(StreamTrim::MaxLen {
+                    exact,
+                    threshold,
+                    limit,
+                }))
             } else {
                 let id_input =
                     parse_stream_id(&args[*start]).ok_or_else(CommandResponse::syntax_error)?;
@@ -184,8 +192,12 @@ fn parse_stream_trim(
                     _ => return Err(CommandResponse::syntax_error()),
                 };
                 *start += 1;
-                limit(start)?;
-                Ok(Some(StreamTrim::MinId { exact, threshold }))
+                let limit = limit(start)?;
+                Ok(Some(StreamTrim::MinId {
+                    exact,
+                    threshold,
+                    limit,
+                }))
             }
         }
         _ => Ok(None),
@@ -1247,6 +1259,44 @@ impl CommandEngine {
             "HSETNX" => {
                 if let Some(key) = args.first() {
                     self.notify_keyspace_event(NOTIFY_HASH, "hsetnx", key);
+                }
+            }
+            "HGETDEL" => {
+                let any = matches!(response, CommandResponse::Array(v)
+                    if v.iter().any(|r| !matches!(r, CommandResponse::Nil)));
+                if let (true, Some(key)) = (any, args.first()) {
+                    self.notify_keyspace_event(NOTIFY_HASH, "hdel", key);
+                }
+            }
+            "HGETEX" => {
+                let any = matches!(response, CommandResponse::Array(v)
+                    if v.iter().any(|r| !matches!(r, CommandResponse::Nil)));
+                let event = match args.get(1).map(|a| Upper::new(a)) {
+                    Some(o) if o.as_str() == "PERSIST" => Some("hpersist"),
+                    Some(o) if matches!(o.as_str(), "EX" | "PX" | "EXAT" | "PXAT") => {
+                        Some("hexpire")
+                    }
+                    _ => None,
+                };
+                if let (true, Some(event), Some(key)) = (any, event, args.first()) {
+                    self.notify_keyspace_event(NOTIFY_HASH, event, key);
+                }
+            }
+            "HSETEX" => {
+                if let (CommandResponse::Integer(1), Some(key)) = (response, args.first()) {
+                    self.notify_keyspace_event(NOTIFY_HASH, "hset", key);
+                    let ttl = args
+                        .iter()
+                        .skip(1)
+                        .take_while(|a| !a.eq_ignore_ascii_case(b"FIELDS"))
+                        .any(|a| {
+                            ["EX", "PX", "EXAT", "PXAT"]
+                                .iter()
+                                .any(|o| a.eq_ignore_ascii_case(o.as_bytes()))
+                        });
+                    if ttl {
+                        self.notify_keyspace_event(NOTIFY_HASH, "hexpire", key);
+                    }
                 }
             }
 
@@ -3033,6 +3083,9 @@ impl CommandEngine {
             }
             Cmd::HTTL | Cmd::HPTTL | Cmd::HEXPIRETIME | Cmd::HPEXPIRETIME => self.httl(id, args),
             Cmd::HPERSIST => self.hpersist(args),
+            Cmd::HGETDEL => self.hgetdel(args),
+            Cmd::HGETEX => self.hgetex(args),
+            Cmd::HSETEX => self.hsetex(args),
             Cmd::SMISMEMBER => self.smismember(args),
             Cmd::SINTERCARD => self.sintercard(args),
             Cmd::ZSCAN => {

@@ -359,6 +359,192 @@ impl ShardStore {
         CommandResponse::array(out)
     }
 
+    /// `HGETDEL key FIELDS n field…` (Redis 8): each field's value (nil if
+    /// absent), the fields removed — and the key, once empty. Returns the
+    /// fields removed, for the log.
+    pub fn hash_hgetdel(&mut self, key: &Bytes, fields: &[Bytes]) -> (CommandResponse, Vec<Bytes>) {
+        let nils =
+            || CommandResponse::array(fields.iter().map(|_| CommandResponse::nil()).collect());
+        self.purge_hash_fields_in(self.db(), key);
+        let Some(idx) = self.index_of_live(key) else {
+            return (nils(), Vec::new());
+        };
+        if !matches!(self.entry_value(idx), RedisValue::Hash(_)) {
+            return (CommandResponse::wrong_type(), Vec::new());
+        }
+        self.capture_index(idx);
+        let mut deleted = Vec::new();
+        let RedisValue::Hash(h) = self.entry_value_mut(idx) else {
+            unreachable!()
+        };
+        let out = fields
+            .iter()
+            .map(|f| match h.swap_remove(f) {
+                Some(v) => {
+                    deleted.push(f.clone());
+                    CommandResponse::bulk(v)
+                }
+                None => CommandResponse::nil(),
+            })
+            .collect();
+        let empty = h.is_empty();
+        if empty {
+            self.del(key);
+        }
+        (CommandResponse::array(out), deleted)
+    }
+
+    /// `HGETEX key [EX|PX|EXAT|PXAT t | PERSIST] FIELDS n field…` (Redis 8):
+    /// each field's value, then its expiry changed — `At` a deadline already
+    /// past removes the fields. Returns what changed, for the log.
+    pub fn hash_hgetex(
+        &mut self,
+        key: &Bytes,
+        fields: &[Bytes],
+        op: FieldExpiry,
+    ) -> (CommandResponse, FieldChanges) {
+        let mut changes = FieldChanges::default();
+        let nils =
+            || CommandResponse::array(fields.iter().map(|_| CommandResponse::nil()).collect());
+        self.purge_hash_fields_in(self.db(), key);
+        let Some(idx) = self.index_of_live(key) else {
+            return (nils(), changes);
+        };
+        if !matches!(self.entry_value(idx), RedisValue::Hash(_)) {
+            return (CommandResponse::wrong_type(), changes);
+        }
+        let values: Vec<CommandResponse> = {
+            let RedisValue::Hash(h) = self.entry_value(idx) else {
+                unreachable!()
+            };
+            fields
+                .iter()
+                .map(|f| match h.get(f) {
+                    Some(v) => CommandResponse::bulk(v.clone()),
+                    None => CommandResponse::nil(),
+                })
+                .collect()
+        };
+        if matches!(op, FieldExpiry::Keep) {
+            return (CommandResponse::array(values), changes);
+        }
+        self.capture_index(idx);
+        let now = now_millis();
+        let mut ttl_set = false;
+        {
+            let RedisValue::Hash(h) = self.entry_value_mut(idx) else {
+                unreachable!()
+            };
+            for f in fields {
+                if !h.contains_key(f) {
+                    continue;
+                }
+                match op {
+                    FieldExpiry::Keep => {}
+                    FieldExpiry::Persist => {
+                        if h.persist_field(f) {
+                            changes.persisted.push(f.clone());
+                        }
+                    }
+                    FieldExpiry::At(at) if at <= now && !is_loading() => {
+                        h.swap_remove(f);
+                        changes.deleted.push(f.clone());
+                    }
+                    FieldExpiry::At(at) => {
+                        h.set_field_ttl(f, at);
+                        ttl_set = true;
+                        changes
+                            .expire_at
+                            .get_or_insert((at, Vec::new()))
+                            .1
+                            .push(f.clone());
+                    }
+                }
+            }
+        }
+        if ttl_set {
+            self.note_field_ttl(key);
+        }
+        if matches!(self.entry_value(idx), RedisValue::Hash(h) if h.is_empty()) {
+            self.del(key);
+        }
+        (CommandResponse::array(values), changes)
+    }
+
+    /// `HSETEX key [FNX|FXX] [EX|PX|EXAT|PXAT t | KEEPTTL] FIELDS n field
+    /// value…` (Redis 8): `1` once every field is set, `0` when `FNX` (one
+    /// already exists) or `FXX` (one does not) refuses all of them. Without
+    /// an expiry option the fields lose theirs, as with `HSET`; `At` a
+    /// deadline already past leaves them removed. Returns what changed.
+    pub fn hash_hsetex(
+        &mut self,
+        key: &Bytes,
+        pairs: Vec<(Bytes, Bytes)>,
+        only: Option<bool>,
+        ttl: SetExpiry,
+    ) -> (CommandResponse, FieldChanges) {
+        let mut changes = FieldChanges::default();
+        let existing: Vec<bool> = match self.get_hash(key) {
+            Err(e) => return (e, changes),
+            Ok(None) => vec![false; pairs.len()],
+            Ok(Some(h)) => pairs.iter().map(|(f, _)| h.contains_key(f)).collect(),
+        };
+        let refused = match only {
+            Some(true) => existing.iter().any(|&e| e),
+            Some(false) => existing.iter().any(|&e| !e),
+            None => false,
+        };
+        if refused {
+            return (CommandResponse::integer(0), changes);
+        }
+        let now = now_millis();
+        let hash = match self.get_or_create_hash(key) {
+            Ok(h) => h,
+            Err(e) => return (e, changes),
+        };
+        let mut ttl_set = false;
+        for (f, v) in pairs {
+            let kept = match ttl {
+                SetExpiry::Keep => hash.field_ttl(&f),
+                _ => None,
+            };
+            // `insert` drops the field's expiry, as HSET does.
+            hash.insert(f.clone(), v.clone());
+            match ttl {
+                SetExpiry::Discard => {}
+                SetExpiry::Keep => {
+                    if let Some(at) = kept {
+                        hash.set_field_ttl(&f, at);
+                        ttl_set = true;
+                        changes.kept.push((f.clone(), at));
+                    }
+                }
+                SetExpiry::At(at) if at <= now && !is_loading() => {
+                    hash.swap_remove(&f);
+                    changes.deleted.push(f.clone());
+                }
+                SetExpiry::At(at) => {
+                    hash.set_field_ttl(&f, at);
+                    ttl_set = true;
+                    changes
+                        .expire_at
+                        .get_or_insert((at, Vec::new()))
+                        .1
+                        .push(f.clone());
+                }
+            }
+            changes.set.push((f, v));
+        }
+        let empty = hash.is_empty();
+        if ttl_set {
+            self.note_field_ttl(key);
+        }
+        if empty {
+            self.del(key);
+        }
+        (CommandResponse::integer(1), changes)
+    }
+
     /// `HSCAN key cursor [MATCH pattern] [COUNT count]`: visits `count`
     /// fields by position, no copy of the hash.
     pub fn hash_hscan(
