@@ -32,7 +32,10 @@ from 0.4.x*. The workspace `Cargo.toml` versions are not bumped yet.
   the bus with mutual TLS.
 - **TLS everywhere**: REST TLS with the RESP certificate, client certificates
   (`--tls-ca-cert`, `--tls-auth-clients`), TLS replication links and
-  `MIGRATE` (`--tls-replication`). Peers are checked against the CA.
+  `MIGRATE` (`--tls-replication`), `--cluster-dump`/`--cluster-restore`
+  over TLS. Peers are checked against the CA. `--tls-auth-clients-user CN`
+  (Redis 8's `tls-auth-clients-user`) logs a RESP client in as the enabled
+  ACL user its verified certificate's subject CN names.
 - **ACL**: users with SHA-256 passwords, command/category/subcommand rules,
   key (`~`, `%R~`, `%W~`) and channel (`&`) patterns, selectors, `ACL LOG`,
   `--aclfile`. Scripts, `SUBSCRIBE`, blocking commands and every REST route
@@ -95,6 +98,14 @@ from 0.4.x*. The workspace `Cargo.toml` versions are not bumped yet.
   are deleted.
 - Expired keys are reclaimed by a timer (`--hz`), not only when traffic hits
   the shard: an idle server kept almost all expired keys resident.
+- **Cluster dump/restore lost data**: replies split across reads were cut
+  short, the first element of every array was dropped, values containing
+  CRLF were truncated, TTLs were lost, collections were restored as strings
+  holding their JSON, and failures exited 0. The tool now reads whole RESP
+  replies, lists keys with `SCAN`, dumps each key's `DUMP` payload and TTL
+  in milliseconds (file format version 2; the binary format restores too),
+  restores with `RESTORE … REPLACE`, and fails loudly on any missed node or
+  error. Version 1 files still restore.
 - Smaller fixes found along the way: `INCRBYFLOAT` formatting, `GEOHASH`'s
   11th character, `XGROUP` events, `XADD` with a bad ID leaving an empty
   stream, `GEOSEARCHSTORE` across shards, `--import-redis-rdb` routing,
@@ -118,7 +129,10 @@ before/after comparison is in `benches/RESULTS.md`.
   hold, overhead moved out of the lock, waiters spin briefly instead of
   parking; per-thread counters instead of shared atomics.
 - Snapshots are taken in steps, so `BGSAVE`, `SAVE` and `--solo` snapshots
-  no longer stall other clients for the whole serialization.
+  no longer stall other clients for the whole serialization. Lists, sets,
+  hashes and sorted sets of 8192 elements or more are serialized a slice per
+  step, so one huge key no longer holds its shard for a whole `BGSAVE`,
+  `BGREWRITEAOF` or replica full sync (streams are still written whole).
 - The keyspace grows incrementally (`IncMap`): growing past ~229k keys per
   shard copied and rehashed the whole map under the shard lock, pausing
   every shard at once.
@@ -182,7 +196,10 @@ before/after comparison is in `benches/RESULTS.md`.
   `<name>.rdb`. With `appendonly` on, startup loads the log only.
 - Keys are placed in shards by cluster slot; existing data is re-hashed on
   load. A 0.4.x *cluster* placed keys by the wrong CRC16 and speaks the old
-  bus protocol: migrate with `--cluster-dump` / `--cluster-restore`.
+  bus protocol: load a copy of each old node's data directory into a 0.5
+  standalone server with `--shards 1` and copy it into a new cluster with
+  `redis-cli --cluster import … --cluster-copy` (0.4.x's own
+  `--cluster-dump` lost data).
 - Lua 5.4 → 5.1.
 - `SELECT n` selects a separate database; old data is in database 0.
 - `--cluster-password` as the bus key is deprecated in favour of
@@ -200,10 +217,11 @@ before/after comparison is in `benches/RESULTS.md`.
 ### Known limitations
 
 - No Sentinel.
-- `--cluster-dump`/`--cluster-restore` use plain TCP.
-- Client certificates are not mapped to ACL users.
-- An append-only log rewrite of a single very large key still holds that
-  key's shard while it is serialized.
+- A very large stream is still serialized in one step during snapshots and
+  rewrites.
+- Multi-shard `SCAN` cursors exceed 32 bits; `redis-cli --cluster import`
+  truncates them and stops after the first shard (use a `--shards 1`
+  source).
 - `appendfsync always` fsyncs right after each write but does not hold the
   reply until the fsync completes, unlike Redis.
 - `INFO`'s `solikv_version` reports the engine crate's version (`0.1.0`)

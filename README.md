@@ -32,7 +32,8 @@ under [Differences from Redis](#differences-from-redis).
   expiry (`hz`), keyspace notifications.
 - **Security**: ACL users with command/category/key/channel rules and
   selectors, TLS on every channel (RESP, REST, replication, cluster bus),
-  client certificates, protected mode. See [SECURITY.md](SECURITY.md).
+  client certificates (optionally naming the ACL user, as Redis 8's
+  `tls-auth-clients-user`), protected mode. See [SECURITY.md](SECURITY.md).
 - **Persistence**: Redis 7-style append-only log directory with a manifest,
   checksummed RDB snapshots, save points, `BGREWRITEAOF`, `SHUTDOWN`, import
   of Redis `dump.rdb` files.
@@ -206,6 +207,7 @@ and `CONFIG REWRITE` writes them back to the file.
 | `--tls-key` | — | TLS private key file (PKCS#8, PKCS#1 or SEC1 PEM) |
 | `--tls-ca-cert` (alias `--tls-client-ca`) | — | CA certificate(s) (PEM). Client certificates on RESP/REST are checked against it (see --tls-auth-clients), and so are the peers of replication links and the cluster bus. |
 | `--tls-auth-clients` | — | Client certificates on RESP and REST: yes (required), optional, or no. Default: yes when --tls-ca-cert is set, as in Redis. |
+| `--tls-auth-clients-user` | `off` | Authenticate a RESP client as the ACL user named by its certificate's subject CN, when that user exists and is on (Redis 8 `tls-auth-clients-user`); otherwise the connection starts as any other. Needs client certificates (--tls-ca-cert). CN or off. |
 | `--tls-replication` | `no` | Replication links (and MIGRATE) use TLS: a replica connects to its master's TLS port and checks its certificate against --tls-ca-cert. |
 | `--tls-cluster` | `no` | The cluster bus uses TLS, both ways, with a certificate signed by --tls-ca-cert required of every peer. The bus keeps its HMAC envelope. |
 
@@ -324,7 +326,8 @@ and `CONFIG REWRITE` writes them back to the file.
   points, shutdown) to a temporary file, fsynced, renamed, and the
   directory fsynced. Snapshots are
   taken in steps, so other clients keep being served while a shard is
-  written. `FUNCTION` libraries are stored in snapshots and the log.
+  written; collections of 8192 elements or more are written a slice at a
+  time (streams whole). `FUNCTION` libraries are stored in snapshots and the log.
 - **Startup** loads the log when `appendonly` is on (as Redis does), the
   snapshot otherwise. Every key is re-hashed to the shard that owns it now,
   so `--shards` can change between runs.
@@ -375,6 +378,12 @@ replica is elected and takes over the slots. `CLUSTER FAILOVER [FORCE|TAKEOVER]`
 does it by hand. Every bus frame is signed with the bus secret, bound to its
 receiver and replay-protected; `--tls-cluster yes` encrypts it too.
 
+`solikv --cluster-connect host:port --cluster-dump FILE` exports every key
+of a running cluster (each key's `DUMP` payload and TTL), and
+`--cluster-restore FILE` loads it into another one with `RESTORE … REPLACE`.
+Given the nodes' `--tls-cert`/`--tls-key`/`--tls-ca-cert`, the tool connects
+over TLS. Files written by 0.4.x still restore.
+
 Within one node, keys are also spread over `--shards` shards (one per core
 by default) by the same slot function, each behind its own lock; commands
 spanning shards lock them all in a fixed order, so multi-key commands,
@@ -391,10 +400,11 @@ spanning shards lock them all in a fixed order, so multi-key commands,
   sorted sets; streams, HyperLogLogs and Bloom filters use a SoliKV-specific
   payload that only SoliKV restores.
 - `--import-redis-rdb` skips streams.
-- Client certificates authenticate the TLS connection but do not log in an
-  ACL user (Redis 8's `tls-auth-clients-user`).
-- `--cluster-dump` / `--cluster-restore` (SoliKV's own export tool) use
-  plain TCP.
+- On a multi-shard server, `SCAN` cursors carry the shard index in their
+  high bits and exceed 32 bits. Clients keep them as strings or 64-bit
+  integers and work, but `redis-cli --cluster import` parses them as an
+  `int` and stops after the first shard: import from a server started with
+  `--shards 1`.
 - `appendfsync always` does not hold a reply until its write is fsynced, so a
   machine crash can lose writes acknowledged in the last few milliseconds.
 - The `INFO` field `redis_version` reports `7.2.0` for client feature
@@ -414,11 +424,21 @@ spanning shards lock them all in a fixed order, so multi-key commands,
 - **Logical databases are real**: `SELECT n` used to share one keyspace.
   Existing data loads into database 0.
 - **Cluster key slots changed**: 0.4.x computed CRC16 with a wrong table, so
-  `CLUSTER KEYSLOT` disagreed with Redis for most keys. A 0.4.x cluster's keys
-  sit on nodes chosen by the wrong slot: export with the old version's
-  `--cluster-dump` and re-import with `--cluster-restore` into a new cluster.
-  The bus protocol changed too (receiver-bound frames, node ids, epochs), so
-  0.4.x and 0.5 nodes do not form one cluster.
+  `CLUSTER KEYSLOT` disagreed with Redis for most keys, and a 0.4.x cluster's
+  keys sit on nodes chosen by the wrong slot. The bus protocol changed too
+  (receiver-bound frames, node ids, epochs), so 0.4.x and 0.5 nodes do not
+  form one cluster. (0.4.x's own `--cluster-dump` lost data, so do not
+  migrate with it.) For each old node, start a *copy* of its data directory
+  with 0.5 as a standalone server with one shard, then copy its keys into a
+  new 0.5 cluster:
+
+  ```bash
+  solikv --dir copy-of-node-a --port 7400 --shards 1 --bind 127.0.0.1 --rest-port 0
+  redis-cli --cluster import 127.0.0.1:7000 --cluster-from 127.0.0.1:7400 --cluster-copy
+  ```
+
+  (`--shards 1` matters: see the `SCAN` cursor note under *Differences from
+  Redis*.)
 - **Cluster bus key**: use `--cluster-bus-secret[-file]`; `--cluster-password`
   still works as the bus key with a deprecation warning.
 - **Lua is 5.1** (was 5.4), like Redis: scripts using 5.4-only syntax

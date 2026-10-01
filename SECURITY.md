@@ -35,7 +35,7 @@ compromises the cluster.
 | Replication (replica → master) | `--masterauth` (+ `--masteruser` for an ACL user) | TLS with `--tls-replication yes` |
 | `MIGRATE` (server → target) | `AUTH` / `AUTH2` arguments | TLS with `--tls-replication yes` |
 | Cluster bus (node ↔ node) | HMAC-SHA-256 envelope keyed by `--cluster-bus-secret`, receiver-bound, replay-protected | TLS with `--tls-cluster yes` (mutual, CA-checked) |
-| `--cluster-dump` / `--cluster-restore` (tool → nodes) | `--cluster-password` (+ `--cluster-user`) | none (plain TCP) |
+| `--cluster-dump` / `--cluster-restore` (tool → nodes) | `--cluster-password` (+ `--cluster-user`) | TLS when given the nodes' `--tls-cert`/`--tls-key`/`--tls-ca-cert` |
 
 ## Hardening summary
 
@@ -53,7 +53,16 @@ compromises the cluster.
     `--tls-client-ca`, and `tls-ca-cert-file` in a config file) checks client
     certificates on RESP and REST per `--tls-auth-clients yes|optional|no`
     — `yes` by default once a CA is set, as in Redis. A certificate proves
-    membership of the CA, not an ACL identity: clients still `AUTH`.
+    membership of the CA, not an ACL identity: clients still `AUTH`, unless
+    `--tls-auth-clients-user CN` is set (Redis 8's `tls-auth-clients-user`):
+    then a RESP client whose verified certificate's subject CN names an
+    existing, enabled ACL user starts authenticated as that user. Off by
+    default; refused at startup without client certificates to read. REST
+    keeps its Bearer/Basic authentication.
+  - **Cluster dump/restore tool**: given the nodes' `--tls-cert`/`--tls-key`/
+    `--tls-ca-cert`, `--cluster-dump`/`--cluster-restore` connect over TLS,
+    check each node against the CA and present the certificate; a CA without
+    a certificate refuses to run rather than dump in clear.
   - **Replication and `MIGRATE`**: `--tls-replication yes` makes a replica
     dial its master over TLS and check the master's certificate against the
     CA; `MIGRATE` uses the same setting, as in Redis.
@@ -248,11 +257,6 @@ compromises the cluster.
 - **Bus membership is shared**: the bus secret (and, with `--tls-cluster`,
   the CA) proves membership, not identity — any member can sign as any
   node. A compromised node can rewrite the topology.
-- **Client certificates do not map to ACL users** (Redis 8's
-  `tls-auth-clients-user` is not implemented): a certificate gets a client
-  to the `AUTH` prompt, not past it.
-- **`--cluster-dump` / `--cluster-restore` speak plain TCP**: they cannot
-  reach nodes that only accept TLS.
 - **Argv password leakage**: secrets given as CLI flags remain visible in
   `/proc/<pid>/cmdline` until the process exits. Prefer the file or
   environment form.

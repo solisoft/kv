@@ -247,7 +247,7 @@
                 </tbody>
             </table>
         </div>
-        <p class="mt-4 text-sm text-slate-500">This is a selection. The README lists all 79 flags; <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">solikv --help</code> prints them too.</p>
+        <p class="mt-4 text-sm text-slate-500">This is a selection. The README lists all 80 flags; <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">solikv --help</code> prints them too.</p>
     </div>
 
     <!-- What's Next -->

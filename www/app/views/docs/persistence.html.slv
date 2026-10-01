@@ -29,7 +29,7 @@
                 <h3 class="text-lg font-semibold text-purple-400 mb-3">Snapshots</h3>
                 <ul class="space-y-2 text-sm text-slate-400">
                     <li class="flex items-start gap-2"><span class="text-purple-400">1.</span> One file holding every shard and every database, with a CRC-32 checksum.</li>
-                    <li class="flex items-start gap-2"><span class="text-purple-400">2.</span> Taken in steps: each shard is held only while its part is captured, so other clients keep being served.</li>
+                    <li class="flex items-start gap-2"><span class="text-purple-400">2.</span> Taken in steps: each shard is held only while its part is captured, so other clients keep being served. Lists, sets, hashes and sorted sets of 8192 elements or more are written a slice at a time (streams whole).</li>
                     <li class="flex items-start gap-2"><span class="text-purple-400">3.</span> Written to a temporary file, fsynced, renamed, and the directory fsynced.</li>
                     <li class="flex items-start gap-2"><span class="text-purple-400">4.</span> Triggered by save points (<code class="text-slate-300">--save</code>, default one change in 300 s), <code class="text-slate-300">BGSAVE</code>, <code class="text-slate-300">SAVE</code> and shutdown.</li>
                 </ul>
