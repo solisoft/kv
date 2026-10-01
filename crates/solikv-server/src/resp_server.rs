@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
+use solikv_engine::output_limits::{Class, Limit};
 use solikv_engine::CommandEngine;
 
 trait AsyncSocket: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -339,6 +340,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     info.set_push(push_tx);
 
     let mut decoder = CommandDecoder::new();
+    // `client-output-buffer-limit normal`: since when replies have been
+    // waiting over the soft limit (see `write_out`).
+    let mut obuf_soft: Option<std::time::Instant> = None;
     // What a replica announces (`REPLCONF`) before it asks to sync.
     let mut repl_hs = crate::replication::Handshake::default();
     // Cluster mode: `ASKING` (for the next command only) and `READONLY`.
@@ -358,7 +362,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 Ok(None) => break, // need more data
                 Err(e) => {
                     encode_frame(&RespFrame::error(format!("ERR {e}")), &mut write_buf);
-                    socket.write_all(&write_buf).await?;
+                    write_out(
+                        &mut socket,
+                        &mut write_buf,
+                        &engine,
+                        &mut obuf_soft,
+                        &info.addr,
+                    )
+                    .await?;
                     return Ok(());
                 }
             }
@@ -422,7 +433,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         encode_push(&p, session.resp, false, &mut write_buf);
                     }
                     if !write_buf.is_empty() {
-                        socket.write_all(&write_buf).await?;
+                        write_out(
+                            &mut socket,
+                            &mut write_buf,
+                            &engine,
+                            &mut obuf_soft,
+                            &info.addr,
+                        )
+                        .await?;
                         write_buf.clear();
                     }
                     continue;
@@ -506,7 +524,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                             }
                         }
                         if write_buf.len() >= FLUSH_AT {
-                            socket.write_all(&write_buf).await?;
+                            write_out(
+                                &mut socket,
+                                &mut write_buf,
+                                &engine,
+                                &mut obuf_soft,
+                                &info.addr,
+                            )
+                            .await?;
                             write_buf.clear();
                         }
                         continue;
@@ -533,7 +558,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 if engine.script_running() {
                     if !write_buf.is_empty() {
-                        socket.write_all(&write_buf).await?;
+                        write_out(
+                            &mut socket,
+                            &mut write_buf,
+                            &engine,
+                            &mut obuf_soft,
+                            &info.addr,
+                        )
+                        .await?;
                         write_buf.clear();
                     }
                     if let Some(busy) = engine.script_gate(&cmd.name, &cmd.args).await {
@@ -572,7 +604,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 // A long pipeline's replies go out as they accumulate
                 // instead of all being held until the batch ends.
                 if write_buf.len() >= FLUSH_AT {
-                    socket.write_all(&write_buf).await?;
+                    write_out(
+                        &mut socket,
+                        &mut write_buf,
+                        &engine,
+                        &mut obuf_soft,
+                        &info.addr,
+                    )
+                    .await?;
                     write_buf.clear();
                 }
             }
@@ -588,7 +627,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                             &RespFrame::error("ERR too many failures, please wait"),
                             &mut write_buf,
                         );
-                        socket.write_all(&write_buf).await?;
+                        write_out(
+                            &mut socket,
+                            &mut write_buf,
+                            &engine,
+                            &mut obuf_soft,
+                            &info.addr,
+                        )
+                        .await?;
                         return Ok(());
                     }
                     let frame = match acl_auth(&engine, &cmd.args) {
@@ -629,7 +675,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                             &RespFrame::error("ERR too many failures, please wait"),
                             &mut write_buf,
                         );
-                        socket.write_all(&write_buf).await?;
+                        write_out(
+                            &mut socket,
+                            &mut write_buf,
+                            &engine,
+                            &mut obuf_soft,
+                            &info.addr,
+                        )
+                        .await?;
                         return Ok(());
                     }
                     let reply = hello(
@@ -693,7 +746,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                                 ),
                                 Some((n, t)) if n >= 0 && t >= 0 => {
                                     if !write_buf.is_empty() {
-                                        socket.write_all(&write_buf).await?;
+                                        write_out(
+                                            &mut socket,
+                                            &mut write_buf,
+                                            &engine,
+                                            &mut obuf_soft,
+                                            &info.addr,
+                                        )
+                                        .await?;
                                         write_buf.clear();
                                     }
                                     let got =
@@ -733,7 +793,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                                 None
                             };
                             if !write_buf.is_empty() {
-                                socket.write_all(&write_buf).await?;
+                                write_out(
+                                    &mut socket,
+                                    &mut write_buf,
+                                    &engine,
+                                    &mut obuf_soft,
+                                    &info.addr,
+                                )
+                                .await?;
                                 write_buf.clear();
                             }
                             let pending = read_buf.split();
@@ -795,7 +862,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                             );
                         }
                         if !write_buf.is_empty() {
-                            socket.write_all(&write_buf).await?;
+                            write_out(
+                                &mut socket,
+                                &mut write_buf,
+                                &engine,
+                                &mut obuf_soft,
+                                &info.addr,
+                            )
+                            .await?;
                             write_buf.clear();
                         }
                         return handle_pubsub_mode(
@@ -824,7 +898,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     "MONITOR" if !session.in_multi() => {
                         encode_frame(&RespFrame::ok(), &mut write_buf);
-                        socket.write_all(&write_buf).await?;
+                        write_out(
+                            &mut socket,
+                            &mut write_buf,
+                            &engine,
+                            &mut obuf_soft,
+                            &info.addr,
+                        )
+                        .await?;
                         write_buf.clear();
                         return monitor_loop(&mut socket, &engine, &info, &mut read_buf).await;
                     }
@@ -846,7 +927,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
                         // Flush confirmations, then enter pubsub loop
                         if !write_buf.is_empty() {
-                            socket.write_all(&write_buf).await?;
+                            write_out(
+                                &mut socket,
+                                &mut write_buf,
+                                &engine,
+                                &mut obuf_soft,
+                                &info.addr,
+                            )
+                            .await?;
                             write_buf.clear();
                         }
 
@@ -880,7 +968,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         }
 
                         if !write_buf.is_empty() {
-                            socket.write_all(&write_buf).await?;
+                            write_out(
+                                &mut socket,
+                                &mut write_buf,
+                                &engine,
+                                &mut obuf_soft,
+                                &info.addr,
+                            )
+                            .await?;
                             write_buf.clear();
                         }
 
@@ -941,7 +1036,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     "QUIT" => {
                         encode_frame(&RespFrame::ok(), &mut write_buf);
-                        socket.write_all(&write_buf).await?;
+                        write_out(
+                            &mut socket,
+                            &mut write_buf,
+                            &engine,
+                            &mut obuf_soft,
+                            &info.addr,
+                        )
+                        .await?;
                         return Ok(());
                     }
                     "CLUSTER" => {
@@ -1011,7 +1113,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     if engine.writes_paused() {
                         if !write_buf.is_empty() {
-                            socket.write_all(&write_buf).await?;
+                            write_out(
+                                &mut socket,
+                                &mut write_buf,
+                                &engine,
+                                &mut obuf_soft,
+                                &info.addr,
+                            )
+                            .await?;
                             write_buf.clear();
                         }
                         wait_while_paused(&engine, &cmd.name, &cmd.args).await;
@@ -1025,7 +1134,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         continue;
                     }
                     if !write_buf.is_empty() {
-                        socket.write_all(&write_buf).await?;
+                        write_out(
+                            &mut socket,
+                            &mut write_buf,
+                            &engine,
+                            &mut obuf_soft,
+                            &info.addr,
+                        )
+                        .await?;
                         write_buf.clear();
                     }
                     let reply = migrate(
@@ -1049,7 +1165,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 };
                 if engine.script_running() {
                     if !write_buf.is_empty() {
-                        socket.write_all(&write_buf).await?;
+                        write_out(
+                            &mut socket,
+                            &mut write_buf,
+                            &engine,
+                            &mut obuf_soft,
+                            &info.addr,
+                        )
+                        .await?;
                         write_buf.clear();
                     }
                     if let Some(busy) = engine.script_gate(&cmd.name, &cmd.args).await {
@@ -1094,7 +1217,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     encode_for(session.resp, &cmd.name, &cmd.args, response, &mut write_buf);
                 }
                 if write_buf.len() >= FLUSH_AT {
-                    socket.write_all(&write_buf).await?;
+                    write_out(
+                        &mut socket,
+                        &mut write_buf,
+                        &engine,
+                        &mut obuf_soft,
+                        &info.addr,
+                    )
+                    .await?;
                     write_buf.clear();
                 }
             }
@@ -1105,7 +1235,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             encode_push(&p, session.resp, false, &mut write_buf);
         }
         if !write_buf.is_empty() {
-            socket.write_all(&write_buf).await?;
+            write_out(
+                &mut socket,
+                &mut write_buf,
+                &engine,
+                &mut obuf_soft,
+                &info.addr,
+            )
+            .await?;
             write_buf.clear();
         }
         shrink_after_spike(&mut write_buf);
@@ -1305,6 +1442,64 @@ fn prepare_read_buf(buf: &mut BytesMut, missing: usize) {
 }
 
 /// Give back the memory a burst (a huge command or reply) left behind.
+/// Write a normal client's pending replies, holding it to its
+/// `client-output-buffer-limit normal`: over the hard limit, or over the
+/// soft one for longer than allowed, the client is disconnected — the error
+/// ends the connection, and its buffers are freed with it. With no limit
+/// (the default, as in Redis) this is a plain write.
+async fn write_out<S: AsyncWrite + Unpin>(
+    socket: &mut S,
+    buf: &mut BytesMut,
+    engine: &CommandEngine,
+    soft_since: &mut Option<std::time::Instant>,
+    addr: &str,
+) -> std::io::Result<()> {
+    let limit = engine.output_limits().get(Class::Normal);
+    if limit.is_unlimited() {
+        socket.write_all(buf).await?;
+        buf.clear();
+        return Ok(());
+    }
+    let over = |limit: &Limit| {
+        tracing::warn!(
+            "{}: client closed for overcoming of output buffer limits ({} {} {})",
+            addr,
+            limit.hard,
+            limit.soft,
+            limit.soft_secs
+        );
+        std::io::Error::other("client-output-buffer-limit")
+    };
+    let mut off = 0;
+    while off < buf.len() {
+        if limit.exceeded(buf.len() - off, soft_since) {
+            return Err(over(&limit));
+        }
+        let n = match *soft_since {
+            // Over the soft limit: wait for the client no longer than the
+            // limit allows, then look again.
+            Some(since) => {
+                let deadline = since
+                    + std::time::Duration::from_secs(limit.soft_secs)
+                    + std::time::Duration::from_millis(1);
+                match tokio::time::timeout_at(deadline.into(), socket.write(&buf[off..])).await {
+                    Ok(n) => n?,
+                    Err(_) => continue,
+                }
+            }
+            None => socket.write(&buf[off..]).await?,
+        };
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        off += n;
+    }
+    // Everything went out: below any limit again.
+    limit.exceeded(0, soft_since);
+    buf.clear();
+    Ok(())
+}
+
 fn shrink_after_spike(buf: &mut BytesMut) {
     if buf.is_empty() && buf.capacity() > 16 * BUF_SIZE {
         *buf = BytesMut::with_capacity(BUF_SIZE);
@@ -1511,7 +1706,11 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
     // Output-buffer accounting shared with the forwarding tasks (Redis'
     // `client-output-buffer-limit pubsub 32mb 8mb 60`).
     let outbuf = Arc::new(OutBuf::default());
-    let mut soft_since: Option<tokio::time::Instant> = None;
+    outbuf.hard.store(
+        engine.output_limits().get(Class::Pubsub).hard,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let mut soft_since: Option<std::time::Instant> = None;
 
     // Forwarding tasks: channel_name -> JoinHandle
     let mut channel_tasks: HashMap<Bytes, JoinHandle<()>> = HashMap::new();
@@ -1583,16 +1782,13 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 write_buf.clear();
                 let left = outbuf.pending.fetch_sub(drained, std::sync::atomic::Ordering::AcqRel) - drained;
-                if left > PUBSUB_SOFT_LIMIT {
-                    let since = *soft_since.get_or_insert_with(tokio::time::Instant::now);
-                    if since.elapsed() >= PUBSUB_SOFT_SECONDS {
-                        tracing::warn!("{}: pub/sub client closed for staying over the soft output buffer limit", info.addr);
-                        for (_, h) in channel_tasks.drain() { h.abort(); }
-                        for (_, h) in pattern_tasks.drain() { h.abort(); }
-                        return Ok(());
-                    }
-                } else {
-                    soft_since = None;
+                let limit = engine.output_limits().get(Class::Pubsub);
+                outbuf.hard.store(limit.hard, std::sync::atomic::Ordering::Relaxed);
+                if limit.exceeded(left, &mut soft_since) {
+                    tracing::warn!("{}: pub/sub client closed for staying over the soft output buffer limit", info.addr);
+                    for (_, h) in channel_tasks.drain() { h.abort(); }
+                    for (_, h) in pattern_tasks.drain() { h.abort(); }
+                    return Ok(());
                 }
                 shrink_after_spike(&mut write_buf);
             }
@@ -1955,16 +2151,15 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Forwarding task: reads from a broadcast receiver and sends to the fan-in mpsc channel.
-/// Redis' `client-output-buffer-limit pubsub` defaults: a subscriber
-/// with more than 32 MB queued, or more than 8 MB for 60 s, is disconnected.
-const PUBSUB_HARD_LIMIT: usize = 32 * 1024 * 1024;
-const PUBSUB_SOFT_LIMIT: usize = 8 * 1024 * 1024;
-const PUBSUB_SOFT_SECONDS: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// What a subscriber has queued and not yet written.
+/// What a subscriber has queued and not yet written, against its
+/// `client-output-buffer-limit pubsub` (by default a subscriber with more
+/// than 32 MB queued, or more than 8 MB for 60 s, is disconnected).
 #[derive(Default)]
 struct OutBuf {
     pending: std::sync::atomic::AtomicUsize,
+    /// The class's hard limit (0 = none), refreshed by the connection so
+    /// that `CONFIG SET` applies to subscribers already connected.
+    hard: std::sync::atomic::AtomicU64,
     overflow: tokio::sync::Notify,
 }
 
@@ -1981,7 +2176,8 @@ async fn forward_broadcast(
                     .pending
                     .fetch_add(size, std::sync::atomic::Ordering::AcqRel)
                     + size;
-                if queued > PUBSUB_HARD_LIMIT {
+                let hard = outbuf.hard.load(std::sync::atomic::Ordering::Relaxed);
+                if hard > 0 && queued as u64 > hard {
                     outbuf.overflow.notify_one();
                     return;
                 }

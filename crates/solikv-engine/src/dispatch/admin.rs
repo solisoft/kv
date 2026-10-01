@@ -605,6 +605,10 @@ impl CommandEngine {
             ("timeout".into(), self.idle_timeout().to_string()),
             ("maxclients".into(), self.maxclients().to_string()),
             (
+                "client-output-buffer-limit".into(),
+                self.output_limits().render(),
+            ),
+            (
                 "slowlog-log-slower-than".into(),
                 self.stats
                     .slowlog_threshold_us
@@ -696,6 +700,7 @@ impl CommandEngine {
         "auto-aof-rewrite-min-size",
         "min-replicas-to-write",
         "min-replicas-max-lag",
+        "client-output-buffer-limit",
     ];
 
     fn config_validate(&self, param: &str, value: &str) -> Result<(), String> {
@@ -750,6 +755,15 @@ impl CommandEngine {
             }),
             "auto-aof-rewrite-percentage" => int(0, i64::MAX),
             "min-replicas-to-write" | "min-replicas-max-lag" => int(0, i32::MAX as i64),
+            "client-output-buffer-limit" => crate::output_limits::OutputLimits::parse(value)
+                .map(|_| ())
+                .map_err(|e| {
+                    format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         'client-output-buffer-limit') - {}",
+                        e
+                    )
+                }),
             "auto-aof-rewrite-min-size" => solikv_core::memory::parse_size(value)
                 .map(|_| ())
                 .ok_or_else(|| {
@@ -820,6 +834,9 @@ impl CommandEngine {
             "auto-aof-rewrite-min-size" => self
                 .persistence
                 .set_auto_rewrite(None, solikv_core::memory::parse_size(value)),
+            "client-output-buffer-limit" => {
+                let _ = self.set_output_limits(value);
+            }
             _ => {}
         }
     }
@@ -959,6 +976,10 @@ impl CommandEngine {
             ("hz", "10"),
             ("min-replicas-to-write", "0"),
             ("min-replicas-max-lag", "10"),
+            (
+                "client-output-buffer-limit",
+                &crate::output_limits::OutputLimits::default_render(),
+            ),
         ];
         let mut header = false;
         for (name, default) in defaults {

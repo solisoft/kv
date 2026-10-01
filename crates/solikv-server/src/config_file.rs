@@ -70,7 +70,6 @@ const IGNORED: &[&str] = &[
     "stream-node-max-bytes",
     "stream-node-max-entries",
     "activerehashing",
-    "client-output-buffer-limit",
     "dynamic-hz",
     "aof-rewrite-incremental-fsync",
     "rdb-save-incremental-fsync",
@@ -298,6 +297,23 @@ fn load_into(
             continue;
         }
         match directive.as_str() {
+            "client-output-buffer-limit" => {
+                // One class per line in redis.conf; the lines add up.
+                if values.is_empty() {
+                    return Err(bad("wrong number of arguments"));
+                }
+                let joined = values.join(" ");
+                match out
+                    .iter_mut()
+                    .find(|a| a.starts_with("--client-output-buffer-limit="))
+                {
+                    Some(prev) => {
+                        prev.push(' ');
+                        prev.push_str(&joined);
+                    }
+                    None => out.push(format!("--client-output-buffer-limit={}", joined)),
+                }
+            }
             "save" => {
                 // `save <seconds> <changes> …`, possibly on several lines,
                 // which add up as in Redis; `save ""` → no snapshots.
@@ -393,7 +409,9 @@ mod tests {
         std::fs::write(
             &main,
             "# comment\nport 7000\nsave 900 1\nsave 300 10\nappendonly no\ntcp-keepalive 300\n\
-             include inc.conf\nloglevel notice\nbind 127.0.0.1 -::1\n",
+             include inc.conf\nloglevel notice\nbind 127.0.0.1 -::1\n\
+             client-output-buffer-limit normal 0 0 0\n\
+             client-output-buffer-limit pubsub 32mb 8mb 60\n",
         )
         .unwrap();
         let known = |f: &str| matches!(f, "port" | "maxmemory-policy");
@@ -407,6 +425,7 @@ mod tests {
                 "--maxmemory-policy=allkeys-lru",
                 "--log-level=info",
                 "--bind=127.0.0.1",
+                "--client-output-buffer-limit=normal 0 0 0 pubsub 32mb 8mb 60",
             ]
         );
         std::fs::write(&main, "nonsense-directive 1\n").unwrap();

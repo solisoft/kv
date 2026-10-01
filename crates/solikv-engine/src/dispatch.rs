@@ -287,6 +287,8 @@ pub struct CommandEngine {
     maxmemory: AtomicU64,
     maxmemory_policy: std::sync::atomic::AtomicU8,
     maxmemory_samples: std::sync::atomic::AtomicUsize,
+    /// `client-output-buffer-limit`, per client class.
+    output_limits: crate::output_limits::OutputLimits,
     /// Clients blocked in `BLPOP` & co (see `crate::blocking`).
     blocking: Arc<crate::blocking::BlockingRegistry>,
     /// The script or function running now (`BUSY`, `SCRIPT KILL`).
@@ -370,6 +372,7 @@ impl CommandEngine {
             maxmemory: AtomicU64::new(0),
             maxmemory_policy: std::sync::atomic::AtomicU8::new(0),
             maxmemory_samples: std::sync::atomic::AtomicUsize::new(5),
+            output_limits: crate::output_limits::OutputLimits::default(),
             blocking: Arc::new(crate::blocking::BlockingRegistry::default()),
             script_state: Arc::new(crate::lua::RunState::default()),
             functions: Arc::new(crate::lua::FunctionRegistry::default()),
@@ -558,6 +561,26 @@ impl CommandEngine {
 
     pub fn maxclients(&self) -> usize {
         self.maxclients.load(Ordering::Relaxed)
+    }
+
+    /// `client-output-buffer-limit` of each client class.
+    pub fn output_limits(&self) -> &crate::output_limits::OutputLimits {
+        &self.output_limits
+    }
+
+    /// Set `client-output-buffer-limit` from its `CONFIG SET` form
+    /// (`<class> <hard> <soft> <seconds> …`); classes not named keep theirs.
+    pub fn set_output_limits(&self, spec: &str) -> Result<(), String> {
+        use crate::output_limits::{Class, OutputLimits};
+        for (class, limit) in OutputLimits::parse(spec)? {
+            self.output_limits.set(class, limit);
+            if class == Class::Replica {
+                self.shards
+                    .repl()
+                    .set_output_limit(limit.hard, limit.soft, limit.soft_secs);
+            }
+        }
+        Ok(())
     }
 
     pub fn set_maxclients(&self, n: usize) {

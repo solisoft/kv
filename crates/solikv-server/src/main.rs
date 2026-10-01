@@ -52,6 +52,14 @@ struct Args {
     #[arg(long, default_value = "10000")]
     maxclients: usize,
 
+    /// Output buffer limits per client class, as Redis takes them:
+    /// "<normal|replica|pubsub> <hard> <soft> <soft-seconds> ...". A client
+    /// over the hard limit, or over the soft one for that long, is
+    /// disconnected; 0 disables a limit. Defaults: normal 0 0 0, replica
+    /// 256mb 64mb 60, pubsub 32mb 8mb 60
+    #[arg(long)]
+    client_output_buffer_limit: Option<String>,
+
     /// Commands slower than this many microseconds go to the slow log
     /// (negative disables, 0 logs every command)
     #[arg(long, default_value = "10000", allow_hyphen_values = true)]
@@ -978,6 +986,12 @@ async fn async_main(args: Args) {
         std::process::exit(1);
     }
     engine.set_maxclients(args.maxclients);
+    if let Some(spec) = &args.client_output_buffer_limit {
+        if let Err(e) = engine.set_output_limits(spec) {
+            eprintln!("ERROR: --client-output-buffer-limit: {e}");
+            std::process::exit(1);
+        }
+    }
     engine.set_idle_timeout(args.timeout);
     engine.set_busy_threshold_ms(args.busy_reply_threshold);
     {

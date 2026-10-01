@@ -67,6 +67,11 @@ pub const DEFAULT_BACKLOG: usize = 1024 * 1024;
 /// (Redis' `client-output-buffer-limit replica 256mb`).
 pub const DEFAULT_REPLICA_BUFFER_LIMIT: usize = 256 * 1024 * 1024;
 
+/// Default soft limit (`… replica 256mb 64mb 60`): a replica may stay
+/// over it for this many seconds.
+pub const DEFAULT_REPLICA_SOFT_LIMIT: usize = 64 * 1024 * 1024;
+pub const DEFAULT_REPLICA_SOFT_SECS: u64 = 60;
+
 const PING_RECORD: &[u8] = b"*1\r\n$4\r\nPING\r\n";
 const GETACK_RECORD: &[u8] = b"*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n";
 
@@ -156,6 +161,8 @@ struct SinkSlot {
     buf: Vec<u8>,
     /// Over the limit: the link is closed and the replica resynchronizes.
     overflow: bool,
+    /// Since when `buf` has been over the soft limit.
+    soft_since: Option<std::time::Instant>,
 }
 
 struct Inner {
@@ -171,7 +178,11 @@ struct Inner {
     db: Option<u32>,
     sinks: Vec<SinkSlot>,
     next_sink: u64,
+    /// `client-output-buffer-limit replica`: hard (0 = none), soft, and
+    /// how long a replica may stay over the soft one.
     buffer_limit: usize,
+    soft_limit: usize,
+    soft_secs: u64,
     /// Ever had a backlog (a replica connected, or this node is a replica).
     backlog_active: bool,
 }
@@ -226,6 +237,8 @@ impl ReplFeed {
                 sinks: Vec::new(),
                 next_sink: 1,
                 buffer_limit: DEFAULT_REPLICA_BUFFER_LIMIT,
+                soft_limit: DEFAULT_REPLICA_SOFT_LIMIT,
+                soft_secs: DEFAULT_REPLICA_SOFT_SECS,
                 backlog_active: false,
             }),
             acked: tokio::sync::Notify::new(),
@@ -263,6 +276,15 @@ impl ReplFeed {
 
     pub fn set_buffer_limit(&self, bytes: usize) {
         self.inner.lock().buffer_limit = bytes.max(1024 * 1024);
+    }
+
+    /// `client-output-buffer-limit replica <hard> <soft> <seconds>`, as
+    /// Redis takes it: 0 disables a limit.
+    pub fn set_output_limit(&self, hard: u64, soft: u64, soft_secs: u64) {
+        let mut g = self.inner.lock();
+        g.buffer_limit = if hard == 0 { usize::MAX } else { hard as usize };
+        g.soft_limit = soft as usize;
+        g.soft_secs = soft_secs;
     }
 
     /// `(replid, replid2, master_repl_offset, second_repl_offset)`.
@@ -414,6 +436,7 @@ impl ReplFeed {
             sink: sink.clone(),
             buf,
             overflow: false,
+            soft_since: None,
         });
         self.connected.fetch_add(1, Ordering::Relaxed);
         Psync::Continue {
@@ -441,6 +464,7 @@ impl ReplFeed {
             sink: sink.clone(),
             buf: Vec::new(),
             overflow: false,
+            soft_since: None,
         });
         self.connected.fetch_add(1, Ordering::Relaxed);
         (g.replid.clone(), g.offset)
@@ -462,6 +486,7 @@ impl ReplFeed {
         if slot.overflow {
             return None;
         }
+        slot.soft_since = None;
         Some(std::mem::take(&mut slot.buf))
     }
 
@@ -606,12 +631,19 @@ impl Inner {
             self.backlog.drain(..over);
         }
         let limit = self.buffer_limit;
+        let (soft, soft_secs) = (self.soft_limit, self.soft_secs);
         for s in self.sinks.iter_mut() {
             if s.overflow {
                 continue;
             }
             s.buf.extend_from_slice(bytes);
-            if s.buf.len() > limit {
+            let over_soft = crate::output_limits::Limit {
+                hard: 0,
+                soft: soft as u64,
+                soft_secs,
+            }
+            .exceeded(s.buf.len(), &mut s.soft_since);
+            if s.buf.len() > limit || over_soft {
                 s.overflow = true;
                 s.buf = Vec::new();
             }
@@ -922,6 +954,36 @@ mod tests {
         let mut want = rec(&["SELECT", "0"]);
         want.extend(rec(&["SWAPDB", "0", "1"]));
         assert_eq!(f.take(&s).unwrap(), want);
+    }
+
+    /// `client-output-buffer-limit replica`: 0 is no hard limit, and a
+    /// replica may stay over the soft one for its seconds, not longer.
+    #[test]
+    fn the_replica_limits_follow_the_config() {
+        let f = ReplFeed::new();
+        f.set_output_limit(0, 1024, 0);
+        let s = sink(&f);
+        f.register_full(&s);
+        let big = "x".repeat(4096);
+        // Over the soft limit once: tolerated (the clock starts).
+        f.record(0, 0, &rec(&["SET", "a", &big]), false);
+        assert!(f.take(&s).is_some());
+        // Taken in time each round: still connected.
+        f.record(0, 0, &rec(&["SET", "a", &big]), false);
+        assert!(f.take(&s).is_some());
+        // Left over it past its (zero) seconds: cut off.
+        f.record(0, 0, &rec(&["SET", "a", &big]), false);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        f.record(0, 0, &rec(&["SET", "a", &big]), false);
+        assert!(f.take(&s).is_none());
+        // No hard limit at 0: a 2 MB backlog is kept.
+        let g = ReplFeed::new();
+        g.set_output_limit(0, 0, 0);
+        let t = sink(&g);
+        g.register_full(&t);
+        let huge = "x".repeat(2 * 1024 * 1024);
+        g.record(0, 0, &rec(&["SET", "a", &huge]), false);
+        assert!(g.take(&t).is_some());
     }
 
     #[test]

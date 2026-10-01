@@ -5,6 +5,7 @@ pub mod commands;
 pub mod dispatch;
 pub mod lua;
 pub mod lua_libs;
+pub mod output_limits;
 pub mod persistence;
 pub mod replication;
 pub mod resp3;
