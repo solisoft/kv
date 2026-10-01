@@ -334,7 +334,15 @@ pub struct Library {
     pub functions: Vec<FunctionMeta>,
 }
 
-#[derive(Default)]
+/// `FUNCTION RESTORE`'s policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestorePolicy {
+    Flush,
+    Append,
+    Replace,
+}
+
+#[derive(Default, Clone)]
 struct FnInner {
     libs: BTreeMap<String, Library>,
     fns: HashMap<String, FunctionMeta>,
@@ -369,8 +377,47 @@ impl FunctionRegistry {
         (g.libs.len(), g.fns.len())
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.read().libs.is_empty()
+    }
+
+    /// `FUNCTION RESTORE`: install `libs` all or nothing. `FLUSH` starts
+    /// from no libraries; `APPEND` fails on any library or function that
+    /// exists; `REPLACE` replaces libraries of the same name, but still
+    /// fails on a function another library registers.
+    pub fn restore(&self, libs: Vec<Library>, policy: RestorePolicy) -> Result<(), String> {
+        let mut g = self.inner.write();
+        let mut next = match policy {
+            RestorePolicy::Flush => FnInner::default(),
+            _ => g.clone(),
+        };
+        for lib in libs {
+            if next.libs.contains_key(&lib.name) {
+                if policy != RestorePolicy::Replace {
+                    return Err(format!("ERR Library {} already exists", lib.name));
+                }
+                if let Some(old) = next.libs.remove(&lib.name) {
+                    for f in old.functions {
+                        next.fns.remove(&f.name);
+                    }
+                }
+            }
+            for f in &lib.functions {
+                if next.fns.contains_key(&f.name) {
+                    return Err(format!("ERR Function {} already exists", f.name));
+                }
+                next.fns.insert(f.name.clone(), f.clone());
+            }
+            next.libs.insert(lib.name.clone(), lib);
+        }
+        *g = next;
+        drop(g);
+        self.version.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
     /// Validate and add `lib` (already loaded once to learn its functions).
-    fn install(&self, lib: Library, replace: bool) -> Result<(), String> {
+    pub fn install(&self, lib: Library, replace: bool) -> Result<(), String> {
         let mut g = self.inner.write();
         if g.libs.contains_key(&lib.name) && !replace {
             return Err(format!("ERR Library '{}' already exists", lib.name));
@@ -967,13 +1014,23 @@ pub fn load_library(
     code: &str,
     replace: bool,
 ) -> Result<String, String> {
+    let lib = prepare_library(engine, code)?;
+    let name = lib.name.clone();
+    engine.functions().install(lib, replace)?;
+    Ok(name)
+}
+
+/// Run a library's code once to learn what it registers, without
+/// installing it: the slow part of `FUNCTION LOAD`, done before the change
+/// is committed (see `CommandEngine::commit_functions`).
+pub fn prepare_library(engine: &Arc<CommandEngine>, code: &str) -> Result<Library, String> {
     let name = parse_library_header(code)?;
     let vm = new_vm(engine).map_err(|e| format!("ERR {}", e))?;
     let regs = load_library_into(&vm, code)?;
     if regs.is_empty() {
         return Err("ERR No functions registered".into());
     }
-    let lib = Library {
+    Ok(Library {
         name: name.clone(),
         code: code.to_string(),
         functions: regs
@@ -985,9 +1042,7 @@ pub fn load_library(
                 description: r.description,
             })
             .collect(),
-    };
-    engine.functions().install(lib, replace)?;
-    Ok(name)
+    })
 }
 
 /// Run a library's body in `vm` with `register_function` enabled, returning

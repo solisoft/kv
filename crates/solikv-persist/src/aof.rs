@@ -881,6 +881,18 @@ fn writer_loop(inner: Arc<Inner>, mut logs: Vec<ShardLog>, dir: PathBuf, stats: 
             }
             report(res, "fsync");
             last_sync = Instant::now();
+        } else if wrote {
+            // Hand this pass's records to the kernel now, fsync or not: a
+            // process that dies (SIGKILL, the OOM killer, a panic that
+            // aborts) then loses nothing it acknowledged — only a machine
+            // crash can cost the last second under `everysec`, as with
+            // Redis. Kept in this buffer until the once-a-second flush, they
+            // were lost with the process.
+            for log in logs.iter_mut() {
+                if !log.w.buffer().is_empty() {
+                    report(log.w.flush(), "write");
+                }
+            }
         }
         if closing {
             break;

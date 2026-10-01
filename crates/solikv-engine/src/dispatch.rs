@@ -356,6 +356,9 @@ pub const DEFAULT_LUA_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 impl CommandEngine {
     pub fn new(shards: Arc<ShardManager>, pubsub: Arc<PubSubBroker>) -> Self {
         let clients = Arc::new(ClientRegistry::default());
+        let functions = Arc::new(crate::lua::FunctionRegistry::default());
+        let persistence = Arc::new(Persistence::new(PersistConfig::default()));
+        persistence.set_functions(functions.clone());
         Self {
             shards,
             pubsub,
@@ -363,7 +366,7 @@ impl CommandEngine {
             script_cache: ScriptCache::new(),
             weak_self: OnceLock::new(),
             notify_flags: Arc::new(AtomicU16::new(0)),
-            persistence: Arc::new(Persistence::new(PersistConfig::default())),
+            persistence,
             shutdown_requested: Arc::new(tokio::sync::Notify::new()),
             lua_memory_limit: DEFAULT_LUA_MEMORY_LIMIT,
             databases: DEFAULT_DATABASES,
@@ -375,7 +378,7 @@ impl CommandEngine {
             output_limits: crate::output_limits::OutputLimits::default(),
             blocking: Arc::new(crate::blocking::BlockingRegistry::default()),
             script_state: Arc::new(crate::lua::RunState::default()),
-            functions: Arc::new(crate::lua::FunctionRegistry::default()),
+            functions,
             busy_threshold_ms: AtomicU64::new(5000),
             acl: Arc::new(crate::acl::Acl::default()),
             stats: Arc::new(crate::stats::Stats::default()),
@@ -847,6 +850,7 @@ impl CommandEngine {
 
     /// Use the server's persistence configuration.
     pub fn with_persistence(mut self, persistence: Arc<Persistence>) -> Self {
+        persistence.set_functions(self.functions.clone());
         self.persistence = persistence;
         self
     }
@@ -5386,49 +5390,80 @@ impl CommandEngine {
         })
     }
 
-    /// Where `FUNCTION LOAD`ed libraries are kept between runs.
-    fn functions_path(&self) -> PathBuf {
-        self.persistence.config().dir.join("functions.lib")
+    /// Apply a change to the libraries and log it as the `FUNCTION`
+    /// command `args`, under shard 0's lock. A log rewrite holds that same
+    /// lock while it reads the libraries for its base and switches shard 0
+    /// to the next generation (`persistence::begin_capture`), so a change is
+    /// either in that base or in the generation after it: never lost, never
+    /// in both. Snapshots carry the libraries; `FUNCTION` records in shard
+    /// 0's log carry the changes since.
+    fn commit_functions(
+        &self,
+        args: &[Bytes],
+        change: impl FnOnce(&crate::lua::FunctionRegistry) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.shards
+            .shard(0)
+            .with_store_mut_unlogged(|store| -> Result<(), String> {
+                change(&self.functions)?;
+                if let Some(w) = self.shards.aof() {
+                    let refs: Vec<&[u8]> = args.iter().map(|a| a.as_ref()).collect();
+                    let rec = solikv_persist::aof::encode_command(b"FUNCTION", &refs);
+                    w.log_raw(0, &mut store.log_seq, &rec);
+                }
+                Ok(())
+            })?;
+        self.stats.bump_dirty();
+        Ok(())
     }
 
-    /// Write the libraries out (after every change), atomically.
-    fn save_functions(&self) {
-        if !self.persistence.config().appendonly && self.persistence.config().save.is_empty() {
-            return;
-        }
-        let path = self.functions_path();
-        let result = if self.functions.counts().0 == 0 {
-            match std::fs::remove_file(&path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-                _ => Ok(()),
-            }
-        } else {
-            solikv_persist::fsutil::write_atomic(&path, self.functions.dump())
+    /// Log the `FUNCTION` command `args` as a change already made (startup
+    /// migration of `functions.lib` into the log).
+    pub(crate) fn commit_functions_logged(&self, args: &[Bytes]) -> std::io::Result<()> {
+        self.commit_functions(args, |_| Ok(()))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    /// Replace every library with those of `dump` (`FUNCTION DUMP`'s
+    /// payload): what a snapshot or a replayed log held. Not logged — it
+    /// is what the log already says. Returns the number of libraries.
+    pub fn restore_functions_dump(&self, dump: &[u8]) -> Result<usize, String> {
+        let Some(arc) = self.get_self_arc() else {
+            return Err("ERR scripting not initialized (call init_self_ref)".into());
         };
-        if let Err(e) = result {
-            tracing::warn!("could not save function libraries to {:?}: {}", path, e);
-        }
+        let codes = crate::lua::parse_function_dump(dump)?;
+        let libs = codes
+            .iter()
+            .map(|code| crate::lua::prepare_library(&arc, code))
+            .collect::<Result<Vec<_>, _>>()?;
+        let n = libs.len();
+        self.functions
+            .restore(libs, crate::lua::RestorePolicy::Flush)?;
+        Ok(n)
     }
 
-    /// Load the libraries saved by [`save_functions`](Self::save_functions).
-    pub fn load_functions(&self) -> std::io::Result<usize> {
-        let path = self.functions_path();
+    /// The libraries, as `FUNCTION DUMP` gives them (snapshots, replay).
+    pub fn functions_dump(&self) -> Vec<u8> {
+        self.functions.dump()
+    }
+
+    pub fn functions_registry(&self) -> &Arc<crate::lua::FunctionRegistry> {
+        &self.functions
+    }
+
+    /// Libraries an earlier version kept in `<dir>/functions.lib`, for when
+    /// neither the snapshot nor the log carries any (see
+    /// `load_persisted`). Returns the number loaded; `None` without a file.
+    pub fn load_legacy_functions(&self) -> std::io::Result<Option<usize>> {
+        let path = crate::persistence::legacy_functions_path(&self.persistence.config().dir);
         let data = match std::fs::read(&path) {
             Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        let Some(arc) = self.get_self_arc() else {
-            return Ok(0);
-        };
-        let codes = crate::lua::parse_function_dump(&data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let n = codes.len();
-        for code in codes {
-            crate::lua::load_library(&arc, &code, true)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        }
-        Ok(n)
+        self.restore_functions_dump(&data)
+            .map(Some)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     fn function_command(&self, args: &[Bytes]) -> CommandResponse {
@@ -5447,11 +5482,13 @@ impl CommandEngine {
                 let Ok(code) = std::str::from_utf8(code) else {
                     return CommandResponse::error("ERR library code must be valid UTF-8");
                 };
-                match crate::lua::load_library(&arc, code, replace) {
-                    Ok(name) => {
-                        self.save_functions();
-                        CommandResponse::bulk(Bytes::from(name))
-                    }
+                let lib = match crate::lua::prepare_library(&arc, code) {
+                    Ok(lib) => lib,
+                    Err(e) => return CommandResponse::error(e),
+                };
+                let name = lib.name.clone();
+                match self.commit_functions(args, |f| f.install(lib, replace)) {
+                    Ok(()) => CommandResponse::bulk(Bytes::from(name)),
                     Err(e) => CommandResponse::error(e),
                 }
             }
@@ -5459,11 +5496,17 @@ impl CommandEngine {
                 let [name] = rest else {
                     return CommandResponse::wrong_arity("function|delete");
                 };
-                if self.functions.delete(&String::from_utf8_lossy(name)) {
-                    self.save_functions();
-                    CommandResponse::ok()
-                } else {
-                    CommandResponse::error("ERR Library not found")
+                let name = String::from_utf8_lossy(name).into_owned();
+                let deleted = self.commit_functions(args, |f| {
+                    if f.delete(&name) {
+                        Ok(())
+                    } else {
+                        Err("ERR Library not found".into())
+                    }
+                });
+                match deleted {
+                    Ok(()) => CommandResponse::ok(),
+                    Err(e) => CommandResponse::error(e),
                 }
             }
             "FLUSH" => {
@@ -5474,9 +5517,13 @@ impl CommandEngine {
                 {
                     return CommandResponse::syntax_error();
                 }
-                self.functions.flush();
-                self.save_functions();
-                CommandResponse::ok()
+                match self.commit_functions(args, |f| {
+                    f.flush();
+                    Ok(())
+                }) {
+                    Ok(()) => CommandResponse::ok(),
+                    Err(e) => CommandResponse::error(e),
+                }
             }
             "KILL" => self.script_state.kill(true),
             "STATS" => {
@@ -5582,28 +5629,34 @@ impl CommandEngine {
                     [p, pol] => (p, Upper::new(pol).to_string()),
                     _ => return CommandResponse::wrong_arity("function|restore"),
                 };
-                let codes = match crate::lua::parse_function_dump(payload) {
-                    Ok(c) => c,
-                    Err(e) => return CommandResponse::error(e),
-                };
-                match policy.as_str() {
-                    "FLUSH" => self.functions.flush(),
-                    "APPEND" | "REPLACE" => {}
+                let policy = match policy.as_str() {
+                    "FLUSH" => crate::lua::RestorePolicy::Flush,
+                    "APPEND" => crate::lua::RestorePolicy::Append,
+                    "REPLACE" => crate::lua::RestorePolicy::Replace,
                     _ => {
                         return CommandResponse::error(
                             "ERR Wrong restore policy given, value should be either FLUSH, \
                              APPEND or REPLACE.",
                         )
                     }
+                };
+                let codes = match crate::lua::parse_function_dump(payload) {
+                    Ok(c) => c,
+                    Err(e) => return CommandResponse::error(e),
+                };
+                // All compiled first, then installed all or nothing.
+                let libs = match codes
+                    .iter()
+                    .map(|code| crate::lua::prepare_library(&arc, code))
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(libs) => libs,
+                    Err(e) => return CommandResponse::error(e),
+                };
+                match self.commit_functions(args, |f| f.restore(libs, policy)) {
+                    Ok(()) => CommandResponse::ok(),
+                    Err(e) => CommandResponse::error(e),
                 }
-                for code in codes {
-                    if let Err(e) = crate::lua::load_library(&arc, &code, policy == "REPLACE") {
-                        self.save_functions();
-                        return CommandResponse::error(e);
-                    }
-                }
-                self.save_functions();
-                CommandResponse::ok()
             }
             "HELP" => CommandResponse::array(
                 [

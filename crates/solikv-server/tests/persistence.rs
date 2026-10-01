@@ -229,3 +229,145 @@ fn shutdown_nosave_exits_and_the_log_still_has_everything() {
     let info = c.cmd(&["INFO"]);
     assert!(info.contains("aof_enabled:1"), "{info}");
 }
+
+const LIB_A: &str = "#!lua name=liba\nredis.register_function('fa', function(keys, args) return 'a:' .. args[1] end)";
+const LIB_B: &str = "#!lua name=libb\nredis.register_function('fb', function(keys, args) return 'b:' .. args[1] end)";
+
+impl Client {
+    /// A bulk reply's raw bytes (`FUNCTION DUMP` is binary).
+    fn bulk_raw(&mut self, args: &[&str]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len());
+        for a in args {
+            out.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        self.w.write_all(out.as_bytes()).unwrap();
+        let mut line = String::new();
+        self.r.read_line(&mut line).unwrap();
+        let n: usize = line.trim_end()[1..].parse().expect("a bulk reply");
+        let mut buf = vec![0u8; n + 2];
+        self.r.read_exact(&mut buf).unwrap();
+        buf.truncate(n);
+        buf
+    }
+
+    fn wait_rewrite_done(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let info = self.cmd(&["INFO", "persistence"]);
+            if info.contains("aof_rewrite_in_progress:0") {
+                return;
+            }
+            assert!(Instant::now() < deadline, "rewrite did not finish: {info}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// SIGKILL, after giving the log writer (which collects records every
+/// millisecond) time to hand the last ones to the kernel.
+fn kill_hard(s: Server) {
+    std::thread::sleep(Duration::from_millis(200));
+    s.signal(nix::sys::signal::Signal::SIGKILL);
+    let _ = s.wait_exit();
+}
+
+/// Libraries live in the log (`FUNCTION` records in shard 0's) and in its
+/// rewritten base — not in a side file — and come back after a crash.
+#[test]
+fn functions_survive_restarts_through_the_log_and_its_rewrite() {
+    let dir = TmpDir::new("fn-aof");
+    let s = Server::start(&dir.0, &["--shards", "4"]);
+    let mut c = s.client();
+    assert_eq!(c.cmd(&["FUNCTION", "LOAD", LIB_A]), "$liba");
+    kill_hard(s);
+    assert!(!dir.0.join("functions.lib").exists());
+
+    let s = Server::start(&dir.0, &["--shards", "4"]);
+    let mut c = s.client();
+    assert_eq!(c.cmd(&["FCALL", "fa", "0", "x"]), "$a:x");
+    // Into the base, then a change after it: both must come back.
+    assert_eq!(c.cmd(&["FUNCTION", "LOAD", LIB_B]), "$libb");
+    assert_eq!(
+        c.cmd(&["BGREWRITEAOF"]),
+        "+Background append only file rewriting started"
+    );
+    c.wait_rewrite_done();
+    assert_eq!(c.cmd(&["FUNCTION", "DELETE", "liba"]), "+OK");
+    kill_hard(s);
+
+    // A different shard count: the libraries are not any shard's data.
+    let s = Server::start(&dir.0, &["--shards", "3"]);
+    let mut c = s.client();
+    assert_eq!(c.cmd(&["FCALL", "fb", "0", "y"]), "$b:y");
+    assert!(c.cmd(&["FCALL", "fa", "0", "y"]).starts_with("-ERR"));
+    // FLUSH is a change too: nothing comes back after it.
+    assert_eq!(c.cmd(&["FUNCTION", "FLUSH"]), "+OK");
+    kill_hard(s);
+    let s = Server::start(&dir.0, &["--shards", "3"]);
+    assert_eq!(s.client().cmd(&["FUNCTION", "LIST"]), "*");
+}
+
+/// Without the log, `dump.rdb` carries the libraries.
+#[test]
+fn functions_survive_in_the_snapshot_alone() {
+    let dir = TmpDir::new("fn-rdb");
+    let s = Server::start(&dir.0, &["--appendonly", "false"]);
+    let mut c = s.client();
+    assert_eq!(c.cmd(&["FUNCTION", "LOAD", LIB_A]), "$liba");
+    assert_eq!(c.cmd(&["SET", "k", "v"]), "+OK");
+    assert_eq!(c.cmd(&["SAVE"]), "+OK");
+    kill_hard(s);
+    assert!(!dir.0.join("functions.lib").exists());
+
+    let s = Server::start(&dir.0, &["--appendonly", "false"]);
+    let mut c = s.client();
+    assert_eq!(c.cmd(&["FCALL", "fa", "0", "z"]), "$a:z");
+    assert_eq!(c.cmd(&["GET", "k"]), "$v");
+}
+
+/// `functions.lib`, where an earlier version kept the libraries: loaded once,
+/// written into the log, then removed — the log alone restores them after.
+#[test]
+fn functions_lib_from_an_earlier_version_migrates_into_the_log() {
+    let src = TmpDir::new("fn-src");
+    let s = Server::start(&src.0, &["--appendonly", "false"]);
+    let mut c = s.client();
+    assert_eq!(c.cmd(&["FUNCTION", "LOAD", LIB_A]), "$liba");
+    let dump = c.bulk_raw(&["FUNCTION", "DUMP"]);
+    drop(s);
+
+    let dir = TmpDir::new("fn-legacy");
+    std::fs::create_dir_all(&dir.0).unwrap();
+    std::fs::write(dir.0.join("functions.lib"), &dump).unwrap();
+    let s = Server::start(&dir.0, &[]);
+    let mut c = s.client();
+    assert_eq!(c.cmd(&["FCALL", "fa", "0", "m"]), "$a:m");
+    assert!(
+        !dir.0.join("functions.lib").exists(),
+        "functions.lib kept after its libraries went into the log"
+    );
+    kill_hard(s);
+
+    let s = Server::start(&dir.0, &[]);
+    assert_eq!(s.client().cmd(&["FCALL", "fa", "0", "n"]), "$a:n");
+}
+
+/// `appendfsync everysec` may lose the last second to a machine crash, not
+/// to the process dying: records reach the kernel within a writer pass
+/// (they used to wait in a user-space buffer for the once-a-second flush).
+#[test]
+fn acknowledged_writes_survive_a_killed_process() {
+    let dir = TmpDir::new("kill9");
+    let s = Server::start(&dir.0, &["--shards", "4"]);
+    let mut c = s.client();
+    for i in 0..50 {
+        assert_eq!(c.cmd(&["SET", &format!("k{i}"), "v"]), "+OK");
+    }
+    assert_eq!(c.cmd(&["INCRBY", "n", "7"]), ":7");
+    kill_hard(s);
+
+    let s = Server::start(&dir.0, &["--shards", "4"]);
+    let mut c = s.client();
+    assert_eq!(c.cmd(&["DBSIZE"]), ":51");
+    assert_eq!(c.cmd(&["GET", "n"]), "$7");
+}

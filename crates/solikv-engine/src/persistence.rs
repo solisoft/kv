@@ -121,6 +121,39 @@ pub struct LoadReport {
     pub keys: u64,
     pub source: &'static str,
     pub log_records: u64,
+    /// The `FUNCTION` libraries the snapshot or log held (`FUNCTION DUMP`'s
+    /// payload): `None` when neither said anything about them — data from
+    /// before they were persisted there (see `legacy_functions_path`).
+    pub functions: Option<Vec<u8>>,
+}
+
+/// Where libraries were kept before snapshots and the log held them. Read
+/// once to migrate; removed once a snapshot or a log rewrite holds them.
+pub fn legacy_functions_path(dir: &Path) -> PathBuf {
+    dir.join("functions.lib")
+}
+
+/// The libraries at a snapshot's cut: read while shard 0's lock is held,
+/// at the instant its snapshot begins (and, for a log rewrite, its log
+/// switches generation) — see `CommandEngine::commit_functions`, which
+/// changes them under the same lock.
+struct FunctionsCut {
+    registry: Option<Arc<crate::lua::FunctionRegistry>>,
+    taken: parking_lot::Mutex<Option<Vec<u8>>>,
+}
+
+impl FunctionsCut {
+    fn take_now(&self) {
+        if let Some(r) = &self.registry {
+            let dump = if r.is_empty() { Vec::new() } else { r.dump() };
+            *self.taken.lock() = Some(dump);
+        }
+    }
+
+    /// The libraries taken at the cut (none taken: none to write).
+    fn result(&self) -> Vec<u8> {
+        self.taken.lock().take().unwrap_or_default()
+    }
 }
 
 pub struct Persistence {
@@ -137,6 +170,8 @@ pub struct Persistence {
     /// Held while a snapshot is taken (SAVE, BGSAVE, a log rewrite): a
     /// store runs one stepped snapshot at a time, so a second waits.
     snapshotting: Mutex<()>,
+    /// The engine's `FUNCTION` libraries, written into every snapshot.
+    functions: parking_lot::RwLock<Option<Arc<crate::lua::FunctionRegistry>>>,
 }
 
 impl Persistence {
@@ -150,7 +185,20 @@ impl Persistence {
             needs_rewrite: AtomicBool::new(false),
             legacy_aof: Mutex::new(None),
             snapshotting: Mutex::new(()),
+            functions: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// The libraries snapshots carry (set by the engine that owns this).
+    pub fn set_functions(&self, registry: Arc<crate::lua::FunctionRegistry>) {
+        *self.functions.write() = Some(registry);
+    }
+
+    fn functions_cut(&self) -> Arc<FunctionsCut> {
+        Arc::new(FunctionsCut {
+            registry: self.functions.read().clone(),
+            taken: parking_lot::Mutex::new(None),
+        })
     }
 
     /// Data arrived from outside the log (an import): rewrite the log at
@@ -216,9 +264,10 @@ impl Persistence {
         if self.cfg.read().appendonly {
             let aof_dir = self.aof_dir();
             if let Some(m) = Manifest::load(&aof_dir)? {
-                let (keys, records) = self.load_manifest(&aof_dir, &m, shards)?;
+                let (keys, records, functions) = self.load_manifest(&aof_dir, &m, shards)?;
                 report.keys = keys;
                 report.log_records = records;
+                report.functions = functions;
                 report.source = "aof";
                 let same_layout = m.shards as usize == shards.num_shards()
                     && (m.shards == 1 || m.hash == ShardManager::HASH_SCHEME);
@@ -258,38 +307,61 @@ impl Persistence {
         let mut keys = 0u64;
         let mut batch = Router::new(shards);
         let cfg = self.config();
-        let files = rdb::load_rdb(&cfg.dir, &cfg.dbfilename, |db, k, e| {
-            keys += 1;
-            batch.push(db, k, e);
-        })?;
+        let mut functions = None;
+        let files = rdb::load_rdb_with_functions(
+            &cfg.dir,
+            &cfg.dbfilename,
+            |db, k, e| {
+                keys += 1;
+                batch.push(db, k, e);
+            },
+            |dump| {
+                functions = Some(dump.to_vec());
+                Ok(())
+            },
+        )?;
         batch.flush();
+        report.functions = functions;
         report.keys = keys;
         report.source = if files.is_empty() { "none" } else { "rdb" };
         Ok(report)
     }
 
-    /// Replay every shard of a manifest; returns (keys, records).
+    /// Replay every shard of a manifest; returns (keys, records, the
+    /// libraries if the base or the log said anything about them).
     fn load_manifest(
         &self,
         aof_dir: &Path,
         m: &Manifest,
         shards: &ShardManager,
-    ) -> io::Result<(u64, u64)> {
+    ) -> io::Result<(u64, u64, Option<Vec<u8>>)> {
         let mut scratch: Vec<Scratch> = (0..m.shards).map(|_| Scratch::new()).collect();
         if let Some(b) = m.base {
-            rdb::load_snapshot_file(&aof::base_path(aof_dir, b), |section, db, k, e| {
-                let s = scratch.get_mut(section as usize).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "base section {} beyond the manifest's {} shards",
-                            section, m.shards
-                        ),
-                    )
-                })?;
-                s.insert(db, k, e);
-                Ok(())
-            })?;
+            let mut base_functions = None;
+            rdb::load_snapshot_file_with_functions(
+                &aof::base_path(aof_dir, b),
+                |section, db, k, e| {
+                    let s = scratch.get_mut(section as usize).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "base section {} beyond the manifest's {} shards",
+                                section, m.shards
+                            ),
+                        )
+                    })?;
+                    s.insert(db, k, e);
+                    Ok(())
+                },
+                |dump| {
+                    base_functions = Some(dump);
+                    Ok(())
+                },
+            )?;
+            // The libraries are shard 0's: its log holds the changes since.
+            if let (Some(dump), Some(s0)) = (base_functions, scratch.first_mut()) {
+                s0.restore_functions(&dump)?;
+            }
         }
         let mut records = 0u64;
         for (s, store) in scratch.iter_mut().enumerate() {
@@ -308,11 +380,12 @@ impl Persistence {
                 }
             }
         }
+        let functions = scratch.first().and_then(Scratch::functions);
         let mut keys = 0u64;
         for store in scratch {
             keys += store.move_into(shards);
         }
-        Ok((keys, records))
+        Ok((keys, records, functions))
     }
 
     /// After `load`: make sure the log can be appended to (rewriting it if
@@ -331,10 +404,12 @@ impl Persistence {
                 let g = old.as_ref().map_or(1, max_gen_plus_one);
                 aof::create_incr_files(&aof_dir, g, n)?;
                 let mut file = SnapshotFile::create(&aof::base_path(&aof_dir, g))?;
+                let cut = self.functions_cut();
                 for i in 0..shards.num_shards() {
-                    let body = capture_shard(shards, i, None)?;
+                    let body = capture_shard(shards, i, None, Some(&cut))?;
                     file.write_section(i as u32, &body)?;
                 }
+                file.write_functions(&cut.result())?;
                 file.commit()?;
                 let m = Manifest {
                     shards: n,
@@ -384,14 +459,16 @@ impl Persistence {
     pub fn save(&self, shards: &ShardManager, dirty: u64) -> io::Result<()> {
         let _one_at_a_time = self.snapshotting.lock();
         let mut file = SnapshotFile::create(&self.rdb_path())?;
+        let cut = self.functions_cut();
         for i in 0..shards.num_shards() {
             let body = if shards.is_solo() {
-                capture_shard(shards, i, None)?
+                capture_shard(shards, i, None, Some(&cut))?
             } else {
-                capture_shard_stepped(shards, i, None)?
+                capture_shard_stepped(shards, i, None, Some(&cut))?
             };
             file.write_section(i as u32, &body)?;
         }
+        file.write_functions(&cut.result())?;
         file.commit()?;
         self.after_save(dirty);
         Ok(())
@@ -405,6 +482,7 @@ impl Persistence {
         // Superseded per-shard files from before the single snapshot file:
         // left behind, they would be loaded if the new file ever went missing.
         let cfg = self.config();
+        remove_legacy_functions(&cfg.dir);
         for old in rdb::legacy_shard_files(&cfg.dir, &cfg.dbfilename) {
             if std::fs::remove_file(&old).is_ok() {
                 tracing::info!("Removed superseded snapshot {}", old.display());
@@ -427,9 +505,10 @@ impl Persistence {
             return Err("ERR Background save already in progress");
         }
         let this = self.clone();
+        let cut = self.functions_cut();
         // Solo: the store may only be read on its own thread.
         let captured = if shards.is_solo() {
-            match solo_capture(shards, None) {
+            match solo_capture(shards, None, cut.clone()) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     this.finish_bgsave(Err(e), dirty);
@@ -450,11 +529,12 @@ impl Persistence {
                         Some(solo) => file.write_section(0, &solo.body()?)?,
                         None => {
                             for i in 0..shards.num_shards() {
-                                let body = capture_shard_stepped(&shards, i, None)?;
+                                let body = capture_shard_stepped(&shards, i, None, Some(&cut))?;
                                 file.write_section(i as u32, &body)?;
                             }
                         }
                     }
+                    file.write_functions(&cut.result())?;
                     file.commit()?;
                     Ok(())
                 })();
@@ -533,8 +613,9 @@ impl Persistence {
             }
         };
 
+        let cut = self.functions_cut();
         let captured = if shards.is_solo() {
-            match solo_capture(shards, Some((&writer, g))) {
+            match solo_capture(shards, Some((&writer, g)), cut.clone()) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     self.finish_rewrite(Err(e));
@@ -556,11 +637,17 @@ impl Persistence {
                         Some(solo) => file.write_section(0, &solo.body()?)?,
                         None => {
                             for i in 0..shards.num_shards() {
-                                let body = capture_shard_stepped(&shards, i, Some((&writer, g)))?;
+                                let body = capture_shard_stepped(
+                                    &shards,
+                                    i,
+                                    Some((&writer, g)),
+                                    Some(&cut),
+                                )?;
                                 file.write_section(i as u32, &body)?;
                             }
                         }
                     }
+                    file.write_functions(&cut.result())?;
                     file.commit()?;
                     // Every shard has rotated; make the old generation's tail
                     // durable before the manifest stops naming it... and the
@@ -575,6 +662,7 @@ impl Persistence {
                     new.store(&aof_dir)?;
                     *this.manifest.lock() = Some(new.clone());
                     remove_unreferenced(&aof_dir, &new);
+                    remove_legacy_functions(&this.config().dir);
                     let size = new.disk_size(&aof_dir);
                     this.stats.aof_base_size.store(size, Ordering::Relaxed);
                     this.stats.aof_current_size.store(size, Ordering::Relaxed);
@@ -665,10 +753,40 @@ impl CommandEngine {
     pub fn load_persisted(&self) -> io::Result<LoadReport> {
         let p = self.persistence();
         let report = p.load(&self.shards)?;
+        // Libraries first: a rewrite `start_aof` makes must hold them.
+        let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidData, e);
+        let migrated = match &report.functions {
+            Some(dump) => {
+                let n = self.restore_functions_dump(dump).map_err(invalid)?;
+                if n > 0 {
+                    tracing::info!("Loaded {} function libraries", n);
+                }
+                false
+            }
+            None => match self.load_legacy_functions()? {
+                Some(n) => {
+                    tracing::info!("Loaded {} function libraries from functions.lib", n);
+                    true
+                }
+                None => false,
+            },
+        };
         p.start_aof(&self.shards)?;
-        let libs = self.load_functions()?;
-        if libs > 0 {
-            tracing::info!("Loaded {} function libraries", libs);
+        if migrated {
+            if let Some(w) = self.shards.aof() {
+                // Into the log, so that the log alone restores them; then
+                // the old file can go. (Without the log it goes after the
+                // next snapshot, which holds them.)
+                let dump = Bytes::from(self.functions_dump());
+                let args = [
+                    Bytes::from_static(b"RESTORE"),
+                    dump,
+                    Bytes::from_static(b"REPLACE"),
+                ];
+                self.commit_functions_logged(&args)?;
+                w.sync()?;
+                remove_legacy_functions(&p.config().dir);
+            }
         }
         Ok(report)
     }
@@ -680,12 +798,18 @@ fn capture_shard(
     shards: &ShardManager,
     i: usize,
     rotate: Option<(&AofWriter, u64)>,
+    cut: Option<&FunctionsCut>,
 ) -> io::Result<Vec<u8>> {
     shards.shard(i).with_store_mut_unlogged(|store| {
         let mut body = Vec::new();
         rdb::serialize_store(store, &mut body)?;
         if let Some((w, g)) = rotate {
             w.rotate(i as u32, &mut store.log_seq, g);
+        }
+        if i == 0 {
+            if let Some(cut) = cut {
+                cut.take_now();
+            }
         }
         Ok(body)
     })
@@ -744,11 +868,12 @@ fn capture_shard_stepped(
     shards: &ShardManager,
     i: usize,
     rotate: Option<(&AofWriter, u64)>,
+    cut: Option<&FunctionsCut>,
 ) -> io::Result<Vec<u8>> {
     let shard = shards.shard(i);
     let mut attempts = 0u32;
     loop {
-        let began = shard.with_store_mut_unlogged(|store| begin_capture(store, i, rotate));
+        let began = shard.with_store_mut_unlogged(|store| begin_capture(store, i, rotate, cut));
         if began {
             break;
         }
@@ -781,12 +906,19 @@ fn begin_capture(
     store: &mut solikv_core::ShardStore,
     i: usize,
     rotate: Option<(&AofWriter, u64)>,
+    cut: Option<&FunctionsCut>,
 ) -> bool {
     if !store.begin_snapshot(rdb::snapshot_encoder) {
         return false;
     }
     if let Some((w, g)) = rotate {
         w.rotate(i as u32, &mut store.log_seq, g);
+    }
+    // Shard 0's cut is the libraries' (see `FunctionsCut`).
+    if i == 0 {
+        if let Some(cut) = cut {
+            cut.take_now();
+        }
     }
     true
 }
@@ -838,18 +970,19 @@ impl SoloCapture {
 fn solo_capture(
     shards: &Arc<ShardManager>,
     rotate: Option<(&AofWriter, u64)>,
+    cut: Arc<FunctionsCut>,
 ) -> io::Result<SoloCapture> {
     let single_worker = tokio::runtime::Handle::try_current()
         .ok()
         .filter(|h| h.metrics().num_workers() == 1);
     let Some(handle) = single_worker else {
-        return capture_shard(shards, 0, rotate).map(SoloCapture::Whole);
+        return capture_shard(shards, 0, rotate, Some(&cut)).map(SoloCapture::Whole);
     };
     // Begun here, inside the command: the snapshot is of this instant, as a
     // fork would be, whatever runs between now and the first step.
     let mut began = shards
         .shard(0)
-        .with_store_mut_unlogged(|store| begin_capture(store, 0, rotate));
+        .with_store_mut_unlogged(|store| begin_capture(store, 0, rotate, Some(&cut)));
     let (tx, rx) = std::sync::mpsc::channel();
     let shards = shards.clone();
     let rotate = rotate.map(|(w, g)| (w.clone(), g));
@@ -859,7 +992,8 @@ fn solo_capture(
         // Another snapshot (a replica's full sync) holds the slot: wait.
         while !began {
             let rotate = rotate.as_ref().map(|(w, g)| (w, *g));
-            began = shard.with_store_mut_unlogged(|store| begin_capture(store, 0, rotate));
+            began =
+                shard.with_store_mut_unlogged(|store| begin_capture(store, 0, rotate, Some(&cut)));
             if began {
                 break;
             }
@@ -887,6 +1021,18 @@ fn solo_capture(
         }
     });
     Ok(SoloCapture::Steps(rx))
+}
+
+/// A snapshot or log rewrite now holds the libraries: the file an earlier
+/// version kept them in is superseded.
+fn remove_legacy_functions(dir: &Path) {
+    let path = legacy_functions_path(dir);
+    if std::fs::remove_file(&path).is_ok() {
+        tracing::info!(
+            "Removed {} (the libraries are in the snapshot now)",
+            path.display()
+        );
+    }
 }
 
 fn max_gen_plus_one(m: &Manifest) -> u64 {
@@ -925,6 +1071,8 @@ struct Scratch {
     /// Database the log being replayed is in (its `SELECT` records). Every
     /// file starts in database 0.
     db: u32,
+    /// The base or a `FUNCTION` record said what the libraries are.
+    functions_seen: bool,
 }
 
 impl Scratch {
@@ -934,7 +1082,26 @@ impl Scratch {
             Arc::new(PubSubBroker::new()),
         ));
         engine.init_self_ref(Arc::downgrade(&engine));
-        Self { engine, db: 0 }
+        Self {
+            engine,
+            db: 0,
+            functions_seen: false,
+        }
+    }
+
+    /// The libraries of a base snapshot.
+    fn restore_functions(&mut self, dump: &[u8]) -> io::Result<()> {
+        self.engine
+            .restore_functions_dump(dump)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.functions_seen = true;
+        Ok(())
+    }
+
+    /// The libraries after replay, if the base or the log held any record
+    /// of them.
+    fn functions(&self) -> Option<Vec<u8>> {
+        self.functions_seen.then(|| self.engine.functions_dump())
     }
 
     fn insert(&mut self, db: u32, key: Bytes, entry: KeyEntry) {
@@ -964,6 +1131,9 @@ impl Scratch {
                 None => tracing::warn!("Replayed SELECT without a valid database"),
             }
             return;
+        }
+        if name == "FUNCTION" {
+            self.functions_seen = true;
         }
         let resp = self.engine.execute_in_db(self.db, &name, &args[1..]);
         if resp.is_error() {

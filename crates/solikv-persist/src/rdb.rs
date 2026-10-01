@@ -77,6 +77,10 @@ const TYPE_STREAM2: u8 = 8;
 const TYPE_HASH_TTL: u8 = 9;
 
 // Framing
+/// The `FUNCTION` libraries (`FUNCTION DUMP`'s payload), before the
+/// sections: they are not data of any shard. Version 4 only; written only
+/// when there are libraries.
+const FUNCTIONS: u8 = 0xFA;
 const SELECT_DB: u8 = 0xFB;
 const EXPIRY: u8 = 0xFC;
 const CHECKSUM: u8 = 0xFD;
@@ -568,7 +572,17 @@ pub struct SnapshotInfo {
 /// damaged file loads into scratch storage first; the startup path does.
 pub fn read_snapshot<R: Read>(
     reader: R,
+    on_entry: impl FnMut(u32, u32, Bytes, KeyEntry) -> io::Result<()>,
+) -> io::Result<SnapshotInfo> {
+    read_snapshot_with_functions(reader, on_entry, |_| Ok(()))
+}
+
+/// [`read_snapshot`], also handing the `FUNCTION` libraries the snapshot
+/// holds, if any, to `on_functions` (`FUNCTION DUMP`'s payload).
+pub fn read_snapshot_with_functions<R: Read>(
+    reader: R,
     mut on_entry: impl FnMut(u32, u32, Bytes, KeyEntry) -> io::Result<()>,
+    mut on_functions: impl FnMut(Bytes) -> io::Result<()>,
 ) -> io::Result<SnapshotInfo> {
     let mut r = CrcReader::new(reader);
     let mut magic = [0u8; 6];
@@ -599,6 +613,7 @@ pub fn read_snapshot<R: Read>(
                     info.keys += read_entries(&mut r, idx, &mut on_entry, false, v == RDB_VERSION)?;
                     info.sections += 1;
                 }
+                FUNCTIONS if v == RDB_VERSION => on_functions(read_bytes(&mut r)?)?,
                 CHECKSUM => {
                     let expected = r.crc();
                     let mut buf = [0u8; 4];
@@ -620,8 +635,22 @@ pub fn load_snapshot_file(
     path: &Path,
     on_entry: impl FnMut(u32, u32, Bytes, KeyEntry) -> io::Result<()>,
 ) -> io::Result<SnapshotInfo> {
+    load_snapshot_file_with_functions(path, on_entry, |_| Ok(()))
+}
+
+/// [`load_snapshot_file`] with the libraries (see
+/// [`read_snapshot_with_functions`]).
+pub fn load_snapshot_file_with_functions(
+    path: &Path,
+    on_entry: impl FnMut(u32, u32, Bytes, KeyEntry) -> io::Result<()>,
+    on_functions: impl FnMut(Bytes) -> io::Result<()>,
+) -> io::Result<SnapshotInfo> {
     let file = std::fs::File::open(path)?;
-    read_snapshot(BufReader::with_capacity(1 << 20, file), on_entry)
+    read_snapshot_with_functions(
+        BufReader::with_capacity(1 << 20, file),
+        on_entry,
+        on_functions,
+    )
 }
 
 /// Streams a snapshot out: header, then sections as they are captured, then
@@ -636,6 +665,16 @@ impl<W: Write> SnapshotWriter<W> {
         w.write_all(RDB_MAGIC)?;
         w.write_all(&[RDB_VERSION])?;
         Ok(Self { w })
+    }
+
+    /// Record the `FUNCTION` libraries (`FUNCTION DUMP`'s payload); nothing
+    /// when there are none.
+    pub fn write_functions(&mut self, dump: &[u8]) -> io::Result<()> {
+        if dump.is_empty() {
+            return Ok(());
+        }
+        self.w.write_all(&[FUNCTIONS])?;
+        write_bytes(&mut self.w, dump)
     }
 
     /// Append one section whose body came from [`serialize_store`].
@@ -686,6 +725,14 @@ impl SnapshotFile {
             .as_mut()
             .expect("snapshot already committed")
             .write_section(idx, body)
+    }
+
+    /// See [`SnapshotWriter::write_functions`].
+    pub fn write_functions(&mut self, dump: &[u8]) -> io::Result<()> {
+        self.writer
+            .as_mut()
+            .expect("snapshot already committed")
+            .write_functions(dump)
     }
 
     /// fsync, rename into place, fsync the directory. Returns the file size.
@@ -784,14 +831,28 @@ pub fn legacy_shard_files(dir: &Path, basename: &str) -> Vec<PathBuf> {
 pub fn load_rdb(
     dir: &Path,
     basename: &str,
+    on_entry: impl FnMut(u32, Bytes, KeyEntry),
+) -> io::Result<Vec<PathBuf>> {
+    load_rdb_with_functions(dir, basename, on_entry, |_| Ok(()))
+}
+
+/// [`load_rdb`] with the libraries (see [`read_snapshot_with_functions`]).
+pub fn load_rdb_with_functions(
+    dir: &Path,
+    basename: &str,
     mut on_entry: impl FnMut(u32, Bytes, KeyEntry),
+    on_functions: impl FnMut(Bytes) -> io::Result<()>,
 ) -> io::Result<Vec<PathBuf>> {
     let single = rdb_path(dir, basename);
     if single.exists() {
-        load_snapshot_file(&single, |_, db, k, e| {
-            on_entry(db, k, e);
-            Ok(())
-        })?;
+        load_snapshot_file_with_functions(
+            &single,
+            |_, db, k, e| {
+                on_entry(db, k, e);
+                Ok(())
+            },
+            on_functions,
+        )?;
         return Ok(vec![single]);
     }
     let legacy = legacy_shard_files(dir, basename);
