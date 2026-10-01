@@ -13,3 +13,8 @@ tasks
 *.pdb.lock
 tasks*
 www/node_modules
+
+# benchmark harness build output and results
+benches/loadgen/loadgen
+benches/results/
+__pycache__/
