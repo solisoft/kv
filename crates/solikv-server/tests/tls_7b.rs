@@ -736,3 +736,78 @@ fn cluster_dump_and_restore_over_tls() {
         assert!(ms > 500_000 && ms <= 600_000, "TTL lost: {pttl}");
     });
 }
+
+// ---------------------------------------------------------------------------
+// --tls-auth-clients-user CN
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_client_certificate_names_its_acl_user() {
+    watchdog(120);
+    let dir = TmpDir::new("tls-cn");
+    let p = pki(&dir.0, "a");
+    let port = next_port();
+    let mut args = p.flags();
+    args.extend(["--requirepass", "secret", "--tls-auth-clients-user", "CN"].map(String::from));
+    let _srv = start_tls(&dir.0, port, &args, p.client(true));
+    // The certificate's subject CN ("solikv node a"; its issuer's CN is the
+    // CA's, so this also shows the subject is the one read).
+    let user = "solikv node a";
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // No such user yet: the connection starts unauthenticated.
+        let r = one(port, p.client(true), &["GET", "k"]).await.unwrap();
+        assert!(r.starts_with("-NOAUTH"), "{r}");
+
+        let mut admin = tls_connect(port, p.client(true)).await.unwrap();
+        assert_eq!(
+            cmd(&mut admin, &["AUTH", "secret"]).await.unwrap(),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            cmd(
+                &mut admin,
+                &["ACL", "SETUSER", user, "on", "nopass", "+@all", "~*"]
+            )
+            .await
+            .unwrap(),
+            "+OK\r\n"
+        );
+        // Now the certificate alone authenticates, as that user.
+        let mut s = tls_connect(port, p.client(true)).await.unwrap();
+        assert_eq!(
+            cmd(&mut s, &["ACL", "WHOAMI"]).await.unwrap(),
+            format!("${}\r\n{user}\r\n", user.len())
+        );
+        assert_eq!(cmd(&mut s, &["SET", "k", "v"]).await.unwrap(), "+OK\r\n");
+
+        // A user turned off authenticates no one.
+        assert_eq!(
+            cmd(&mut admin, &["ACL", "SETUSER", user, "off"])
+                .await
+                .unwrap(),
+            "+OK\r\n"
+        );
+        let r = one(port, p.client(true), &["GET", "k"]).await.unwrap();
+        assert!(r.starts_with("-NOAUTH"), "{r}");
+    });
+
+    // Without client certificates there is nothing to name a user with.
+    let no_ca = Command::new(env!("CARGO_BIN_EXE_solikv"))
+        .args(["--port", &next_port().to_string(), "--rest-port", "0"])
+        .args(["--bind", "127.0.0.1", "--dir"])
+        .arg(&dir.0)
+        .args([
+            "--tls-cert",
+            p.cert.to_str().unwrap(),
+            "--tls-key",
+            p.key.to_str().unwrap(),
+            "--tls-auth-clients-user",
+            "CN",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!no_ca.success(), "CN without client certificates started");
+}

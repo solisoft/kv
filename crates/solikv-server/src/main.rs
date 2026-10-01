@@ -267,6 +267,13 @@ struct Args {
     #[arg(long, value_name = "yes|no|optional")]
     tls_auth_clients: Option<String>,
 
+    /// Authenticate a RESP client as the ACL user named by its certificate's
+    /// subject CN, when that user exists and is on (Redis 8
+    /// `tls-auth-clients-user`); otherwise the connection starts as any
+    /// other. Needs client certificates (--tls-ca-cert). CN or off.
+    #[arg(long, value_name = "CN|off", default_value = "off")]
+    tls_auth_clients_user: String,
+
     /// Replication links (and MIGRATE) use TLS: a replica connects to its
     /// master's TLS port and checks its certificate against --tls-ca-cert.
     #[arg(long, default_value = "no", value_parser = parse_yes_no, action = clap::ArgAction::Set)]
@@ -851,6 +858,31 @@ async fn async_main(args: Args) {
         }
     };
     let tls_config: Option<rustls::ServerConfig> = tls.as_ref().map(|t| (*t.server).clone());
+    let tls_cert_user = match args.tls_auth_clients_user.to_ascii_lowercase().as_str() {
+        "off" | "no" => false,
+        "cn" => {
+            // Only a certificate checked against the CA may name a user.
+            let checked = args.tls_ca_cert.is_some()
+                && !matches!(
+                    args.tls_auth_clients
+                        .as_deref()
+                        .map(solikv_server::tls::ClientAuth::parse),
+                    Some(Ok(solikv_server::tls::ClientAuth::No))
+                );
+            if tls.is_none() || !checked {
+                eprintln!(
+                    "ERROR: --tls-auth-clients-user CN needs client certificates: TLS with \
+                     --tls-ca-cert, and --tls-auth-clients yes or optional"
+                );
+                std::process::exit(1);
+            }
+            true
+        }
+        other => {
+            eprintln!("ERROR: --tls-auth-clients-user: expected CN or off, got '{other}'");
+            std::process::exit(1);
+        }
+    };
 
     if args.solo {
         tracing::info!(
@@ -1353,6 +1385,7 @@ async fn async_main(args: Args) {
         idle_timeout: secs(args.timeout),
         query_buffer_limit: args.client_query_buffer_limit,
         outbound_tls: tls.as_ref().and_then(|t| t.replication_client()),
+        tls_cert_user,
     };
     let resp_handle = tokio::spawn(async move {
         if let Err(e) = resp_server::run_with_limits(

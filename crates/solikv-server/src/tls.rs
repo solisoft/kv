@@ -323,3 +323,106 @@ pub async fn connect(host: &str, port: u16, tls: Option<&Outbound>) -> std::io::
         None => Box::new(tcp),
     })
 }
+
+/// One DER element at the start of `b`: its tag, its contents, and what
+/// follows it.
+fn der(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, b) = b.split_first()?;
+    let (&first, mut b) = b.split_first()?;
+    let len = if first < 0x80 {
+        first as usize
+    } else {
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 4 || b.len() < n {
+            return None;
+        }
+        let len = b[..n].iter().fold(0usize, |l, &x| (l << 8) | x as usize);
+        b = &b[n..];
+        len
+    };
+    (b.len() >= len).then(|| (tag, &b[..len], &b[len..]))
+}
+
+/// The subject common name of a DER certificate (`--tls-auth-clients-user
+/// CN`), if it has one in a string type. Only reads a certificate rustls has
+/// already verified against the CA.
+pub fn certificate_cn(cert: &[u8]) -> Option<String> {
+    const SEQUENCE: u8 = 0x30;
+    const SET: u8 = 0x31;
+    const OID: u8 = 0x06;
+    const COMMON_NAME: [u8; 3] = [0x55, 0x04, 0x03]; // 2.5.4.3
+    let (SEQUENCE, cert, _) = der(cert)? else {
+        return None;
+    };
+    let (SEQUENCE, tbs, _) = der(cert)? else {
+        return None;
+    };
+    // [0] version (optional), then serial number, signature algorithm,
+    // issuer and validity come before the subject.
+    let mut rest = tbs;
+    if let (0xA0, _, after) = der(rest)? {
+        rest = after;
+    }
+    for _ in 0..4 {
+        rest = der(rest)?.2;
+    }
+    let (SEQUENCE, mut rdns, _) = der(rest)? else {
+        return None;
+    };
+    while !rdns.is_empty() {
+        let (SET, mut set, next) = der(rdns)? else {
+            return None;
+        };
+        rdns = next;
+        while !set.is_empty() {
+            let (SEQUENCE, attr, next) = der(set)? else {
+                return None;
+            };
+            set = next;
+            let (OID, oid, value) = der(attr)? else {
+                return None;
+            };
+            if oid == COMMON_NAME {
+                let (tag, v, _) = der(value)?;
+                // UTF8String, PrintableString, T61String, IA5String.
+                return match tag {
+                    0x0C | 0x13 | 0x14 | 0x16 => std::str::from_utf8(v).ok().map(str::to_string),
+                    _ => None,
+                };
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cert_with(dn: rcgen::DistinguishedName) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.distinguished_name = dn;
+        let key = rcgen::KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().der().to_vec()
+    }
+
+    #[test]
+    fn the_subject_common_name_is_read() {
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::OrganizationName, "Acme");
+        dn.push(rcgen::DnType::CommonName, "alice");
+        assert_eq!(certificate_cn(&cert_with(dn)).as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn no_common_name_and_garbage_read_as_none() {
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::OrganizationName, "Acme");
+        assert_eq!(certificate_cn(&cert_with(dn)), None);
+        assert_eq!(certificate_cn(b""), None);
+        assert_eq!(certificate_cn(&[0x30, 0x84, 0xff, 0xff, 0xff, 0xff]), None);
+        let mut cut = cert_with(rcgen::DistinguishedName::new());
+        cut.truncate(cut.len() / 2);
+        assert_eq!(certificate_cn(&cut), None);
+    }
+}

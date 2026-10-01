@@ -115,6 +115,9 @@ pub struct ConnLimits {
     /// `MIGRATE` connects to its target over TLS (`--tls-replication`, as in
     /// Redis).
     pub outbound_tls: Option<crate::tls::Outbound>,
+    /// `--tls-auth-clients-user CN`: a client whose verified certificate's
+    /// subject CN names an enabled ACL user starts authenticated as it.
+    pub tls_cert_user: bool,
 }
 
 impl Default for ConnLimits {
@@ -125,6 +128,7 @@ impl Default for ConnLimits {
             idle_timeout: None,
             query_buffer_limit: 1024 * 1024 * 1024,
             outbound_tls: None,
+            tls_cert_user: false,
         }
     }
 }
@@ -269,6 +273,7 @@ pub async fn run_with_limits(
 
         tokio::spawn(async move {
             let accepted_at = tokio::time::Instant::now();
+            let mut cert_user = None;
             let mut socket: Box<dyn AsyncSocket> = match tls_acceptor {
                 // Bounded: a peer that opens a socket and never finishes the
                 // handshake otherwise holds a connection slot forever.
@@ -276,7 +281,17 @@ pub async fn run_with_limits(
                     match tokio::time::timeout(limits.handshake_timeout, acceptor.accept(socket))
                         .await
                     {
-                        Ok(Ok(stream)) => Box::new(stream),
+                        Ok(Ok(stream)) => {
+                            if limits.tls_cert_user {
+                                cert_user = stream
+                                    .get_ref()
+                                    .1
+                                    .peer_certificates()
+                                    .and_then(|c| c.first())
+                                    .and_then(|c| crate::tls::certificate_cn(c.as_ref()));
+                            }
+                            Box::new(stream)
+                        }
                         Ok(Err(e)) => {
                             tracing::debug!("TLS accept error from {}: {}", peer_addr, e);
                             drop(permit);
@@ -303,6 +318,7 @@ pub async fn run_with_limits(
                 &limits,
                 accepted_at,
                 &migrate_cache,
+                cert_user,
             )
             .await
             {
@@ -326,6 +342,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     limits: &ConnLimits,
     accepted_at: tokio::time::Instant,
     migrate_cache: &MigrateCache,
+    cert_user: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let auth_deadline = limits.auth_timeout.map(|t| accepted_at + t);
 
@@ -335,6 +352,18 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     // Database, MULTI queue, watches, CLIENT metadata: engine-side state.
     let mut session = engine.new_session(peer_addr.to_string(), local_addr);
     let info = session.info.clone();
+    // `--tls-auth-clients-user CN`: the certificate names the user.
+    if let Some(name) = cert_user {
+        match engine.acl().user(&name) {
+            Some(user) if user.enabled() => {
+                conn.authenticated = true;
+                session.set_user(user, engine.acl().version());
+            }
+            _ => tracing::debug!(
+                "TLS client {peer_addr}: certificate CN {name:?} names no enabled user"
+            ),
+        }
+    }
     // Out-of-band messages for this connection (tracking invalidations).
     let (push_tx, mut push_rx) = mpsc::unbounded_channel::<solikv_engine::tracking::Push>();
     info.set_push(push_tx);
