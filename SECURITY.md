@@ -253,8 +253,6 @@ compromises the cluster.
   to the `AUTH` prompt, not past it.
 - **`--cluster-dump` / `--cluster-restore` speak plain TCP**: they cannot
   reach nodes that only accept TLS.
-- **`CLIENT NO-TOUCH`** is recorded but does not yet keep a client's reads
-  from refreshing LRU/LFU.
 - **Argv password leakage**: secrets given as CLI flags remain visible in
   `/proc/<pid>/cmdline` until the process exits. Prefer the file or
   environment form.

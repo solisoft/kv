@@ -1,12 +1,12 @@
 <div class="space-y-12">
     <div>
         <h1 class="text-4xl font-bold mb-4">Persistence</h1>
-        <p class="text-lg text-slate-400">RDB snapshots + AOF append-only file &mdash; Redis-compatible persistence with near-zero overhead</p>
+        <p class="text-lg text-slate-400">A Redis 7-style append-only log and RDB snapshots &mdash; a restart brings back exactly the state the server stopped in</p>
     </div>
 
     <!-- Overview -->
     <div class="p-6 rounded-xl bg-indigo-500/10 border border-indigo-500/30">
-        <p class="text-slate-400">SoliKV supports two complementary persistence mechanisms, matching Redis defaults. AOF is enabled by default with <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">appendfsync everysec</code>, losing at most ~1 second of data on crash. RDB snapshots are saved every 5 minutes as a safety net.</p>
+        <p class="text-slate-400">The append-only log is on by default with <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">appendfsync everysec</code>. A writer thread hands each pass of records (about every millisecond) to the kernel, so a process killed with SIGKILL loses at most that last pass, and a machine crash up to about a second. Snapshots (<code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">dump.rdb</code>) are taken in the background on save points, on <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">BGSAVE</code> and at shutdown.</p>
     </div>
 
     <!-- How It Works -->
@@ -14,30 +14,36 @@
         <h2 class="text-2xl font-semibold mb-6">How It Works</h2>
         <div class="grid grid-cols-2 gap-6">
             <div class="p-6 rounded-xl bg-white/5 border border-white/10">
-                <h3 class="text-lg font-semibold text-emerald-400 mb-3">AOF (Append-Only File)</h3>
+                <h3 class="text-lg font-semibold text-emerald-400 mb-3">Append-only log</h3>
                 <ul class="space-y-2 text-sm text-slate-400">
-                    <li class="flex items-start gap-2"><span class="text-emerald-400">1.</span> Every write command is RESP-serialized on the caller thread</li>
-                    <li class="flex items-start gap-2"><span class="text-emerald-400">2.</span> Serialized bytes are sent through a 256K bounded channel (lock-free)</li>
-                    <li class="flex items-start gap-2"><span class="text-emerald-400">3.</span> Background task batch-drains the channel into a 64KB BufWriter</li>
-                    <li class="flex items-start gap-2"><span class="text-emerald-400">4.</span> fsync is called per the configured policy (always/everysec/no)</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">1.</span> One log per shard; each record is appended while that shard's lock is held, so the log replays in exactly the order the shard executed.</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">2.</span> Records are the <em>effect</em> on the shard: a command spanning shards writes one record per shard, relative TTLs become absolute deadlines, expirations and evictions are logged as <code class="text-slate-300">DEL</code>.</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">3.</span> Transactions and scripts are bracketed <code class="text-slate-300">MULTI</code>/<code class="text-slate-300">EXEC</code>; an unfinished block at the end of the log is not applied.</li>
+                    <li class="flex items-start gap-2"><span class="text-emerald-400">4.</span> A writer thread collects the records about every millisecond, hands them to the kernel and fsyncs per policy (always / everysec / no).</li>
                 </ul>
                 <div class="mt-4 p-3 rounded-lg bg-slate-900 text-xs font-mono text-slate-500">
-                    File: data/appendonly.aof (RESP format)
+                    Directory: &lt;dir&gt;/appendonlydir/ (manifest + base + per-shard logs)
                 </div>
             </div>
             <div class="p-6 rounded-xl bg-white/5 border border-white/10">
-                <h3 class="text-lg font-semibold text-purple-400 mb-3">RDB (Snapshots)</h3>
+                <h3 class="text-lg font-semibold text-purple-400 mb-3">Snapshots</h3>
                 <ul class="space-y-2 text-sm text-slate-400">
-                    <li class="flex items-start gap-2"><span class="text-purple-400">1.</span> Full point-in-time snapshot of all data per shard</li>
-                    <li class="flex items-start gap-2"><span class="text-purple-400">2.</span> Background task saves every 300 seconds</li>
-                    <li class="flex items-start gap-2"><span class="text-purple-400">3.</span> Atomic write via temp file + rename (crash-safe)</li>
-                    <li class="flex items-start gap-2"><span class="text-purple-400">4.</span> Final snapshot saved on graceful shutdown (CTRL-C)</li>
+                    <li class="flex items-start gap-2"><span class="text-purple-400">1.</span> One file holding every shard and every database, with a CRC-32 checksum.</li>
+                    <li class="flex items-start gap-2"><span class="text-purple-400">2.</span> Taken in steps: each shard is held only while its part is captured, so other clients keep being served.</li>
+                    <li class="flex items-start gap-2"><span class="text-purple-400">3.</span> Written to a temporary file, fsynced, renamed, and the directory fsynced.</li>
+                    <li class="flex items-start gap-2"><span class="text-purple-400">4.</span> Triggered by save points (<code class="text-slate-300">--save</code>, default one change in 300 s), <code class="text-slate-300">BGSAVE</code>, <code class="text-slate-300">SAVE</code> and shutdown.</li>
                 </ul>
                 <div class="mt-4 p-3 rounded-lg bg-slate-900 text-xs font-mono text-slate-500">
-                    Files: data/dump-0.rdb, data/dump-1.rdb, ...
+                    File: &lt;dir&gt;/dump.rdb (&lt;dbfilename&gt;.rdb)
                 </div>
             </div>
         </div>
+    </div>
+
+    <!-- Rewrites -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4">Rewrites</h2>
+        <p class="text-slate-400 mb-4"><code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">BGREWRITEAOF</code>, or automatically once the log has grown by <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--auto-aof-rewrite-percentage</code> (100) and is at least <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--auto-aof-rewrite-min-size</code> (64mb), captures each shard and switches it to a new log generation under one lock hold. Everything the new base holds is in the old generation, everything it lacks in the new one, so a restart never applies a write twice nor skips one. The manifest lists the new generation before the old files are dropped, so a crash in the middle of a rewrite still loads correctly.</p>
     </div>
 
     <!-- Startup Sequence -->
@@ -47,19 +53,19 @@
             <ol class="space-y-3 text-slate-300">
                 <li class="flex items-start gap-3">
                     <span class="shrink-0 w-7 h-7 rounded-lg bg-indigo-500/20 flex items-center justify-center text-sm font-bold text-indigo-400">1</span>
-                    <div><strong class="text-white">Load RDB snapshots</strong> &mdash; Each shard's RDB file is loaded to restore the base state</div>
+                    <div><strong class="text-white">Choose the source</strong> &mdash; with <code class="text-slate-300">appendonly</code> on: the log named by the manifest; else a single <code class="text-slate-300">appendonly.aof</code> from an earlier version; else the snapshot. With the log off: the snapshot. The snapshot is never replayed under the log (that applied every logged write twice in 0.4).</div>
                 </li>
                 <li class="flex items-start gap-3">
                     <span class="shrink-0 w-7 h-7 rounded-lg bg-indigo-500/20 flex items-center justify-center text-sm font-bold text-indigo-400">2</span>
-                    <div><strong class="text-white">Replay AOF</strong> &mdash; Commands from the AOF are replayed on top of the RDB state to bring data up to date</div>
+                    <div><strong class="text-white">Replay</strong> &mdash; records are streamed, never collected in memory. A record cut off by a crash at the very end is dropped and truncated away; anything else that does not parse stops startup.</div>
                 </li>
                 <li class="flex items-start gap-3">
                     <span class="shrink-0 w-7 h-7 rounded-lg bg-indigo-500/20 flex items-center justify-center text-sm font-bold text-indigo-400">3</span>
-                    <div><strong class="text-white">Open AOF writer</strong> &mdash; New write commands start being logged to the AOF</div>
+                    <div><strong class="text-white">Re-hash</strong> &mdash; every key moves to the shard that owns it under the current configuration, so <code class="text-slate-300">--shards</code> can change between runs. If the layout changed, the log is rewritten before the first client connects.</div>
                 </li>
                 <li class="flex items-start gap-3">
                     <span class="shrink-0 w-7 h-7 rounded-lg bg-indigo-500/20 flex items-center justify-center text-sm font-bold text-indigo-400">4</span>
-                    <div><strong class="text-white">Start serving</strong> &mdash; RESP and REST servers begin accepting connections</div>
+                    <div><strong class="text-white">Start serving</strong> &mdash; RESP and REST accept connections; new writes go to the log.</div>
                 </li>
             </ol>
         </div>
@@ -70,26 +76,11 @@
         <h2 class="text-2xl font-semibold mb-4">Fsync Policies</h2>
         <div class="overflow-x-auto">
             <table class="w-full text-left">
-                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Policy</th><th class="py-3 pr-4 text-slate-400 font-medium">Durability</th><th class="py-3 pr-4 text-slate-400 font-medium">Performance</th><th class="py-3 text-slate-400 font-medium">Use case</th></tr></thead>
+                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Policy</th><th class="py-3 pr-4 text-slate-400 font-medium">Process killed (SIGKILL, OOM)</th><th class="py-3 pr-4 text-slate-400 font-medium">Machine crash / power loss</th></tr></thead>
                 <tbody class="text-slate-300">
-                    <tr class="border-b border-white/5">
-                        <td class="py-3 pr-4 font-mono text-indigo-400">always</td>
-                        <td class="py-3 pr-4">Every write fsynced</td>
-                        <td class="py-3 pr-4 text-slate-500">Slowest</td>
-                        <td class="py-3 text-slate-500">Maximum durability</td>
-                    </tr>
-                    <tr class="border-b border-white/5">
-                        <td class="py-3 pr-4 font-mono text-emerald-400">everysec</td>
-                        <td class="py-3 pr-4">Fsync every 1 second</td>
-                        <td class="py-3 pr-4 text-emerald-400">Near-zero overhead</td>
-                        <td class="py-3 text-slate-500">Default. Lose at most ~1s on crash</td>
-                    </tr>
-                    <tr>
-                        <td class="py-3 pr-4 font-mono text-indigo-400">no</td>
-                        <td class="py-3 pr-4">OS decides when to flush</td>
-                        <td class="py-3 pr-4 text-slate-500">Fastest</td>
-                        <td class="py-3 text-slate-500">Maximum performance, data at risk</td>
-                    </tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">always</td><td class="py-3 pr-4">At most the last writer pass (~1 ms)</td><td class="py-3 pr-4">Fsynced right after each write. The reply is not held until the fsync completes (Redis holds it), so writes acknowledged in the last few milliseconds can be lost</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">everysec</td><td class="py-3 pr-4">At most the last writer pass (~1 ms)</td><td class="py-3 pr-4">Up to about one second. Default</td></tr>
+                    <tr><td class="py-3 pr-4 font-mono text-indigo-400">no</td><td class="py-3 pr-4">At most the last writer pass (~1 ms)</td><td class="py-3 pr-4">Whatever the OS had not flushed</td></tr>
                 </tbody>
             </table>
         </div>
@@ -100,125 +91,108 @@
         <h2 class="text-2xl font-semibold mb-4">Configuration</h2>
         <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
             <div class="flex items-center gap-2 px-4 py-2 bg-white/5 border-b border-white/5">
-                <div class="w-3 h-3 rounded-full bg-red-500/60"></div>
-                <div class="w-3 h-3 rounded-full bg-yellow-500/60"></div>
-                <div class="w-3 h-3 rounded-full bg-green-500/60"></div>
-                <span class="ml-2 text-xs text-slate-500 font-mono">Terminal</span>
+                <span class="text-xs text-slate-500 font-mono">Terminal</span>
             </div>
-            <div class="p-4 font-mono text-sm">
-                <div class="text-slate-500"># Default: AOF enabled with everysec fsync</div>
-                <div class="text-emerald-400">./solikv</div>
-                <div class="text-slate-500 mt-3"># Custom data directory and fsync policy</div>
-                <div class="text-emerald-400">./solikv --dir /var/data/solikv --appendfsync always</div>
-                <div class="text-slate-500 mt-3"># Disable AOF (RDB snapshots only)</div>
-                <div class="text-emerald-400">./solikv --appendonly false</div>
-                <div class="text-slate-500 mt-3"># Custom RDB filename prefix</div>
-                <div class="text-emerald-400">./solikv --dbfilename mydb</div>
-                <div class="text-slate-500 mt-1"># Creates: data/mydb-0.rdb, data/mydb-1.rdb, ...</div>
+            <div class="p-4 font-mono text-sm space-y-1">
+                <div class="text-slate-500"># Data directory and fsync policy</div>
+                <div class="text-emerald-400">solikv --dir /var/lib/solikv --appendfsync always</div>
+                <div class="text-slate-500 mt-3"># Redis save points: after 1 change in 3600 s, or 100 changes in 300 s</div>
+                <div class="text-emerald-400">solikv --save "3600 1 300 100"</div>
+                <div class="text-slate-500 mt-3"># Snapshots only (no log); "" disables periodic snapshots too</div>
+                <div class="text-emerald-400">solikv --appendonly false</div>
+                <div class="text-slate-500 mt-3"># At runtime</div>
+                <div class="text-emerald-400">redis-cli CONFIG SET appendonly yes</div>
+                <div class="text-emerald-400">redis-cli CONFIG SET appendfsync everysec</div>
+                <div class="text-emerald-400">redis-cli CONFIG SET save "900 1"</div>
             </div>
         </div>
+        <p class="mt-4 text-sm text-slate-500">Turning the log on at runtime starts it from the current dataset with a rewrite; turning it off keeps the existing files. Both are refused while a rewrite runs.</p>
     </div>
 
-    <!-- Redis Commands -->
+    <!-- Persistence Commands -->
     <div>
         <h2 class="text-2xl font-semibold mb-4">Persistence Commands</h2>
         <div class="overflow-x-auto">
             <table class="w-full text-left">
-                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Syntax</th><th class="py-3 text-slate-400 font-medium">Description</th></tr></thead>
+                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 text-slate-400 font-medium">Description</th></tr></thead>
                 <tbody class="text-slate-300">
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">SAVE</td><td class="py-3 pr-4 font-mono text-sm">SAVE</td><td class="py-3">Synchronous RDB save (blocks until complete)</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">BGSAVE</td><td class="py-3 pr-4 font-mono text-sm">BGSAVE</td><td class="py-3">Background RDB save</td></tr>
-                    <tr><td class="py-3 pr-4 font-mono text-indigo-400">BGREWRITEAOF</td><td class="py-3 pr-4 font-mono text-sm">BGREWRITEAOF</td><td class="py-3">Rewrite AOF from current state (compaction)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">SAVE</td><td class="py-3">Snapshot now and reply when done. Other clients keep being served, except in <code class="text-slate-300">--solo</code> mode where, as in Redis, the server waits</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">BGSAVE</td><td class="py-3">Snapshot in the background (<code class="text-slate-300">Background saving started</code>)</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">BGREWRITEAOF</td><td class="py-3">Compact the log in the background</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">LASTSAVE</td><td class="py-3">Unix time of the last successful snapshot</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">SHUTDOWN [NOSAVE|SAVE]</td><td class="py-3">Stop writes, fsync the log, snapshot (when save points are set, or with <code class="text-slate-300">SAVE</code>), exit. SIGTERM and SIGINT do the same.</td></tr>
+                    <tr><td class="py-3 pr-4 font-mono text-indigo-400">INFO persistence</td><td class="py-3">Snapshot and rewrite status, log sizes</td></tr>
                 </tbody>
             </table>
         </div>
     </div>
 
-    <!-- AOF Performance -->
-    <div class="p-6 rounded-xl bg-emerald-500/10 border border-emerald-500/30">
-        <h2 class="text-xl font-semibold mb-3 text-emerald-400">Lock-Free AOF Performance</h2>
-        <p class="text-slate-400 mb-4">SoliKV's AOF uses a channel-based architecture that eliminates mutex contention on the hot path. Write commands are RESP-serialized on the caller thread and sent through a bounded channel to a dedicated I/O task.</p>
-        <div class="grid grid-cols-3 gap-4">
-            <div class="p-4 rounded-xl bg-slate-900 text-center">
-                <div class="text-lg font-bold text-emerald-400 font-mono">~2-3%</div>
-                <div class="text-xs text-slate-500 mt-1">AOF overhead on writes</div>
-            </div>
-            <div class="p-4 rounded-xl bg-slate-900 text-center">
-                <div class="text-lg font-bold text-emerald-400 font-mono">256K</div>
-                <div class="text-xs text-slate-500 mt-1">channel buffer capacity</div>
-            </div>
-            <div class="p-4 rounded-xl bg-slate-900 text-center">
-                <div class="text-lg font-bold text-emerald-400 font-mono">64KB</div>
-                <div class="text-xs text-slate-500 mt-1">BufWriter buffer size</div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Redis RDB Import -->
+    <!-- Migrating from Redis -->
     <div>
         <h2 class="text-2xl font-semibold mb-4">Migrating from Redis</h2>
-        <p class="text-slate-400 mb-6">SoliKV can import standard Redis <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">dump.rdb</code> snapshot files at startup. This lets you migrate from Redis without re-inserting all your data.</p>
-
-        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden mb-6">
+        <p class="text-slate-400 mb-4">SoliKV imports Redis <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">dump.rdb</code> files at startup, Redis 7.4's (RDB version 12) included. Each key keeps its Redis database; keys already expired are left out.</p>
+        <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden mb-4">
             <div class="flex items-center gap-2 px-4 py-2 bg-white/5 border-b border-white/5">
-                <div class="w-3 h-3 rounded-full bg-red-500/60"></div>
-                <div class="w-3 h-3 rounded-full bg-yellow-500/60"></div>
-                <div class="w-3 h-3 rounded-full bg-green-500/60"></div>
-                <span class="ml-2 text-xs text-slate-500 font-mono">Terminal</span>
+                <span class="text-xs text-slate-500 font-mono">Terminal</span>
             </div>
-            <div class="p-4 font-mono text-sm">
+            <div class="p-4 font-mono text-sm space-y-1">
                 <div class="text-slate-500"># 1. Generate a dump on your Redis instance</div>
                 <div class="text-emerald-400">redis-cli BGSAVE</div>
                 <div class="text-emerald-400">cp /var/lib/redis/dump.rdb /tmp/dump.rdb</div>
                 <div class="text-slate-500 mt-3"># 2. Import into SoliKV</div>
-                <div class="text-emerald-400">./solikv --import-redis-rdb /tmp/dump.rdb</div>
-                <div class="text-white mt-1">Parsing Redis RDB version 11</div>
-                <div class="text-white">Redis RDB import complete: RDB v11: 4821 keys imported, 0 skipped, 12 expired, 1 database(s)</div>
+                <div class="text-emerald-400">solikv --import-redis-rdb /tmp/dump.rdb --bind 127.0.0.1</div>
                 <div class="text-slate-500 mt-3"># 3. Verify your data</div>
                 <div class="text-emerald-400">redis-cli DBSIZE</div>
-                <div class="text-white mt-1">(integer) 4821</div>
             </div>
         </div>
-
-        <div class="grid grid-cols-2 gap-6">
-            <div class="p-5 rounded-xl bg-white/5 border border-white/10">
-                <h3 class="text-lg font-semibold text-emerald-400 mb-3">Supported Types</h3>
-                <ul class="space-y-1.5 text-sm text-slate-400">
-                    <li class="flex items-center gap-2"><span class="text-emerald-400">&#10003;</span> Strings</li>
-                    <li class="flex items-center gap-2"><span class="text-emerald-400">&#10003;</span> Lists (plain, ziplist, quicklist, quicklist v2)</li>
-                    <li class="flex items-center gap-2"><span class="text-emerald-400">&#10003;</span> Sets (plain, intset, listpack)</li>
-                    <li class="flex items-center gap-2"><span class="text-emerald-400">&#10003;</span> Sorted Sets (plain, ziplist, listpack, binary scores)</li>
-                    <li class="flex items-center gap-2"><span class="text-emerald-400">&#10003;</span> Hashes (plain, ziplist, listpack)</li>
-                    <li class="flex items-center gap-2"><span class="text-emerald-400">&#10003;</span> LZF compressed values</li>
-                    <li class="flex items-center gap-2"><span class="text-emerald-400">&#10003;</span> Key expiry (absolute timestamps, ms precision)</li>
+        <div class="grid grid-cols-2 gap-4">
+            <div class="p-4 rounded-xl bg-white/5 border border-white/10">
+                <h4 class="font-semibold text-emerald-400 mb-2">Imported</h4>
+                <ul class="space-y-1 text-sm text-slate-400">
+                    <li>&#10003; Strings</li>
+                    <li>&#10003; Lists (plain, ziplist, quicklist, quicklist v2)</li>
+                    <li>&#10003; Sets (plain, intset, listpack)</li>
+                    <li>&#10003; Sorted sets (plain, ziplist, listpack, binary scores)</li>
+                    <li>&#10003; Hashes (plain, ziplist, listpack)</li>
+                    <li>&#10003; Hashes with field expiry (Redis 7.4)</li>
+                    <li>&#10003; LZF-compressed values, key expiry, databases</li>
                 </ul>
             </div>
-            <div class="p-5 rounded-xl bg-white/5 border border-white/10">
-                <h3 class="text-lg font-semibold text-slate-400 mb-3">Skipped (with warning)</h3>
-                <ul class="space-y-1.5 text-sm text-slate-500">
-                    <li class="flex items-center gap-2"><span class="text-slate-600">&mdash;</span> Streams</li>
-                    <li class="flex items-center gap-2"><span class="text-slate-600">&mdash;</span> Modules</li>
-                    <li class="flex items-center gap-2"><span class="text-slate-600">&mdash;</span> Hash with per-field expiry (Redis 7.4+)</li>
+            <div class="p-4 rounded-xl bg-white/5 border border-white/10">
+                <h4 class="font-semibold text-amber-400 mb-2">Skipped (with a warning)</h4>
+                <ul class="space-y-1 text-sm text-slate-400">
+                    <li>&mdash; Streams</li>
+                    <li>&mdash; Modules</li>
+                    <li>&mdash; zipmap hashes (Redis &lt; 2.6)</li>
                 </ul>
-                <p class="text-xs text-slate-600 mt-4">Unsupported keys are skipped and logged. All other keys are imported normally.</p>
             </div>
         </div>
+        <p class="mt-4 text-sm text-slate-500"><code class="text-slate-300">DUMP</code>/<code class="text-slate-300">RESTORE</code> payloads also use Redis' format for strings, lists, sets, hashes and sorted sets, so single keys move in both directions.</p>
+    </div>
 
-        <div class="mt-6 p-4 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-sm text-slate-400">
-            <strong class="text-white">Multi-database RDB files:</strong> If your Redis instance uses multiple databases (DB 0, DB 1, ...), all keys are flattened into SoliKV's single namespace. Already-expired keys are automatically filtered out during import.
-        </div>
+    <!-- Upgrading -->
+    <div class="p-6 rounded-xl bg-amber-500/10 border border-amber-500/30">
+        <h2 class="text-xl font-semibold mb-3">Upgrading from 0.4.x</h2>
+        <ul class="space-y-2 text-sm text-slate-400">
+            <li>&bull; A single <code class="text-slate-300">appendonly.aof</code> is loaded, rewritten into <code class="text-slate-300">appendonlydir/</code> and kept as <code class="text-slate-300">appendonly.aof.migrated</code>.</li>
+            <li>&bull; Per-shard <code class="text-slate-300">dump-&lt;n&gt;.rdb</code> files are still read, for any shard count; the next snapshot is the single <code class="text-slate-300">dump.rdb</code>. <code class="text-slate-300">--dbfilename</code> is now the base name of <code class="text-slate-300">&lt;name&gt;.rdb</code>.</li>
+            <li>&bull; Data written by 0.4 loads into database 0.</li>
+        </ul>
     </div>
 
     <!-- File Layout -->
     <div>
         <h2 class="text-2xl font-semibold mb-4">File Layout</h2>
-        <div class="rounded-xl bg-slate-900 border border-white/10 p-4 font-mono text-sm">
-            <div class="text-slate-500">data/</div>
-            <div class="text-white pl-4">appendonly.aof    <span class="text-slate-600"># AOF log (RESP format)</span></div>
-            <div class="text-white pl-4">dump-0.rdb        <span class="text-slate-600"># RDB snapshot for shard 0</span></div>
-            <div class="text-white pl-4">dump-1.rdb        <span class="text-slate-600"># RDB snapshot for shard 1</span></div>
-            <div class="text-white pl-4">dump-2.rdb        <span class="text-slate-600"># RDB snapshot for shard 2</span></div>
-            <div class="text-white pl-4">...               <span class="text-slate-600"># One per shard (auto-detected from --shards)</span></div>
+        <div class="rounded-xl bg-slate-900 border border-white/10 p-6">
+            <pre class="text-sm font-mono text-slate-300 overflow-x-auto">
+data/
+  dump.rdb                          # snapshot: all shards and databases, CRC-32
+  appendonlydir/
+    appendonly.manifest             # which files make up the log, in order
+    appendonly.&lt;gen&gt;.base.rdb       # snapshot the log starts from
+    appendonly.&lt;gen&gt;.incr.&lt;s&gt;.aof   # RESP records for shard &lt;s&gt;
+  solikv.log                        # daemon mode log (--logfile)</pre>
         </div>
+        <p class="mt-4 text-sm text-slate-500">The data directory is created with mode 0700 and the files with 0600.</p>
     </div>
 </div>

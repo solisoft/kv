@@ -1,12 +1,13 @@
 <div class="space-y-12">
     <div>
         <h1 class="text-4xl font-bold mb-4">REST API Reference</h1>
-        <p class="text-lg text-slate-400">HTTP API on port 5020 powered by Axum &mdash; RESTful endpoints for all 5 data types</p>
+        <p class="text-lg text-slate-400">HTTP API on port 5020 powered by Axum &mdash; JSON endpoints for every data type, plus health and metrics</p>
     </div>
 
     <!-- Info -->
     <div class="p-6 rounded-xl bg-indigo-500/10 border border-indigo-500/30">
-        <p class="text-slate-400">SoliKV exposes two interfaces: the <a href="/docs/tcp-protocol" class="text-indigo-400 hover:text-indigo-300 transition-colors">Redis protocol</a> on port 6379 for RESP2 operations, and this REST API on port 5020 for HTTP access to all data types. Both share the same engine &mdash; AOF persistence covers both interfaces automatically.</p>
+        <p class="text-slate-400">SoliKV exposes two interfaces: the <a href="/docs/tcp-protocol" class="text-indigo-400 hover:text-indigo-300 transition-colors">Redis protocol</a> on port 6379 (RESP2/RESP3), and this REST API on port 5020 for HTTP access to all data types. Both share the same engine: persistence, replication, ACL and keyspace notifications cover both. Set <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--rest-port 0</code> to disable the REST API.</p>
+        <p class="text-slate-400">Replies are the JSON form of the command's reply: a bare string, number or array; <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">null</code> with HTTP 404 for a missing value; <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">{{"result":"OK"}}</code> for OK; <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">{{"error": "…"}}</code> with HTTP 400 for an error, 403 for a permission error or a refused command.</p>
     </div>
 
     <!-- Authentication -->
@@ -17,13 +18,20 @@
             </span>
             Authentication
         </h2>
-        <p class="text-slate-400">When the server is started with <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--requirepass &lt;PASSWORD&gt;</code>, all REST API requests must include a Bearer token in the <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">Authorization</code> header. Without the flag, no authentication is required.</p>
+        <p class="text-slate-400">When a password, a REST token or ACL users are configured, requests authenticate with one of:</p>
+        <ul class="text-slate-400 space-y-2 text-sm">
+            <li>&bull; <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">Authorization: Bearer &lt;token&gt;</code> &mdash; the token is <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--rest-token</code> (or <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--rest-token-file</code>), else the <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">requirepass</code> password. It acts as the ACL user <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--rest-token-user</code> (<code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">default</code>).</li>
+            <li>&bull; <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">Authorization: Basic &lt;base64(user:password)&gt;</code> &mdash; any ACL user.</li>
+        </ul>
+        <p class="text-slate-400">Every route is checked against the user's ACL like the command it runs (403 with a <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">NOPERM</code> error otherwise). Missing or wrong credentials give 401; ten failures from one address within the window give 429 for 30 s. A request without credentials does not count as a failure. On a loopback bind only the Host names <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">localhost</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">127.0.0.1</code> and <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">::1</code> (plus <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--rest-allowed-hosts</code>) are answered, which stops DNS-rebinding attacks from a browser (421 otherwise). Over <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--rest-max-connections</code> (1024) connections, new ones get 503. With <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--tls-cert</code>/<code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--tls-key</code> the REST port serves HTTPS.</p>
         <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
             <div class="p-4 font-mono text-sm">
                 <div class="text-slate-500"># With authentication enabled (--requirepass secret123)</div>
                 <div class="text-emerald-400">curl -H "Authorization: Bearer secret123" \</div>
                 <div class="text-emerald-400 ml-4">http://localhost:5020/kv/mykey</div>
-                <div class="text-white mt-1">{"result":"hello"}</div>
+                <div class="text-white mt-1">"hello"</div>
+                <div class="text-slate-500 mt-3"># As an ACL user</div>
+                <div class="text-emerald-400">curl -u reader:secret http://localhost:5020/kv/cache:home</div>
                 <div class="text-slate-500 mt-3"># Missing or invalid token returns 401</div>
                 <div class="text-emerald-400">curl http://localhost:5020/kv/mykey</div>
                 <div class="text-white mt-1">{"error":"Unauthorized"}</div>
@@ -44,7 +52,7 @@
                 <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
                 <div class="flex-1">
                     <code class="text-white">/kv/:key</code>
-                    <p class="text-sm text-slate-400 mt-1">Get the value of a key. Returns 404 if key does not exist.</p>
+                    <p class="text-sm text-slate-400 mt-1">Get the value of a key: a JSON string, or <code class="text-white">null</code> with HTTP 404 if the key does not exist.</p>
                 </div>
             </div>
             <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
@@ -380,7 +388,7 @@
             </span>
             Generic Command Endpoint
         </h2>
-        <p class="text-slate-400">Execute any Redis command via HTTP. This gives you access to all 100+ commands without needing dedicated REST endpoints.</p>
+        <p class="text-slate-400">Execute a data command via HTTP, for everything without a dedicated route. Administrative and keyspace-wide commands are refused with 403: <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">FLUSHDB</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">FLUSHALL</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">SHUTDOWN</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">DEBUG</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">EVAL</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">EVALSHA</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">SCRIPT</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">MODULE</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">SAVE</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">BGSAVE</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">BGREWRITEAOF</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">REPLICAOF</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">SLAVEOF</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">CLUSTER</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">CONFIG</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">MIGRATE</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">RESTORE</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">OBJECT</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">KEYS</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">SCAN</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">HSCAN</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">SSCAN</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">ZSCAN</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">RENAME</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">RENAMENX</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">RESET</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">LATENCY</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">MEMORY</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">WAIT</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">FAILOVER</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">CLIENT</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">INFO</code>, <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">DBSIZE</code> (the last two have their own routes).</p>
         <div class="space-y-3">
             <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
                 <span class="shrink-0 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs font-mono">POST</span>
@@ -413,7 +421,28 @@
                 <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
                 <div class="flex-1">
                     <code class="text-white">/dbsize</code>
-                    <p class="text-sm text-slate-400 mt-1">Returns the number of keys in the database</p>
+                    <p class="text-sm text-slate-400 mt-1">Returns the number of keys in database 0</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/health</code>
+                    <p class="text-sm text-slate-400 mt-1">Liveness: <code class="text-white">{"status":"ok"}</code>. Never authenticated.</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/ready</code>
+                    <p class="text-sm text-slate-400 mt-1">Readiness: 200 <code class="text-white">{"status":"ready"}</code>, or 503 <code class="text-white">{"status":"busy"}</code> while a script runs past <code class="text-white">--busy-reply-threshold</code>. Never authenticated.</p>
+                </div>
+            </div>
+            <div class="flex items-start gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
+                <span class="shrink-0 px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 text-xs font-mono">GET</span>
+                <div class="flex-1">
+                    <code class="text-white">/metrics</code>
+                    <p class="text-sm text-slate-400 mt-1">Prometheus text format: every numeric <code class="text-white">INFO</code> field as a gauge <code class="text-white">solikv_&lt;field&gt;</code>, the keyspace per database (<code class="text-white">solikv_keyspace_keys{db="0"}</code>), and per-command counters (<code class="text-white">solikv_command_calls_total</code>, <code class="text-white">_duration_seconds_total</code>, <code class="text-white">_rejected_total</code>, <code class="text-white">_failed_total</code>). Needs the token when one is set, unless <code class="text-white">--metrics-auth no</code>.</p>
                 </div>
             </div>
         </div>
@@ -437,25 +466,25 @@
                 <div class="text-white mt-1">{"result":"OK"}</div>
                 <div class="text-slate-500 mt-3"># Get a key</div>
                 <div class="text-emerald-400">curl http://localhost:5020/kv/session:abc</div>
-                <div class="text-white mt-1">{"result":"token123"}</div>
+                <div class="text-white mt-1">"token123"</div>
                 <div class="text-slate-500 mt-3"># Push to a list</div>
                 <div class="text-emerald-400">curl -X POST http://localhost:5020/list/queue/rpush \</div>
                 <div class="text-emerald-400 ml-4">-H "Content-Type: application/json" \</div>
                 <div class="text-emerald-400 ml-4">-d '{"values":["job1","job2","job3"]}'</div>
-                <div class="text-white mt-1">{"result":3}</div>
+                <div class="text-white mt-1">3</div>
                 <div class="text-slate-500 mt-3"># Set hash fields</div>
                 <div class="text-emerald-400">curl -X PUT http://localhost:5020/hash/user:1 \</div>
                 <div class="text-emerald-400 ml-4">-H "Content-Type: application/json" \</div>
                 <div class="text-emerald-400 ml-4">-d '{"fields":{"name":"Alice","age":"30"}}'</div>
-                <div class="text-white mt-1">{"result":2}</div>
+                <div class="text-white mt-1">2</div>
                 <div class="text-slate-500 mt-3"># Get all hash fields</div>
                 <div class="text-emerald-400">curl http://localhost:5020/hash/user:1</div>
-                <div class="text-white mt-1">{"result":["name","Alice","age","30"]}</div>
+                <div class="text-white mt-1">["name","Alice","age","30"]</div>
                 <div class="text-slate-500 mt-3"># Execute any command via /cmd</div>
                 <div class="text-emerald-400">curl -X POST http://localhost:5020/cmd \</div>
                 <div class="text-emerald-400 ml-4">-H "Content-Type: application/json" \</div>
                 <div class="text-emerald-400 ml-4">-d '{"command":"ZADD","args":["leaderboard","100","alice","200","bob"]}'</div>
-                <div class="text-white mt-1">{"result":2}</div>
+                <div class="text-white mt-1">2</div>
             </div>
         </div>
     </div>

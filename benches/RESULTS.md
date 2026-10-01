@@ -1,5 +1,9 @@
 # SoliKV benchmark results
 
+> **Note (0.5.0):** the tables below were measured on SoliKV 0.4.1 and
+> predate the audit follow-up (persistence, command path and data-structure
+> rewrites). Before/after results for 0.5.0 will be added to this file.
+
 **Date:** 2026-07-16  
 **Machine:** AMD Ryzen 7 255 (16 threads), 27 GiB RAM, Linux x86_64  
 **Tooling:** `redis-benchmark` (Redis 7.0.15 package), `oha`  

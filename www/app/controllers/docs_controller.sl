@@ -31,7 +31,7 @@ class DocsController extends Controller
     # GET /docs/clustering
     def clustering(req)
         return render("docs/clustering", {
-            "title": "Clustering",
+            "title": "Replication & Cluster",
             "active_page": "clustering",
             "layout": "layouts/docs"
         });

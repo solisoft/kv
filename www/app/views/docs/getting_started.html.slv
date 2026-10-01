@@ -15,7 +15,7 @@
             <li class="flex items-center gap-2"><span class="text-indigo-400">02.</span> curl or wget (for binary install)</li>
             <li class="flex items-center gap-2"><span class="text-indigo-400">03.</span> redis-cli (optional, for testing)</li>
         </ul>
-        <p class="mt-3 text-sm text-slate-500">For building from source: Rust 1.75+ with cargo</p>
+        <p class="mt-3 text-sm text-slate-500">For building from source: a recent stable Rust toolchain with cargo</p>
     </div>
 
     <!-- Quick Install -->
@@ -43,11 +43,11 @@
                 <span class="text-xs text-slate-500 font-mono">Docker</span>
             </div>
             <div class="p-4 font-mono text-sm">
-                <div class="text-slate-500"># Pull and run</div>
-                <div class="text-emerald-400">docker run -p 6379:6379 -p 5020:5020 -v ./data:/data ghcr.io/solisoft/kv:latest</div>
-                <div class="text-slate-500 mt-3"># Or with custom config</div>
+                <div class="text-slate-500"># The image runs as UID 10001: the data directory must be writable by it</div>
+                <div class="text-emerald-400">mkdir -p data &amp;&amp; sudo chown 10001 data</div>
+                <div class="text-slate-500 mt-3"># The container binds 0.0.0.0, so protected mode requires a password</div>
                 <div class="text-emerald-400">docker run -p 6379:6379 -p 5020:5020 -v ./data:/data \</div>
-                <div class="text-emerald-400 ml-4">ghcr.io/solisoft/kv:latest --shards 4 --appendfsync always</div>
+                <div class="text-emerald-400 ml-4">ghcr.io/solisoft/kv:latest --dir /data --requirepass "$SOLIKV_PASSWORD"</div>
             </div>
         </div>
     </div>
@@ -77,10 +77,14 @@
         <h2 class="text-2xl font-semibold mb-4">Run</h2>
         <div class="rounded-xl bg-slate-900 border border-white/10 overflow-hidden">
             <div class="p-4 font-mono text-sm">
-                <div class="text-slate-500"># Start the server (RESP on port 6379, REST on port 5020)</div>
-                <div class="text-emerald-400">./target/release/solikv</div>
+                <div class="text-slate-500"># Start the server on loopback (RESP on port 6379, REST on port 5020)</div>
+                <div class="text-emerald-400">./target/release/solikv --bind 127.0.0.1</div>
                 <div class="text-white mt-1">SoliKV starting with 8 shards, RESP on port 6379, REST on port 5020</div>
-                <div class="text-white">AOF enabled (Everysec fsync) at "data/appendonly.aof"</div>
+                <div class="text-slate-500 mt-3"># The default bind address is 0.0.0.0: protected mode then refuses to start</div>
+                <div class="text-slate-500"># without a password. Set one (the file must be mode 0600):</div>
+                <div class="text-emerald-400">./target/release/solikv --requirepass-file /etc/solikv/password</div>
+                <div class="text-slate-500 mt-3"># Or use a config file in redis.conf syntax</div>
+                <div class="text-emerald-400">./target/release/solikv /etc/solikv/solikv.conf</div>
                 <div class="text-slate-500 mt-3"># Verify it's running</div>
                 <div class="text-emerald-400">redis-cli PING</div>
                 <div class="text-white mt-1">PONG</div>
@@ -137,7 +141,7 @@
                 <div class="text-white mt-1">{"result":"OK"}</div>
                 <div class="text-slate-500 mt-3"># Get a key via REST</div>
                 <div class="text-emerald-400">curl http://localhost:5020/kv/mykey</div>
-                <div class="text-white mt-1">{"result":"hello"}</div>
+                <div class="text-white mt-1">"hello"</div>
             </div>
         </div>
     </div>
@@ -158,17 +162,17 @@
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--port</td>
                         <td class="py-3 pr-4">6379</td>
-                        <td class="py-3">RESP2 TCP server port</td>
+                        <td class="py-3">Redis protocol port (RESP2/RESP3)</td>
                     </tr>
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--rest-port</td>
                         <td class="py-3 pr-4">5020</td>
-                        <td class="py-3">REST API port</td>
+                        <td class="py-3">REST API port (0 disables it)</td>
                     </tr>
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--bind</td>
                         <td class="py-3 pr-4">0.0.0.0</td>
-                        <td class="py-3">Bind address</td>
+                        <td class="py-3">Bind address. Non-loopback without a password is refused (protected mode)</td>
                     </tr>
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--shards</td>
@@ -183,12 +187,12 @@
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--dbfilename</td>
                         <td class="py-3 pr-4">dump</td>
-                        <td class="py-3">RDB snapshot base filename</td>
+                        <td class="py-3">Snapshot base filename (<code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">&lt;dir&gt;/&lt;name&gt;.rdb</code>)</td>
                     </tr>
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--appendonly</td>
                         <td class="py-3 pr-4">true</td>
-                        <td class="py-3">Enable append-only file persistence</td>
+                        <td class="py-3">Append-only log in <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">&lt;dir&gt;/appendonlydir</code>; when on, startup loads the log</td>
                     </tr>
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--appendfsync</td>
@@ -213,12 +217,22 @@
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--replicaof</td>
                         <td class="py-3 pr-4">&mdash;</td>
-                        <td class="py-3">Become replica of master at <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">HOST:PORT</code></td>
+                        <td class="py-3">Follow a master at startup: <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">"host port"</code> or <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">host:port</code></td>
                     </tr>
                     <tr class="border-b border-white/5">
-                        <td class="py-3 pr-4 font-mono text-indigo-400">--generate-master-keyfile</td>
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--config</td>
                         <td class="py-3 pr-4">&mdash;</td>
-                        <td class="py-3">Generate <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">master.keyfile</code> in data dir and exit</td>
+                        <td class="py-3">Config file in redis.conf syntax (also accepted as the first argument); flags override it</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--maxmemory</td>
+                        <td class="py-3 pr-4">0</td>
+                        <td class="py-3">Memory limit (0 = none), with <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--maxmemory-policy</code></td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-3 pr-4 font-mono text-indigo-400">--tls-cert / --tls-key</td>
+                        <td class="py-3 pr-4">&mdash;</td>
+                        <td class="py-3">Enable TLS on the RESP and REST ports</td>
                     </tr>
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--daemon, -d</td>
@@ -228,11 +242,12 @@
                     <tr class="border-b border-white/5">
                         <td class="py-3 pr-4 font-mono text-indigo-400">--cluster-enabled</td>
                         <td class="py-3 pr-4">false</td>
-                        <td class="py-3">Enable Redis Cluster-compatible mode</td>
+                        <td class="py-3">Enable Redis Cluster mode (needs <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">--cluster-bus-secret-file</code>)</td>
                     </tr>
                 </tbody>
             </table>
         </div>
+        <p class="mt-4 text-sm text-slate-500">This is a selection. The README lists all 79 flags; <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">solikv --help</code> prints them too.</p>
     </div>
 
     <!-- What's Next -->
@@ -244,7 +259,7 @@
             <a href="/docs/api" class="text-indigo-400 hover:text-indigo-300 transition-colors">REST API Reference &rarr;</a>
             <a href="/docs/persistence" class="text-indigo-400 hover:text-indigo-300 transition-colors">Persistence &rarr;</a>
             <a href="/docs/benchmarks" class="text-indigo-400 hover:text-indigo-300 transition-colors">Benchmarks &rarr;</a>
-            <a href="/docs/clustering" class="text-indigo-400 hover:text-indigo-300 transition-colors">Clustering &rarr;</a>
+            <a href="/docs/clustering" class="text-indigo-400 hover:text-indigo-300 transition-colors">Replication &amp; Cluster &rarr;</a>
         </div>
     </div>
 </div>

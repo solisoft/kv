@@ -1,28 +1,59 @@
 <div class="space-y-16">
     <div>
         <h1 class="text-4xl font-bold mb-4">Command Reference</h1>
-        <p class="text-lg text-slate-400">Complete reference for all 100+ Redis-compatible commands</p>
+        <p class="text-lg text-slate-400">Reference for the 253 commands of SoliKV's command table, grouped by family</p>
     </div>
 
     <!-- Quick Navigation -->
     <div class="p-6 rounded-xl bg-slate-900 border border-white/10">
         <div class="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">Jump to</div>
         <div class="flex flex-wrap gap-2">
-            <a href="#strings" class="px-3 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 text-sm hover:bg-emerald-500/20 transition-colors">Strings (21)</a>
-            <a href="#lists" class="px-3 py-1.5 rounded-lg bg-cyan-500/10 text-cyan-400 text-sm hover:bg-cyan-500/20 transition-colors">Lists (14)</a>
-            <a href="#hashes" class="px-3 py-1.5 rounded-lg bg-purple-500/10 text-purple-400 text-sm hover:bg-purple-500/20 transition-colors">Hashes (14)</a>
-            <a href="#sets" class="px-3 py-1.5 rounded-lg bg-pink-500/10 text-pink-400 text-sm hover:bg-pink-500/20 transition-colors">Sets (11)</a>
-            <a href="#sorted-sets" class="px-3 py-1.5 rounded-lg bg-orange-500/10 text-orange-400 text-sm hover:bg-orange-500/20 transition-colors">Sorted Sets (17)</a>
-            <a href="#streams" class="px-3 py-1.5 rounded-lg bg-sky-500/10 text-sky-400 text-sm hover:bg-sky-500/20 transition-colors">Streams (14)</a>
-            <a href="#keys" class="px-3 py-1.5 rounded-lg bg-yellow-500/10 text-yellow-400 text-sm hover:bg-yellow-500/20 transition-colors">Keys (18)</a>
-            <a href="#transactions" class="px-3 py-1.5 rounded-lg bg-red-500/10 text-red-400 text-sm hover:bg-red-500/20 transition-colors">Transactions (3)</a>
-            <a href="#pubsub" class="px-3 py-1.5 rounded-lg bg-teal-500/10 text-teal-400 text-sm hover:bg-teal-500/20 transition-colors">Pub/Sub (8)</a>
-            <a href="#scripting" class="px-3 py-1.5 rounded-lg bg-indigo-500/10 text-indigo-400 text-sm hover:bg-indigo-500/20 transition-colors">Scripting (5)</a>
-            <a href="#bitmap" class="px-3 py-1.5 rounded-lg bg-amber-500/10 text-amber-400 text-sm hover:bg-amber-500/20 transition-colors">Bitmap (4)</a>
+            <a href="#strings" class="px-3 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 text-sm hover:bg-emerald-500/20 transition-colors">Strings (22)</a>
+            <a href="#lists" class="px-3 py-1.5 rounded-lg bg-cyan-500/10 text-cyan-400 text-sm hover:bg-cyan-500/20 transition-colors">Lists (22)</a>
+            <a href="#hashes" class="px-3 py-1.5 rounded-lg bg-purple-500/10 text-purple-400 text-sm hover:bg-purple-500/20 transition-colors">Hashes (28)</a>
+            <a href="#sets" class="px-3 py-1.5 rounded-lg bg-pink-500/10 text-pink-400 text-sm hover:bg-pink-500/20 transition-colors">Sets (17)</a>
+            <a href="#sorted-sets" class="px-3 py-1.5 rounded-lg bg-orange-500/10 text-orange-400 text-sm hover:bg-orange-500/20 transition-colors">Sorted Sets (35)</a>
+            <a href="#streams" class="px-3 py-1.5 rounded-lg bg-sky-500/10 text-sky-400 text-sm hover:bg-sky-500/20 transition-colors">Streams (15)</a>
+            <a href="#keys" class="px-3 py-1.5 rounded-lg bg-yellow-500/10 text-yellow-400 text-sm hover:bg-yellow-500/20 transition-colors">Keys (26)</a>
+            <a href="#transactions" class="px-3 py-1.5 rounded-lg bg-red-500/10 text-red-400 text-sm hover:bg-red-500/20 transition-colors">Transactions (5)</a>
+            <a href="#pubsub" class="px-3 py-1.5 rounded-lg bg-teal-500/10 text-teal-400 text-sm hover:bg-teal-500/20 transition-colors">Pub/Sub (9)</a>
+            <a href="#scripting" class="px-3 py-1.5 rounded-lg bg-indigo-500/10 text-indigo-400 text-sm hover:bg-indigo-500/20 transition-colors">Scripting (8)</a>
+            <a href="#bitmap" class="px-3 py-1.5 rounded-lg bg-amber-500/10 text-amber-400 text-sm hover:bg-amber-500/20 transition-colors">Bitmap (7)</a>
             <a href="#hyperloglog" class="px-3 py-1.5 rounded-lg bg-violet-500/10 text-violet-400 text-sm hover:bg-violet-500/20 transition-colors">HyperLogLog (3)</a>
             <a href="#bloom-filter" class="px-3 py-1.5 rounded-lg bg-rose-500/10 text-rose-400 text-sm hover:bg-rose-500/20 transition-colors">Bloom Filter (6)</a>
-            <a href="#geospatial" class="px-3 py-1.5 rounded-lg bg-teal-500/10 text-teal-400 text-sm hover:bg-teal-500/20 transition-colors">Geospatial (6)</a>
-            <a href="#server" class="px-3 py-1.5 rounded-lg bg-slate-500/10 text-slate-400 text-sm hover:bg-slate-500/20 transition-colors">Server (20)</a>
+            <a href="#geospatial" class="px-3 py-1.5 rounded-lg bg-teal-500/10 text-teal-400 text-sm hover:bg-teal-500/20 transition-colors">Geospatial (10)</a>
+            <a href="#server" class="px-3 py-1.5 rounded-lg bg-slate-500/10 text-slate-400 text-sm hover:bg-slate-500/20 transition-colors">Server &amp; Cluster (40)</a>
+        </div>
+    </div>
+
+    <!-- All commands (generated from crates/solikv-engine/src/commands.rs) -->
+    <div id="all-commands">
+        <h2 class="text-2xl font-semibold mb-4">All commands</h2>
+        <p class="text-slate-400 mb-4">Every command <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">COMMAND</code> lists. The sections below give syntax and examples for each family.</p>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left">
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#strings" class="text-emerald-400 hover:text-white">Strings</a> <span class="text-slate-500 text-sm">(22)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GET</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SET</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SETNX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SETEX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PSETEX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GETSET</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GETDEL</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GETEX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">MGET</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">MSET</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">MSETNX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">INCR</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">DECR</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">INCRBY</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">DECRBY</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">INCRBYFLOAT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">APPEND</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">STRLEN</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GETRANGE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SUBSTR</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SETRANGE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LCS</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#bitmap" class="text-amber-400 hover:text-white">Bitmaps</a> <span class="text-slate-500 text-sm">(7)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SETBIT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GETBIT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BITCOUNT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BITOP</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BITPOS</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BITFIELD</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BITFIELD_RO</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#lists" class="text-cyan-400 hover:text-white">Lists</a> <span class="text-slate-500 text-sm">(22)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LPUSH</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">RPUSH</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LPOP</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">RPOP</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LLEN</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LINDEX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LSET</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LRANGE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LINSERT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LREM</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LTRIM</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LPUSHX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">RPUSHX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LPOS</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LMOVE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">RPOPLPUSH</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LMPOP</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BLPOP</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BRPOP</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BLMOVE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BRPOPLPUSH</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BLMPOP</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#hashes" class="text-purple-400 hover:text-white">Hashes</a> <span class="text-slate-500 text-sm">(28)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HSET</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HMSET</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HSETNX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HGET</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HMGET</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HDEL</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HGETALL</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HINCRBY</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HINCRBYFLOAT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HKEYS</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HVALS</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HLEN</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HEXISTS</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HSCAN</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HSTRLEN</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HRANDFIELD</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HEXPIRE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HPEXPIRE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HEXPIREAT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HPEXPIREAT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HTTL</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HPTTL</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HEXPIRETIME</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HPEXPIRETIME</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HPERSIST</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HGETDEL</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HGETEX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HSETEX</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#sets" class="text-pink-400 hover:text-white">Sets</a> <span class="text-slate-500 text-sm">(17)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SSCAN</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SADD</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SREM</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SMEMBERS</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SISMEMBER</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SCARD</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SPOP</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SRANDMEMBER</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SMOVE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SINTER</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SUNION</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SDIFF</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SINTERSTORE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SUNIONSTORE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SDIFFSTORE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SMISMEMBER</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SINTERCARD</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#sorted-sets" class="text-orange-400 hover:text-white">Sorted sets</a> <span class="text-slate-500 text-sm">(35)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZADD</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZREM</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZSCORE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZCARD</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZRANK</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZREVRANK</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZINCRBY</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZCOUNT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZRANGE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZREVRANGE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZRANGEBYSCORE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZREVRANGEBYSCORE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZRANGEBYLEX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZREVRANGEBYLEX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZLEXCOUNT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZREMRANGEBYLEX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZREMRANGEBYSCORE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZREMRANGEBYRANK</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZPOPMIN</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZPOPMAX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZMPOP</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BZPOPMIN</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BZPOPMAX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BZMPOP</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZUNIONSTORE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZINTERSTORE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZSCAN</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZUNION</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZINTER</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZDIFF</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZINTERCARD</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZDIFFSTORE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZRANGESTORE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZMSCORE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ZRANDMEMBER</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#streams" class="text-sky-400 hover:text-white">Streams</a> <span class="text-slate-500 text-sm">(15)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XADD</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XLEN</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XRANGE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XREVRANGE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XREAD</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XREADGROUP</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XDEL</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XTRIM</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XINFO</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XGROUP</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XACK</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XPENDING</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XCLAIM</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XAUTOCLAIM</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">XSETID</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#geospatial" class="text-teal-400 hover:text-white">Geo</a> <span class="text-slate-500 text-sm">(10)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GEOADD</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GEOPOS</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GEOHASH</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GEODIST</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GEOSEARCH</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GEOSEARCHSTORE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GEORADIUS</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GEORADIUSBYMEMBER</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GEORADIUS_RO</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">GEORADIUSBYMEMBER_RO</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#hyperloglog" class="text-violet-400 hover:text-white">HyperLogLog</a> <span class="text-slate-500 text-sm">(3)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PFADD</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PFCOUNT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PFMERGE</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#bloom-filter" class="text-rose-400 hover:text-white">Bloom filters</a> <span class="text-slate-500 text-sm">(6)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BF.RESERVE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BF.ADD</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BF.MADD</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BF.EXISTS</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BF.MEXISTS</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BF.INFO</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#keys" class="text-yellow-400 hover:text-white">Keys</a> <span class="text-slate-500 text-sm">(26)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">DEL</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">UNLINK</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">EXISTS</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">TOUCH</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">TYPE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">EXPIRE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PEXPIRE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">EXPIREAT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PEXPIREAT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">EXPIRETIME</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PEXPIRETIME</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">TTL</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PTTL</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PERSIST</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">RENAME</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">RENAMENX</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">MOVE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">KEYS</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SCAN</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">RANDOMKEY</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">OBJECT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">DUMP</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">RESTORE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SORT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SORT_RO</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">COPY</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#transactions" class="text-red-400 hover:text-white">Transactions</a> <span class="text-slate-500 text-sm">(5)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">MULTI</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">EXEC</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">DISCARD</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">WATCH</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">UNWATCH</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#scripting" class="text-indigo-400 hover:text-white">Scripting & functions</a> <span class="text-slate-500 text-sm">(8)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">EVAL</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">EVALSHA</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">EVAL_RO</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">EVALSHA_RO</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SCRIPT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">FCALL</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">FCALL_RO</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">FUNCTION</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#pubsub" class="text-teal-400 hover:text-white">Pub/Sub</a> <span class="text-slate-500 text-sm">(9)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PUBLISH</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PUBSUB</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SUBSCRIBE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">UNSUBSCRIBE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PSUBSCRIBE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PUNSUBSCRIBE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SSUBSCRIBE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SUNSUBSCRIBE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SPUBLISH</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#server" class="text-slate-400 hover:text-white">Connection</a> <span class="text-slate-500 text-sm">(8)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PING</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ECHO</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">AUTH</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">HELLO</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">QUIT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">RESET</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SELECT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">CLIENT</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#server" class="text-slate-400 hover:text-white">Server & admin</a> <span class="text-slate-500 text-sm">(14)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">COMMAND</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">CONFIG</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">INFO</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">DBSIZE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">FLUSHDB</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">FLUSHALL</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SWAPDB</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ACL</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SLOWLOG</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LATENCY</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">MEMORY</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">DEBUG</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">MONITOR</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">TIME</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#server" class="text-slate-400 hover:text-white">Persistence</a> <span class="text-slate-500 text-sm">(5)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SAVE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BGSAVE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">BGREWRITEAOF</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">LASTSAVE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SHUTDOWN</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#server" class="text-slate-400 hover:text-white">Replication</a> <span class="text-slate-500 text-sm">(7)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">REPLICAOF</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SLAVEOF</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ROLE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">WAIT</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">REPLCONF</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">PSYNC</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">SYNC</code></div></td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4" style="vertical-align:top;white-space:nowrap"><a href="#server" class="text-slate-400 hover:text-white">Cluster</a> <span class="text-slate-500 text-sm">(6)</span></td><td class="py-3"><div class="flex flex-wrap gap-2"><code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">CLUSTER</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">ASKING</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">READONLY</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">READWRITE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">MIGRATE</code> <code class="px-1.5 py-0.5 rounded bg-white/5 text-slate-300 text-xs font-mono">RESTORE-ASKING</code></div></td></tr>
+                </tbody>
+            </table>
         </div>
     </div>
 
@@ -37,12 +68,14 @@
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-emerald-400">SET</h3>
             <div class="text-sm text-slate-400 mb-3">Set a key to a string value with optional flags and expiry.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SET key value [NX|XX] [GET] [EX seconds | PX milliseconds]</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SET key value [NX|XX] [GET] [EX seconds | PX milliseconds | EXAT unix-seconds | PXAT unix-ms | KEEPTTL]</div>
             <div class="text-xs text-slate-500 mb-3">
                 <span class="text-slate-400">NX</span> &mdash; only set if key does not exist.
                 <span class="text-slate-400">XX</span> &mdash; only set if key exists.
                 <span class="text-slate-400">GET</span> &mdash; return the old value.
                 <span class="text-slate-400">EX/PX</span> &mdash; set TTL in seconds/milliseconds.
+                <span class="text-slate-400">EXAT/PXAT</span> &mdash; expire at a Unix time.
+                <span class="text-slate-400">KEEPTTL</span> &mdash; keep the existing TTL.
             </div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET mykey hello</span></div>
@@ -166,7 +199,7 @@
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-emerald-400">GETDEL / GETEX</h3>
             <div class="text-sm text-slate-400 mb-3">GETDEL returns and deletes the value atomically. GETEX returns value and optionally sets expiry.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">GETDEL key<br>GETEX key [EX seconds | PX milliseconds | PERSIST]</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">GETDEL key<br>GETEX key [EX seconds | PX milliseconds | EXAT unix-seconds | PXAT unix-ms | PERSIST]</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET temp "value"</span></div>
                 <div class="text-white">OK</div>
@@ -191,12 +224,12 @@
                 <div class="text-white">OK</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GETRANGE greeting 0 4</span></div>
                 <div class="text-white">"hello"</div>
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GETRANGE greeting -6 -1</span></div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GETRANGE greeting -5 -1</span></div>
                 <div class="text-white">"world"</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SETRANGE greeting 6 "rust"</span></div>
                 <div class="text-white">(integer) 11</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GET greeting</span></div>
-                <div class="text-white">"hello rust"</div>
+                <div class="text-white">"hello rustd"</div>
             </div>
         </div>
     </div>
@@ -238,8 +271,8 @@
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LPOP tasks</span></div>
                 <div class="text-white">"a"</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPOP tasks 2</span></div>
-                <div class="text-white">1) "d"</div>
-                <div class="text-white">2) "e"</div>
+                <div class="text-white">1) "e"</div>
+                <div class="text-white">2) "d"</div>
             </div>
         </div>
 
@@ -268,7 +301,7 @@
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-cyan-400">LREM / LTRIM / LINSERT / LPOS</h3>
             <div class="text-sm text-slate-400 mb-3">Advanced list manipulation.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">LREM key count value<br>LTRIM key start stop<br>LINSERT key BEFORE|AFTER pivot value<br>LPOS key value</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">LREM key count value<br>LTRIM key start stop<br>LINSERT key BEFORE|AFTER pivot value<br>LPOS key element [RANK rank] [COUNT n] [MAXLEN len]</div>
             <div class="text-xs text-slate-500 mb-3">
                 <span class="text-slate-400">LREM count&gt;0</span> &mdash; remove first N from head.
                 <span class="text-slate-400">count&lt;0</span> &mdash; remove first N from tail.
@@ -289,6 +322,40 @@
                 <div class="text-white">1) "a"</div>
                 <div class="text-white">2) "X"</div>
                 <div class="text-white">3) "c"</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-cyan-400">LMOVE / RPOPLPUSH / LMPOP / LPUSHX / RPUSHX</h3>
+            <div class="text-sm text-slate-400 mb-3">Move an element between lists atomically (across shards too), pop from the first non-empty list, or push only to an existing list.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">LMOVE source destination LEFT|RIGHT LEFT|RIGHT<br>RPOPLPUSH source destination<br>LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]<br>LPUSHX key element [element ...]<br>RPUSHX key element [element ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPUSH jobs j1 j2 j3</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LMOVE jobs inflight LEFT RIGHT</span></div>
+                <div class="text-white">"j1"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LMPOP 2 empty jobs RIGHT COUNT 2</span></div>
+                <div class="text-white">1) "jobs"</div>
+                <div class="text-white">2) 1) "j3"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp;2) "j2"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LPUSHX nolist x</span></div>
+                <div class="text-white">(integer) 0</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-cyan-400">BLPOP / BRPOP / BLMOVE / BRPOPLPUSH / BLMPOP</h3>
+            <div class="text-sm text-slate-400 mb-3">Blocking pops. When every list is empty the client waits up to <code class="text-slate-300">timeout</code> seconds (0 = forever, fractions allowed); clients blocked on the same key are served first come, first served. Inside MULTI or a script they behave like the non-blocking form. <code class="text-slate-300">CLIENT UNBLOCK</code> releases a waiting client.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">BLPOP key [key ...] timeout<br>BRPOP key [key ...] timeout<br>BLMOVE source destination LEFT|RIGHT LEFT|RIGHT timeout<br>BRPOPLPUSH source destination timeout<br>BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT count]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPUSH q task1</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">BLPOP q other 5</span></div>
+                <div class="text-white">1) "q"</div>
+                <div class="text-white">2) "task1"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">BLPOP q 0.1</span></div>
+                <div class="text-white">(nil)</div>
+                <div class="text-slate-500"># with nothing to pop, the client waits; the timeout ends it with nil</div>
             </div>
         </div>
     </div>
@@ -355,7 +422,51 @@
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HSCAN user:1 0</span></div>
                 <div class="text-white">1) "0"</div>
                 <div class="text-white">2) 1) "name"</div>
-                <div class="text-white">3) "Alice"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp;2) "Alice"</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-purple-400">HSTRLEN / HRANDFIELD</h3>
+            <div class="text-sm text-slate-400 mb-3">Length of a field's value; random fields (a negative count may repeat fields).</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">HSTRLEN key field<br>HRANDFIELD key [count [WITHVALUES]]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HSET product name "Widget" sku W-1</span></div>
+                <div class="text-white">(integer) 2</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HSTRLEN product name</span></div>
+                <div class="text-white">(integer) 6</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-purple-400">HEXPIRE / HPEXPIRE / HEXPIREAT / HPEXPIREAT / HTTL / HPTTL / HEXPIRETIME / HPEXPIRETIME / HPERSIST</h3>
+            <div class="text-sm text-slate-400 mb-3">Expiry per hash field (Redis 7.4). Each command takes <code class="text-slate-300">FIELDS numfields field ...</code> and answers one code per field: <code class="text-slate-300">-2</code> no such field, <code class="text-slate-300">0</code> condition not met, <code class="text-slate-300">1</code> set, <code class="text-slate-300">2</code> deleted because the time is already past.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">HEXPIRE key seconds [NX | XX | GT | LT] FIELDS numfields field [field ...]<br>HPEXPIRE key milliseconds [NX | XX | GT | LT] FIELDS numfields field [field ...]<br>HEXPIREAT key unix-seconds [NX | XX | GT | LT] FIELDS numfields field [field ...]<br>HTTL key FIELDS numfields field [field ...]<br>HPERSIST key FIELDS numfields field [field ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HSET session user alice token abc</span></div>
+                <div class="text-white">(integer) 2</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HEXPIRE session 60 FIELDS 2 token missing</span></div>
+                <div class="text-white">1) (integer) 1</div>
+                <div class="text-white">2) (integer) -2</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HTTL session FIELDS 2 token user</span></div>
+                <div class="text-white">1) (integer) 60</div>
+                <div class="text-white">2) (integer) -1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HPERSIST session FIELDS 1 token</span></div>
+                <div class="text-white">1) (integer) 1</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-purple-400">HGETDEL / HGETEX / HSETEX</h3>
+            <div class="text-sm text-slate-400 mb-3">Redis 8's field commands: read and delete, read and set or clear expiry, and set fields with expiry all-or-nothing (<code class="text-slate-300">FNX</code>: none may exist, <code class="text-slate-300">FXX</code>: all must).</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">HGETDEL key FIELDS numfields field [field ...]<br>HGETEX key [EX seconds | PX ms | EXAT unix-seconds | PXAT unix-ms | PERSIST] FIELDS numfields field [field ...]<br>HSETEX key [FNX | FXX] [EX seconds | PX ms | EXAT unix-seconds | PXAT unix-ms | KEEPTTL] FIELDS numfields field value [field value ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HSETEX cart EX 3600 FIELDS 2 item1 2 item2 1</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HGETDEL cart FIELDS 1 item1</span></div>
+                <div class="text-white">1) "2"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">HGETEX cart PERSIST FIELDS 1 item2</span></div>
+                <div class="text-white">1) "1"</div>
             </div>
         </div>
     </div>
@@ -412,6 +523,25 @@
                 <div class="text-white">5) "f"</div>
             </div>
         </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-pink-400">SMISMEMBER / SINTERCARD / SINTERSTORE / SUNIONSTORE / SDIFFSTORE / SSCAN</h3>
+            <div class="text-sm text-slate-400 mb-3">Membership of several members at once, intersection size with an early stop, set algebra stored into a key, and cursor iteration.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SMISMEMBER key member [member ...]<br>SINTERCARD numkeys key [key ...] [LIMIT limit]<br>SINTERSTORE destination key [key ...]<br>SUNIONSTORE destination key [key ...]<br>SDIFFSTORE destination key [key ...]<br>SSCAN key cursor [MATCH pattern] [COUNT count]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SADD {t}a x y z</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SADD {t}b y z w</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SMISMEMBER {t}a x w</span></div>
+                <div class="text-white">1) (integer) 1</div>
+                <div class="text-white">2) (integer) 0</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SINTERCARD 2 {t}a {t}b</span></div>
+                <div class="text-white">(integer) 2</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SINTERSTORE {t}both {t}a {t}b</span></div>
+                <div class="text-white">(integer) 2</div>
+            </div>
+        </div>
     </div>
 
     <!-- ==================== SORTED SETS ==================== -->
@@ -425,7 +555,7 @@
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-orange-400">ZADD / ZREM / ZSCORE / ZRANK / ZREVRANK</h3>
             <div class="text-sm text-slate-400 mb-3">Add scored members and query individual scores/ranks.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">ZADD key [NX|XX] [GT|LT] score member [score member ...]<br>ZREM key member [member ...]<br>ZSCORE key member<br>ZRANK key member<br>ZREVRANK key member</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">ZADD key [NX|XX] [GT|LT] [CH] [INCR] score member [score member ...]<br>ZREM key member [member ...]<br>ZSCORE key member<br>ZRANK key member<br>ZREVRANK key member</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZADD leaderboard 100 alice 200 bob 150 charlie</span></div>
                 <div class="text-white">(integer) 3</div>
@@ -444,7 +574,8 @@
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-orange-400">ZRANGE / ZREVRANGE / ZRANGEBYSCORE</h3>
             <div class="text-sm text-slate-400 mb-3">Range queries by rank or score. Use WITHSCORES to include scores. Use -inf/+inf for open ranges.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">ZRANGE key start stop [WITHSCORES]<br>ZREVRANGE key start stop [WITHSCORES]<br>ZRANGEBYSCORE key min max [LIMIT offset count]</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">ZRANGE key start stop [BYSCORE | BYLEX] [REV] [LIMIT offset count] [WITHSCORES]<br>ZREVRANGE key start stop [WITHSCORES]<br>ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]<br>ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]</div>
+            <div class="text-xs text-slate-500 mb-3">Score bounds accept <span class="text-slate-400">-inf</span>, <span class="text-slate-400">+inf</span> and exclusive <span class="text-slate-400">(</span> bounds, e.g. <span class="text-slate-400">(100</span>. Lex bounds use <span class="text-slate-400">[a</span>, <span class="text-slate-400">(a</span>, <span class="text-slate-400">-</span> and <span class="text-slate-400">+</span>.</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZRANGE leaderboard 0 -1 WITHSCORES</span></div>
                 <div class="text-white">1) "alice"</div>
@@ -515,10 +646,10 @@
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZRANGE result 0 -1 WITHSCORES</span></div>
                 <div class="text-white">1) "a"</div>
                 <div class="text-white">2) "1"</div>
-                <div class="text-white">3) "b"</div>
-                <div class="text-white">4) "3"</div>
-                <div class="text-white">5) "c"</div>
-                <div class="text-white">6) "2"</div>
+                <div class="text-white">3) "c"</div>
+                <div class="text-white">4) "2"</div>
+                <div class="text-white">5) "b"</div>
+                <div class="text-white">6) "3"</div>
             </div>
         </div>
 
@@ -531,9 +662,64 @@
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZSCAN leaderboard 0</span></div>
                 <div class="text-white">1) "0"</div>
                 <div class="text-white">2) 1) "alice"</div>
-                <div class="text-white">3) "100"</div>
-                <div class="text-white">4) "bob"</div>
-                <div class="text-white">5) "200"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp;2) "100"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp;3) "bob"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp;4) "200"</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-orange-400">ZRANGEBYLEX / ZREVRANGEBYLEX / ZLEXCOUNT / ZREMRANGEBYLEX / ZREMRANGEBYRANK</h3>
+            <div class="text-sm text-slate-400 mb-3">Lexicographic ranges over members that share a score, and removal by rank.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">ZRANGEBYLEX key min max [LIMIT offset count]<br>ZREVRANGEBYLEX key max min [LIMIT offset count]<br>ZLEXCOUNT key min max<br>ZREMRANGEBYLEX key min max<br>ZREMRANGEBYRANK key start stop</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZADD names 0 alice 0 bob 0 carol 0 dave</span></div>
+                <div class="text-white">(integer) 4</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZRANGEBYLEX names [b (d</span></div>
+                <div class="text-white">1) "bob"</div>
+                <div class="text-white">2) "carol"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZLEXCOUNT names - +</span></div>
+                <div class="text-white">(integer) 4</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZREMRANGEBYRANK names 0 0</span></div>
+                <div class="text-white">(integer) 1</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-orange-400">BZPOPMIN / BZPOPMAX / ZMPOP / BZMPOP</h3>
+            <div class="text-sm text-slate-400 mb-3">Pop the lowest or highest members, optionally blocking until one is available.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">BZPOPMIN key [key ...] timeout<br>BZPOPMAX key [key ...] timeout<br>ZMPOP numkeys key [key ...] MIN|MAX [COUNT count]<br>BZMPOP timeout numkeys key [key ...] MIN|MAX [COUNT count]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZADD prio 1 low 5 high</span></div>
+                <div class="text-white">(integer) 2</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">BZPOPMAX prio 1</span></div>
+                <div class="text-white">1) "prio"</div>
+                <div class="text-white">2) "high"</div>
+                <div class="text-white">3) "5"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZMPOP 1 prio MIN</span></div>
+                <div class="text-white">1) "prio"</div>
+                <div class="text-white">2) 1) 1) "low"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;2) "1"</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-orange-400">ZUNION / ZINTER / ZDIFF / ZDIFFSTORE / ZINTERCARD / ZRANGESTORE / ZMSCORE / ZRANDMEMBER</h3>
+            <div class="text-sm text-slate-400 mb-3">Set algebra returned directly, stored range queries, several scores at once, and random members.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">ZUNION numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM|MIN|MAX] [WITHSCORES]<br>ZINTER numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM|MIN|MAX] [WITHSCORES]<br>ZDIFF numkeys key [key ...] [WITHSCORES]<br>ZDIFFSTORE destination numkeys key [key ...]<br>ZINTERCARD numkeys key [key ...] [LIMIT limit]<br>ZRANGESTORE dst src min max [BYSCORE | BYLEX] [REV] [LIMIT offset count]<br>ZMSCORE key member [member ...]<br>ZRANDMEMBER key [count [WITHSCORES]]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZADD {z}a 1 x 2 y</span></div>
+                <div class="text-white">(integer) 2</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZADD {z}b 10 y 20 z</span></div>
+                <div class="text-white">(integer) 2</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZINTER 2 {z}a {z}b WITHSCORES</span></div>
+                <div class="text-white">1) "y"</div>
+                <div class="text-white">2) "12"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZMSCORE {z}a x nope</span></div>
+                <div class="text-white">1) "1"</div>
+                <div class="text-white">2) (nil)</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ZRANGESTORE {z}top {z}b 0 0 REV</span></div>
+                <div class="text-white">(integer) 1</div>
             </div>
         </div>
     </div>
@@ -548,7 +734,7 @@
         <!-- XADD / XLEN -->
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XADD / XLEN</h3>
-            <div class="text-sm text-slate-400 mb-3">Append entries to a stream and query its length. Use <code>*</code> for auto-generated IDs. NOMKSTREAM prevents creating a new stream. MAXLEN/MINID trim older entries on write.</div>
+            <div class="text-sm text-slate-400 mb-3">Append entries to a stream and query its length. Use <code class="text-slate-300">*</code> for auto-generated IDs. NOMKSTREAM prevents creating a new stream. MAXLEN/MINID trim older entries on write.</div>
             <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XADD key [NOMKSTREAM] [MAXLEN|MINID [=|~] N] *|id field value [field value ...]<br>XLEN key</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XADD events * user alice action login</span></div>
@@ -566,7 +752,7 @@
         <!-- XRANGE / XREVRANGE -->
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XRANGE / XREVRANGE</h3>
-            <div class="text-sm text-slate-400 mb-3">Query entries by ID range. Use <code>-</code> for minimum and <code>+</code> for maximum. XREVRANGE returns entries in reverse order. COUNT limits results.</div>
+            <div class="text-sm text-slate-400 mb-3">Query entries by ID range. Use <code class="text-slate-300">-</code> for minimum and <code class="text-slate-300">+</code> for maximum. XREVRANGE returns entries in reverse order. COUNT limits results.</div>
             <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XRANGE key start end [COUNT n]<br>XREVRANGE key end start [COUNT n]</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XRANGE events - +</span></div>
@@ -589,7 +775,7 @@
         <!-- XREAD -->
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XREAD</h3>
-            <div class="text-sm text-slate-400 mb-3">Read new entries from one or more streams after the given IDs. Use <code>0-0</code> to read from the beginning. BLOCK is accepted but returns immediately in v1.</div>
+            <div class="text-sm text-slate-400 mb-3">Read new entries from one or more streams after the given IDs. Use <code class="text-slate-300">0-0</code> to read from the beginning. BLOCK is accepted but returns immediately in v1.</div>
             <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XREAD [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XREAD COUNT 2 STREAMS events 0-0</span></div>
@@ -607,7 +793,7 @@
         <!-- XDEL / XTRIM -->
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XDEL / XTRIM</h3>
-            <div class="text-sm text-slate-400 mb-3">Remove specific entries or trim the stream. MAXLEN caps the total number of entries. MINID removes entries below a threshold ID. Use <code>~</code> for approximate trimming.</div>
+            <div class="text-sm text-slate-400 mb-3">Remove specific entries or trim the stream. MAXLEN caps the total number of entries. MINID removes entries below a threshold ID. Use <code class="text-slate-300">~</code> for approximate trimming.</div>
             <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XDEL key id [id ...]<br>XTRIM key MAXLEN|MINID [=|~] N</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XDEL events 1709000000000-0</span></div>
@@ -650,7 +836,7 @@
         <!-- XGROUP CREATE / DESTROY / DELCONSUMER -->
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XGROUP CREATE / DESTROY / DELCONSUMER</h3>
-            <div class="text-sm text-slate-400 mb-3">Manage consumer groups. CREATE attaches a group to a stream starting from a given ID (<code>0</code> = all history, <code>$</code> = new entries only). MKSTREAM creates the stream if it doesn't exist. DELCONSUMER removes a consumer and its pending entries.</div>
+            <div class="text-sm text-slate-400 mb-3">Manage consumer groups. CREATE attaches a group to a stream starting from a given ID (<code class="text-slate-300">0</code> = all history, <code class="text-slate-300">$</code> = new entries only). MKSTREAM creates the stream if it doesn't exist. DELCONSUMER removes a consumer and its pending entries.</div>
             <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XGROUP CREATE key group id|$ [MKSTREAM]<br>XGROUP DESTROY key group<br>XGROUP DELCONSUMER key group consumer</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XGROUP CREATE events workers 0</span></div>
@@ -670,7 +856,7 @@
         <!-- XREADGROUP -->
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XREADGROUP</h3>
-            <div class="text-sm text-slate-400 mb-3">Read entries via a consumer group. Use <code>&gt;</code> to get new undelivered entries. Use <code>0</code> to re-read your own pending entries. Each delivered entry is tracked until acknowledged with XACK.</div>
+            <div class="text-sm text-slate-400 mb-3">Read entries via a consumer group. Use <code class="text-slate-300">&gt;</code> to get new undelivered entries. Use <code class="text-slate-300">0</code> to re-read your own pending entries. Each delivered entry is tracked until acknowledged with XACK.</div>
             <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XREADGROUP GROUP group consumer [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XADD tasks * job build</span></div>
@@ -734,6 +920,21 @@
                 <div class="text-slate-600 text-xs"># Same but filtered to a specific consumer</div>
             </div>
         </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-sky-400">XCLAIM / XAUTOCLAIM / XSETID</h3>
+            <div class="text-sm text-slate-400 mb-3">Recover pending entries from consumers that died: claim given IDs, or scan the pending list for entries idle longer than a threshold. Delivery times and counts survive restarts and reach replicas.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">XCLAIM key group consumer min-idle-time id [id ...] [IDLE ms] [TIME unix-ms] [RETRYCOUNT n] [FORCE] [JUSTID] [LASTID id]<br>XAUTOCLAIM key group consumer min-idle-time start [COUNT count] [JUSTID]<br>XSETID key last-id [ENTRIESADDED n] [MAXDELETEDID id]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XGROUP CREATE orders billing $ MKSTREAM</span></div>
+                <div class="text-white">OK</div>
+                <div class="text-slate-500"># … a consumer reads with XREADGROUP and never acknowledges …</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">XAUTOCLAIM orders billing worker-2 60000 0-0 COUNT 10</span></div>
+                <div class="text-white">1) "0-0"</div>
+                <div class="text-white">2) (empty array)</div>
+                <div class="text-white">3) (empty array)</div>
+            </div>
+        </div>
     </div>
 
     <!-- ==================== KEYS ==================== -->
@@ -764,7 +965,8 @@
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-yellow-400">EXPIRE / PEXPIRE / EXPIREAT / PEXPIREAT / TTL / PTTL / PERSIST / KEYS</h3>
             <div class="text-sm text-slate-400 mb-3">TTL management and key search. EXPIRE/PEXPIRE set relative TTL. EXPIREAT/PEXPIREAT set absolute timestamp.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">EXPIRE key seconds<br>PEXPIRE key milliseconds<br>EXPIREAT key timestamp<br>PEXPIREAT key milliseconds<br>TTL key<br>PTTL key<br>PERSIST key<br>KEYS pattern</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">EXPIRE key seconds [NX | XX | GT | LT]<br>PEXPIRE key milliseconds [NX | XX | GT | LT]<br>EXPIREAT key unix-seconds [NX | XX | GT | LT]<br>PEXPIREAT key unix-ms [NX | XX | GT | LT]<br>EXPIRETIME key<br>PEXPIRETIME key<br>TTL key<br>PTTL key<br>PERSIST key<br>KEYS pattern</div>
+            <div class="text-xs text-slate-500 mb-3"><span class="text-slate-400">NX</span> &mdash; only if the key has no TTL. <span class="text-slate-400">XX</span> &mdash; only if it has one. <span class="text-slate-400">GT/LT</span> &mdash; only if the new TTL is greater/less. A TTL that is zero, negative or in the past deletes the key.</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET temp hello</span></div>
                 <div class="text-white">OK</div>
@@ -781,17 +983,35 @@
 
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-yellow-400">SCAN / RANDOMKEY / OBJECT</h3>
-            <div class="text-sm text-slate-400 mb-3">Key iteration and introspection. SCAN iterates keys without blocking. OBJECT reports internal encoding.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SCAN cursor [MATCH pattern] [COUNT count]<br>RANDOMKEY<br>OBJECT ENCODING key</div>
+            <div class="text-sm text-slate-400 mb-3">Key iteration and introspection. SCAN iterates keys without blocking and returns every key present for the whole iteration; on a multi-shard server the cursor walks shard by shard, so keep calling until it returns "0". SCAN also takes TYPE. OBJECT reports encoding, idle time and frequency.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]<br>RANDOMKEY<br>OBJECT ENCODING|IDLETIME|FREQ|REFCOUNT key</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SCAN 0 MATCH user:* COUNT 100</span></div>
                 <div class="text-white">1) "0"</div>
                 <div class="text-white">2) 1) "user:1"</div>
-                <div class="text-white">3) "user:2"</div>
+                <div class="text-white">&nbsp;&nbsp;&nbsp;2) "user:2"</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RANDOMKEY</span></div>
                 <div class="text-white">"user:1"</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">OBJECT ENCODING mystring</span></div>
                 <div class="text-white">"embstr"</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-yellow-400">COPY / MOVE / TOUCH / SORT / SORT_RO / DUMP / RESTORE</h3>
+            <div class="text-sm text-slate-400 mb-3">Copy or move keys between databases, refresh access time, sort lists/sets/sorted sets, and serialize values. <code class="text-slate-300">DUMP</code> payloads use Redis' format for strings, lists, sets, hashes and sorted sets, so they restore into Redis and back.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">COPY source destination [DB index] [REPLACE]<br>MOVE key db<br>TOUCH key [key ...]<br>SORT key [BY pattern] [LIMIT offset count] [GET pattern ...] [ASC|DESC] [ALPHA] [STORE destination]<br>SORT_RO key [BY pattern] [LIMIT offset count] [GET pattern ...] [ASC|DESC] [ALPHA]<br>DUMP key<br>RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME s] [FREQ f]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">RPUSH nums 3 1 2</span></div>
+                <div class="text-white">(integer) 3</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SORT nums</span></div>
+                <div class="text-white">1) "1"</div>
+                <div class="text-white">2) "2"</div>
+                <div class="text-white">3) "3"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">COPY nums nums-copy</span></div>
+                <div class="text-white">(integer) 1</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">MOVE nums-copy 1</span></div>
+                <div class="text-white">(integer) 1</div>
             </div>
         </div>
     </div>
@@ -804,9 +1024,9 @@
         </h2>
 
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
-            <h3 class="text-xl font-semibold mb-1 font-mono text-red-400">MULTI / EXEC / DISCARD</h3>
-            <div class="text-sm text-slate-400 mb-3">Queue commands with MULTI, then execute atomically with EXEC. All commands between MULTI and EXEC run under a single write lock. DISCARD aborts the transaction.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">MULTI<br>EXEC<br>DISCARD</div>
+            <h3 class="text-xl font-semibold mb-1 font-mono text-red-400">MULTI / EXEC / DISCARD / WATCH / UNWATCH</h3>
+            <div class="text-sm text-slate-400 mb-3">Queue commands with MULTI, then execute atomically with EXEC: the shards of every queued and watched key are locked for the duration, so no other client interleaves. WATCH makes EXEC return nil if a watched key changed (write, expiry, flush) before it ran. A queued command with an unknown name or wrong argument count aborts the transaction with EXECABORT. DISCARD drops the queue and the watches.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">MULTI<br>EXEC<br>DISCARD<br>WATCH key [key ...]<br>UNWATCH</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">MULTI</span></div>
                 <div class="text-white">OK</div>
@@ -870,12 +1090,12 @@
             <h3 class="text-xl font-semibold mb-1 font-mono text-teal-400">Keyspace Notifications</h3>
             <div class="text-sm text-slate-400 mb-3">
                 Enable event-driven notifications when keys are modified, deleted, or expire.
-                Clients subscribe via PSUBSCRIBE to channels like <code>__keyevent@0__:expired</code> or <code>__keyspace@0__:mykey</code>.
-                Disabled by default &mdash; enable with <code>CONFIG SET notify-keyspace-events</code>.
+                Clients subscribe via PSUBSCRIBE to channels like <code class="text-slate-300">__keyevent@0__:expired</code> or <code class="text-slate-300">__keyspace@0__:mykey</code>.
+                Disabled by default &mdash; enable with <code class="text-slate-300">CONFIG SET notify-keyspace-events</code>.
             </div>
             <div class="text-xs text-slate-500 mb-3">
-                <span class="text-slate-400">K</span> &mdash; keyspace events (<code>__keyspace@0__:&lt;key&gt;</code>).
-                <span class="text-slate-400">E</span> &mdash; keyevent events (<code>__keyevent@0__:&lt;event&gt;</code>).
+                <span class="text-slate-400">K</span> &mdash; keyspace events (<code class="text-slate-300">__keyspace@0__:&lt;key&gt;</code>).
+                <span class="text-slate-400">E</span> &mdash; keyevent events (<code class="text-slate-300">__keyevent@0__:&lt;event&gt;</code>).
                 <span class="text-slate-400">g</span> &mdash; generic commands (DEL, EXPIRE, RENAME...).
                 <span class="text-slate-400">$</span> &mdash; string commands.
                 <span class="text-slate-400">l</span> &mdash; list commands.
@@ -916,6 +1136,16 @@
                 </div>
             </div>
         </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-teal-400">SSUBSCRIBE / SUNSUBSCRIBE / SPUBLISH / PUBSUB SHARDCHANNELS / SHARDNUMSUB</h3>
+            <div class="text-sm text-slate-400 mb-3">Sharded pub/sub: channels hash to a slot like keys, so in cluster mode a message only travels to the node that owns it (plain <code class="text-slate-300">PUBLISH</code> reaches every node). Under RESP3 messages arrive as push frames and other commands can run on the same connection.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SSUBSCRIBE shardchannel [shardchannel ...]<br>SUNSUBSCRIBE [shardchannel ...]<br>SPUBLISH shardchannel message<br>PUBSUB SHARDCHANNELS [pattern]<br>PUBSUB SHARDNUMSUB [shardchannel ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SPUBLISH orders:eu "created 42"</span></div>
+                <div class="text-white">(integer) 0</div>
+            </div>
+        </div>
     </div>
 
     <!-- ==================== SCRIPTING ==================== -->
@@ -927,7 +1157,7 @@
 
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
             <h3 class="text-xl font-semibold mb-1 font-mono text-indigo-400">EVAL</h3>
-            <div class="text-sm text-slate-400 mb-3">Execute a Lua script server-side. Scripts receive KEYS and ARGV tables, and can call Redis commands via <code>redis.call()</code> and <code>redis.pcall()</code>.</div>
+            <div class="text-sm text-slate-400 mb-3">Execute a Lua script server-side. Scripts receive KEYS and ARGV tables, and can call Redis commands via <code class="text-slate-300">redis.call()</code> and <code class="text-slate-300">redis.pcall()</code>.</div>
             <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">EVAL script numkeys [key ...] [arg ...]</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">EVAL "return 42" 0</span></div>
@@ -948,7 +1178,7 @@
             <div class="text-sm text-slate-400 mb-3">Execute a cached script by its SHA1 digest. Use SCRIPT LOAD to cache scripts first. Returns NOSCRIPT error if the script is not cached.</div>
             <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">EVALSHA sha1 numkeys [key ...] [arg ...]</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">EVALSHA e0e1f9fabfc9d4800c877a703b823ac0578ff831 0</span></div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">EVALSHA 1b936e3fe509bcbc9cd0664897bbe8fd0cac101b 0</span></div>
                 <div class="text-white">"hello"</div>
             </div>
         </div>
@@ -959,7 +1189,7 @@
             <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SCRIPT LOAD script</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SCRIPT LOAD "return 'hello'"</span></div>
-                <div class="text-white">"e0e1f9fabfc9d4800c877a703b823ac0578ff831"</div>
+                <div class="text-white">"1b936e3fe509bcbc9cd0664897bbe8fd0cac101b"</div>
             </div>
         </div>
 
@@ -968,7 +1198,7 @@
             <div class="text-sm text-slate-400 mb-3">Check if one or more scripts are cached. Returns an array of 1 (cached) or 0 (not cached) for each SHA1.</div>
             <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SCRIPT EXISTS sha1 [sha1 ...]</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SCRIPT EXISTS e0e1f9fabfc9d4800c877a703b823ac0578ff831 0000000000000000000000000000000000000000</span></div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SCRIPT EXISTS 1b936e3fe509bcbc9cd0664897bbe8fd0cac101b 0000000000000000000000000000000000000000</span></div>
                 <div class="text-white">1) (integer) 1</div>
                 <div class="text-white">2) (integer) 0</div>
             </div>
@@ -981,6 +1211,20 @@
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SCRIPT FLUSH</span></div>
                 <div class="text-white">OK</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-indigo-400">EVAL_RO / EVALSHA_RO / SCRIPT KILL / FUNCTION / FCALL / FCALL_RO</h3>
+            <div class="text-sm text-slate-400 mb-3">Read-only script variants, stopping a runaway script, and Redis 7 functions. Scripts run Lua 5.1 with <code class="text-slate-300">cjson</code>, <code class="text-slate-300">cmsgpack</code>, <code class="text-slate-300">bit</code> and <code class="text-slate-300">struct</code>; globals and libraries are read-only. A script running past <code class="text-slate-300">--busy-reply-threshold</code> makes other clients get <code class="text-slate-300">-BUSY</code>. Function libraries are stored in snapshots and the log, and replicated.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">EVAL_RO script numkeys [key ...] [arg ...]<br>EVALSHA_RO sha1 numkeys [key ...] [arg ...]<br>SCRIPT LOAD | EXISTS | FLUSH [ASYNC|SYNC] | KILL<br>FUNCTION LOAD [REPLACE] code | DELETE name | FLUSH | LIST [LIBRARYNAME p] [WITHCODE] | DUMP | RESTORE payload | STATS | KILL<br>FCALL function numkeys [key ...] [arg ...]<br>FCALL_RO function numkeys [key ...] [arg ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">EVAL "return cjson.encode({ok=true})" 0</span></div>
+                <div class="text-white">"{\"ok\":true}"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">FUNCTION LOAD "#!lua name=util\nredis.register_function('hello', function() return 'hi' end)"</span></div>
+                <div class="text-white">"util"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">FCALL hello 0</span></div>
+                <div class="text-white">"hi"</div>
             </div>
         </div>
     </div>
@@ -1049,6 +1293,25 @@
                 <div class="text-white">(integer) 1</div>
                 <div><span class="text-slate-500">&gt;</span> <span class="text-amber-400">BITOP NOT negated k1</span></div>
                 <div class="text-white">(integer) 1</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-amber-400">BITPOS / BITFIELD / BITFIELD_RO / LCS</h3>
+            <div class="text-sm text-slate-400 mb-3">Find the first set or clear bit, treat a string as an array of integers of any width, and longest common subsequence of two strings.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">BITPOS key bit [start [end [BYTE | BIT]]]<br>BITFIELD key [GET type offset] [SET type offset value] [INCRBY type offset increment] [OVERFLOW WRAP|SAT|FAIL] ...<br>BITFIELD_RO key GET type offset [GET type offset ...]<br>LCS key1 key2 [LEN] [IDX] [MINMATCHLEN n] [WITHMATCHLEN]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SETBIT flags 9 1</span></div>
+                <div class="text-white">(integer) 0</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">BITPOS flags 1</span></div>
+                <div class="text-white">(integer) 9</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">BITFIELD counters INCRBY u8 0 200 INCRBY u8 0 100</span></div>
+                <div class="text-white">1) (integer) 200</div>
+                <div class="text-white">2) (integer) 44</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">MSET {l}a ohmytext {l}b mynewtext</span></div>
+                <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">LCS {l}a {l}b</span></div>
+                <div class="text-white">"mytext"</div>
             </div>
         </div>
     </div>
@@ -1254,54 +1517,104 @@
                 <div class="text-white">(integer) 2</div>
             </div>
         </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-teal-400">GEORADIUS / GEORADIUSBYMEMBER / GEORADIUS_RO / GEORADIUSBYMEMBER_RO</h3>
+            <div class="text-sm text-slate-400 mb-3">The pre-6.2 radius queries, kept for older clients; <code class="text-slate-300">GEOSEARCH</code> is the modern form.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">GEORADIUS key longitude latitude radius m|km|ft|mi [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT n [ANY]] [ASC|DESC] [STORE key] [STOREDIST key]<br>GEORADIUSBYMEMBER key member radius m|km|ft|mi [...same options]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GEOADD sicily 13.361389 38.115556 Palermo 15.087269 37.502669 Catania</span></div>
+                <div class="text-white">(integer) 2</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">GEORADIUS sicily 15 37 200 km ASC</span></div>
+                <div class="text-white">1) "Catania"</div>
+                <div class="text-white">2) "Palermo"</div>
+            </div>
+        </div>
     </div>
 
     <div id="server">
         <h2 class="text-3xl font-bold mb-8 flex items-center gap-3">
             <span class="w-10 h-10 rounded-xl bg-slate-500/20 flex items-center justify-center text-lg font-bold text-slate-400">*</span>
-            Server
+            Server, persistence, replication &amp; cluster
         </h2>
 
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
-            <h3 class="text-xl font-semibold mb-1 font-mono text-slate-400">PING / ECHO / QUIT / SELECT / DBSIZE / FLUSHDB / FLUSHALL / INFO / COMMAND / CONFIG / TIME / CLIENT / RESET / SAVE / BGSAVE / ROLE / REPLICAOF</h3>
-            <div class="text-sm text-slate-400 mb-3">Server management, diagnostics, persistence, and replication.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">PING [message]<br>ECHO message<br>QUIT<br>RESET<br>SELECT db (0-15)<br>DBSIZE<br>FLUSHDB<br>FLUSHALL<br>INFO [section]<br>COMMAND [DOCS|COUNT]<br>CONFIG GET pattern<br>TIME<br>CLIENT SETNAME name<br>CLIENT GETNAME<br>CLIENT ID<br>SAVE<br>BGSAVE<br>ROLE<br>REPLICAOF host port<br>REPLICAOF NO ONE</div>
+            <h3 class="text-xl font-semibold mb-1 font-mono text-slate-400">PING / ECHO / AUTH / HELLO / QUIT / RESET / SELECT / CLIENT</h3>
+            <div class="text-sm text-slate-400 mb-3">Connection commands. <code class="text-slate-300">HELLO 3</code> switches the connection to RESP3. <code class="text-slate-300">CLIENT</code> covers <code class="text-slate-300">ID</code>, <code class="text-slate-300">SETNAME</code>/<code class="text-slate-300">GETNAME</code>, <code class="text-slate-300">SETINFO</code>, <code class="text-slate-300">LIST</code>, <code class="text-slate-300">INFO</code>, <code class="text-slate-300">KILL</code> (by <code class="text-slate-300">ID</code>, <code class="text-slate-300">ADDR</code>, <code class="text-slate-300">TYPE</code>, <code class="text-slate-300">USER</code>, <code class="text-slate-300">MAXAGE</code>), <code class="text-slate-300">PAUSE</code>/<code class="text-slate-300">UNPAUSE</code>, <code class="text-slate-300">UNBLOCK</code>, <code class="text-slate-300">REPLY</code>, <code class="text-slate-300">NO-EVICT</code>, <code class="text-slate-300">NO-TOUCH</code>, <code class="text-slate-300">TRACKING</code>, <code class="text-slate-300">CACHING</code>, <code class="text-slate-300">TRACKINGINFO</code> and <code class="text-slate-300">GETREDIR</code>.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">PING [message]<br>ECHO message<br>AUTH [username] password<br>HELLO [protover [AUTH username password] [SETNAME name]]<br>QUIT<br>RESET<br>SELECT index (0 … --databases − 1)<br>CLIENT subcommand [arguments]</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
                 <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">PING</span></div>
                 <div class="text-white">PONG</div>
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ROLE</span></div>
-                <div class="text-white">1) "master"</div>
-                <div class="text-white">2) "0"</div>
-                <div class="text-white">3) </div>
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">REPLICAOF 127.0.0.1 6379</span></div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">CLIENT SETNAME worker-1</span></div>
                 <div class="text-white">OK</div>
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ROLE</span></div>
-                <div class="text-white">1) "slave"</div>
-                <div class="text-white">2) "127.0.0.1:6379"</div>
-                <div class="text-white">3) "connect"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">CLIENT GETNAME</span></div>
+                <div class="text-white">"worker-1"</div>
             </div>
         </div>
 
-        <!-- Cluster -->
         <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
-            <h3 class="text-xl font-semibold mb-1 font-mono text-slate-400">CLUSTER INFO / NODES / SLOTS / MEET / ADDSLOTS / DELSLOTS / KEYSLOT</h3>
-            <div class="text-sm text-slate-400 mb-3">Redis Cluster-compatible commands for sharding and node management.</div>
-            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">CLUSTER INFO<br>CLUSTER NODES<br>CLUSTER SLOTS<br>CLUSTER MEET ip port<br>CLUSTER ADDSLOTS slot [slot...]<br>CLUSTER DELSLOTS slot [slot...]<br>CLUSTER KEYSLOT key</div>
+            <h3 class="text-xl font-semibold mb-1 font-mono text-slate-400">INFO / CONFIG / COMMAND / DBSIZE / FLUSHDB / FLUSHALL / SWAPDB / TIME / ACL / SLOWLOG / LATENCY / MEMORY / MONITOR / DEBUG</h3>
+            <div class="text-sm text-slate-400 mb-3">Administration and diagnostics. <code class="text-slate-300">INFO</code> has every Redis section, including <code class="text-slate-300">commandstats</code> and <code class="text-slate-300">errorstats</code>. <code class="text-slate-300">CONFIG SET</code> changes the runtime-mutable parameters and <code class="text-slate-300">CONFIG REWRITE</code> writes them back to the config file. <code class="text-slate-300">DEBUG</code> is off unless the server runs with <code class="text-slate-300">--enable-debug-command</code>.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">INFO [section ...]<br>CONFIG GET pattern [pattern ...] | SET param value [...] | REWRITE | RESETSTAT<br>COMMAND [COUNT | INFO name ... | DOCS | LIST | GETKEYS ...]<br>DBSIZE<br>FLUSHDB [ASYNC|SYNC]<br>FLUSHALL [ASYNC|SYNC]<br>SWAPDB index1 index2<br>TIME<br>ACL SETUSER | GETUSER | DELUSER | LIST | USERS | WHOAMI | CAT | GENPASS | LOG | DRYRUN | SAVE | LOAD<br>SLOWLOG GET [count] | LEN | RESET<br>LATENCY LATEST | HISTORY event | RESET | DOCTOR<br>MEMORY USAGE key | STATS | DOCTOR<br>MONITOR</div>
             <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">CLUSTER INFO</span></div>
-                <div class="text-white">cluster_state:ok</div>
-                <div class="text-white">cluster_slots_assigned:16384</div>
-                <div class="text-white">...</div>
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">CLUSTER NODES</span></div>
-                <div class="text-white">node_id 127.0.0.1@7000 myself,master - 0-16383</div>
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">CLUSTER KEYSLOT mykey</span></div>
-                <div class="text-white">(integer) 12591</div>
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">CLUSTER MEET 127.0.0.1 7001</span></div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ACL WHOAMI</span></div>
+                <div class="text-white">"default"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">CONFIG GET maxmemory</span></div>
+                <div class="text-white">1) "maxmemory"</div>
+                <div class="text-white">2) "0"</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ACL SETUSER reader on &gt;secret ~cache:* +get +mget</span></div>
                 <div class="text-white">OK</div>
-                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">CLUSTER ADDSLOTS 0 5000</span></div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">SET k v</span></div>
                 <div class="text-white">OK</div>
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">MEMORY USAGE k</span></div>
+                <div class="text-white">(integer) 66</div>
             </div>
         </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-slate-400">SAVE / BGSAVE / BGREWRITEAOF / LASTSAVE / SHUTDOWN</h3>
+            <div class="text-sm text-slate-400 mb-3">Persistence. <code class="text-slate-300">BGSAVE</code> and <code class="text-slate-300">BGREWRITEAOF</code> return at once and work in the background; <code class="text-slate-300">SAVE</code> blocks the caller only. <code class="text-slate-300">SHUTDOWN</code> stops writes, fsyncs the log and snapshots unless <code class="text-slate-300">NOSAVE</code>. See <a href="/docs/persistence" class="text-indigo-400 hover:text-white">Persistence</a>.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">SAVE<br>BGSAVE<br>BGREWRITEAOF<br>LASTSAVE<br>SHUTDOWN [NOSAVE | SAVE]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">BGSAVE</span></div>
+                <div class="text-white">Background saving started</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-slate-400">REPLICAOF / ROLE / WAIT</h3>
+            <div class="text-sm text-slate-400 mb-3">Replication. A replica does a full resynchronization, then follows the master's stream and resumes with a partial resync after a disconnect. <code class="text-slate-300">WAIT</code> blocks until that many replicas acknowledged the client's writes. See <a href="/docs/clustering" class="text-indigo-400 hover:text-white">Replication &amp; Cluster</a>.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">REPLICAOF host port<br>REPLICAOF NO ONE<br>ROLE<br>WAIT numreplicas timeout-ms</div>
+            <div class="text-xs text-slate-500 mb-3">On a replica, <span class="text-slate-400">ROLE</span> returns <span class="text-slate-400">"slave"</span>, the master's host and port, the link state (<span class="text-slate-400">connected</span>) and the replication offset.</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div><span class="text-slate-500">&gt;</span> <span class="text-emerald-400">ROLE</span></div>
+                <div class="text-white">1) "master"</div>
+                <div class="text-white">2) (integer) 0</div>
+                <div class="text-white">3) (empty array)</div>
+            </div>
+        </div>
+
+        <div class="mb-8 p-6 rounded-xl bg-white/5 border border-white/10">
+            <h3 class="text-xl font-semibold mb-1 font-mono text-slate-400">CLUSTER / ASKING / READONLY / READWRITE / MIGRATE</h3>
+            <div class="text-sm text-slate-400 mb-3">Redis Cluster protocol (with <code class="text-slate-300">--cluster-enabled</code>). <code class="text-slate-300">CLUSTER</code> subcommands: <code class="text-slate-300">INFO</code>, <code class="text-slate-300">NODES</code>, <code class="text-slate-300">SLOTS</code>, <code class="text-slate-300">SHARDS</code>, <code class="text-slate-300">MYID</code>, <code class="text-slate-300">MYSHARDID</code>, <code class="text-slate-300">KEYSLOT</code>, <code class="text-slate-300">COUNTKEYSINSLOT</code>, <code class="text-slate-300">GETKEYSINSLOT</code>, <code class="text-slate-300">MEET</code>, <code class="text-slate-300">FORGET</code>, <code class="text-slate-300">ADDSLOTS</code>, <code class="text-slate-300">ADDSLOTSRANGE</code>, <code class="text-slate-300">DELSLOTS</code>, <code class="text-slate-300">DELSLOTSRANGE</code>, <code class="text-slate-300">FLUSHSLOTS</code>, <code class="text-slate-300">SETSLOT</code> (<code class="text-slate-300">IMPORTING</code>/<code class="text-slate-300">MIGRATING</code>/<code class="text-slate-300">STABLE</code>/<code class="text-slate-300">NODE</code>), <code class="text-slate-300">REPLICATE</code>, <code class="text-slate-300">REPLICAS</code>, <code class="text-slate-300">FAILOVER [FORCE|TAKEOVER]</code>, <code class="text-slate-300">RESET</code>, <code class="text-slate-300">SAVECONFIG</code>, <code class="text-slate-300">BUMPEPOCH</code>, <code class="text-slate-300">SET-CONFIG-EPOCH</code>, <code class="text-slate-300">COUNT-FAILURE-REPORTS</code>, <code class="text-slate-300">LINKS</code>.</div>
+            <div class="font-mono text-sm text-slate-300 bg-slate-900 rounded-lg px-4 py-2 mb-4">CLUSTER subcommand [arguments]<br>ASKING<br>READONLY<br>READWRITE<br>MIGRATE host port key|"" destination-db timeout [COPY] [REPLACE] [AUTH password | AUTH2 username password] [KEYS key ...]</div>
+            <div class="font-mono text-sm bg-slate-900 rounded-lg p-4">
+                <div class="text-slate-500"># On node 127.0.0.1:7000 of a three-master cluster</div>
+                <div><span class="text-slate-500">127.0.0.1:7000&gt;</span> <span class="text-emerald-400">CLUSTER KEYSLOT mykey</span></div>
+                <div class="text-white">(integer) 14687</div>
+                <div><span class="text-slate-500">127.0.0.1:7000&gt;</span> <span class="text-emerald-400">GET mykey</span></div>
+                <div class="text-white">(error) MOVED 14687 127.0.0.1:7002</div>
+                <div><span class="text-slate-500">127.0.0.1:7000&gt;</span> <span class="text-emerald-400">MSET a 1 b 2</span></div>
+                <div class="text-white">(error) CROSSSLOT Keys in request don't hash to the same slot</div>
+                <div><span class="text-slate-500">127.0.0.1:7000&gt;</span> <span class="text-emerald-400">CLUSTER INFO</span></div>
+                <div class="text-white">cluster_state:ok</div>
+                <div class="text-white">cluster_slots_assigned:16384</div>
+                <div class="text-white">cluster_known_nodes:6</div>
+                <div class="text-white">cluster_size:3</div>
+                <div class="text-white">...</div>
+            </div>
+        </div>
+
     </div>
 
     <!-- WRONGTYPE note -->
