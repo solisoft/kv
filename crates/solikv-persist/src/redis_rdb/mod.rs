@@ -51,10 +51,14 @@ const TYPE_LIST_QUICKLIST_2: u8 = 18;
 const TYPE_STREAM_LISTPACKS_2: u8 = 19;
 const TYPE_SET_LISTPACK: u8 = 20;
 const TYPE_STREAM_LISTPACKS_3: u8 = 21;
-const TYPE_HASH_FIELD_EXPIRY_LISTPACK: u8 = 22;
-const TYPE_HASH_FIELD_EXPIRY_HT: u8 = 23;
-const TYPE_HASH_FIELD_EXPIRY_LISTPACK_EX: u8 = 24;
-const TYPE_HASH_FIELD_EXPIRY_HT_EX: u8 = 25;
+/// Hashes with field expiry (Redis 7.4, `rdb.h`): `[ttl][field][value]`
+/// tuples, the ttl absolute (`_PRE_GA`, 7.4 release candidates) or relative
+/// to a minimum written first; or a listpack of `field, value, ttl` triplets
+/// (ttl absolute, 0 for none), after that minimum in the GA form.
+pub(crate) const TYPE_HASH_METADATA_PRE_GA: u8 = 22;
+pub(crate) const TYPE_HASH_LISTPACK_EX_PRE_GA: u8 = 23;
+pub(crate) const TYPE_HASH_METADATA: u8 = 24;
+pub(crate) const TYPE_HASH_LISTPACK_EX: u8 = 25;
 const TYPE_STREAM_LISTPACKS_4: u8 = 26;
 
 /// Statistics from a Redis RDB import.
@@ -398,6 +402,54 @@ pub(crate) fn read_value<R: io::Read>(
             let set: SetValue = entries.into_iter().collect();
             Ok(Some(RedisValue::set(set)))
         }
+        TYPE_HASH_METADATA | TYPE_HASH_METADATA_PRE_GA => {
+            let min = if type_code == TYPE_HASH_METADATA {
+                Some(read_ms_time(reader)?)
+            } else {
+                None
+            };
+            let len = reader.read_length()?;
+            let mut fields = Vec::with_capacity(len.min(parser::MAX_PREALLOC));
+            for _ in 0..len {
+                let ttl = reader.read_length()? as u64;
+                let at = match (ttl, min) {
+                    (0, _) => None,
+                    // Relative to the minimum, plus one (0 means none).
+                    (t, Some(m)) => Some(
+                        (t - 1)
+                            .checked_add(m)
+                            .ok_or_else(|| invalid_data("hash field expiry out of range"))?,
+                    ),
+                    (t, None) => Some(t),
+                };
+                let field = reader.read_string()?;
+                let value = reader.read_string()?;
+                fields.push((field, value, at));
+            }
+            Ok(hash_with_ttls(fields))
+        }
+        TYPE_HASH_LISTPACK_EX | TYPE_HASH_LISTPACK_EX_PRE_GA => {
+            if type_code == TYPE_HASH_LISTPACK_EX {
+                // The minimum deadline: Redis keeps it for later use only.
+                read_ms_time(reader)?;
+            }
+            let blob = reader.read_string_raw()?;
+            let entries = listpack::decode_listpack(&blob)?;
+            if entries.len() % 3 != 0 {
+                return Err(invalid_data(
+                    "HASH_LISTPACK_EX: entries are not field/value/ttl triplets",
+                ));
+            }
+            let mut fields = Vec::with_capacity(entries.len() / 3);
+            for t in entries.as_chunks::<3>().0 {
+                let ttl: u64 = std::str::from_utf8(&t[2])
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| invalid_data("HASH_LISTPACK_EX: bad ttl"))?;
+                fields.push((t[0].clone(), t[1].clone(), (ttl != 0).then_some(ttl)));
+            }
+            Ok(hash_with_ttls(fields))
+        }
         // Unsupported types — skip and warn
         TYPE_MODULE_OLD
         | TYPE_MODULE_2
@@ -405,11 +457,7 @@ pub(crate) fn read_value<R: io::Read>(
         | TYPE_STREAM_LISTPACKS
         | TYPE_STREAM_LISTPACKS_2
         | TYPE_STREAM_LISTPACKS_3
-        | TYPE_STREAM_LISTPACKS_4
-        | TYPE_HASH_FIELD_EXPIRY_LISTPACK
-        | TYPE_HASH_FIELD_EXPIRY_HT
-        | TYPE_HASH_FIELD_EXPIRY_LISTPACK_EX
-        | TYPE_HASH_FIELD_EXPIRY_HT_EX => {
+        | TYPE_STREAM_LISTPACKS_4 => {
             tracing::warn!(
                 "Skipping unsupported Redis type {} ({})",
                 type_code,
@@ -423,6 +471,35 @@ pub(crate) fn read_value<R: io::Read>(
             format!("unknown Redis value type code: {type_code}"),
         )),
     }
+}
+
+fn invalid_data(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+}
+
+/// A millisecond time as `rdbSaveMillisecondTime` writes it (i64 LE).
+fn read_ms_time<R: io::Read>(reader: &mut RdbReader<R>) -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf)?;
+    Ok(i64::from_le_bytes(buf).max(0) as u64)
+}
+
+/// A hash from `(field, value, deadline)`s, leaving out fields already
+/// due, as Redis does when it loads them; `None` when none is left (Redis
+/// treats that as an empty key).
+fn hash_with_ttls(fields: Vec<(Bytes, Bytes, Option<u64>)>) -> Option<RedisValue> {
+    let now = solikv_core::now_millis();
+    let mut hash = HashValue::with_capacity(fields.len());
+    for (field, value, at) in fields {
+        if at.is_some_and(|at| at <= now) {
+            continue;
+        }
+        hash.insert(field.clone(), value);
+        if let Some(at) = at {
+            hash.set_field_ttl(&field, at);
+        }
+    }
+    (!hash.is_empty()).then(|| RedisValue::hash(hash))
 }
 
 /// Skip over the value data for a given type code without converting it.
@@ -498,22 +575,6 @@ fn skip_value<R: io::Read>(reader: &mut RdbReader<R>, type_code: u8) -> io::Resu
                 io::ErrorKind::Unsupported,
                 "MODULE_OLD (type 6) cannot be skipped — the data format is unknown",
             ));
-        }
-        // Hash with field expiry
-        TYPE_HASH_FIELD_EXPIRY_LISTPACK | TYPE_HASH_FIELD_EXPIRY_LISTPACK_EX => {
-            // Single listpack blob + minimum-expiry (u64 LE)
-            reader.read_string_raw()?;
-            reader.skip(8)?;
-        }
-        TYPE_HASH_FIELD_EXPIRY_HT | TYPE_HASH_FIELD_EXPIRY_HT_EX => {
-            // length + (field string + value string + expiry_ms u64)* + minimum-expiry (u64 LE)
-            let len = reader.read_length()?;
-            for _ in 0..len {
-                reader.read_string_raw()?; // field
-                reader.read_string_raw()?; // value
-                reader.skip(8)?; // field expiry timestamp
-            }
-            reader.skip(8)?; // minimum expiry
         }
         _ => {
             return Err(io::Error::new(

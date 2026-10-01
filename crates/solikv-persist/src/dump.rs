@@ -6,9 +6,13 @@
 //! Strings, lists, sets, hashes and sorted sets are written in encodings
 //! every Redis since 2.x loads, and anything a Redis 7.x `DUMP` produces for
 //! them is read back (listpacks, quicklists, intsets, ziplists, via the RDB
-//! importer). Streams, HyperLogLogs and bloom filters, whose layouts differ
-//! from Redis', use a private type byte: they round-trip between SoliKV
-//! servers, and Redis refuses them as it refuses any unknown type.
+//! importer). A hash with field expiry goes out as Redis 7.4 writes one
+//! (`RDB_TYPE_HASH_METADATA`, RDB version 12), and Redis 7.4's forms of it
+//! are read, release-candidate ones included. Streams, HyperLogLogs and
+//! bloom filters, whose layouts differ from Redis', use a private type
+//! byte: they round-trip between SoliKV servers, and Redis refuses them as
+//! it refuses any unknown type (as it does the private form SoliKV used
+//! for hashes with field expiry before, still accepted here).
 
 use bytes::Bytes;
 
@@ -21,6 +25,7 @@ const TYPE_LIST: u8 = 1;
 const TYPE_SET: u8 = 2;
 const TYPE_HASH: u8 = 4;
 const TYPE_ZSET_2: u8 = 5;
+const TYPE_HASH_METADATA: u8 = crate::redis_rdb::TYPE_HASH_METADATA;
 /// SoliKV's own encoding (`crate::rdb::encode_entry`) of other values.
 const TYPE_SOLIKV: u8 = 0xF0;
 
@@ -29,6 +34,9 @@ const TYPE_SOLIKV: u8 = 0xF0;
 const DUMP_RDB_VERSION: u16 = 9;
 /// Newest RDB version accepted (Redis 7.4 writes 12).
 const MAX_RDB_VERSION: u16 = 12;
+/// The version a hash with field expiry is written with: the first whose
+/// Redis loads `RDB_TYPE_HASH_METADATA` (7.4).
+const HFE_RDB_VERSION: u16 = 12;
 
 /// Why a payload was refused (Redis' two errors).
 #[derive(Debug, PartialEq, Eq)]
@@ -88,6 +96,7 @@ fn write_str(out: &mut Vec<u8>, s: &[u8]) {
 /// The `DUMP` payload of a value.
 pub fn dump(value: &RedisValue) -> Vec<u8> {
     let mut out = Vec::new();
+    let mut version = DUMP_RDB_VERSION;
     match value {
         RedisValue::String(s) => {
             out.push(TYPE_STRING);
@@ -107,13 +116,26 @@ pub fn dump(value: &RedisValue) -> Vec<u8> {
                 write_str(&mut out, e);
             }
         }
-        // A hash with field expiry goes out in SoliKV's own encoding (below),
-        // which keeps the expiries: a payload Redis would misread is worse
-        // than one it refuses.
         RedisValue::Hash(h) if !h.has_field_ttls() => {
             out.push(TYPE_HASH);
             write_len(&mut out, h.len());
             for (f, v) in h.iter() {
+                write_str(&mut out, f);
+                write_str(&mut out, v);
+            }
+        }
+        // As Redis 7.4's `rdbSaveObject`: the earliest deadline (i64 LE ms),
+        // the field count, then per field its deadline relative to that
+        // earliest one plus one (0: none), the field and the value.
+        RedisValue::Hash(h) => {
+            version = HFE_RDB_VERSION;
+            let min = h.field_ttls().map(|(_, at)| at).min().unwrap_or(0);
+            out.push(TYPE_HASH_METADATA);
+            out.extend_from_slice(&(min as i64).to_le_bytes());
+            write_len(&mut out, h.len());
+            for (f, v) in h.iter() {
+                let ttl = h.field_ttl(f).map_or(0, |at| at - min + 1);
+                write_len(&mut out, ttl as usize);
                 write_str(&mut out, f);
                 write_str(&mut out, v);
             }
@@ -131,7 +153,7 @@ pub fn dump(value: &RedisValue) -> Vec<u8> {
             out.extend_from_slice(&crate::rdb::encode_entry(&KeyEntry::new(other.clone())));
         }
     }
-    out.extend_from_slice(&DUMP_RDB_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     let crc = crc64(0, &out);
     out.extend_from_slice(&crc.to_le_bytes());
     out
@@ -211,5 +233,59 @@ mod tests {
         assert_eq!(restore(&bad).unwrap_err(), RestoreError::VersionOrChecksum);
         let big = dump_string(&vec![b'x'; 70_000]);
         assert!(matches!(restore(&big), Ok(RedisValue::String(s)) if s.len() == 70_000));
+    }
+
+    /// `HSET h f0 v0 f1 v1 f2 v2`, `HPEXPIREAT h 4102444800000 FIELDS 1 f0`,
+    /// `HPEXPIREAT h 4102444805000 FIELDS 1 f2`, then `DUMP h` on Redis 7.4.2:
+    /// a listpack-ex hash (type 25, RDB 12).
+    #[test]
+    fn a_redis_7_4_hash_with_field_expiry_restores() {
+        let redis: &[u8] = b"\x19\x00\xd8\xc3\x2c\xbb\x03\x00\x00\x35\x35\x00\x00\x00\x09\x00\x82\x66\x30\x03\x82\x76\x30\x03\xf4\x00\xd8\xc3\x2c\xbb\x03\x00\x00\x09\x82\x66\x32\x03\x82\x76\x32\x03\xf4\x88\xeb\xc3\x2c\xbb\x03\x00\x00\x09\x82\x66\x31\x03\x82\x76\x31\x03\x00\x01\xff\x0c\x00\xa4\x4e\xa7\xe3\x80\x23\xc5\xb7";
+        assert_eq!(redis[0], 25);
+        match restore(redis) {
+            Ok(RedisValue::Hash(h)) => {
+                assert_eq!(h.len(), 3);
+                assert_eq!(h.get(b"f1".as_slice()).map(|v| &v[..]), Some(&b"v1"[..]));
+                assert_eq!(h.field_ttl(b"f0"), Some(4_102_444_800_000));
+                assert_eq!(h.field_ttl(b"f1"), None);
+                assert_eq!(h.field_ttl(b"f2"), Some(4_102_444_805_000));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A hash with field expiry goes out as Redis 7.4 writes it (type 24,
+    /// RDB 12) and comes back with its deadlines; fields already due are
+    /// left out, as Redis does, and a hash left empty is refused.
+    #[test]
+    fn hashes_with_field_expiry_use_redis_7_4s_layout() {
+        let far = solikv_core::now_millis() + 3_600_000;
+        let mut h = solikv_core::types::HashValue::with_capacity(3);
+        for (f, v) in [("a", "1"), ("b", "2"), ("c", "3")] {
+            h.insert(Bytes::from(f), Bytes::from(v));
+        }
+        h.set_field_ttl(&Bytes::from("a"), far);
+        h.set_field_ttl(&Bytes::from("c"), far + 5_000);
+        let p = dump(&RedisValue::hash(h));
+        assert_eq!(p[0], TYPE_HASH_METADATA);
+        assert_eq!(&p[p.len() - 10..p.len() - 8], &12u16.to_le_bytes());
+        match restore(&p) {
+            Ok(RedisValue::Hash(h)) => {
+                assert_eq!(h.len(), 3);
+                assert_eq!(h.field_ttl(b"a"), Some(far));
+                assert_eq!(h.field_ttl(b"b"), None);
+                assert_eq!(h.field_ttl(b"c"), Some(far + 5_000));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Due fields are dropped; nothing left: refused.
+        let mut h = solikv_core::types::HashValue::with_capacity(1);
+        h.insert(Bytes::from("gone"), Bytes::from("x"));
+        h.set_field_ttl(&Bytes::from("gone"), 1);
+        assert_eq!(
+            restore(&dump(&RedisValue::hash(h))).unwrap_err(),
+            RestoreError::BadData
+        );
     }
 }
