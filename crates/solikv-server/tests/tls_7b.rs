@@ -592,3 +592,147 @@ fn the_cluster_bus_forms_over_tls_and_refuses_a_foreign_ca() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// Cluster dump / restore
+// ---------------------------------------------------------------------------
+
+/// `--cluster-dump`/`--cluster-restore` run as a one-shot process.
+fn dump_tool(args: &[String]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_solikv"))
+        .args(args)
+        .output()
+        .expect("run solikv dump tool")
+}
+
+#[test]
+fn cluster_dump_and_restore_over_tls() {
+    watchdog(180);
+    let dir = TmpDir::new("tls-dump");
+    let p = pki(&dir.0, "a");
+    let foreign = pki(&dir.0, "foreign");
+    let node_dir = TmpDir::new("tls-dump-node");
+    let port = next_port();
+    let _n = start_tls(&node_dir.0, port, &cluster_args(&p), p.client(true));
+    let c = p.client(true);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        assert_eq!(
+            one(port, c.clone(), &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"])
+                .await
+                .unwrap(),
+            "+OK\r\n"
+        );
+        wait_for(Duration::from_secs(20), async || {
+            one(port, c.clone(), &["SET", "dump:s", "hello"])
+                .await
+                .map(|r| r == "+OK\r\n")
+                .unwrap_or(false)
+        })
+        .await;
+        one(port, c.clone(), &["RPUSH", "dump:l", "a", "b"])
+            .await
+            .unwrap();
+        one(port, c.clone(), &["HSET", "dump:h", "f", "v"])
+            .await
+            .unwrap();
+        one(port, c.clone(), &["XADD", "dump:x", "*", "f", "v"])
+            .await
+            .unwrap();
+        one(
+            port,
+            c.clone(),
+            &["SET", "dump:t", "a\r\nb", "PX", "600000"],
+        )
+        .await
+        .unwrap();
+    });
+
+    let connect = format!("127.0.0.1:{port}");
+    let out_file = dir.0.join("cluster.jsonl");
+    let base = |pki: &Pki, file: &Path, verb: &str| {
+        let mut a = vec![
+            verb.to_string(),
+            file.display().to_string(),
+            "--cluster-connect".into(),
+            connect.clone(),
+        ];
+        a.extend(pki.flags());
+        a
+    };
+
+    // In clear against a TLS port: refused (the node never answers RESP).
+    let clear = dump_tool(&[
+        "--cluster-dump".into(),
+        dir.0.join("clear.jsonl").display().to_string(),
+        "--cluster-connect".into(),
+        connect.clone(),
+    ]);
+    assert!(
+        !clear.status.success(),
+        "a clear dump of a TLS node succeeded"
+    );
+
+    // A certificate from another CA: the handshake fails both ways.
+    let wrong = dump_tool(&base(
+        &foreign,
+        &dir.0.join("wrong.jsonl"),
+        "--cluster-dump",
+    ));
+    assert!(!wrong.status.success(), "a foreign-CA dump succeeded");
+
+    // The node's own TLS material: the dump works.
+    let ok = dump_tool(&base(&p, &out_file, "--cluster-dump"));
+    assert!(
+        ok.status.success(),
+        "dump failed: {}{}",
+        String::from_utf8_lossy(&ok.stdout),
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let dumped = std::fs::read_to_string(&out_file).unwrap();
+    for k in ["dump:s", "dump:l", "dump:h", "dump:x", "dump:t"] {
+        assert!(dumped.contains(k), "{k} missing from the dump: {dumped}");
+    }
+
+    // Restore it into the emptied node, over TLS.
+    rt.block_on(async {
+        one(port, c.clone(), &["FLUSHALL"]).await.unwrap();
+    });
+    let restored = dump_tool(&base(&p, &out_file, "--cluster-restore"));
+    assert!(
+        restored.status.success(),
+        "restore failed: {}{}",
+        String::from_utf8_lossy(&restored.stdout),
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    rt.block_on(async {
+        assert_eq!(
+            one(port, c.clone(), &["GET", "dump:s"]).await.unwrap(),
+            "$5\r\nhello\r\n"
+        );
+        assert_eq!(
+            one(port, c.clone(), &["LRANGE", "dump:l", "0", "-1"])
+                .await
+                .unwrap(),
+            "*2\r\n$1\r\na\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(
+            one(port, c.clone(), &["HGET", "dump:h", "f"])
+                .await
+                .unwrap(),
+            "$1\r\nv\r\n"
+        );
+        assert_eq!(
+            one(port, c.clone(), &["XLEN", "dump:x"]).await.unwrap(),
+            ":1\r\n"
+        );
+        // A value holding CRLF comes back whole, with its TTL.
+        assert_eq!(
+            one(port, c.clone(), &["GET", "dump:t"]).await.unwrap(),
+            "$4\r\na\r\nb\r\n"
+        );
+        let pttl = one(port, c.clone(), &["PTTL", "dump:t"]).await.unwrap();
+        let ms: i64 = pttl.trim().trim_start_matches(':').parse().unwrap();
+        assert!(ms > 500_000 && ms <= 600_000, "TTL lost: {pttl}");
+    });
+}

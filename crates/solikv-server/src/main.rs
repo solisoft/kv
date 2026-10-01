@@ -450,6 +450,55 @@ fn args_with_config_file() -> Vec<std::ffi::OsString> {
     out
 }
 
+/// The TLS client for `--cluster-dump`/`--cluster-restore`: given the
+/// nodes' own `--tls-cert`/`--tls-key`/`--tls-ca-cert`, the tool connects
+/// over TLS, checks each node's certificate against the CA and presents
+/// the certificate as its client certificate (mutual TLS when the nodes
+/// require one). Without TLS flags it connects in clear, as before.
+fn cluster_dump_tls(args: &Args) -> Option<cluster_dump::DumpTls> {
+    let (cert, key) = match (&args.tls_cert, &args.tls_key) {
+        (Some(c), Some(k)) => (c, k),
+        (None, None) => {
+            if args.tls_ca_cert.is_some() {
+                eprintln!(
+                    "ERROR: --tls-ca-cert without --tls-cert/--tls-key; refusing to dump or \
+                     restore in clear"
+                );
+                std::process::exit(1);
+            }
+            return None;
+        }
+        _ => {
+            eprintln!("ERROR: --tls-cert and --tls-key go together");
+            std::process::exit(1);
+        }
+    };
+    let opts = solikv_server::tls::TlsOptions {
+        cert: cert.into(),
+        key: key.into(),
+        ca: args.tls_ca_cert.as_ref().map(PathBuf::from),
+        auth_clients: None,
+        replication: false,
+        cluster: false,
+    };
+    match solikv_server::tls::Tls::load(&opts) {
+        Ok(t) => match t.client {
+            Some(c) => Some(c.0),
+            None => {
+                eprintln!(
+                    "ERROR: cluster dump/restore over TLS needs --tls-ca-cert to check the \
+                     nodes' certificates against"
+                );
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("ERROR: TLS: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     solikv_core::memory::enable();
     let args = Args::parse_from(args_with_config_file());
@@ -605,6 +654,11 @@ async fn async_main(args: Args) {
             eprintln!("WARNING: {w}");
         }
     }
+    let dump_tls = if args.cluster_dump.is_some() || args.cluster_restore.is_some() {
+        cluster_dump_tls(&args)
+    } else {
+        None
+    };
     if let Some(dump_path) = &args.cluster_dump {
         if args.cluster_connect.is_none() {
             eprintln!("Error: --cluster-connect required for cluster dump");
@@ -621,6 +675,7 @@ async fn async_main(args: Args) {
             } else {
                 cluster_password.as_deref()
             },
+            dump_tls.as_ref(),
         );
         match result {
             Ok((keys, nodes)) => {
@@ -649,6 +704,7 @@ async fn async_main(args: Args) {
             } else {
                 cluster_password.as_deref()
             },
+            dump_tls.as_ref(),
         );
         match result {
             Ok((success, errors)) => {
@@ -656,6 +712,9 @@ async fn async_main(args: Args) {
                     "Cluster restore complete: {} success, {} errors",
                     success, errors
                 );
+                if errors > 0 {
+                    std::process::exit(1);
+                }
             }
             Err(e) => {
                 eprintln!("Cluster restore failed: {}", e);

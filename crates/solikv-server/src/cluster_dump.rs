@@ -3,14 +3,54 @@
 
 use solikv_cluster::ConsistentHash;
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// The TLS client configuration dump/restore connect with, when the nodes'
+/// RESP ports speak TLS (the same `--tls-*` flags as the nodes).
+pub type DumpTls = Arc<rustls::ClientConfig>;
+
+/// A connection to one node: plain TCP, or TLS over it. Dump and restore are
+/// one-shot blocking tools, so rustls is driven synchronously.
+pub enum NodeStream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Read for NodeStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            NodeStream::Plain(s) => s.read(buf),
+            NodeStream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for NodeStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            NodeStream::Plain(s) => s.write(buf),
+            NodeStream::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            NodeStream::Plain(s) => s.flush(),
+            NodeStream::Tls(s) => s.flush(),
+        }
+    }
+}
+
 const DUMP_MAGIC: &[u8] = b"SLKVCLST";
-const DUMP_VERSION: u16 = 1;
+/// 2: each key carries its `DUMP` payload (`dump`), restored with
+/// `RESTORE`; its TTL is `PTTL`'s milliseconds (`None`: no TTL). Version-1
+/// files (readable values only, TTL in whole seconds × 1000, 0 for none)
+/// still restore, for the types they recorded.
+const DUMP_VERSION: u16 = 2;
 
 #[derive(Debug, Clone)]
 pub struct ClusterNode {
@@ -42,6 +82,9 @@ pub struct DumpKey {
     pub r#type: String,
     pub ttl_ms: Option<i64>,
     pub value: serde_json::Value,
+    /// The key's `DUMP` payload, base64 (version ≥ 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dump: Option<String>,
 }
 
 /// The masters in a `CLUSTER NODES` reply (Redis' format:
@@ -94,339 +137,312 @@ pub fn parse_cluster_nodes(output: &str) -> Vec<ClusterNode> {
     nodes
 }
 
-fn read_full_response(stream: &mut TcpStream) -> Result<Vec<u8>, std::io::Error> {
-    let mut response = Vec::new();
-    let mut buf = [0u8; 4096];
+/// One RESP2 reply.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reply {
+    Status(String),
+    Error(String),
+    Int(i64),
+    Bulk(Option<Vec<u8>>),
+    Array(Option<Vec<Reply>>),
+}
 
-    loop {
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            break;
+impl Reply {
+    fn into_bulk(self) -> Option<Vec<u8>> {
+        match self {
+            Reply::Bulk(b) => b,
+            Reply::Status(s) => Some(s.into_bytes()),
+            _ => None,
         }
-        response.extend_from_slice(&buf[..n]);
+    }
 
-        if !response.is_empty() {
-            let first = response[0];
+    fn into_array(self) -> Vec<Reply> {
+        match self {
+            Reply::Array(Some(a)) => a,
+            _ => Vec::new(),
+        }
+    }
 
-            if first == b'+' || first == b'-' || first == b':' {
-                if response.ends_with(b"\r\n") {
-                    break;
-                }
-            } else if first == b'$' {
-                if response.len() >= 5 && response.starts_with(b"$-1\r\n") {
-                    break;
-                }
-                if response.ends_with(b"\r\n") {
-                    if let Some(pos) = response[1..].iter().position(|&b| b == b'\r') {
-                        let len_str = String::from_utf8_lossy(&response[1..1 + pos]);
-                        if let Ok(len) = len_str.trim().parse::<usize>() {
-                            let expected = 1 + pos + 2 + len + 2;
-                            if response.len() >= expected {
-                                break;
-                            }
-                        }
-                    }
-                }
-            } else if first == b'*' && response.ends_with(b"\r\n") && response.ends_with(b"\r\n") {
-                break;
+    fn as_text(&self) -> String {
+        match self {
+            Reply::Status(s) | Reply::Error(s) => s.clone(),
+            Reply::Int(n) => n.to_string(),
+            Reply::Bulk(Some(b)) => String::from_utf8_lossy(b).into_owned(),
+            Reply::Bulk(None) | Reply::Array(None) => String::new(),
+            Reply::Array(Some(a)) => a.iter().map(Reply::as_text).collect::<Vec<_>>().join(" "),
+        }
+    }
+
+    /// The reply, or an error if the node answered with one.
+    fn ok(self) -> Result<Reply, std::io::Error> {
+        match self {
+            Reply::Error(e) => Err(std::io::Error::other(e)),
+            r => Ok(r),
+        }
+    }
+}
+
+/// Read exactly one complete reply. Bulk strings are read by length, so
+/// values holding `\r\n` or arbitrary bytes come back whole, however the
+/// transport (TCP segments, TLS records) splits them.
+pub fn read_reply<R: BufRead>(r: &mut R) -> Result<Reply, std::io::Error> {
+    read_reply_depth(r, 0)
+}
+
+fn read_reply_depth<R: BufRead>(r: &mut R, depth: usize) -> Result<Reply, std::io::Error> {
+    let bad = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidData, m);
+    if depth > 16 {
+        return Err(bad("reply nested too deeply".into()));
+    }
+    let mut line = Vec::new();
+    if r.read_until(b'\n', &mut line)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed",
+        ));
+    }
+    if !line.ends_with(b"\r\n") {
+        return Err(bad("truncated reply line".into()));
+    }
+    line.truncate(line.len() - 2);
+    let (kind, rest) = line
+        .split_first()
+        .ok_or_else(|| bad("empty reply line".into()))?;
+    let text = String::from_utf8_lossy(rest).into_owned();
+    let num = || {
+        text.parse::<i64>()
+            .map_err(|_| bad(format!("bad length {text:?}")))
+    };
+    Ok(match kind {
+        b'+' => Reply::Status(text),
+        b'-' => Reply::Error(text),
+        b':' => Reply::Int(num()?),
+        b'$' => {
+            let n = num()?;
+            if n < 0 {
+                Reply::Bulk(None)
+            } else {
+                let mut buf = vec![0u8; n as usize + 2];
+                r.read_exact(&mut buf)?;
+                buf.truncate(n as usize);
+                Reply::Bulk(Some(buf))
             }
         }
-    }
-
-    Ok(response)
+        b'*' => {
+            let n = num()?;
+            if n < 0 {
+                Reply::Array(None)
+            } else {
+                let mut items = Vec::with_capacity((n as usize).min(1024));
+                for _ in 0..n {
+                    items.push(read_reply_depth(r, depth + 1)?);
+                }
+                Reply::Array(Some(items))
+            }
+        }
+        _ => return Err(bad(format!("unexpected reply type {:?}", *kind as char))),
+    })
 }
 
-pub fn send_resp_command(stream: &mut TcpStream, args: &[&str]) -> Result<String, std::io::Error> {
-    let mut cmd = format!("*{}\r\n", args.len());
-    for arg in args {
-        cmd.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
-    }
-
-    stream.write_all(cmd.as_bytes())?;
-    stream.flush()?;
-
-    let response = read_full_response(stream)?;
-
-    Ok(String::from_utf8_lossy(&response).to_string())
+/// A connection to one node.
+pub struct NodeConn {
+    io: BufReader<NodeStream>,
 }
 
-/// Connect to one node, authenticating with `AUTH [user] password` when a
-/// password is given.
+impl NodeConn {
+    /// Send one command and read its reply.
+    pub fn cmd(&mut self, args: &[&[u8]]) -> Result<Reply, std::io::Error> {
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+        for a in args {
+            out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            out.extend_from_slice(a);
+            out.extend_from_slice(b"\r\n");
+        }
+        let w = self.io.get_mut();
+        w.write_all(&out)?;
+        w.flush()?;
+        read_reply(&mut self.io)
+    }
+}
+
+/// Connect to one node — over TLS when `tls` is given, checking the node's
+/// certificate against the CA and presenting ours — authenticating with
+/// `AUTH [user] password` when a password is given.
 pub fn connect_node(
     ip: &str,
     port: u16,
     user: Option<&str>,
     password: Option<&str>,
-) -> Result<TcpStream, std::io::Error> {
-    let addr = format!("{}:{}", ip, port);
-    let mut stream = TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-
+    tls: Option<&DumpTls>,
+) -> Result<NodeConn, std::io::Error> {
+    let addr = (ip.trim_start_matches('[').trim_end_matches(']'), port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no address for {ip}:{port}"),
+            )
+        })?;
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(30)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let stream = match tls {
+        None => NodeStream::Plain(tcp),
+        Some(cfg) => {
+            let conn = rustls::ClientConnection::new(cfg.clone(), crate::tls::server_name(ip))
+                .map_err(std::io::Error::other)?;
+            let mut s = rustls::StreamOwned::new(conn, tcp);
+            // Finish the handshake here, so a refused certificate is
+            // reported as a connection failure, not as a garbled reply.
+            while s.conn.is_handshaking() {
+                s.conn.complete_io(&mut s.sock)?;
+            }
+            NodeStream::Tls(Box::new(s))
+        }
+    };
+    let mut conn = NodeConn {
+        io: BufReader::with_capacity(64 * 1024, stream),
+    };
     if let Some(pwd) = password {
-        let resp = match user {
-            Some(u) => send_resp_command(&mut stream, &["AUTH", u, pwd])?,
-            None => send_resp_command(&mut stream, &["AUTH", pwd])?,
+        let reply = match user {
+            Some(u) => conn.cmd(&[b"AUTH", u.as_bytes(), pwd.as_bytes()])?,
+            None => conn.cmd(&[b"AUTH", pwd.as_bytes()])?,
         };
-        if !resp.starts_with("+OK") {
+        if reply != Reply::Status("OK".into()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "Authentication failed",
+                format!("authentication failed: {}", reply.as_text()),
             ));
         }
     }
-
-    Ok(stream)
+    Ok(conn)
 }
 
-#[allow(clippy::type_complexity)]
-pub fn scan_all_keys(
-    stream: &mut TcpStream,
-) -> Result<Vec<(String, String, Option<i64>, serde_json::Value)>, std::io::Error> {
-    let mut all_keys = Vec::new();
-
-    // Use KEYS * to get all keys (simpler for single-node dump)
-    let resp = send_resp_command(stream, &["KEYS", "*"])?;
-    let keys = parse_keys_response(&resp)?;
-
-    for key in keys {
-        let key_str = String::from_utf8_lossy(&key).to_string();
-
-        // Get key type
-        let type_resp = send_resp_command(stream, &["TYPE", &key_str])?;
-        let r#type = parse_type_response(&type_resp);
-
-        // Get TTL
-        let ttl_resp = send_resp_command(stream, &["TTL", &key_str])?;
-        let ttl = parse_ttl_response(&ttl_resp);
-
-        // Get value based on type
-        let value = match r#type.as_str() {
-            "string" => {
-                let val_resp = send_resp_command(stream, &["GET", &key_str])?;
-                parse_string_value(&val_resp)
-            }
-            "list" => {
-                let val_resp = send_resp_command(stream, &["LRANGE", &key_str, "0", "-1"])?;
-                parse_list_value(&val_resp)
-            }
-            "hash" => {
-                let val_resp = send_resp_command(stream, &["HGETALL", &key_str])?;
-                parse_hash_value(&val_resp)
-            }
-            "set" => {
-                let val_resp = send_resp_command(stream, &["SMEMBERS", &key_str])?;
-                parse_set_value(&val_resp)
-            }
-            "zset" => {
-                let val_resp =
-                    send_resp_command(stream, &["ZRANGE", &key_str, "0", "-1", "WITHSCORES"])?;
-                parse_zset_value(&val_resp)
-            }
-            _ => serde_json::Value::Null,
-        };
-
-        all_keys.push((key_str, r#type, ttl, value));
-    }
-
-    Ok(all_keys)
+fn text(b: &[u8]) -> serde_json::Value {
+    serde_json::Value::String(String::from_utf8_lossy(b).into_owned())
 }
 
-fn parse_keys_response(resp: &str) -> Result<Vec<Vec<u8>>, std::io::Error> {
-    let lines: Vec<&str> = resp.lines().collect();
-    if lines.is_empty() || !lines[0].starts_with('*') {
-        return Ok(Vec::new());
-    }
-
-    let count: usize = lines[0].trim_start_matches('*').parse().unwrap_or(0);
-    let mut keys = Vec::new();
-
-    let mut i = 2;
-    while i < lines.len() && keys.len() < count {
-        if lines[i].starts_with('$') {
-            if i + 1 < lines.len() {
-                keys.push(lines[i + 1].as_bytes().to_vec());
-                i += 2;
-            } else {
-                break;
+/// A readable rendering of a value, for people and tools reading the dump;
+/// restore uses the `DUMP` payload beside it.
+fn readable_value(
+    conn: &mut NodeConn,
+    key: &[u8],
+    r#type: &str,
+) -> Result<serde_json::Value, std::io::Error> {
+    use serde_json::Value;
+    Ok(match r#type {
+        "string" => conn
+            .cmd(&[b"GET", key])?
+            .ok()?
+            .into_bulk()
+            .map_or(Value::Null, |b| text(&b)),
+        "list" => Value::Array(
+            conn.cmd(&[b"LRANGE", key, b"0", b"-1"])?
+                .ok()?
+                .into_array()
+                .into_iter()
+                .filter_map(Reply::into_bulk)
+                .map(|b| text(&b))
+                .collect(),
+        ),
+        "set" => Value::Array(
+            conn.cmd(&[b"SMEMBERS", key])?
+                .ok()?
+                .into_array()
+                .into_iter()
+                .filter_map(Reply::into_bulk)
+                .map(|b| text(&b))
+                .collect(),
+        ),
+        "hash" => {
+            let items = conn.cmd(&[b"HGETALL", key])?.ok()?.into_array();
+            let mut map = serde_json::Map::new();
+            let mut it = items.into_iter().filter_map(Reply::into_bulk);
+            while let (Some(f), Some(v)) = (it.next(), it.next()) {
+                map.insert(String::from_utf8_lossy(&f).into_owned(), text(&v));
             }
-        } else {
-            i += 1;
+            Value::Object(map)
+        }
+        "zset" => {
+            let items = conn
+                .cmd(&[b"ZRANGE", key, b"0", b"-1", b"WITHSCORES"])?
+                .ok()?
+                .into_array();
+            let mut out = Vec::new();
+            let mut it = items.into_iter().filter_map(Reply::into_bulk);
+            while let (Some(m), Some(s)) = (it.next(), it.next()) {
+                let score = String::from_utf8_lossy(&s).parse::<f64>().unwrap_or(0.0);
+                out.push(serde_json::json!({ "member": text(&m), "score": score }));
+            }
+            Value::Array(out)
+        }
+        _ => Value::Null,
+    })
+}
+
+/// Every key of one node (SCAN, so the node keeps serving), with its type,
+/// remaining TTL in milliseconds, readable value and `DUMP` payload.
+pub fn scan_all_keys(conn: &mut NodeConn) -> Result<Vec<DumpKey>, std::io::Error> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut out = Vec::new();
+    let mut cursor = b"0".to_vec();
+    loop {
+        let mut page = conn
+            .cmd(&[b"SCAN", &cursor, b"COUNT", b"1000"])?
+            .ok()?
+            .into_array();
+        if page.len() != 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed SCAN reply",
+            ));
+        }
+        let keys = page.pop().unwrap().into_array();
+        cursor = page.pop().unwrap().into_bulk().unwrap_or_default();
+        for key in keys.into_iter().filter_map(Reply::into_bulk) {
+            let r#type = conn.cmd(&[b"TYPE", &key])?.ok()?.as_text();
+            if r#type == "none" {
+                continue; // deleted or expired since SCAN listed it
+            }
+            let ttl_ms = match conn.cmd(&[b"PTTL", &key])?.ok()? {
+                Reply::Int(ms) if ms > 0 => Some(ms),
+                Reply::Int(-2) => continue,
+                _ => None,
+            };
+            let dump = conn
+                .cmd(&[b"DUMP", &key])?
+                .ok()?
+                .into_bulk()
+                .map(|p| b64.encode(p));
+            if dump.is_none() {
+                continue; // gone between TYPE and DUMP
+            }
+            let value = readable_value(conn, &key, &r#type)?;
+            out.push(DumpKey {
+                key: String::from_utf8_lossy(&key).into_owned(),
+                key_bytes: key,
+                r#type,
+                ttl_ms,
+                value,
+                dump,
+            });
+        }
+        if cursor == b"0" {
+            break;
         }
     }
-
-    Ok(keys)
+    Ok(out)
 }
 
-#[allow(dead_code)]
-fn parse_scan_response(resp: &str) -> Result<(String, Vec<Vec<u8>>), std::io::Error> {
-    let lines: Vec<&str> = resp.lines().collect();
-    if lines.len() < 4 || !lines[0].starts_with('*') {
-        return Ok((String::new(), Vec::new()));
+/// Split `host:port` (IPv6 hosts in brackets), defaulting to port 6379.
+fn split_addr(addr: &str) -> (String, u16) {
+    match addr.rsplit_once(':') {
+        Some((ip, port)) if !ip.is_empty() => (ip.to_string(), port.parse().unwrap_or(6379)),
+        _ => ("127.0.0.1".to_string(), addr.parse().unwrap_or(6379)),
     }
-
-    let cursor = lines[2].trim_start_matches('$').to_string();
-
-    let mut keys = Vec::new();
-    let mut i = 4;
-    while i < lines.len() - 1 {
-        if lines[i].starts_with('$') {
-            let _len: usize = lines[i].trim_start_matches('$').parse().unwrap_or(0);
-            if i + 1 < lines.len() {
-                keys.push(lines[i + 1].as_bytes().to_vec());
-                i += 2;
-            } else {
-                break;
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    Ok((cursor, keys))
-}
-
-fn parse_type_response(resp: &str) -> String {
-    let resp = resp.trim();
-    if let Some(stripped) = resp.strip_prefix('+') {
-        return stripped.trim().to_string();
-    }
-    "none".to_string()
-}
-
-fn parse_ttl_response(resp: &str) -> Option<i64> {
-    let resp = resp.trim();
-    if let Some(stripped) = resp.strip_prefix(':') {
-        if let Ok(ttl) = stripped.trim().parse::<i64>() {
-            if ttl > 0 {
-                return Some(ttl * 1000);
-            }
-            return Some(0);
-        }
-    }
-    None
-}
-
-fn parse_string_value(resp: &str) -> serde_json::Value {
-    let resp = resp.trim();
-    if resp.starts_with('$') {
-        if let Some(crlf_pos) = resp.find("\r\n") {
-            let len_str = &resp[1..crlf_pos];
-            if let Ok(len) = len_str.parse::<usize>() {
-                let value_start = crlf_pos + 2;
-                let value_end = value_start + len;
-                if resp.len() >= value_end {
-                    return serde_json::Value::String(resp[value_start..value_end].to_string());
-                }
-            }
-        }
-    }
-    serde_json::Value::Null
-}
-
-fn parse_list_value(resp: &str) -> serde_json::Value {
-    let lines: Vec<&str> = resp.lines().collect();
-    if lines.is_empty() || !lines[0].starts_with('*') {
-        return serde_json::Value::Array(Vec::new());
-    }
-
-    let count: usize = lines[0].trim_start_matches('*').parse().unwrap_or(0);
-    let mut items = Vec::new();
-
-    let mut i = 2;
-    while i < lines.len() && items.len() < count {
-        if lines[i].starts_with('$') {
-            if i + 1 < lines.len() {
-                items.push(serde_json::Value::String(lines[i + 1].to_string()));
-                i += 2;
-            } else {
-                break;
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    serde_json::Value::Array(items)
-}
-
-fn parse_hash_value(resp: &str) -> serde_json::Value {
-    let lines: Vec<&str> = resp.lines().collect();
-    if lines.is_empty() || !lines[0].starts_with('*') {
-        return serde_json::Value::Object(serde_json::Map::new());
-    }
-
-    let count: usize = lines[0].trim_start_matches('*').parse().unwrap_or(0);
-    let mut map = serde_json::Map::new();
-
-    let mut i = 2;
-    while i + 1 < lines.len() && map.len() < count / 2 {
-        if lines[i].starts_with('$') {
-            if i + 1 < lines.len() {
-                let key = lines[i + 1].to_string();
-                i += 2;
-                if i < lines.len() && lines[i].starts_with('$') && i + 1 < lines.len() {
-                    let value = lines[i + 1].to_string();
-                    map.insert(key, serde_json::Value::String(value));
-                    i += 2;
-                }
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    serde_json::Value::Object(map)
-}
-
-fn parse_set_value(resp: &str) -> serde_json::Value {
-    let lines: Vec<&str> = resp.lines().collect();
-    if lines.is_empty() || !lines[0].starts_with('*') {
-        return serde_json::Value::Array(Vec::new());
-    }
-
-    let count: usize = lines[0].trim_start_matches('*').parse().unwrap_or(0);
-    let mut items = Vec::new();
-
-    let mut i = 2;
-    while i < lines.len() && items.len() < count {
-        if lines[i].starts_with('$') {
-            if i + 1 < lines.len() {
-                items.push(serde_json::Value::String(lines[i + 1].to_string()));
-                i += 2;
-            } else {
-                break;
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    serde_json::Value::Array(items)
-}
-
-fn parse_zset_value(resp: &str) -> serde_json::Value {
-    let lines: Vec<&str> = resp.lines().collect();
-    if lines.is_empty() || !lines[0].starts_with('*') {
-        return serde_json::Value::Array(Vec::new());
-    }
-
-    let items: Vec<&str> = lines
-        .iter()
-        .filter(|l| !l.is_empty() && !l.starts_with('*') && !l.starts_with('$'))
-        .cloned()
-        .collect();
-
-    let mut result = Vec::new();
-    let mut i = 0;
-    while i < items.len() - 1 {
-        result.push(serde_json::json!({
-            "member": items[i],
-            "score": items[i + 1].parse::<f64>().unwrap_or(0.0)
-        }));
-        i += 2;
-    }
-
-    serde_json::Value::Array(result)
 }
 
 pub fn dump_cluster(
@@ -436,166 +452,218 @@ pub fn dump_cluster(
     user: Option<&str>,
     password: Option<&str>,
     per_node_password: Option<&str>,
+    tls: Option<&DumpTls>,
 ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
-    let (seed_ip, seed_port) = if let Some((ip, port)) = connect_addr.rsplit_once(':') {
-        (ip.to_string(), port.parse().unwrap_or(6379))
-    } else {
-        ("127.0.0.1".to_string(), 6379)
-    };
+    let (seed_ip, seed_port) = split_addr(connect_addr);
 
     tracing::info!("Connecting to seed node {}:{}", seed_ip, seed_port);
-    let mut stream = connect_node(&seed_ip, seed_port, user, password)?;
-
-    let nodes_resp = send_resp_command(&mut stream, &["CLUSTER", "NODES"])?;
-    let nodes = parse_cluster_nodes(&nodes_resp);
-
+    let mut conn = connect_node(&seed_ip, seed_port, user, password, tls)?;
+    let nodes_reply = conn.cmd(&[b"CLUSTER", b"NODES"])?.ok()?.as_text();
+    let nodes = parse_cluster_nodes(&nodes_reply);
+    if nodes.is_empty() {
+        // A node not in cluster mode, or an empty reply: an empty dump
+        // would read as an empty cluster.
+        return Err(format!(
+            "seed node {seed_ip}:{seed_port} listed no masters (reply: {:?})",
+            nodes_reply.chars().take(120).collect::<String>()
+        )
+        .into());
+    }
     tracing::info!("Found {} nodes in cluster", nodes.len());
 
     let mut all_data: Vec<DumpKey> = Vec::new();
-    let mut success_nodes = 0usize;
-    let mut failed_nodes = 0usize;
-
+    let mut failed: Vec<String> = Vec::new();
     for node in &nodes {
         let node_password = if node.ip == seed_ip && node.port == seed_port {
             password
         } else {
             per_node_password
         };
-
         tracing::info!(
             "Dumping node {}:{} (id: {})",
             node.ip,
             node.port,
             node.node_id
         );
-
-        match connect_node(&node.ip, node.port, user, node_password) {
-            Ok(mut node_stream) => match scan_all_keys(&mut node_stream) {
-                Ok(keys) => {
-                    for (key, r#type, ttl, value) in keys {
-                        all_data.push(DumpKey {
-                            key,
-                            key_bytes: Vec::new(),
-                            r#type,
-                            ttl_ms: ttl,
-                            value,
-                        });
-                    }
-                    success_nodes += 1;
-                }
-                Err(e) => {
-                    eprintln!("Failed to scan keys: {}", e);
-                    failed_nodes += 1;
-                }
-            },
-            Err(e) => {
-                eprintln!("Failed to connect: {}", e);
-                failed_nodes += 1;
-            }
+        let got = connect_node(&node.ip, node.port, user, node_password, tls)
+            .and_then(|mut c| scan_all_keys(&mut c));
+        match got {
+            Ok(keys) => all_data.extend(keys),
+            Err(e) => failed.push(format!("{}:{}: {e}", node.ip, node.port)),
         }
     }
+    // A dump missing a node's keys must not pass for the whole cluster.
+    if !failed.is_empty() {
+        return Err(format!(
+            "{} of {} nodes could not be dumped, no file written: {}",
+            failed.len(),
+            nodes.len(),
+            failed.join("; ")
+        )
+        .into());
+    }
 
-    // Prepare node info for dump
-    let node_info: Vec<DumpNodeInfo> = nodes
-        .iter()
-        .map(|n| DumpNodeInfo {
-            node_id: n.node_id.clone(),
-            ip: n.ip.clone(),
-            port: n.port,
-            slots: n.slots.clone(),
-        })
-        .collect();
-
-    // Write dump file
     let header = DumpHeader {
         version: DUMP_VERSION,
-        nodes: node_info,
+        nodes: nodes
+            .iter()
+            .map(|n| DumpNodeInfo {
+                node_id: n.node_id.clone(),
+                ip: n.ip.clone(),
+                port: n.port,
+                slots: n.slots.clone(),
+            })
+            .collect(),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
 
+    // Every key and value of the cluster: 0600, and no following a symlink
+    // planted at the output path.
+    let file = solikv_persist::fsutil::create_private(output_path)?;
+    let mut writer = std::io::BufWriter::new(file);
     if format == "jsonl" {
-        // Every key and value of the cluster: 0600, and no following a
-        // symlink planted at the output path.
-        let file = solikv_persist::fsutil::create_private(output_path)?;
-        let mut writer = std::io::BufWriter::new(file);
-
-        // Write header as first line
         writeln!(writer, "{}", serde_json::to_string(&header)?)?;
-
-        // Write each key
         for key in &all_data {
             writeln!(writer, "{}", serde_json::to_string(key)?)?;
         }
     } else {
-        // Binary format
-        // Every key and value of the cluster: 0600, and no following a
-        // symlink planted at the output path.
-        let file = solikv_persist::fsutil::create_private(output_path)?;
-        let mut writer = std::io::BufWriter::new(file);
-
-        // Magic + version
+        // Binary: magic, version, then the same records as JSONL, each
+        // length-prefixed (u32 LE) — the header first.
         writer.write_all(DUMP_MAGIC)?;
         writer.write_all(&DUMP_VERSION.to_le_bytes())?;
-
-        // Nodes
-        let num_nodes = (nodes.len() as u16).to_le_bytes();
-        writer.write_all(&num_nodes)?;
-
-        for node in &nodes {
-            let node_id_bytes = node.node_id.as_bytes();
-            writer.write_all(&(node_id_bytes.len() as u16).to_le_bytes())?;
-            writer.write_all(node_id_bytes)?;
-
-            let ip_bytes = node.ip.as_bytes();
-            writer.write_all(&(ip_bytes.len() as u16).to_le_bytes())?;
-            writer.write_all(ip_bytes)?;
-            writer.write_all(&node.port.to_le_bytes())?;
-
-            let num_slots = (node.slots.len() as u32).to_le_bytes();
-            writer.write_all(&num_slots)?;
-            for (s, e) in &node.slots {
-                writer.write_all(&s.to_le_bytes())?;
-                writer.write_all(&e.to_le_bytes())?;
-            }
-        }
-
-        // Keys
-        let num_keys = (all_data.len() as u64).to_le_bytes();
-        writer.write_all(&num_keys)?;
-
+        let mut record = |bytes: Vec<u8>| -> std::io::Result<()> {
+            writer.write_all(&(bytes.len() as u32).to_le_bytes())?;
+            writer.write_all(&bytes)
+        };
+        record(serde_json::to_vec(&header)?)?;
         for key in &all_data {
-            let key_bytes = key.key.as_bytes();
-            writer.write_all(&(key_bytes.len() as u16).to_le_bytes())?;
-            writer.write_all(key_bytes)?;
-
-            let type_byte: u8 = match key.r#type.as_str() {
-                "string" => 0,
-                "list" => 1,
-                "hash" => 2,
-                "set" => 3,
-                "zset" => 4,
-                _ => 255,
-            };
-            writer.write_all(&[type_byte])?;
-
-            let ttl = key.ttl_ms.unwrap_or(-1);
-            writer.write_all(&ttl.to_le_bytes())?;
-
-            // Serialize value as JSON for now
-            let value_json = serde_json::to_string(&key.value).unwrap_or_default();
-            let value_bytes = value_json.as_bytes();
-            writer.write_all(&(value_bytes.len() as u32).to_le_bytes())?;
-            writer.write_all(value_bytes)?;
+            record(serde_json::to_vec(key)?)?;
         }
     }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
 
     tracing::info!(
-        "Cluster dump complete: {} keys from {} nodes ({} failed)",
+        "Cluster dump complete: {} keys from {} nodes",
         all_data.len(),
-        success_nodes,
-        failed_nodes
+        nodes.len()
     );
-    Ok((all_data.len(), success_nodes))
+    Ok((all_data.len(), nodes.len()))
+}
+
+/// The header and keys of a dump file, JSONL or binary.
+fn read_dump_file(
+    path: &Path,
+) -> Result<(DumpHeader, Vec<DumpKey>), Box<dyn std::error::Error + Send + Sync>> {
+    let content = std::fs::read(path)?;
+    if content.starts_with(DUMP_MAGIC) {
+        let mut at = DUMP_MAGIC.len() + 2;
+        let version = u16::from_le_bytes(
+            content
+                .get(DUMP_MAGIC.len()..at)
+                .ok_or("truncated binary dump")?
+                .try_into()?,
+        );
+        if version < 2 {
+            return Err(
+                "binary dumps written before version 2 hold no restorable data; \
+                        dump again (jsonl or binary)"
+                    .into(),
+            );
+        }
+        let mut records = Vec::new();
+        while at < content.len() {
+            let len = u32::from_le_bytes(
+                content
+                    .get(at..at + 4)
+                    .ok_or("truncated binary dump")?
+                    .try_into()?,
+            ) as usize;
+            at += 4;
+            records.push(content.get(at..at + len).ok_or("truncated binary dump")?);
+            at += len;
+        }
+        let (first, rest) = records.split_first().ok_or("empty dump file")?;
+        let header: DumpHeader = serde_json::from_slice(first)?;
+        let keys = rest
+            .iter()
+            .map(|r| serde_json::from_slice::<DumpKey>(r))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok((header, keys));
+    }
+    let content = String::from_utf8(content)?;
+    let mut lines = content.lines().filter(|l| !l.trim().is_empty());
+    let header: DumpHeader = serde_json::from_str(lines.next().ok_or("empty dump file")?)?;
+    let keys = lines
+        .map(serde_json::from_str::<DumpKey>)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((header, keys))
+}
+
+/// The commands that recreate one dumped key: `RESTORE` from its payload
+/// (version ≥ 2), or, for a version-1 dump that has none, the type's write
+/// commands from the readable value (strings, lists, sets, hashes, sorted
+/// sets — the types version 1 recorded).
+fn restore_commands(k: &DumpKey) -> Result<Vec<Vec<Vec<u8>>>, String> {
+    use base64::Engine;
+    let key = if k.key_bytes.is_empty() {
+        k.key.as_bytes().to_vec()
+    } else {
+        k.key_bytes.clone()
+    };
+    let ttl = k.ttl_ms.filter(|&t| t > 0);
+    if let Some(p) = &k.dump {
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(p)
+            .map_err(|e| format!("bad payload: {e}"))?;
+        return Ok(vec![vec![
+            b"RESTORE".to_vec(),
+            key,
+            ttl.unwrap_or(0).to_string().into_bytes(),
+            payload,
+            b"REPLACE".to_vec(),
+        ]]);
+    }
+    let s = |v: &serde_json::Value| v.as_str().map(|s| s.as_bytes().to_vec());
+    let mut cmds = vec![vec![b"DEL".to_vec(), key.clone()]];
+    let mut write = |name: &[u8], items: Vec<Vec<u8>>| {
+        if !items.is_empty() {
+            let mut c = vec![name.to_vec(), key.clone()];
+            c.extend(items);
+            cmds.push(c);
+        }
+    };
+    match (k.r#type.as_str(), &k.value) {
+        ("string", v) => write(b"SET", vec![s(v).ok_or("string value is not a string")?]),
+        ("list", serde_json::Value::Array(a)) => write(b"RPUSH", a.iter().filter_map(s).collect()),
+        ("set", serde_json::Value::Array(a)) => write(b"SADD", a.iter().filter_map(s).collect()),
+        ("hash", serde_json::Value::Object(m)) => write(
+            b"HSET",
+            m.iter()
+                .flat_map(|(f, v)| [Some(f.as_bytes().to_vec()), s(v)])
+                .flatten()
+                .collect(),
+        ),
+        ("zset", serde_json::Value::Array(a)) => write(
+            b"ZADD",
+            a.iter()
+                .flat_map(|e| {
+                    [
+                        e.get("score")
+                            .and_then(|x| x.as_f64())
+                            .map(|x| x.to_string().into_bytes()),
+                        e.get("member").and_then(s),
+                    ]
+                })
+                .flatten()
+                .collect(),
+        ),
+        (t, _) => return Err(format!("cannot restore a version-1 {t} without a payload")),
+    }
+    if let Some(ms) = ttl {
+        cmds.push(vec![b"PEXPIRE".to_vec(), key, ms.to_string().into_bytes()]);
+    }
+    Ok(cmds)
 }
 
 pub fn restore_cluster(
@@ -604,178 +672,100 @@ pub fn restore_cluster(
     user: Option<&str>,
     password: Option<&str>,
     per_node_password: Option<&str>,
+    tls: Option<&DumpTls>,
 ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
-    // Read dump file
-    let content = std::fs::read_to_string(input_path)?;
-    let lines: Vec<&str> = content.lines().collect();
-
-    if lines.is_empty() {
-        return Err("Empty dump file".into());
-    }
-
-    // Parse header
-    let header: DumpHeader = serde_json::from_str(lines[0])?;
+    let (header, keys) = read_dump_file(input_path)?;
     tracing::info!(
-        "Dump version: {}, nodes: {}",
+        "Dump version: {}, nodes: {}, keys: {}",
         header.version,
-        header.nodes.len()
+        header.nodes.len(),
+        keys.len()
     );
 
-    // Build slot -> node mapping
-    let mut slot_to_node: HashMap<u16, (&str, u16)> = HashMap::new();
-    for node in &header.nodes {
-        for (start, end) in &node.slots {
-            for slot in *start..=*end {
-                slot_to_node.insert(slot, (&node.ip as &str, node.port));
-            }
-        }
-    }
-
-    // Parse keys
-    let mut keys_to_restore: Vec<(String, String, Option<i64>, serde_json::Value)> = Vec::new();
-    for line in &lines[1..] {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(dump_key) = serde_json::from_str::<DumpKey>(line) {
-            keys_to_restore.push((
-                dump_key.key,
-                dump_key.r#type,
-                dump_key.ttl_ms,
-                dump_key.value,
-            ));
-        }
-    }
-
-    tracing::info!("Restoring {} keys", keys_to_restore.len());
-
-    let (seed_ip, seed_port) = if let Some((ip, port)) = connect_addr.rsplit_once(':') {
-        (ip.to_string(), port.parse().unwrap_or(6379))
-    } else {
-        (
-            "127.0.0.1".to_string(),
-            connect_addr.parse().unwrap_or(6379),
-        )
-    };
-
-    let mut stream = connect_node(&seed_ip, seed_port, user, password)?;
-
-    // Get current cluster nodes
-    let nodes_resp = send_resp_command(&mut stream, &["CLUSTER", "NODES"])?;
-    let current_nodes = parse_cluster_nodes(&nodes_resp);
-
-    // Build slot -> current node mapping (with owned strings)
-    let mut current_slot_to_node: HashMap<u16, (String, u16)> = HashMap::new();
-    for node in &current_nodes {
-        for (start, end) in &node.slots {
-            for slot in *start..=*end {
-                current_slot_to_node.insert(slot, (node.ip.clone(), node.port));
+    let (seed_ip, seed_port) = split_addr(connect_addr);
+    let mut seed = connect_node(&seed_ip, seed_port, user, password, tls)?;
+    let nodes_reply = seed.cmd(&[b"CLUSTER", b"NODES"])?.ok()?.as_text();
+    let mut owner: Vec<Option<(String, u16)>> = vec![None; 16384];
+    for node in parse_cluster_nodes(&nodes_reply) {
+        for &(start, end) in &node.slots {
+            for slot in start..=end.min(16383) {
+                owner[slot as usize] = Some((node.ip.clone(), node.port));
             }
         }
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
+    use std::sync::Mutex;
 
-    let semaphore = Arc::new(AtomicUsize::new(4));
-    let mut handles = Vec::new();
-    let success_count = Arc::new(AtomicUsize::new(0));
-    let error_count = Arc::new(AtomicUsize::new(0));
-
-    for (key, r#type, ttl, value) in keys_to_restore {
-        while semaphore.load(Ordering::Relaxed) == 0 {
-            thread::yield_now();
-        }
-        semaphore.fetch_sub(1, Ordering::Relaxed);
-
-        let password = password.map(|s| s.to_string());
-        let user = user.map(|s| s.to_string());
-        let slot_to_node = current_slot_to_node.clone();
-        let sem = semaphore.clone();
-        let success = success_count.clone();
-        let errors = error_count.clone();
-        let seed_ip = seed_ip.clone();
-        let per_node_password = per_node_password.map(|s| s.to_string());
-
-        let handle = thread::spawn(move || {
-            // Calculate slot
-            let slot = ConsistentHash::key_slot(key.as_bytes());
-
-            // Find target node
-            let target = slot_to_node.get(&slot).cloned();
-
-            let result = if let Some((target_ip, target_port)) = target {
-                let node_password = if target_ip == seed_ip && target_port == seed_port {
-                    password.as_deref()
-                } else {
-                    per_node_password.as_deref()
-                };
-                match connect_node(&target_ip, target_port, user.as_deref(), node_password) {
-                    Ok(mut stream) => {
-                        // Restore based on type
-                        let result = match r#type.as_str() {
-                            "string" => {
-                                if let Some(s) = value.as_str() {
-                                    send_resp_command(&mut stream, &["SET", &key, s])
-                                } else {
-                                    Err(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        "Invalid string value",
-                                    ))
+    // A few workers, each keeping one connection per node it writes to.
+    let queue = Mutex::new(keys.into_iter());
+    let success = AtomicUsize::new(0);
+    let errors = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                let mut conns: HashMap<(String, u16), NodeConn> = HashMap::new();
+                loop {
+                    let Some(k) = queue.lock().unwrap().next() else {
+                        break;
+                    };
+                    let key = if k.key_bytes.is_empty() {
+                        k.key.as_bytes()
+                    } else {
+                        &k.key_bytes[..]
+                    };
+                    let slot = ConsistentHash::key_slot(key) as usize;
+                    let result = (|| -> Result<(), String> {
+                        let target = owner[slot]
+                            .clone()
+                            .ok_or_else(|| format!("no node owns slot {slot}"))?;
+                        let cmds = restore_commands(&k)?;
+                        if !conns.contains_key(&target) {
+                            let pw = if target.0 == seed_ip && target.1 == seed_port {
+                                password
+                            } else {
+                                per_node_password
+                            };
+                            let c = connect_node(&target.0, target.1, user, pw, tls)
+                                .map_err(|e| e.to_string())?;
+                            conns.insert(target.clone(), c);
+                        }
+                        let conn = conns.get_mut(&target).expect("inserted above");
+                        let mut broken = None;
+                        for c in &cmds {
+                            let args: Vec<&[u8]> = c.iter().map(Vec::as_slice).collect();
+                            match conn.cmd(&args) {
+                                Ok(r) => {
+                                    r.ok().map_err(|e| e.to_string())?;
                                 }
-                            }
-                            _ => {
-                                let json_str = serde_json::to_string(&value).unwrap_or_default();
-                                send_resp_command(&mut stream, &["SET", &key, &json_str])
-                            }
-                        };
-
-                        if result.is_ok() {
-                            if let Some(ttl_s) = ttl {
-                                if ttl_s > 0 {
-                                    let ttl_s = (ttl_s / 1000) as u64;
-                                    let _ = send_resp_command(
-                                        &mut stream,
-                                        &["EXPIRE", &key, &ttl_s.to_string()],
-                                    );
+                                Err(e) => {
+                                    broken = Some(e.to_string());
+                                    break;
                                 }
                             }
                         }
-                        result
-                    }
-                    Err(e) => Err(e),
+                        if let Some(e) = broken {
+                            // The link is in an unknown state: reconnect next time.
+                            conns.remove(&target);
+                            return Err(e);
+                        }
+                        Ok(())
+                    })();
+                    match result {
+                        Ok(()) => success.fetch_add(1, Ordering::Relaxed),
+                        Err(e) => {
+                            tracing::warn!("restore of {:?} failed: {e}", k.key);
+                            errors.fetch_add(1, Ordering::Relaxed)
+                        }
+                    };
                 }
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("No node found for slot {}", slot),
-                ))
-            };
+            });
+        }
+    });
 
-            sem.fetch_add(1, Ordering::Relaxed);
-
-            match result {
-                Ok(_) => success.fetch_add(1, Ordering::Relaxed),
-                Err(_) => errors.fetch_add(1, Ordering::Relaxed),
-            }
-        });
-
-        handles.push(handle);
-    }
-
-    for handle in handles {
-        handle.join().ok();
-    }
-
-    let final_success = success_count.load(Ordering::Relaxed);
-    let final_errors = error_count.load(Ordering::Relaxed);
-
-    tracing::info!(
-        "Restore complete: {} success, {} errors",
-        final_success,
-        final_errors
-    );
-    Ok((final_success, final_errors))
+    let (ok, failed) = (success.into_inner(), errors.into_inner());
+    tracing::info!("Restore complete: {} success, {} errors", ok, failed);
+    Ok((ok, failed))
 }
 
 #[cfg(test)]
@@ -806,136 +796,6 @@ mod tests {
         let nodes = parse_cluster_nodes(&output);
         assert_eq!(nodes.len(), 1);
         assert!(nodes[0].slots.is_empty());
-    }
-
-    #[test]
-    fn test_parse_type_response_simple_string() {
-        let resp = "+string\r\n";
-        let result = parse_type_response(resp);
-        assert_eq!(result, "string");
-    }
-
-    #[test]
-    fn test_parse_type_response_list() {
-        let resp = "+list\r\n";
-        let result = parse_type_response(resp);
-        assert_eq!(result, "list");
-    }
-
-    #[test]
-    fn test_parse_type_response_hash() {
-        let resp = "+hash\r\n";
-        let result = parse_type_response(resp);
-        assert_eq!(result, "hash");
-    }
-
-    #[test]
-    fn test_parse_type_response_with_whitespace() {
-        let resp = "+string  \r\n";
-        let result = parse_type_response(resp);
-        assert_eq!(result, "string");
-    }
-
-    #[test]
-    fn test_parse_type_response_invalid() {
-        let resp = "invalid\r\n";
-        let result = parse_type_response(resp);
-        assert_eq!(result, "none");
-    }
-
-    #[test]
-    fn test_parse_ttl_response_no_expiry() {
-        let resp = ":-1\r\n";
-        let result = parse_ttl_response(resp);
-        assert_eq!(result, Some(0));
-    }
-
-    #[test]
-    fn test_parse_ttl_response_has_expiry() {
-        let resp = ":3600\r\n";
-        let result = parse_ttl_response(resp);
-        assert_eq!(result, Some(3600000));
-    }
-
-    #[test]
-    fn test_parse_ttl_response_no_key() {
-        let resp = ":-2\r\n";
-        let result = parse_ttl_response(resp);
-        assert_eq!(result, Some(0));
-    }
-
-    #[test]
-    fn test_parse_string_value_simple() {
-        let resp = "$9\r\ntestvalue\r\n";
-        let result = parse_string_value(resp);
-        assert_eq!(result, serde_json::Value::String("testvalue".to_string()));
-    }
-
-    #[test]
-    fn test_parse_string_value_empty() {
-        let resp = "$0\r\n\r\n";
-        let result = parse_string_value(resp);
-        assert_eq!(result, serde_json::Value::Null);
-    }
-
-    #[test]
-    fn test_parse_string_value_with_newlines() {
-        let resp = "$11\r\nhello\r\nworl\r\n";
-        let result = parse_string_value(resp);
-        assert_eq!(
-            result,
-            serde_json::Value::String("hello\r\nworl".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_string_value_null() {
-        let resp = "+OK\r\n";
-        let result = parse_string_value(resp);
-        assert_eq!(result, serde_json::Value::Null);
-    }
-
-    #[test]
-    fn test_parse_list_value() {
-        let resp = "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n";
-        let result = parse_list_value(resp);
-        let arr = result.as_array().unwrap();
-        assert!(!arr.is_empty());
-    }
-
-    #[test]
-    fn test_parse_list_value_empty() {
-        let resp = "*0\r\n";
-        let result = parse_list_value(resp);
-        assert_eq!(result, serde_json::Value::Array(vec![]));
-    }
-
-    #[test]
-    fn test_parse_set_value() {
-        let resp = "*2\r\n$3\r\none\r\n$3\r\ntwo\r\n";
-        let result = parse_set_value(resp);
-        let arr = result.as_array().unwrap();
-        assert!(!arr.is_empty());
-    }
-
-    #[test]
-    fn test_parse_hash_value() {
-        let resp = "*4\r\n$5\r\nfield1\r\n$6\r\nvalue1\r\n$5\r\nfield2\r\n$6\r\nvalue2\r\n";
-        let result = parse_hash_value(resp);
-        match result {
-            serde_json::Value::Object(map) => {
-                assert!(!map.is_empty());
-            }
-            _ => panic!("Expected object"),
-        }
-    }
-
-    #[test]
-    fn test_parse_zset_value() {
-        let resp = "*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n";
-        let result = parse_zset_value(resp);
-        let arr = result.as_array().unwrap();
-        assert_eq!(arr.len(), 2);
     }
 
     #[test]
@@ -987,6 +847,7 @@ mod tests {
             r#type: "string".to_string(),
             ttl_ms: Some(3600000),
             value: serde_json::Value::String("testvalue".to_string()),
+            dump: None,
         };
 
         let json = serde_json::to_string(&key).unwrap();
@@ -994,5 +855,144 @@ mod tests {
 
         assert_eq!(parsed.key, "testkey");
         assert_eq!(parsed.ttl_ms, Some(3600000));
+    }
+
+    /// A reader handing out one byte per read, like a transport that splits
+    /// every reply at the worst places.
+    struct Trickle(Vec<u8>, usize);
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.1 >= self.0.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = self.0[self.1];
+            self.1 += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn replies_are_read_whole_however_they_are_split() {
+        let wire = b"*3\r\n$1\r\na\r\n$4\r\nx\r\ny\r\n$-1\r\n:42\r\n-ERR no\r\n+OK\r\n";
+        let mut r = BufReader::with_capacity(1, Trickle(wire.to_vec(), 0));
+        assert_eq!(
+            read_reply(&mut r).unwrap(),
+            Reply::Array(Some(vec![
+                Reply::Bulk(Some(b"a".to_vec())),
+                Reply::Bulk(Some(b"x\r\ny".to_vec())),
+                Reply::Bulk(None),
+            ]))
+        );
+        assert_eq!(read_reply(&mut r).unwrap(), Reply::Int(42));
+        assert_eq!(read_reply(&mut r).unwrap(), Reply::Error("ERR no".into()));
+        assert_eq!(read_reply(&mut r).unwrap(), Reply::Status("OK".into()));
+        assert!(read_reply(&mut r).is_err(), "EOF is an error, not a reply");
+    }
+
+    #[test]
+    fn a_truncated_bulk_is_an_error() {
+        let mut r = BufReader::new(&b"$10\r\nabc"[..]);
+        assert!(read_reply(&mut r).is_err());
+    }
+
+    fn v1_key(t: &str, value: serde_json::Value, ttl: Option<i64>) -> DumpKey {
+        DumpKey {
+            key: "k".into(),
+            key_bytes: vec![],
+            r#type: t.into(),
+            ttl_ms: ttl,
+            value,
+            dump: None,
+        }
+    }
+
+    fn strs(cmds: &[Vec<Vec<u8>>]) -> Vec<Vec<String>> {
+        cmds.iter()
+            .map(|c| {
+                c.iter()
+                    .map(|a| String::from_utf8_lossy(a).into_owned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn version_1_dumps_restore_by_type_not_as_json_strings() {
+        let list =
+            restore_commands(&v1_key("list", serde_json::json!(["a", "b"]), Some(0))).unwrap();
+        assert_eq!(
+            strs(&list),
+            [vec!["DEL", "k"], vec!["RPUSH", "k", "a", "b"]]
+        );
+        let hash =
+            restore_commands(&v1_key("hash", serde_json::json!({"f": "v"}), Some(5000))).unwrap();
+        assert_eq!(
+            strs(&hash),
+            [
+                vec!["DEL", "k"],
+                vec!["HSET", "k", "f", "v"],
+                vec!["PEXPIRE", "k", "5000"]
+            ]
+        );
+        let zset = restore_commands(&v1_key(
+            "zset",
+            serde_json::json!([{"member": "m", "score": 1.5}]),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            strs(&zset),
+            [vec!["DEL", "k"], vec!["ZADD", "k", "1.5", "m"]]
+        );
+        assert!(restore_commands(&v1_key("stream", serde_json::Value::Null, None)).is_err());
+    }
+
+    #[test]
+    fn version_2_dumps_restore_from_the_payload() {
+        use base64::Engine;
+        let mut k = v1_key("list", serde_json::json!(["a"]), Some(1234));
+        k.key_bytes = b"k\x00bin".to_vec();
+        k.dump = Some(base64::engine::general_purpose::STANDARD.encode(b"\x0e\x01payload"));
+        let cmds = restore_commands(&k).unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0][0], b"RESTORE");
+        assert_eq!(cmds[0][1], b"k\x00bin", "the exact key bytes");
+        assert_eq!(cmds[0][2], b"1234");
+        assert_eq!(cmds[0][3], b"\x0e\x01payload");
+        assert_eq!(cmds[0][4], b"REPLACE");
+    }
+
+    #[test]
+    fn binary_dumps_read_back() {
+        let dir = std::env::temp_dir().join(format!("solikv-dump-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("d.bin");
+        let header = DumpHeader {
+            version: DUMP_VERSION,
+            nodes: vec![],
+            created_at: "now".into(),
+        };
+        let key = v1_key("string", serde_json::json!("v"), None);
+        let mut bytes = DUMP_MAGIC.to_vec();
+        bytes.extend_from_slice(&DUMP_VERSION.to_le_bytes());
+        for rec in [
+            serde_json::to_vec(&header).unwrap(),
+            serde_json::to_vec(&key).unwrap(),
+        ] {
+            bytes.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&rec);
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let (h, keys) = read_dump_file(&path).unwrap();
+        assert_eq!(h.version, DUMP_VERSION);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].value, serde_json::json!("v"));
+
+        // A version-1 binary file held no restorable records.
+        let mut old = DUMP_MAGIC.to_vec();
+        old.extend_from_slice(&1u16.to_le_bytes());
+        std::fs::write(&path, &old).unwrap();
+        assert!(read_dump_file(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
