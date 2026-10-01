@@ -1,5 +1,109 @@
 # SoliKV benchmark results
 
+## SoliKV against Redis 7.4 and Redis 8.10 (2026-10-01)
+
+**Servers:** SoliKV at 49ff314 (`claude/audit-fixes`, default 16 shards, and `--solo`), Redis 7.4.11 and Redis 8.10.2, all built from source on this machine (Redis with its default jemalloc).
+**Settings, every server:** AOF on, `appendfsync everysec`, no RDB save points, automatic AOF rewrite at the defaults, everything else at its defaults (Redis `io-threads 1`). Data directories on tmpfs.
+**Machine:** AMD Ryzen 7 255 (16 threads), 27 GiB RAM, Linux 7.2; client and server on the same host over loopback.
+**Method:** three rounds alternating the four servers, a fresh server for every suite, median shown; the best value of each row in bold. `redis-benchmark` 7.4.2 and `benches/loadgen`. Reproduce with `benches/versus.py` (see [README.md](README.md)).
+
+### Versions
+
+| Server | Version | Flags |
+|---|---|---|
+| SoliKV | solikv 0.4.3 | `--save ''` |
+| SoliKV --solo | solikv 0.4.3 | `--solo --save ''` |
+| Redis 7.4 | Redis 7.4.11 | — |
+| Redis 8.10 | Redis 8.10.2 | — |
+
+### Standard commands — 50 clients, 200k ops (req/s)
+
+| Command | SoliKV | SoliKV --solo | Redis 7.4 | Redis 8.10 |
+|---|---|---|---|---|
+| PING INLINE | 118.3K/s | 119.3K/s | 119.2K/s | **119.7K/s** |
+| PING MBULK | 116.3K/s | **120.2K/s** | 117.7K/s | 120.0K/s |
+| SET | 117.1K/s | **120.1K/s** | 119.8K/s | 120.0K/s |
+| GET | 116.6K/s | 118.3K/s | 118.6K/s | **120.1K/s** |
+| INCR | 119.3K/s | 118.5K/s | 118.6K/s | **119.7K/s** |
+| LPUSH | 112.1K/s | 119.4K/s | 116.8K/s | **119.7K/s** |
+| RPUSH | 113.2K/s | 115.4K/s | **119.5K/s** | 119.2K/s |
+| LPOP | 115.7K/s | **122.0K/s** | 119.1K/s | 119.8K/s |
+| RPOP | 117.4K/s | 118.8K/s | 120.0K/s | **120.3K/s** |
+| SADD | 116.1K/s | 119.2K/s | 117.8K/s | **119.8K/s** |
+| HSET | 115.4K/s | 119.0K/s | 118.1K/s | **120.0K/s** |
+| ZADD | 118.6K/s | **120.1K/s** | 119.0K/s | 119.6K/s |
+| MSET | 117.8K/s | **121.1K/s** | 118.1K/s | 118.9K/s |
+
+### Pipelined — P=16, 50 clients, 2M ops (req/s)
+
+| Command | SoliKV | SoliKV --solo | Redis 7.4 | Redis 8.10 |
+|---|---|---|---|---|
+| SET | **1.75M/s** | 1.56M/s | 1.32M/s | 1.17M/s |
+| GET | 1.75M/s | **1.82M/s** | 1.78M/s | 1.77M/s |
+| INCR | **1.73M/s** | 1.60M/s | 1.45M/s | 1.31M/s |
+| LPUSH | **1.52M/s** | 1.41M/s | 1.22M/s | 1.18M/s |
+| SADD | 1.69M/s | 1.47M/s | 1.73M/s | **1.81M/s** |
+| HSET | **1.73M/s** | 1.26M/s | 1.10M/s | 1.07M/s |
+| ZADD | 1.70M/s | 1.23M/s | **1.71M/s** | 1.65M/s |
+
+### One hot key — `redis-benchmark --threads 6 -c 96 -P 32 -n 20000000` (req/s)
+
+| Command | SoliKV | SoliKV --solo | Redis 7.4 | Redis 8.10 |
+|---|---|---|---|---|
+| SET | **3.64M/s** | 2.00M/s | 1.54M/s | 1.35M/s |
+| GET | **5.71M/s** | 2.76M/s | 3.07M/s | 3.07M/s |
+| INCR | **3.48M/s** | 2.05M/s | 1.74M/s | 1.60M/s |
+| LPUSH | **2.28M/s** | 1.40M/s | 1.43M/s | 1.35M/s |
+| HSET | **3.20M/s** | 1.63M/s | 1.31M/s | 1.27M/s |
+| ZADD | **2.96M/s** | 1.60M/s | 2.28M/s | 2.10M/s |
+
+### Targeted workloads
+
+| Workload | SoliKV | SoliKV --solo | Redis 7.4 | Redis 8.10 |
+|---|---|---|---|---|
+| SETBIT growing a 10 MB bitmap (100k calls) | 114.0 ms | **104.5 ms** | 131.8 ms | 134.1 ms |
+| APPEND building a 10 MB string (20k calls) | 34.7 ms | **23.6 ms** | 45.3 ms | 46.5 ms |
+| ZRANK, 200k-member sorted set | 538.0K/s | 607.4K/s | **619.7K/s** | 609.7K/s |
+| ZRANGE 10 members deep in a 200k sorted set | 373.1K/s | 407.6K/s | **439.8K/s** | 437.9K/s |
+| Full ZSCAN, 50k members | **21.1 ms** | 21.6 ms | 37.0 ms | 31.0 ms |
+| Full HSCAN, 50k fields | 19.9 ms | **17.4 ms** | 24.1 ms | 20.5 ms |
+| SINTER 100k-member set with 100-member set | 73.6K/s | **73.6K/s** | 63.1K/s | 65.3K/s |
+| SPOP until a 100k set is empty | 118.6 ms | **117.4 ms** | 151.5 ms | 153.9 ms |
+| One MSET of 10k pairs | 3.92 ms | 3.80 ms | **3.68 ms** | 4.09 ms |
+| One RPUSH of 100k elements | 14.5 ms | **13.4 ms** | 14.9 ms | 14.6 ms |
+| One DEL of 1000 keys | 234 µs | 204 µs | 221 µs | **203 µs** |
+
+### Latency seen by other clients
+
+| Measurement | SoliKV | SoliKV --solo | Redis 7.4 | Redis 8.10 |
+|---|---|---|---|---|
+| GET p99.9 during BGSAVE (1M keys, 16 clients) | 843 µs | 803 µs | **573 µs** | 745 µs |
+| GET worst during BGSAVE | **2.80 ms** | 18.4 ms | 5.08 ms | 3.41 ms |
+| GET p99.9 while SAVE runs | 774 µs | **600 µs** | 651 µs | 807 µs |
+| GET worst while SAVE runs | **80.6 ms** | 357.3 ms | 551.1 ms | 445.1 ms |
+| SET p99.9 refilling after FLUSHALL of 1M keys | 5.37 ms | 14.3 ms | 2.20 ms | **1.95 ms** |
+| SET worst refilling after FLUSHALL | 79.9 ms | 62.1 ms | **4.86 ms** | 6.03 ms |
+| Other keys, worst, BGSAVE with a 2M-element list | 4.59 ms | 4.39 ms | **1.30 ms** | 1.69 ms |
+| Other keys, worst, BGREWRITEAOF with a 2M-element list | 2.71 ms | 3.26 ms | **1.70 ms** | 2.34 ms |
+
+### Housekeeping
+
+| Measurement | SoliKV | SoliKV --solo | Redis 7.4 | Redis 8.10 |
+|---|---|---|---|---|
+| Expired keys still counted 3 s after 200k keys expired, idle server | **0** | **0** | **0** | **0** |
+
+### Reading these numbers
+
+- **One command at a time**, a single `redis-benchmark` process saturates near 120K req/s before any of the servers does; the four are within noise of each other.
+- **One hot key** is where SoliKV's design shows: network I/O and command parsing run on every core, and only execution is serialized on the key's shard. Redis runs everything on one thread (`io-threads 1`, its default). SoliKV is 1.4–2.7× Redis 8.10 there; `--solo`, which has Redis' shape, lands at the same level as Redis. Redis' `io-threads` option was not tried.
+- **Pipelined**, the single benchmark client is again close to its limit (GET is level everywhere). SoliKV leads on SET, INCR, LPUSH and HSET; Redis leads on SADD and matches on ZADD.
+- **Data structures** are comparable. SoliKV is faster growing strings (SETBIT, APPEND), on full ZSCAN, SINTER and SPOP; Redis is 13–15% faster on ZRANK and 17–18% faster on deep ZRANGE than SoliKV's default mode.
+- **Snapshots:** Redis forks for BGSAVE and BGREWRITEAOF; SoliKV saves in steps under each shard's lock. With 1M small keys, SoliKV's worst GET during BGSAVE is the lowest of the four (2.8 ms against 3.4–5.1 ms), with p99.9 slightly higher (0.80–0.84 ms against 0.57–0.75 ms). Next to a 2M-element list, other keys of that shard see up to 4.6 ms on SoliKV against 1.3–1.7 ms on Redis. SAVE blocks every Redis client for the whole save (worst 445–551 ms here); SoliKV's SAVE holds one shard at a time in its default mode (worst 81 ms).
+- **Refill after a FLUSHALL of 1M keys is SoliKV's weak spot:** worst SET 62–80 ms against 5–6 ms for Redis, p99.9 5–14 ms against about 2 ms.
+- Client and server share one 16-thread CPU and the desktop was in use during the run (load average 3–6), spread evenly by alternating the servers. On a real disk, AOF-heavy numbers would be lower for every server.
+
+---
+
 ## Audit fixes: before and after (2026-10-01)
 
 **Before:** `main` at 6645a90 (0.4.3). **After:** `claude/audit-fixes` at 7109ba1.

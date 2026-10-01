@@ -9,6 +9,8 @@ alternating them round by round, each suite on a fresh server with its own data 
 | `harness.py` | Starts and stops a server, runs `redis-benchmark` or the load generator against it. |
 | `compare.py` | The full before/after run: suites, one hot key, `--solo` BGSAVE, a huge key. About 40 minutes with 3 rounds. |
 | `report.py` | Prints the Markdown tables of `RESULTS.md` from a `compare.py` results directory. |
+| `versus.py` | Several servers side by side (SoliKV, SoliKV `--solo`, Redis 7, Redis 8…), alternating round by round: suites, one hot key, a huge key. |
+| `report_versus.py` | One column per server, best value of each row in bold. |
 
 ## Requirements
 
@@ -30,6 +32,20 @@ rbuild --faithful --no-link kv && cp ../target/remote/release/solikv /tmp/solikv
 python3 compare.py /tmp/solikv-before /tmp/solikv-after results/ --rounds 3
 python3 report.py results/
 ```
+
+Against Redis, build `redis-server` from the Redis sources (`make redis-server`) and give each server a name:
+
+```bash
+python3 versus.py results-vs/ \
+  "SoliKV=solikv:/tmp/solikv-after:--save ''" \
+  "SoliKV --solo=solikv:/tmp/solikv-after:--solo --save ''" \
+  "Redis 7.4=redis:/opt/redis-7.4.11/src/redis-server" \
+  "Redis 8.10=redis:/opt/redis-8.10.2/src/redis-server"
+python3 report_versus.py results-vs/
+```
+
+Redis runs with `--appendonly yes --appendfsync everysec --save ""` and its other defaults
+(`io-threads 1`); `--save ''` gives SoliKV the same no-snapshot setting.
 
 The server under test listens on `127.0.0.1:6390` (REST on 6391); change it with `BENCH_PORT`.
 Data directories go to the system temp directory unless `BENCH_TMP` is set. With AOF on, the

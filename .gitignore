@@ -17,4 +17,5 @@ www/node_modules
 # benchmark harness build output and results
 benches/loadgen/loadgen
 benches/results/
+benches/results-vs/
 __pycache__/

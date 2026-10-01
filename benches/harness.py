@@ -46,6 +46,37 @@ def start(binary, extra=(), aof="true"):
     return p, d
 
 
+def start_redis(binary, extra=()):
+    """Start redis-server with the settings the SoliKV runs use: AOF everysec,
+    no RDB save points, default automatic AOF rewrite, everything else default."""
+    d = tempfile.mkdtemp(prefix="redis-bench-", dir=os.environ.get("BENCH_TMP"))
+    p = subprocess.Popen(
+        [binary, "--port", str(PORT), "--bind", "127.0.0.1", "--dir", d,
+         "--appendonly", "yes", "--appendfsync", "everysec", "--save", "",
+         "--protected-mode", "no", "--daemonize", "no",
+         "--logfile", os.path.join(d, "redis.log"), *extra],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _wait_port(PORT)
+    except RuntimeError:
+        stop(p, d)
+        raise
+    return p, d
+
+
+def target(path, kind="solikv", extra=()):
+    """A server to benchmark: kind is "solikv" or "redis"."""
+    return {"path": os.path.abspath(path), "kind": kind, "extra": list(extra)}
+
+
+def start_target(t):
+    if isinstance(t, str):
+        t = target(t)
+    if t["kind"] == "redis":
+        return start_redis(t["path"], t["extra"])
+    return start(t["path"], t["extra"])
+
+
 def stop(p, d):
     p.terminate()
     try:
@@ -86,10 +117,11 @@ def loadgen(only=None, env=None):
     return out
 
 
-def suite(binary):
+def suite(t):
     """One full pass: standard and pipelined redis-benchmark on one server,
-    then every default load-generator scenario on another."""
-    p, d = start(binary)
+    then every default load-generator scenario on another. `t` is a binary
+    path (SoliKV) or a target()."""
+    p, d = start_target(t)
     try:
         std = redis_bench(["-t", "ping,set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,zadd,mset",
                            "-n", "200000", "-c", "50"])
@@ -97,7 +129,7 @@ def suite(binary):
                             "-n", "2000000", "-c", "50", "-P", "16"])
     finally:
         stop(p, d)
-    p, d = start(binary)
+    p, d = start_target(t)
     try:
         lg = loadgen()
     finally:
@@ -105,10 +137,10 @@ def suite(binary):
     return {"std": std, "pipe": pipe, "loadgen": lg}
 
 
-def hot_key(binary, command, ops=20_000_000):
+def hot_key(t, command, ops=20_000_000):
     """Six benchmark threads, 96 connections, pipeline 32, all on one key.
     Returns ops/s. A fresh server per call so AOF files never pile up."""
-    p, d = start(binary)
+    p, d = start_target(t)
     try:
         r = redis_bench(["-t", command, "-n", str(ops), "-c", "96", "-P", "32", "--threads", "6"])
     finally:
