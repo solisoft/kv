@@ -334,6 +334,10 @@ pub struct AclUser {
     all_channels: bool,
     /// Everything allowed: no check needed.
     unrestricted: bool,
+    /// Redis 7 selectors, `(~key* +cmd …)`: further sets of command, key
+    /// and channel permissions. A command is allowed when the user's own
+    /// permissions or any one selector allow all of it.
+    selectors: Vec<AclUser>,
 }
 
 impl AclUser {
@@ -350,7 +354,42 @@ impl AclUser {
             channels: Vec::new(),
             all_channels: false,
             unrestricted: false,
+            selectors: Vec::new(),
         }
+    }
+
+    /// A selector's permissions from its rules (the text between the
+    /// parentheses): commands, keys and channels only.
+    fn selector(rules: &str) -> Result<Self, String> {
+        let mut sel = AclUser::new("");
+        sel.enabled = true;
+        for rule in rules.split_ascii_whitespace() {
+            let lower = rule.to_ascii_lowercase();
+            let allowed = rule.starts_with(['+', '-', '~', '%', '&'])
+                || matches!(
+                    lower.as_str(),
+                    "allkeys"
+                        | "resetkeys"
+                        | "allchannels"
+                        | "resetchannels"
+                        | "allcommands"
+                        | "nocommands"
+                );
+            if !allowed {
+                return Err(format!("Syntax error in selector: '{}'", rule));
+            }
+            sel.apply(rule)?;
+        }
+        Ok(sel)
+    }
+
+    /// A selector's rules, as `ACL LIST` writes them inside parentheses.
+    fn selector_rules(&self) -> String {
+        [self.keys_rule(), self.channels_rule(), self.commands_rule()]
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// The `default` user of a fresh server: everything, and `nopass`
@@ -431,7 +470,8 @@ impl AclUser {
                 *self = AclUser::new(&self.name.clone());
                 self.apply("resetchannels")?;
             }
-            "clearselectors" | "sanitize-payload" | "skip-sanitize-payload" => {}
+            "clearselectors" => self.selectors.clear(),
+            "sanitize-payload" | "skip-sanitize-payload" => {}
             _ => {
                 if let Some(p) = rule.strip_prefix('>') {
                     let h = sha256(p.as_bytes());
@@ -506,8 +546,11 @@ impl AclUser {
                     self.set_cmd(spec.id as usize, false);
                     self.allowed_sub.retain(|(id, _)| *id != spec.id);
                     self.push_cmd_rule(&rule.to_ascii_lowercase());
-                } else if rule.starts_with('(') {
-                    return Err("Selectors are not supported".into());
+                } else if let Some(inner) = rule.strip_prefix('(') {
+                    let inner = inner
+                        .strip_suffix(')')
+                        .ok_or("Unmatched parenthesis in acl selector")?;
+                    self.selectors.push(AclUser::selector(inner)?);
                 } else {
                     return Err("Syntax error".into());
                 }
@@ -591,6 +634,9 @@ impl AclUser {
         parts.push(self.keys_rule());
         parts.push(self.channels_rule());
         parts.push(self.commands_rule());
+        for sel in &self.selectors {
+            parts.push(format!("({})", sel.selector_rules()));
+        }
         parts.retain(|p| !p.is_empty());
         parts.join(" ")
     }
@@ -679,8 +725,61 @@ impl AclUser {
                     .join(" ")
             })),
             CommandResponse::bulk_string("selectors"),
-            CommandResponse::array(vec![]),
+            CommandResponse::array(
+                self.selectors
+                    .iter()
+                    .map(|sel| {
+                        CommandResponse::array(vec![
+                            CommandResponse::bulk_string("commands"),
+                            CommandResponse::bulk(Bytes::from(sel.commands_rule())),
+                            CommandResponse::bulk_string("keys"),
+                            CommandResponse::bulk(Bytes::from(if sel.keys.is_empty() {
+                                String::new()
+                            } else {
+                                sel.keys_rule()
+                            })),
+                            CommandResponse::bulk_string("channels"),
+                            CommandResponse::bulk(Bytes::from(if sel.all_channels {
+                                "&*".to_string()
+                            } else {
+                                sel.channels
+                                    .iter()
+                                    .map(|c| format!("&{}", c))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            })),
+                        ])
+                    })
+                    .collect(),
+            ),
         ])
+    }
+}
+
+/// Join a selector given as several arguments — `(~key*` `+get)`, as a
+/// shell or an ACL file line splits it — back into one rule, as Redis does.
+fn merge_selector_args(args: impl IntoIterator<Item = String>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut open: Option<String> = None;
+    for a in args {
+        match open.as_mut() {
+            Some(sel) => {
+                sel.push(' ');
+                sel.push_str(&a);
+                if a.ends_with(')') {
+                    out.extend(open.take());
+                }
+            }
+            None if a.starts_with('(') && !a.ends_with(')') => open = Some(a),
+            None => out.push(a),
+        }
+    }
+    match open {
+        Some(sel) => Err(format!(
+            "Unmatched parenthesis in acl selector starting at '{}'.",
+            sel
+        )),
+        None => Ok(out),
     }
 }
 
@@ -890,8 +989,27 @@ impl Acl {
         }
     }
 
-    /// Check `name args…` for `user`.
+    /// Check `name args…` for `user`: its own permissions, else any of its
+    /// selectors (the denial reported is the one of its own permissions,
+    /// as in Redis).
     pub fn check(&self, user: &AclUser, spec: &CommandSpec, args: &[Bytes]) -> Result<(), Denied> {
+        match Self::check_perms(user, spec, args) {
+            Ok(()) => Ok(()),
+            Err(denied) => {
+                if user
+                    .selectors
+                    .iter()
+                    .any(|sel| Self::check_perms(sel, spec, args).is_ok())
+                {
+                    Ok(())
+                } else {
+                    Err(denied)
+                }
+            }
+        }
+    }
+
+    fn check_perms(user: &AclUser, spec: &CommandSpec, args: &[Bytes]) -> Result<(), Denied> {
         if user.unrestricted {
             return Ok(());
         }
@@ -1033,7 +1151,9 @@ impl Acl {
                 .next()
                 .ok_or_else(|| format!("ERR {}:{}: missing user name", path.display(), n + 1))?;
             let mut u = AclUser::new(name);
-            for rule in parts {
+            let rules = merge_selector_args(parts.map(str::to_string))
+                .map_err(|e| format!("ERR {}:{}: {}", path.display(), n + 1, e))?;
+            for rule in &rules {
                 u.apply(rule)
                     .map_err(|e| format!("ERR Error in user declaration '{}': {}", rule, e))?;
             }
@@ -1089,9 +1209,16 @@ impl Acl {
                     .user(&name)
                     .map(|u| (*u).clone())
                     .unwrap_or_else(|| AclUser::new(&name));
-                for r in &rest[1..] {
-                    let rule = String::from_utf8_lossy(r);
-                    if let Err(e) = u.apply(&rule) {
+                let rules = match merge_selector_args(
+                    rest[1..]
+                        .iter()
+                        .map(|r| String::from_utf8_lossy(r).to_string()),
+                ) {
+                    Ok(r) => r,
+                    Err(e) => return CommandResponse::error(format!("ERR {}", e)),
+                };
+                for rule in &rules {
+                    if let Err(e) = u.apply(rule) {
                         return CommandResponse::error(format!(
                             "ERR Error in ACL SETUSER modifier '{}': {}",
                             rule, e
@@ -1452,5 +1579,78 @@ mod tests {
         assert!(hset & cat_bit("hash").unwrap() != 0);
         let hello = categories_of(commands::lookup("HELLO").unwrap());
         assert!(hello & cat_bit("hash").unwrap() == 0);
+    }
+
+    #[test]
+    fn selectors_add_permission_sets() {
+        let acl = Acl::default();
+        // As a shell splits it: the selector arrives in two arguments.
+        let r = acl.command(
+            &[
+                b("SETUSER"),
+                b("sel"),
+                b("on"),
+                b("nopass"),
+                b("~root:*"),
+                b("+get"),
+                b("(~sel:*"),
+                b("+set)"),
+                b("(%R~ro:* +get +strlen)"),
+            ],
+            "default",
+        );
+        assert!(matches!(r, CommandResponse::Ok), "{r:?}");
+        let u = acl.user("sel").unwrap();
+        let get = commands::lookup("GET").unwrap();
+        let set = commands::lookup("SET").unwrap();
+        let strlen = commands::lookup("STRLEN").unwrap();
+        // Root: GET on root:*. First selector: SET on sel:*. Second: reads
+        // of ro:*.
+        assert!(acl.check(&u, get, &[b("root:1")]).is_ok());
+        assert!(acl.check(&u, set, &[b("sel:1"), b("v")]).is_ok());
+        assert!(acl.check(&u, strlen, &[b("ro:1")]).is_ok());
+        assert!(acl.check(&u, get, &[b("ro:1")]).is_ok());
+        // Each set is checked whole: no mixing a command from one with keys
+        // from another.
+        assert!(acl.check(&u, set, &[b("root:1"), b("v")]).is_err());
+        assert!(acl.check(&u, get, &[b("sel:1")]).is_err());
+        assert!(acl.check(&u, set, &[b("ro:1"), b("v")]).is_err());
+        // The denial is the root permissions' one.
+        assert!(matches!(
+            acl.check(&u, set, &[b("other"), b("v")]),
+            Err(Denied::Command(_))
+        ));
+
+        // ACL LIST writes them back, and that line loads to the same user.
+        let line = u.describe();
+        assert!(line.contains("(~sel:* resetchannels -@all +set)"), "{line}");
+        let dir = std::env::temp_dir().join(format!("solikv-acl-sel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("users.acl");
+        std::fs::write(&file, format!("{line}\n")).unwrap();
+        let acl2 = Acl::default();
+        acl2.set_file(Some(file));
+        acl2.load_file().unwrap();
+        let u2 = acl2.user("sel").unwrap();
+        assert_eq!(u2.describe(), line);
+        assert!(acl2.check(&u2, set, &[b("sel:2"), b("v")]).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // GETUSER lists them; clearselectors removes them.
+        let CommandResponse::Array(fields) = u.getuser() else {
+            panic!("GETUSER is an array");
+        };
+        assert!(matches!(&fields[fields.len() - 1], CommandResponse::Array(s) if s.len() == 2));
+        acl.command(&[b("SETUSER"), b("sel"), b("clearselectors")], "default");
+        let u = acl.user("sel").unwrap();
+        assert!(acl.check(&u, set, &[b("sel:1"), b("v")]).is_err());
+
+        // Selectors take permissions only; an open parenthesis is an error.
+        for bad in [&["(on)"][..], &["(>pw)"], &["(~a", "+get"]] {
+            let mut args = vec![b("SETUSER"), b("bad")];
+            args.extend(bad.iter().map(|a| b(a)));
+            let r = acl.command(&args, "default");
+            assert!(matches!(r, CommandResponse::Error(_)), "{bad:?}: {r:?}");
+        }
     }
 }

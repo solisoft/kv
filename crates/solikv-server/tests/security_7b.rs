@@ -354,3 +354,53 @@ fn migrate_reuses_its_connection_to_a_target() {
     ca.ok(&["MIGRATE", "127.0.0.1", &bport, "m3", "0", "5000"]);
     assert_eq!(cb.get("m3").as_deref(), Some("v3"));
 }
+
+#[test]
+fn monitor_and_slowlog_do_not_show_secrets() {
+    watchdog(60);
+    let dir = TmpDir::new("redact");
+    let srv = Server::start(&dir.0, &[]);
+    let mut mon = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+    mon.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    mon.write_all(b"*1\r\n$7\r\nMONITOR\r\n").unwrap();
+    let mut c = srv.client();
+    c.ok(&["CONFIG", "SET", "slowlog-log-slower-than", "0"]);
+    c.ok(&[
+        "ACL",
+        "SETUSER",
+        "u",
+        "on",
+        ">hunter2-secret",
+        "~*",
+        "+@all",
+    ]);
+    let hello = c.cmd(&["HELLO", "2", "AUTH", "u", "hunter2-secret"]);
+    assert!(hello.starts_with('*'), "{hello}");
+    c.ok(&["SET", "visible", "1"]);
+    std::thread::sleep(Duration::from_millis(300));
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 8192];
+    while let Ok(n) = mon.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        seen.extend_from_slice(&buf[..n]);
+    }
+    let seen = String::from_utf8_lossy(&seen);
+    assert!(seen.contains(r#""set" "visible" "1""#), "{seen}");
+    assert!(
+        !seen.contains("hunter2"),
+        "MONITOR leaked a password: {seen}"
+    );
+    assert!(
+        !seen.contains(r#""acl""#),
+        "MONITOR showed an admin command: {seen}"
+    );
+    let slow = c.cmd(&["SLOWLOG", "GET", "-1"]);
+    assert!(
+        !slow.contains("hunter2"),
+        "SLOWLOG leaked a password: {slow}"
+    );
+    assert!(slow.contains("(redacted)"), "{slow}");
+}

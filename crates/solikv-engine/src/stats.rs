@@ -395,6 +395,8 @@ impl Stats {
         if threshold < 0 || (us as i64) < threshold {
             return;
         }
+        let args = redact(name, args);
+        let args: &[Bytes] = &args;
         let mut argv = Vec::with_capacity((args.len() + 1).min(SLOWLOG_ARGS));
         argv.push(Bytes::from(name.to_lowercase()));
         let max_args = SLOWLOG_ARGS - 1;
@@ -641,6 +643,15 @@ impl Stats {
         if !self.monitoring() {
             return;
         }
+        // As Redis: administrative commands are not shown at all, and
+        // secrets in the others are redacted.
+        if name == "AUTH"
+            || crate::commands::lookup(name).is_some_and(|s| s.has(crate::commands::F_ADMIN))
+        {
+            return;
+        }
+        let args = redact(name, args);
+        let args: &[Bytes] = &args;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
@@ -719,9 +730,110 @@ impl Drop for MonitorFeed {
     }
 }
 
+/// `name args…` with its secrets replaced by `(redacted)`, for `MONITOR`
+/// and `SLOWLOG`: the passwords of `AUTH`, `HELLO … AUTH`, `MIGRATE … AUTH
+/// | AUTH2`, the password rules of `ACL SETUSER` (`>`, `<`, `#`, `!`) and
+/// the values of `CONFIG SET requirepass | masterauth`. Redis redacts the
+/// same arguments.
+pub fn redact<'a>(name: &str, args: &'a [Bytes]) -> std::borrow::Cow<'a, [Bytes]> {
+    let hidden = Bytes::from_static(b"(redacted)");
+    let mut secret: Vec<usize> = Vec::new();
+    let is = |a: &Bytes, w: &str| a.eq_ignore_ascii_case(w.as_bytes());
+    match name {
+        "AUTH" => secret.extend(0..args.len()),
+        "HELLO" => {
+            if let Some(i) = args.iter().position(|a| is(a, "AUTH")) {
+                secret.extend([i + 1, i + 2]);
+            }
+        }
+        "MIGRATE" => {
+            for (i, a) in args.iter().enumerate() {
+                if is(a, "AUTH") {
+                    secret.push(i + 1);
+                } else if is(a, "AUTH2") {
+                    secret.push(i + 2);
+                }
+            }
+        }
+        "ACL" if args.first().is_some_and(|a| is(a, "SETUSER")) => {
+            for (i, a) in args.iter().enumerate().skip(2) {
+                if matches!(a.first(), Some(b'>' | b'<' | b'#' | b'!')) {
+                    secret.push(i);
+                }
+            }
+        }
+        "CONFIG" if args.first().is_some_and(|a| is(a, "SET")) => {
+            let mut i = 1;
+            while i + 1 < args.len() {
+                if is(&args[i], "requirepass") || is(&args[i], "masterauth") {
+                    secret.push(i + 1);
+                }
+                i += 2;
+            }
+        }
+        _ => {}
+    }
+    secret.retain(|&i| i < args.len());
+    if secret.is_empty() {
+        return std::borrow::Cow::Borrowed(args);
+    }
+    let mut out = args.to_vec();
+    for i in secret {
+        out[i] = hidden.clone();
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secrets_are_redacted() {
+        let b = |v: &[&str]| {
+            v.iter()
+                .map(|s| Bytes::from(s.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let shown = |name: &str, args: &[&str]| -> Vec<String> {
+            redact(name, &b(args))
+                .iter()
+                .map(|a| String::from_utf8_lossy(a).to_string())
+                .collect()
+        };
+        assert_eq!(shown("AUTH", &["u", "pw"]), ["(redacted)", "(redacted)"]);
+        assert_eq!(
+            shown("HELLO", &["3", "AUTH", "u", "pw", "SETNAME", "n"]),
+            ["3", "AUTH", "(redacted)", "(redacted)", "SETNAME", "n"]
+        );
+        assert_eq!(
+            shown("ACL", &["SETUSER", "u", "on", ">pw", "~*", "#abc"]),
+            ["SETUSER", "u", "on", "(redacted)", "~*", "(redacted)"]
+        );
+        assert_eq!(
+            shown("CONFIG", &["SET", "maxmemory", "1", "masterauth", "pw"]),
+            ["SET", "maxmemory", "1", "masterauth", "(redacted)"]
+        );
+        assert_eq!(
+            shown(
+                "MIGRATE",
+                &["h", "1", "", "0", "10", "AUTH2", "u", "pw", "KEYS", "k"]
+            ),
+            [
+                "h",
+                "1",
+                "",
+                "0",
+                "10",
+                "AUTH2",
+                "u",
+                "(redacted)",
+                "KEYS",
+                "k"
+            ]
+        );
+        assert_eq!(shown("SET", &["k", ">v"]), ["k", ">v"]);
+    }
 
     #[test]
     fn counters_sum_across_threads_and_reset() {
