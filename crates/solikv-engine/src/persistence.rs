@@ -375,11 +375,21 @@ impl Persistence {
     // -----------------------------------------------------------------------
 
     /// `SAVE`: snapshot now, on this thread.
+    ///
+    /// The caller waits for the whole save, as Redis' does; the other
+    /// clients do not, in multi-shard mode: each shard is serialized a step
+    /// at a time, its lock released in between (see `capture_shard_stepped`).
+    /// A solo store can only be stepped from its own thread, which this
+    /// command is occupying — there `SAVE` blocks the server, like Redis'.
     pub fn save(&self, shards: &ShardManager, dirty: u64) -> io::Result<()> {
         let _one_at_a_time = self.snapshotting.lock();
         let mut file = SnapshotFile::create(&self.rdb_path())?;
         for i in 0..shards.num_shards() {
-            let body = capture_shard(shards, i, None)?;
+            let body = if shards.is_solo() {
+                capture_shard(shards, i, None)?
+            } else {
+                capture_shard_stepped(shards, i, None)?
+            };
             file.write_section(i as u32, &body)?;
         }
         file.commit()?;
@@ -417,10 +427,10 @@ impl Persistence {
             return Err("ERR Background save already in progress");
         }
         let this = self.clone();
-        // Solo: the store may only be read on this thread.
+        // Solo: the store may only be read on its own thread.
         let captured = if shards.is_solo() {
-            match capture_shard(shards, 0, None) {
-                Ok(body) => Some(vec![(0u32, body)]),
+            match solo_capture(shards, None) {
+                Ok(c) => Some(c),
                 Err(e) => {
                     this.finish_bgsave(Err(e), dirty);
                     return Ok(());
@@ -437,11 +447,7 @@ impl Persistence {
                     let _one_at_a_time = this.snapshotting.lock();
                     let mut file = SnapshotFile::create(&this.rdb_path())?;
                     match captured {
-                        Some(sections) => {
-                            for (i, body) in sections {
-                                file.write_section(i, &body)?;
-                            }
-                        }
+                        Some(solo) => file.write_section(0, &solo.body()?)?,
                         None => {
                             for i in 0..shards.num_shards() {
                                 let body = capture_shard_stepped(&shards, i, None)?;
@@ -528,8 +534,8 @@ impl Persistence {
         };
 
         let captured = if shards.is_solo() {
-            match capture_shard(shards, 0, Some((&writer, g))) {
-                Ok(body) => Some(vec![(0u32, body)]),
+            match solo_capture(shards, Some((&writer, g))) {
+                Ok(c) => Some(c),
                 Err(e) => {
                     self.finish_rewrite(Err(e));
                     return Ok(());
@@ -547,11 +553,7 @@ impl Persistence {
                     let _one_at_a_time = this.snapshotting.lock();
                     let mut file = SnapshotFile::create(&aof::base_path(&aof_dir, g))?;
                     match captured {
-                        Some(sections) => {
-                            for (i, body) in sections {
-                                file.write_section(i, &body)?;
-                            }
-                        }
+                        Some(solo) => file.write_section(0, &solo.body()?)?,
                         None => {
                             for i in 0..shards.num_shards() {
                                 let body = capture_shard_stepped(&shards, i, Some((&writer, g)))?;
@@ -744,19 +746,21 @@ fn capture_shard_stepped(
     rotate: Option<(&AofWriter, u64)>,
 ) -> io::Result<Vec<u8>> {
     let shard = shards.shard(i);
-    let began = shard.with_store_mut_unlogged(|store| {
-        if !store.begin_snapshot(rdb::snapshot_encoder) {
-            return false;
+    let mut attempts = 0u32;
+    loop {
+        let began = shard.with_store_mut_unlogged(|store| begin_capture(store, i, rotate));
+        if began {
+            break;
         }
-        if let Some((w, g)) = rotate {
-            w.rotate(i as u32, &mut store.log_seq, g);
+        // A replica's full resynchronization holds the snapshot slot; it
+        // ends.
+        attempts += 1;
+        if attempts > BEGIN_ATTEMPTS {
+            return Err(io::Error::other(
+                "a snapshot of this shard is already running",
+            ));
         }
-        true
-    });
-    if !began {
-        return Err(io::Error::other(
-            "a snapshot of this shard is already running",
-        ));
+        std::thread::sleep(BEGIN_RETRY);
     }
     let mut body = Vec::new();
     loop {
@@ -768,6 +772,121 @@ fn capture_shard_stepped(
         // Let the commands that queued on the lock in.
         std::thread::yield_now();
     }
+}
+
+/// Begin shard `i`'s stepped snapshot, switching its log to the next
+/// generation in the same lock hold with `rotate`. False when one is
+/// already running.
+fn begin_capture(
+    store: &mut solikv_core::ShardStore,
+    i: usize,
+    rotate: Option<(&AofWriter, u64)>,
+) -> bool {
+    if !store.begin_snapshot(rdb::snapshot_encoder) {
+        return false;
+    }
+    if let Some((w, g)) = rotate {
+        w.rotate(i as u32, &mut store.log_seq, g);
+    }
+    true
+}
+
+/// How often, and how long, a snapshot waits for another to free the
+/// shard's snapshot slot (one at a time per shard).
+const BEGIN_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
+const BEGIN_ATTEMPTS: u32 = 3000;
+
+/// The solo shard's snapshot for a background save or log rewrite.
+enum SoloCapture {
+    /// Taken whole, before returning: no runtime to step it on.
+    Whole(Vec<u8>),
+    /// Being taken a step at a time on the runtime's worker; the steps
+    /// arrive here, `None` once complete.
+    Steps(std::sync::mpsc::Receiver<io::Result<Option<Vec<u8>>>>),
+}
+
+impl SoloCapture {
+    /// The serialized shard (waits for the steps, on the writer thread).
+    fn body(self) -> io::Result<Vec<u8>> {
+        match self {
+            SoloCapture::Whole(body) => Ok(body),
+            SoloCapture::Steps(rx) => {
+                let mut body = Vec::new();
+                loop {
+                    match rx.recv() {
+                        Ok(Ok(Some(chunk))) => body.extend_from_slice(&chunk),
+                        Ok(Ok(None)) => return Ok(body),
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => return Err(io::Error::other("the snapshot was abandoned")),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Start the solo shard's snapshot for `BGSAVE` / `BGREWRITEAOF`.
+///
+/// The solo store belongs to the runtime's only worker, so its snapshot
+/// cannot be stepped from the writer thread as a locked shard's is. It is
+/// stepped by a task on that worker instead, yielding to the connections
+/// between steps: the server keeps answering while a large dataset is
+/// saved, rather than stalling for the whole serialization. The store keeps
+/// the result point-in-time (`ShardStore::begin_snapshot`). Outside such a
+/// runtime (no runtime, or one with several workers, where a task could run
+/// on another thread), the shard is captured whole, here.
+fn solo_capture(
+    shards: &Arc<ShardManager>,
+    rotate: Option<(&AofWriter, u64)>,
+) -> io::Result<SoloCapture> {
+    let single_worker = tokio::runtime::Handle::try_current()
+        .ok()
+        .filter(|h| h.metrics().num_workers() == 1);
+    let Some(handle) = single_worker else {
+        return capture_shard(shards, 0, rotate).map(SoloCapture::Whole);
+    };
+    // Begun here, inside the command: the snapshot is of this instant, as a
+    // fork would be, whatever runs between now and the first step.
+    let mut began = shards
+        .shard(0)
+        .with_store_mut_unlogged(|store| begin_capture(store, 0, rotate));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let shards = shards.clone();
+    let rotate = rotate.map(|(w, g)| (w.clone(), g));
+    handle.spawn(async move {
+        let shard = shards.shard(0);
+        let mut attempts = 0u32;
+        // Another snapshot (a replica's full sync) holds the slot: wait.
+        while !began {
+            let rotate = rotate.as_ref().map(|(w, g)| (w, *g));
+            began = shard.with_store_mut_unlogged(|store| begin_capture(store, 0, rotate));
+            if began {
+                break;
+            }
+            attempts += 1;
+            if attempts > BEGIN_ATTEMPTS {
+                let _ = tx.send(Err(io::Error::other(
+                    "a snapshot of this shard is already running",
+                )));
+                return;
+            }
+            tokio::time::sleep(BEGIN_RETRY).await;
+        }
+        loop {
+            let (chunk, done) = shard.with_store_mut_unlogged(|s| s.snapshot_step(SNAPSHOT_STEP));
+            if tx.send(Ok(Some(chunk))).is_err() {
+                // The writer gave up: free the snapshot slot.
+                shard.with_store_mut_unlogged(|s| s.abort_snapshot());
+                return;
+            }
+            if done {
+                let _ = tx.send(Ok(None));
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    Ok(SoloCapture::Steps(rx))
 }
 
 fn max_gen_plus_one(m: &Manifest) -> u64 {
