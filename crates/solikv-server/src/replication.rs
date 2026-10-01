@@ -310,6 +310,8 @@ pub struct ReplConfig {
     pub announce_ip: Option<String>,
     /// Where the snapshot is staged while it is received.
     pub dir: PathBuf,
+    /// Connect to the master over TLS (`--tls-replication`).
+    pub tls: Option<crate::tls::Outbound>,
 }
 
 #[derive(Debug, Default)]
@@ -405,22 +407,26 @@ impl Replication {
     /// One connection to the master: handshake, synchronization, stream.
     async fn sync_once(&self, gen: u64, host: &str, port: u16) -> Result<(), String> {
         let stale = || self.generation.load(Ordering::Acquire) != gen;
+        let cfg = self.cfg.read().clone();
         let stream = tokio::time::timeout(
             CONNECT_TIMEOUT,
-            tokio::net::TcpStream::connect((host, port)),
+            crate::tls::connect(host, port, cfg.tls.as_ref()),
         )
         .await
         .map_err(|_| "connect timed out".to_string())?
         .map_err(|e| format!("connect: {e}"))?;
-        let _ = stream.set_nodelay(true);
         let mut link = Link::new(stream);
-        let cfg = self.cfg.read().clone();
 
         // PING (an `-NOAUTH` answer is fine: AUTH comes next).
         link.send(&[b"PING"]).await?;
         let r = link.line().await?;
         if r.starts_with('-') && !r.starts_with("-NOAUTH") && !r.starts_with("-NOPERM") {
             return Err(format!("master answered PING with {r}"));
+        }
+        if r.starts_with("-NOAUTH") && cfg.masterauth.is_none() {
+            return Err("the master requires authentication: set --masterauth (and \
+                        --masteruser for an ACL user)"
+                .into());
         }
         if let Some(pass) = &cfg.masterauth {
             match &cfg.masteruser {
@@ -802,12 +808,12 @@ impl Applier {
 
 /// The replica's connection to its master, with a read buffer.
 struct Link {
-    stream: tokio::net::TcpStream,
+    stream: crate::tls::BoxStream,
     buf: BytesMut,
 }
 
 impl Link {
-    fn new(stream: tokio::net::TcpStream) -> Self {
+    fn new(stream: crate::tls::BoxStream) -> Self {
         Self {
             stream,
             buf: BytesMut::with_capacity(64 * 1024),

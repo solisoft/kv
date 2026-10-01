@@ -84,14 +84,57 @@ const AUTH_TRACKER_PRUNE_AT: usize = 4096;
 struct AppState {
     engine: Arc<CommandEngine>,
     password: Option<Arc<String>>,
+    /// The ACL user a valid Bearer token acts as.
+    token_user: Arc<String>,
     auth_tracker: Arc<AuthFailureTracker>,
+}
+
+tokio::task_local! {
+    /// The ACL user of the request being served, set by `auth_middleware`
+    /// around the handler (which runs in the same task).
+    static REST_USER: Arc<solikv_engine::acl::AclUser>;
+}
+
+/// Run a command for the current request, under its user's ACL: a REST
+/// route is checked exactly as the command it maps to would be over RESP.
+fn exec(state: &AppState, cmd: &str, args: &[Bytes]) -> CommandResponse {
+    let user = REST_USER.try_with(|u| u.clone()).ok();
+    if let Some(user) = user.filter(|u| !u.unrestricted()) {
+        let acl = state.engine.acl();
+        match solikv_engine::commands::lookup_ci(cmd.as_bytes()) {
+            Some(spec) => {
+                if let Err(denied) = acl.check(&user, spec, args) {
+                    acl.log_denial(
+                        &user.name,
+                        &denied,
+                        solikv_engine::acl::Context::TopLevel,
+                        format!("rest user={}", user.name),
+                    );
+                    return CommandResponse::Error(denied.message(&user.name));
+                }
+            }
+            None => {
+                return CommandResponse::Error(format!(
+                    "ERR unknown command '{}'",
+                    cmd.to_lowercase()
+                ))
+            }
+        }
+    }
+    state.engine.execute(cmd, args)
 }
 
 /// How the REST listener is exposed.
 #[derive(Clone, Default)]
 pub struct RestConfig {
-    /// Bearer token. `None` = no authentication.
+    /// Bearer token. `None`: no token; requests then need `Basic`
+    /// credentials of an ACL user, unless the `default` user needs no
+    /// password (an open server).
     pub token: Option<Arc<String>>,
+    /// The ACL user a valid Bearer token acts as (`None`: `default`).
+    pub token_user: Option<String>,
+    /// Most concurrent connections (0 = no limit).
+    pub max_connections: usize,
     /// Terminate TLS with this configuration.
     pub tls: Option<rustls::ServerConfig>,
     /// Accepted `Host` header names (without port). `None` = no check.
@@ -135,6 +178,12 @@ pub async fn run_with(
     let state = AppState {
         engine,
         password: config.token.clone(),
+        token_user: Arc::new(
+            config
+                .token_user
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+        ),
         auth_tracker: Arc::new(AuthFailureTracker::default()),
     };
     let allowed_hosts: Arc<Option<Vec<String>>> = Arc::new(
@@ -218,10 +267,17 @@ pub async fn run_with(
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let limit = Arc::new(tokio::sync::Semaphore::new(
+        if config.max_connections == 0 {
+            tokio::sync::Semaphore::MAX_PERMITS
+        } else {
+            config.max_connections
+        },
+    ));
     match config.tls {
         Some(tls) => {
             tracing::info!("REST API listening on {} (TLS)", addr);
-            let listener = TlsListener::spawn(listener, tls, config.handshake_timeout);
+            let listener = TlsListener::spawn(listener, tls, config.handshake_timeout, limit);
             axum::serve(
                 listener.tap_io(|_| {}),
                 app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -231,13 +287,129 @@ pub async fn run_with(
         None => {
             tracing::info!("REST API listening on {}", addr);
             axum::serve(
-                listener,
+                // `tap_io`: axum provides `ConnectInfo<SocketAddr>` for a
+                // custom listener through it.
+                CappedListener {
+                    inner: listener,
+                    limit,
+                }
+                .tap_io(|_| {}),
                 app.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await?;
         }
     }
     Ok(())
+}
+
+/// A connection holding one of the listener's slots until it closes.
+pub struct Counted<S> {
+    inner: S,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Counted<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Counted<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+/// What a connection over `--rest-max-connections` gets before it is closed.
+const REST_BUSY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\n\
+content-length: 39\r\nconnection: close\r\n\r\n{\"error\":\"too many REST connections\"}";
+
+/// Refuse a connection over the cap: a 503, then close.
+fn refuse_busy(mut socket: tokio::net::TcpStream, peer: SocketAddr) {
+    tracing::warn!("REST connection limit reached, refusing {}", peer);
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            socket.write_all(REST_BUSY),
+        )
+        .await;
+    });
+}
+
+/// The plain listener, with the connection cap.
+struct CappedListener {
+    inner: tokio::net::TcpListener,
+    limit: Arc<tokio::sync::Semaphore>,
+}
+
+impl axum::serve::Listener for CappedListener {
+    type Io = Counted<tokio::net::TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (socket, peer) = match self.inner.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    tracing::debug!("REST accept error: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+            match self.limit.clone().try_acquire_owned() {
+                Ok(slot) => {
+                    let _ = socket.set_nodelay(true);
+                    return (
+                        Counted {
+                            inner: socket,
+                            _slot: slot,
+                        },
+                        peer,
+                    );
+                }
+                Err(_) => refuse_busy(socket, peer),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
 }
 
 /// A listener that hands axum TLS streams.
@@ -247,7 +419,7 @@ pub async fn run_with(
 /// completes the handshake would stall every connection behind it.
 struct TlsListener {
     rx: tokio::sync::mpsc::Receiver<(
-        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        Counted<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
         SocketAddr,
     )>,
     local: SocketAddr,
@@ -258,6 +430,7 @@ impl TlsListener {
         listener: tokio::net::TcpListener,
         config: rustls::ServerConfig,
         handshake_timeout: std::time::Duration,
+        limit: Arc<tokio::sync::Semaphore>,
     ) -> Self {
         let local = listener
             .local_addr()
@@ -274,12 +447,29 @@ impl TlsListener {
                         continue;
                     }
                 };
+                // The slot is taken before the handshake: half-open TLS
+                // connections count too.
+                let slot = match limit.clone().try_acquire_owned() {
+                    Ok(slot) => slot,
+                    Err(_) => {
+                        tracing::warn!("REST connection limit reached, refusing {}", peer);
+                        continue;
+                    }
+                };
                 let acceptor = acceptor.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     match tokio::time::timeout(handshake_timeout, acceptor.accept(socket)).await {
                         Ok(Ok(stream)) => {
-                            let _ = tx.send((stream, peer)).await;
+                            let _ = tx
+                                .send((
+                                    Counted {
+                                        inner: stream,
+                                        _slot: slot,
+                                    },
+                                    peer,
+                                ))
+                                .await;
                         }
                         Ok(Err(e)) => tracing::debug!("REST TLS handshake from {}: {}", peer, e),
                         Err(_) => tracing::debug!("REST TLS handshake from {} timed out", peer),
@@ -292,7 +482,7 @@ impl TlsListener {
 }
 
 impl axum::serve::Listener for TlsListener {
-    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Io = Counted<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>;
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
@@ -465,41 +655,86 @@ async fn auth_middleware(
         ));
     }
 
-    let password = match &state.password {
-        None => return Ok(next.run(req).await),
-        Some(p) => p,
+    let unauthorized = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Unauthorized"})),
+        )
     };
-
+    let acl = state.engine.acl();
     let auth_header = req
         .headers()
         .get("authorization")
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
 
-    match auth_header {
-        Some(header) if header.starts_with("Bearer ") => {
-            let token = &header[7..];
-            if constant_time_eq(token.as_bytes(), password.as_bytes()) {
-                state.auth_tracker.record_success(&ip);
-                Ok(next.run(req).await)
-            } else {
+    let user = match auth_header.as_deref() {
+        // The token: `--rest-token`, else `requirepass`. It acts as
+        // `--rest-token-user` (`default` unless set).
+        Some(h) if h.starts_with("Bearer ") && state.password.is_some() => {
+            let token = &h[7..];
+            let expected = state
+                .password
+                .as_deref()
+                .map(|p| p.as_bytes())
+                .unwrap_or(b"");
+            if !constant_time_eq(token.as_bytes(), expected) {
                 state.auth_tracker.record_failure(&ip);
                 tracing::warn!("Failed REST AUTH attempt from {}", ip);
-                Err((
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({"error": "Unauthorized"})),
-                ))
+                return Err(unauthorized());
+            }
+            match acl.user(&state.token_user).filter(|u| u.enabled()) {
+                Some(u) => u,
+                None => {
+                    tracing::warn!(
+                        "REST token user '{}' does not exist or is disabled",
+                        state.token_user
+                    );
+                    return Err(unauthorized());
+                }
             }
         }
-        _ => {
-            // No credentials is not a failed guess. Counting it locked out
-            // every client behind a shared address — a reverse proxy — after
-            // ten unauthenticated probes.
-            Err((
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Unauthorized"})),
-            ))
+        // An ACL user's own credentials.
+        Some(h) if h.starts_with("Basic ") => {
+            let Some((name, pass)) = decode_basic(&h[6..]) else {
+                return Err(unauthorized());
+            };
+            match acl.authenticate(Some(name.as_bytes()), pass.as_bytes()) {
+                Ok(u) => u,
+                Err(_) => {
+                    state.auth_tracker.record_failure(&ip);
+                    acl.log_auth_failure(&name, format!("rest addr={}", peer));
+                    tracing::warn!("Failed REST AUTH attempt from {} (user {})", ip, name);
+                    return Err(unauthorized());
+                }
+            }
         }
-    }
+        // No credentials (or a Bearer where no token is configured): only an
+        // open server — no token, and a `default` user without a password —
+        // lets the request through, as `default`. No credentials is not a
+        // failed guess: counting it locked out every client behind a
+        // shared address (a reverse proxy) after ten probes.
+        _ => {
+            if state.password.is_none() && acl.default_auto_auth() {
+                acl.default_user()
+            } else {
+                return Err(unauthorized());
+            }
+        }
+    };
+    state.auth_tracker.record_success(&ip);
+    Ok(REST_USER.scope(user, next.run(req)).await)
+}
+
+/// `Basic <base64(user:password)>`.
+fn decode_basic(b64: &str) -> Option<(String, String)> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .ok()?;
+    let text = String::from_utf8(raw).ok()?;
+    let (user, pass) = text.split_once(':')?;
+    Some((user.to_string(), pass.to_string()))
 }
 
 /// Constant-time byte comparison to prevent timing side-channel attacks on password checks.
@@ -634,7 +869,7 @@ async fn get_key(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("GET", &[Bytes::from(key)]);
+    let resp = exec(&state, "GET", &[Bytes::from(key)]);
     to_json_response(resp)
 }
 
@@ -651,7 +886,7 @@ async fn set_key(
         args.push(Bytes::from("PX"));
         args.push(Bytes::from(px.to_string()));
     }
-    let resp = state.engine.execute("SET", &args);
+    let resp = exec(&state, "SET", &args);
     to_json_response(resp)
 }
 
@@ -659,7 +894,7 @@ async fn delete_key(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("DEL", &[Bytes::from(key)]);
+    let resp = exec(&state, "DEL", &[Bytes::from(key)]);
     to_json_response(resp)
 }
 
@@ -670,7 +905,8 @@ async fn list_range(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let start = range.start.unwrap_or(0);
     let stop = range.stop.unwrap_or(-1);
-    let resp = state.engine.execute(
+    let resp = exec(
+        &state,
         "LRANGE",
         &[
             Bytes::from(key),
@@ -688,7 +924,7 @@ async fn list_lpush(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let mut args = vec![Bytes::from(key)];
     args.extend(body.values.into_iter().map(Bytes::from));
-    let resp = state.engine.execute("LPUSH", &args);
+    let resp = exec(&state, "LPUSH", &args);
     to_json_response(resp)
 }
 
@@ -699,7 +935,7 @@ async fn list_rpush(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let mut args = vec![Bytes::from(key)];
     args.extend(body.values.into_iter().map(Bytes::from));
-    let resp = state.engine.execute("RPUSH", &args);
+    let resp = exec(&state, "RPUSH", &args);
     to_json_response(resp)
 }
 
@@ -707,7 +943,7 @@ async fn list_lpop(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("LPOP", &[Bytes::from(key)]);
+    let resp = exec(&state, "LPOP", &[Bytes::from(key)]);
     to_json_response(resp)
 }
 
@@ -715,7 +951,7 @@ async fn list_rpop(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("RPOP", &[Bytes::from(key)]);
+    let resp = exec(&state, "RPOP", &[Bytes::from(key)]);
     to_json_response(resp)
 }
 
@@ -723,7 +959,7 @@ async fn hash_getall(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("HGETALL", &[Bytes::from(key)]);
+    let resp = exec(&state, "HGETALL", &[Bytes::from(key)]);
     to_json_response(resp)
 }
 
@@ -731,9 +967,7 @@ async fn hash_get_field(
     State(state): State<AppState>,
     Path((key, field)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state
-        .engine
-        .execute("HGET", &[Bytes::from(key), Bytes::from(field)]);
+    let resp = exec(&state, "HGET", &[Bytes::from(key), Bytes::from(field)]);
     to_json_response(resp)
 }
 
@@ -747,7 +981,7 @@ async fn hash_set(
         args.push(Bytes::from(field));
         args.push(Bytes::from(value));
     }
-    let resp = state.engine.execute("HSET", &args);
+    let resp = exec(&state, "HSET", &args);
     to_json_response(resp)
 }
 
@@ -755,9 +989,7 @@ async fn hash_del_field(
     State(state): State<AppState>,
     Path((key, field)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state
-        .engine
-        .execute("HDEL", &[Bytes::from(key), Bytes::from(field)]);
+    let resp = exec(&state, "HDEL", &[Bytes::from(key), Bytes::from(field)]);
     to_json_response(resp)
 }
 
@@ -765,7 +997,7 @@ async fn set_members(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("SMEMBERS", &[Bytes::from(key)]);
+    let resp = exec(&state, "SMEMBERS", &[Bytes::from(key)]);
     to_json_response(resp)
 }
 
@@ -776,7 +1008,7 @@ async fn set_add(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let mut args = vec![Bytes::from(key)];
     args.extend(body.members.into_iter().map(Bytes::from));
-    let resp = state.engine.execute("SADD", &args);
+    let resp = exec(&state, "SADD", &args);
     to_json_response(resp)
 }
 
@@ -784,9 +1016,7 @@ async fn set_rem_member(
     State(state): State<AppState>,
     Path((key, member)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state
-        .engine
-        .execute("SREM", &[Bytes::from(key), Bytes::from(member)]);
+    let resp = exec(&state, "SREM", &[Bytes::from(key), Bytes::from(member)]);
     to_json_response(resp)
 }
 
@@ -797,7 +1027,8 @@ async fn zset_range(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let start = range.start.unwrap_or(0);
     let stop = range.stop.unwrap_or(-1);
-    let resp = state.engine.execute(
+    let resp = exec(
+        &state,
         "ZRANGE",
         &[
             Bytes::from(key),
@@ -819,7 +1050,7 @@ async fn zset_add(
         args.push(Bytes::from(member.score.to_string()));
         args.push(Bytes::from(member.member));
     }
-    let resp = state.engine.execute("ZADD", &args);
+    let resp = exec(&state, "ZADD", &args);
     to_json_response(resp)
 }
 
@@ -877,17 +1108,17 @@ async fn execute_command(
         );
     }
     let args: Vec<Bytes> = body.args.into_iter().map(Bytes::from).collect();
-    let resp = state.engine.execute(&cmd, &args);
+    let resp = exec(&state, &cmd, &args);
     to_json_response(resp)
 }
 
 async fn server_info(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("INFO", &[]);
+    let resp = exec(&state, "INFO", &[]);
     to_json_response(resp)
 }
 
 async fn dbsize(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("DBSIZE", &[]);
+    let resp = exec(&state, "DBSIZE", &[]);
     to_json_response(resp)
 }
 
@@ -900,7 +1131,7 @@ async fn pfadd(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let mut args = vec![Bytes::from(key)];
     args.extend(body.elements.into_iter().map(Bytes::from));
-    let resp = state.engine.execute("PFADD", &args);
+    let resp = exec(&state, "PFADD", &args);
     to_json_response(resp)
 }
 
@@ -908,7 +1139,7 @@ async fn pfcount(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("PFCOUNT", &[Bytes::from(key)]);
+    let resp = exec(&state, "PFCOUNT", &[Bytes::from(key)]);
     to_json_response(resp)
 }
 
@@ -919,7 +1150,7 @@ async fn pfmerge(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let mut args = vec![Bytes::from(dest)];
     args.extend(body.sources.into_iter().map(Bytes::from));
-    let resp = state.engine.execute("PFMERGE", &args);
+    let resp = exec(&state, "PFMERGE", &args);
     to_json_response(resp)
 }
 
@@ -930,7 +1161,8 @@ async fn bf_reserve(
     Path(key): Path<String>,
     Json(body): Json<BfReserveBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute(
+    let resp = exec(
+        &state,
         "BF.RESERVE",
         &[
             Bytes::from(key),
@@ -946,9 +1178,11 @@ async fn bf_add(
     Path(key): Path<String>,
     Json(body): Json<BfAddBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state
-        .engine
-        .execute("BF.ADD", &[Bytes::from(key), Bytes::from(body.item)]);
+    let resp = exec(
+        &state,
+        "BF.ADD",
+        &[Bytes::from(key), Bytes::from(body.item)],
+    );
     to_json_response(resp)
 }
 
@@ -956,9 +1190,7 @@ async fn bf_exists(
     State(state): State<AppState>,
     Path((key, item)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state
-        .engine
-        .execute("BF.EXISTS", &[Bytes::from(key), Bytes::from(item)]);
+    let resp = exec(&state, "BF.EXISTS", &[Bytes::from(key), Bytes::from(item)]);
     to_json_response(resp)
 }
 
@@ -966,7 +1198,7 @@ async fn bf_info(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute("BF.INFO", &[Bytes::from(key)]);
+    let resp = exec(&state, "BF.INFO", &[Bytes::from(key)]);
     to_json_response(resp)
 }
 
@@ -977,7 +1209,8 @@ async fn bitmap_setbit(
     Path(key): Path<String>,
     Json(body): Json<SetBitBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state.engine.execute(
+    let resp = exec(
+        &state,
         "SETBIT",
         &[
             Bytes::from(key),
@@ -992,9 +1225,7 @@ async fn bitmap_getbit(
     State(state): State<AppState>,
     Path((key, offset)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state
-        .engine
-        .execute("GETBIT", &[Bytes::from(key), Bytes::from(offset)]);
+    let resp = exec(&state, "GETBIT", &[Bytes::from(key), Bytes::from(offset)]);
     to_json_response(resp)
 }
 
@@ -1008,7 +1239,7 @@ async fn bitmap_bitcount(
         args.push(Bytes::from(start.to_string()));
         args.push(Bytes::from(end.to_string()));
     }
-    let resp = state.engine.execute("BITCOUNT", &args);
+    let resp = exec(&state, "BITCOUNT", &args);
     to_json_response(resp)
 }
 
@@ -1025,7 +1256,7 @@ async fn geo_add(
         args.push(Bytes::from(m.latitude.to_string()));
         args.push(Bytes::from(m.member));
     }
-    let resp = state.engine.execute("GEOADD", &args);
+    let resp = exec(&state, "GEOADD", &args);
     to_json_response(resp)
 }
 
@@ -1033,9 +1264,7 @@ async fn geo_pos(
     State(state): State<AppState>,
     Path((key, member)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let resp = state
-        .engine
-        .execute("GEOPOS", &[Bytes::from(key), Bytes::from(member)]);
+    let resp = exec(&state, "GEOPOS", &[Bytes::from(key), Bytes::from(member)]);
     to_json_response(resp)
 }
 
@@ -1048,7 +1277,7 @@ async fn geo_dist(
     if let Some(unit) = query.unit {
         args.push(Bytes::from(unit));
     }
-    let resp = state.engine.execute("GEODIST", &args);
+    let resp = exec(&state, "GEODIST", &args);
     to_json_response(resp)
 }
 
@@ -1102,12 +1331,13 @@ async fn geo_search(
         args.push(Bytes::from("WITHDIST"));
     }
 
-    let resp = state.engine.execute("GEOSEARCH", &args);
+    let resp = exec(&state, "GEOSEARCH", &args);
     to_json_response(resp)
 }
 
 fn to_json_response(resp: CommandResponse) -> (StatusCode, Json<serde_json::Value>) {
     let status = match &resp {
+        CommandResponse::Error(e) if e.starts_with("NOPERM") => StatusCode::FORBIDDEN,
         CommandResponse::Error(_) => StatusCode::BAD_REQUEST,
         CommandResponse::Nil => StatusCode::NOT_FOUND,
         _ => StatusCode::OK,

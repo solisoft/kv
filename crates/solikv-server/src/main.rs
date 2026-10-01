@@ -101,6 +101,15 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     rest_token_file: Option<PathBuf>,
 
+    /// The ACL user a valid REST Bearer token acts as. Other users
+    /// authenticate with `Authorization: Basic` (user:password).
+    #[arg(long, default_value = "default", value_name = "USER")]
+    rest_token_user: String,
+
+    /// Most concurrent REST connections (0 = no limit)
+    #[arg(long, default_value = "1024")]
+    rest_max_connections: usize,
+
     /// Extra Host header names the REST API accepts (comma-separated). On a
     /// loopback bind, localhost/127.0.0.1/::1 are always accepted and any
     /// other Host is refused, which stops DNS rebinding from a browser. On
@@ -229,20 +238,36 @@ struct Args {
     #[arg(long, default_value = "yes")]
     protected_mode: String,
 
-    /// TLS certificate file. With --tls-key, enables TLS on both the RESP
-    /// and the REST port. The cluster bus is not encrypted (it is
-    /// authenticated; see SECURITY.md).
+    /// TLS certificate file. With --tls-key, enables TLS on the RESP and
+    /// REST ports; it is also this node's client certificate on the links it
+    /// opens (--tls-replication, --tls-cluster).
     #[arg(long, value_name = "PATH")]
     tls_cert: Option<String>,
 
-    /// TLS private key file
+    /// TLS private key file (PKCS#8, PKCS#1 or SEC1 PEM)
     #[arg(long, value_name = "PATH")]
     tls_key: Option<String>,
 
-    /// Reserved for client-certificate (mTLS) verification. Not implemented:
-    /// the server refuses to start with it rather than silently skip it.
-    #[arg(long, value_name = "PATH")]
-    tls_client_ca: Option<String>,
+    /// CA certificate(s) (PEM). Client certificates on RESP/REST are checked
+    /// against it (see --tls-auth-clients), and so are the peers of
+    /// replication links and the cluster bus.
+    #[arg(long, value_name = "PATH", alias = "tls-client-ca")]
+    tls_ca_cert: Option<String>,
+
+    /// Client certificates on RESP and REST: yes (required), optional, or no.
+    /// Default: yes when --tls-ca-cert is set, as in Redis.
+    #[arg(long, value_name = "yes|no|optional")]
+    tls_auth_clients: Option<String>,
+
+    /// Replication links (and MIGRATE) use TLS: a replica connects to its
+    /// master's TLS port and checks its certificate against --tls-ca-cert.
+    #[arg(long, default_value = "no", value_parser = parse_yes_no)]
+    tls_replication: bool,
+
+    /// The cluster bus uses TLS, both ways, with a certificate signed by
+    /// --tls-ca-cert required of every peer. The bus keeps its HMAC envelope.
+    #[arg(long, default_value = "no", value_parser = parse_yes_no)]
+    tls_cluster: bool,
 
     /// Keyspace notification flags (e.g. "KEA" for all events, "" to disable)
     #[arg(long, default_value = "")]
@@ -318,13 +343,30 @@ struct Args {
     #[arg(long)]
     cluster_connect: Option<String>,
 
-    /// Cluster password for dump/restore
+    /// Password `--cluster-dump`/`--cluster-restore` authenticate to the
+    /// nodes with (`AUTH`). Before --cluster-bus-secret existed it was also
+    /// the bus key; it still is, with a warning, when no bus secret is set.
     #[arg(long)]
     cluster_password: Option<String>,
 
-    /// Read cluster password from a file
+    /// Read the dump/restore password from a file (mode 0600 enforced)
     #[arg(long)]
     cluster_password_file: Option<PathBuf>,
+
+    /// ACL user dump/restore authenticate as (`AUTH user password`)
+    #[arg(long)]
+    cluster_user: Option<String>,
+
+    /// The cluster bus key (HMAC-SHA256, at least 32 bytes): every frame
+    /// between nodes is signed with it. Separate from any client password,
+    /// so a credential handed to an operator tool is not the key to the
+    /// topology. Prefer --cluster-bus-secret-file or SOLIKV_CLUSTER_BUS_SECRET.
+    #[arg(long, value_name = "SECRET")]
+    cluster_bus_secret: Option<String>,
+
+    /// Read the cluster bus key from a file (mode 0600 enforced)
+    #[arg(long, value_name = "PATH")]
+    cluster_bus_secret_file: Option<PathBuf>,
 
     /// For cluster dump/restore: send password only to seed node, not to
     /// discovered nodes. `--cluster-password-seed-only=false` sends it to
@@ -532,6 +574,7 @@ async fn async_main(args: Args) {
             std::path::Path::new(dump_path),
             &args.cluster_dump_format,
             args.cluster_connect.as_ref().unwrap(),
+            args.cluster_user.as_deref(),
             cluster_password.as_deref(),
             if args.cluster_password_seed_only {
                 None
@@ -559,6 +602,7 @@ async fn async_main(args: Args) {
         let result = cluster_dump::restore_cluster(
             std::path::Path::new(restore_path),
             args.cluster_connect.as_ref().unwrap(),
+            args.cluster_user.as_deref(),
             cluster_password.as_deref(),
             if args.cluster_password_seed_only {
                 None
@@ -593,14 +637,6 @@ async fn async_main(args: Args) {
     }
     for w in &early_warnings {
         tracing::warn!("{}", w);
-    }
-
-    if args.tls_client_ca.is_some() {
-        eprintln!(
-            "ERROR: --tls-client-ca (client certificate verification) is not implemented. \
-             Refusing to start rather than accept clients without the check you asked for."
-        );
-        std::process::exit(1);
     }
 
     let num_shards = if args.solo {
@@ -651,45 +687,71 @@ async fn async_main(args: Args) {
     };
 
     let is_loopback = args.bind == "127.0.0.1" || args.bind == "::1" || args.bind == "localhost";
+    // Protected mode is decided once the ACL file is loaded (it may give
+    // the `default` user a password): see below.
     let protected = args.protected_mode.to_lowercase() != "no";
-    if !is_loopback && password.is_none() && protected {
-        eprintln!("ERROR: SoliKV is running in protected mode because no password is set.");
-        eprintln!("To disable protected mode, either set a password with --requirepass PASSWORD");
-        eprintln!("or pass --protected-mode no (NOT RECOMMENDED for exposed deployments).");
-        std::process::exit(1);
-    }
 
-    let tls_config = match (&args.tls_cert, &args.tls_key) {
-        (Some(cert_path), Some(key_path)) => {
-            let cert = std::fs::read(cert_path).expect("Failed to read TLS certificate");
-            let key = std::fs::read(key_path).expect("Failed to read TLS private key");
-            let certs = pem::parse_many(&cert).expect("Failed to parse TLS certificate");
-            let keys = pem::parse_many(&key).expect("Failed to parse TLS private key");
-            let certs: Vec<rustls::pki_types::CertificateDer> = certs
-                .iter()
-                .filter(|p| p.tag() == "CERTIFICATE")
-                .map(|p| p.contents().to_vec().into())
-                .collect();
-            let key_der = keys
-                .iter()
-                .find(|p| p.tag() == "PRIVATE KEY")
-                .expect("No private key found")
-                .contents()
-                .to_vec();
-            let key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
-                .expect("Failed to create private key der");
-            let config = rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .expect("Failed to create TLS config");
-            tracing::info!("TLS enabled");
-            Some(config)
+    let tls: Option<solikv_server::tls::Tls> = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => {
+            let auth_clients = match args.tls_auth_clients.as_deref() {
+                Some(v) => match solikv_server::tls::ClientAuth::parse(v) {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        eprintln!("ERROR: --tls-auth-clients: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                None => None,
+            };
+            let opts = solikv_server::tls::TlsOptions {
+                cert: cert.into(),
+                key: key.into(),
+                ca: args.tls_ca_cert.as_ref().map(PathBuf::from),
+                auth_clients,
+                replication: args.tls_replication,
+                cluster: args.tls_cluster,
+            };
+            match solikv_server::tls::Tls::load(&opts) {
+                Ok(t) => {
+                    tracing::info!(
+                        client_certificates = ?auth_clients.unwrap_or(if opts.ca.is_some() {
+                            solikv_server::tls::ClientAuth::Required
+                        } else {
+                            solikv_server::tls::ClientAuth::No
+                        }),
+                        replication = t.replication,
+                        cluster_bus = t.cluster,
+                        "TLS enabled"
+                    );
+                    Some(t)
+                }
+                Err(e) => {
+                    eprintln!("ERROR: TLS: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
-        _ => {
+        (None, None) => {
+            if args.tls_ca_cert.is_some()
+                || args.tls_auth_clients.is_some()
+                || args.tls_replication
+                || args.tls_cluster
+            {
+                eprintln!(
+                    "ERROR: TLS options were given without --tls-cert and --tls-key; refusing \
+                     to start without the encryption they ask for."
+                );
+                std::process::exit(1);
+            }
             tracing::info!("TLS disabled (no --tls-cert/--tls-key provided)");
             None
         }
+        _ => {
+            eprintln!("ERROR: --tls-cert and --tls-key go together");
+            std::process::exit(1);
+        }
     };
+    let tls_config: Option<rustls::ServerConfig> = tls.as_ref().map(|t| (*t.server).clone());
 
     if args.solo {
         tracing::info!(
@@ -725,22 +787,46 @@ async fn async_main(args: Args) {
         // The bus secret. Required, and checked before anything is bound:
         // the bus decides membership, slot ownership and failovers, so an
         // unauthenticated one lets a stranger decide all three.
-        let bus_secret = match cluster_password.as_deref() {
-            Some(pw) => match solikv_cluster::auth::ClusterSecret::new(pw) {
+        let bus_key: Option<String> = if let Some(path) = &args.cluster_bus_secret_file {
+            Some(read_secret_file(path).unwrap_or_else(|e| {
+                eprintln!("ERROR: failed to read cluster bus secret file {path:?}: {e}");
+                std::process::exit(1);
+            }))
+        } else if let Some(s) = &args.cluster_bus_secret {
+            tracing::warn!(
+                "Cluster bus secret via CLI flag is visible in /proc/cmdline. Consider \
+                 --cluster-bus-secret-file or SOLIKV_CLUSTER_BUS_SECRET."
+            );
+            Some(s.clone())
+        } else if let Ok(s) = std::env::var("SOLIKV_CLUSTER_BUS_SECRET") {
+            Some(s)
+        } else if let Some(pw) = cluster_password.clone() {
+            // Deprecated: the dump/restore password doubling as the bus key.
+            tracing::warn!(
+                "Using the cluster password as the cluster bus secret. This is deprecated: \
+                 the same string then authenticates clients for dump/restore and signs the \
+                 topology. Set --cluster-bus-secret-file (or SOLIKV_CLUSTER_BUS_SECRET)."
+            );
+            Some(pw)
+        } else {
+            None
+        };
+        let bus_secret = match bus_key.as_deref() {
+            Some(key) => match solikv_cluster::auth::ClusterSecret::new(key) {
                 Ok(secret) => secret,
                 Err(e) => {
                     eprintln!("ERROR: cluster mode needs a usable bus secret: {e}");
-                    eprintln!("       set --cluster-password-file or SOLIKV_CLUSTER_PASSWORD");
+                    eprintln!("       set --cluster-bus-secret-file or SOLIKV_CLUSTER_BUS_SECRET");
                     std::process::exit(1);
                 }
             },
             None => {
                 eprintln!(
-                    "ERROR: --cluster-enabled requires a cluster password: the gossip bus decides \
+                    "ERROR: --cluster-enabled requires a cluster bus secret: the bus decides \
                      cluster membership and slot ownership, and an unauthenticated bus lets \
                      anyone who can reach the port decide both."
                 );
-                eprintln!("       set --cluster-password-file or SOLIKV_CLUSTER_PASSWORD");
+                eprintln!("       set --cluster-bus-secret-file or SOLIKV_CLUSTER_BUS_SECRET");
                 std::process::exit(1);
             }
         };
@@ -762,6 +848,13 @@ async fn async_main(args: Args) {
         } else {
             announce_ip.clone()
         };
+        if !args.tls_cluster && !is_loopback {
+            tracing::warn!(
+                "The cluster bus is authenticated but not encrypted: topology, failover votes \
+                 and relayed PUBLISH payloads cross the network in cleartext. Use \
+                 --tls-cluster yes on untrusted networks."
+            );
+        }
         let bus_bind: std::net::SocketAddr = format!("{}:{}", bus_bind_ip, cport)
             .parse()
             .unwrap_or_else(|e| {
@@ -918,6 +1011,17 @@ async fn async_main(args: Args) {
             tracing::info!("Loaded ACL users from {}", abs_display(path));
         }
     }
+    // Protected mode: a non-loopback bind where anyone who connects is the
+    // unrestricted `default` user without a password is refused — on every
+    // port this process opens (RESP, REST, and the bus, which needs its own
+    // secret regardless).
+    if !is_loopback && protected && engine.acl().default_auto_auth() {
+        eprintln!("ERROR: SoliKV is running in protected mode because no password is set.");
+        eprintln!("To disable protected mode, either set a password with --requirepass PASSWORD");
+        eprintln!("(or give the default user one in --aclfile), or pass --protected-mode no");
+        eprintln!("(NOT RECOMMENDED for exposed deployments).");
+        std::process::exit(1);
+    }
     // Throughput and peak memory for INFO, sampled ten times a second.
     {
         let engine_stats = engine.clone();
@@ -995,6 +1099,7 @@ async fn async_main(args: Args) {
             listening_port: args.port,
             announce_ip: args.replica_announce_ip.clone(),
             dir: args.dir.clone(),
+            tls: tls.as_ref().and_then(|t| t.replication_client()),
         },
     );
     solikv_server::replication::spawn_master_pinger(engine.clone());
@@ -1002,7 +1107,13 @@ async fn async_main(args: Args) {
     // --- Cluster: attach the node to this server, start its bus and cron ---
     if let Some((cluster, bus_secret, bus_bind)) = cluster_setup {
         engine.enable_slot_index();
-        let bus = solikv_cluster::Bus::new(bus_secret.clone());
+        let bus_tls = tls.as_ref().filter(|t| t.cluster).and_then(|t| {
+            Some(solikv_cluster::gossip::BusTls {
+                connector: t.client.as_ref()?.connector(),
+                acceptor: tokio_rustls::TlsAcceptor::from(t.bus_server.clone()?),
+            })
+        });
+        let bus = solikv_cluster::Bus::with_tls(bus_secret.clone(), bus_tls);
         cluster.attach(
             bus.clone(),
             Arc::new(solikv_server::cluster_host::ServerClusterHost::new(
@@ -1133,6 +1244,7 @@ async fn async_main(args: Args) {
         auth_timeout: secs(args.auth_timeout),
         idle_timeout: secs(args.timeout),
         query_buffer_limit: args.client_query_buffer_limit,
+        outbound_tls: tls.as_ref().and_then(|t| t.replication_client()),
     };
     let resp_handle = tokio::spawn(async move {
         if let Err(e) = resp_server::run_with_limits(
@@ -1152,6 +1264,8 @@ async fn async_main(args: Args) {
 
     let rest_config = rest_server::RestConfig {
         token: rest_token.clone(),
+        token_user: Some(args.rest_token_user.clone()),
+        max_connections: args.rest_max_connections,
         tls: tls_config.clone(),
         allowed_hosts: if is_loopback || !args.rest_allowed_hosts.is_empty() {
             let mut hosts: Vec<String> = args.rest_allowed_hosts.clone();

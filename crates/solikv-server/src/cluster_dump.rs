@@ -150,9 +150,12 @@ pub fn send_resp_command(stream: &mut TcpStream, args: &[&str]) -> Result<String
     Ok(String::from_utf8_lossy(&response).to_string())
 }
 
+/// Connect to one node, authenticating with `AUTH [user] password` when a
+/// password is given.
 pub fn connect_node(
     ip: &str,
     port: u16,
+    user: Option<&str>,
     password: Option<&str>,
 ) -> Result<TcpStream, std::io::Error> {
     let addr = format!("{}:{}", ip, port);
@@ -160,7 +163,10 @@ pub fn connect_node(
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
     if let Some(pwd) = password {
-        let resp = send_resp_command(&mut stream, &["AUTH", pwd])?;
+        let resp = match user {
+            Some(u) => send_resp_command(&mut stream, &["AUTH", u, pwd])?,
+            None => send_resp_command(&mut stream, &["AUTH", pwd])?,
+        };
         if !resp.starts_with("+OK") {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -427,6 +433,7 @@ pub fn dump_cluster(
     output_path: &Path,
     format: &str,
     connect_addr: &str,
+    user: Option<&str>,
     password: Option<&str>,
     per_node_password: Option<&str>,
 ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
@@ -437,7 +444,7 @@ pub fn dump_cluster(
     };
 
     tracing::info!("Connecting to seed node {}:{}", seed_ip, seed_port);
-    let mut stream = connect_node(&seed_ip, seed_port, password)?;
+    let mut stream = connect_node(&seed_ip, seed_port, user, password)?;
 
     let nodes_resp = send_resp_command(&mut stream, &["CLUSTER", "NODES"])?;
     let nodes = parse_cluster_nodes(&nodes_resp);
@@ -462,7 +469,7 @@ pub fn dump_cluster(
             node.node_id
         );
 
-        match connect_node(&node.ip, node.port, node_password) {
+        match connect_node(&node.ip, node.port, user, node_password) {
             Ok(mut node_stream) => match scan_all_keys(&mut node_stream) {
                 Ok(keys) => {
                     for (key, r#type, ttl, value) in keys {
@@ -594,6 +601,7 @@ pub fn dump_cluster(
 pub fn restore_cluster(
     input_path: &Path,
     connect_addr: &str,
+    user: Option<&str>,
     password: Option<&str>,
     per_node_password: Option<&str>,
 ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
@@ -650,7 +658,7 @@ pub fn restore_cluster(
         )
     };
 
-    let mut stream = connect_node(&seed_ip, seed_port, password)?;
+    let mut stream = connect_node(&seed_ip, seed_port, user, password)?;
 
     // Get current cluster nodes
     let nodes_resp = send_resp_command(&mut stream, &["CLUSTER", "NODES"])?;
@@ -681,6 +689,7 @@ pub fn restore_cluster(
         semaphore.fetch_sub(1, Ordering::Relaxed);
 
         let password = password.map(|s| s.to_string());
+        let user = user.map(|s| s.to_string());
         let slot_to_node = current_slot_to_node.clone();
         let sem = semaphore.clone();
         let success = success_count.clone();
@@ -701,7 +710,7 @@ pub fn restore_cluster(
                 } else {
                     per_node_password.as_deref()
                 };
-                match connect_node(&target_ip, target_port, node_password) {
+                match connect_node(&target_ip, target_port, user.as_deref(), node_password) {
                     Ok(mut stream) => {
                         // Restore based on type
                         let result = match r#type.as_str() {

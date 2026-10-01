@@ -26,7 +26,15 @@
 //! Every frame is sealed for one receiver, named by node id. Only `PING` and
 //! `MEET` may be unaddressed (`*`): they are sent before the peer's id is
 //! known, and carry no authority. One replay memory covers the whole bus.
-//! The bus is not encrypted (see SECURITY.md).
+//!
+//! # Encryption
+//!
+//! With [`BusTls`] (`--tls-cluster`), every bus connection is TLS both ways:
+//! the dialling node presents its certificate, the listening node requires
+//! one signed by the cluster's CA, and the dialling node checks the
+//! listener's against the same CA. The HMAC envelope stays: TLS keeps the
+//! traffic private, the envelope keeps membership tied to the shared secret.
+//! Without it the bus is authenticated but cleartext (see SECURITY.md).
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -225,10 +233,19 @@ pub fn ranges_of(slots: impl IntoIterator<Item = u16>) -> Vec<(u16, u16)> {
 // Transport
 // ---------------------------------------------------------------------------
 
+/// TLS for the bus: what the dialling and the listening side use.
+#[derive(Clone)]
+pub struct BusTls {
+    pub connector: tokio_rustls::TlsConnector,
+    /// Must require client certificates (see the module doc).
+    pub acceptor: tokio_rustls::TlsAcceptor,
+}
+
 /// Outbound links to the other nodes.
 pub struct Bus {
     secret: crate::auth::ClusterSecret,
     links: Mutex<HashMap<String, Link>>,
+    tls: Option<BusTls>,
     pub sent: AtomicU64,
     pub received: AtomicU64,
 }
@@ -247,12 +264,21 @@ pub struct LinkInfo {
 
 impl Bus {
     pub fn new(secret: crate::auth::ClusterSecret) -> Arc<Self> {
+        Self::with_tls(secret, None)
+    }
+
+    pub fn with_tls(secret: crate::auth::ClusterSecret, tls: Option<BusTls>) -> Arc<Self> {
         Arc::new(Self {
             secret,
             links: Mutex::new(HashMap::new()),
+            tls,
             sent: AtomicU64::new(0),
             received: AtomicU64::new(0),
         })
+    }
+
+    pub fn is_tls(&self) -> bool {
+        self.tls.is_some()
     }
 
     /// Queue `msg` for the node filed under `key`, at `addr` (its bus port),
@@ -275,7 +301,11 @@ impl Bus {
         }
         let link = links.entry(key.to_string()).or_insert_with(|| {
             let (tx, rx) = mpsc::channel(LINK_QUEUE);
-            tokio::spawn(run_link(addr, rx));
+            tokio::spawn(run_link(
+                addr,
+                rx,
+                self.tls.as_ref().map(|t| t.connector.clone()),
+            ));
             Link {
                 addr,
                 tx,
@@ -304,18 +334,39 @@ impl Bus {
     }
 }
 
+trait BusStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> BusStream for T {}
+
+/// Connect to a peer's bus port, with TLS when configured.
+async fn dial(
+    addr: SocketAddr,
+    tls: Option<&tokio_rustls::TlsConnector>,
+) -> std::io::Result<Box<dyn BusStream>> {
+    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    let _ = tcp.set_nodelay(true);
+    Ok(match tls {
+        Some(c) => {
+            let name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
+            Box::new(c.connect(name, tcp).await?)
+        }
+        None => Box::new(tcp),
+    })
+}
+
 /// One peer's outbound connection: connect, write queued frames, reconnect.
-async fn run_link(addr: SocketAddr, mut rx: mpsc::Receiver<(String, String)>) {
+async fn run_link(
+    addr: SocketAddr,
+    mut rx: mpsc::Receiver<(String, String)>,
+    tls: Option<tokio_rustls::TlsConnector>,
+) {
     use tokio::io::AsyncWriteExt;
     loop {
-        let stream = match tokio::time::timeout(
-            BUS_IO_TIMEOUT,
-            tokio::net::TcpStream::connect(addr),
-        )
-        .await
-        {
+        let stream = match tokio::time::timeout(BUS_IO_TIMEOUT, dial(addr, tls.as_ref())).await {
             Ok(Ok(s)) => s,
-            _ => {
+            failed => {
+                if let Ok(Err(e)) = failed {
+                    tracing::debug!(%addr, error = %e, "cluster bus connection failed");
+                }
                 // Unreachable: what was queued is stale by the time it
                 // could go. Drop it; the next round repeats what matters.
                 loop {
@@ -332,7 +383,6 @@ async fn run_link(addr: SocketAddr, mut rx: mpsc::Receiver<(String, String)>) {
                 continue;
             }
         };
-        let _ = stream.set_nodelay(true);
         let mut stream = stream;
         loop {
             let Some((_, line)) = rx.recv().await else {
@@ -364,7 +414,12 @@ pub async fn start_bus_server(
     bus: Arc<Bus>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(bind).await?;
-    tracing::info!(%bind, "cluster bus listening, every frame authenticated");
+    let acceptor = bus.tls.as_ref().map(|t| t.acceptor.clone());
+    if acceptor.is_some() {
+        tracing::info!(%bind, "cluster bus listening (TLS, peer certificates required), every frame authenticated");
+    } else {
+        tracing::info!(%bind, "cluster bus listening, every frame authenticated");
+    }
 
     let seen = Arc::new(parking_lot::Mutex::new(crate::auth::NonceMemory::new()));
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_BUS_CONNECTIONS));
@@ -394,7 +449,21 @@ pub async fn start_bus_server(
                 rejected_log: rejected_log.clone(),
                 bus: bus.clone(),
             };
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
+                let stream: Box<dyn BusStream> = match acceptor {
+                    Some(a) => match tokio::time::timeout(BUS_IO_TIMEOUT, a.accept(stream)).await {
+                        Ok(Ok(s)) => Box::new(s),
+                        Ok(Err(e)) => {
+                            ctx.rejected_log.warn(|suppressed| {
+                                    tracing::warn!(%peer_addr, error = %e, suppressed, "cluster bus TLS handshake refused");
+                                });
+                            return;
+                        }
+                        Err(_) => return,
+                    },
+                    None => Box::new(stream),
+                };
                 if let Err(e) = serve_peer(stream, peer_addr, ctx).await {
                     tracing::debug!(%peer_addr, error = %e, "cluster bus connection closed");
                 }
@@ -470,7 +539,7 @@ async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
 
 /// One inbound connection: a peer's outbound link to us.
 async fn serve_peer(
-    stream: tokio::net::TcpStream,
+    stream: Box<dyn BusStream>,
     peer_addr: SocketAddr,
     ctx: PeerContext,
 ) -> Result<(), std::io::Error> {

@@ -111,6 +111,9 @@ pub struct ConnLimits {
     /// Most bytes buffered for one authenticated client's queries (Redis
     /// `client-query-buffer-limit`).
     pub query_buffer_limit: usize,
+    /// `MIGRATE` connects to its target over TLS (`--tls-replication`, as in
+    /// Redis).
+    pub outbound_tls: Option<crate::tls::Outbound>,
 }
 
 impl Default for ConnLimits {
@@ -120,7 +123,48 @@ impl Default for ConnLimits {
             auth_timeout: Some(std::time::Duration::from_secs(10)),
             idle_timeout: None,
             query_buffer_limit: 1024 * 1024 * 1024,
+            outbound_tls: None,
         }
+    }
+}
+
+/// `MIGRATE`'s connections, kept per target for reuse as Redis does: a
+/// resharding moves a slot's keys in many calls to one node, and a fresh
+/// connection (and TLS handshake) per call dominated it. A connection is
+/// used by one `MIGRATE` at a time, and closed after [`MIGRATE_IDLE`].
+#[derive(Default)]
+pub struct MigrateCache {
+    conns: parking_lot::Mutex<HashMap<(String, u16), (crate::tls::BoxStream, std::time::Instant)>>,
+    /// Connections opened (for tests and `INFO`-style accounting).
+    pub opened: std::sync::atomic::AtomicU64,
+}
+
+/// A cached `MIGRATE` connection unused this long is closed (Redis: 10 s).
+pub const MIGRATE_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl MigrateCache {
+    fn take(&self, host: &str, port: u16) -> Option<crate::tls::BoxStream> {
+        let mut conns = self.conns.lock();
+        conns.retain(|_, (_, at)| at.elapsed() < MIGRATE_IDLE);
+        conns.remove(&(host.to_string(), port)).map(|(s, _)| s)
+    }
+
+    fn put(&self, host: &str, port: u16, stream: crate::tls::BoxStream) {
+        self.conns.lock().insert(
+            (host.to_string(), port),
+            (stream, std::time::Instant::now()),
+        );
+    }
+
+    /// Close the connections idle past [`MIGRATE_IDLE`].
+    pub fn sweep(&self) {
+        self.conns
+            .lock()
+            .retain(|_, (_, at)| at.elapsed() < MIGRATE_IDLE);
+    }
+
+    pub fn cached(&self) -> usize {
+        self.conns.lock().len()
     }
 }
 
@@ -164,6 +208,20 @@ pub async fn run_with_limits(
 
     let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let auth_tracker = Arc::new(AuthFailureTracker::default());
+    let migrate_cache = Arc::new(MigrateCache::default());
+    {
+        let cache = Arc::downgrade(&migrate_cache);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                match cache.upgrade() {
+                    Some(c) => c.sweep(),
+                    None => return,
+                }
+            }
+        });
+    }
 
     loop {
         let (socket, peer_addr) = listener.accept().await?;
@@ -206,6 +264,7 @@ pub async fn run_with_limits(
         let tls_acceptor = tls_acceptor.clone();
         let auth_tracker = auth_tracker.clone();
         let limits = limits.clone();
+        let migrate_cache = migrate_cache.clone();
 
         tokio::spawn(async move {
             let accepted_at = tokio::time::Instant::now();
@@ -242,6 +301,7 @@ pub async fn run_with_limits(
                 auth_tracker,
                 &limits,
                 accepted_at,
+                &migrate_cache,
             )
             .await
             {
@@ -264,6 +324,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     auth_tracker: Arc<AuthFailureTracker>,
     limits: &ConnLimits,
     accepted_at: tokio::time::Instant,
+    migrate_cache: &MigrateCache,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let auth_deadline = limits.auth_timeout.map(|t| accepted_at + t);
 
@@ -975,7 +1036,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         socket.write_all(&write_buf).await?;
                         write_buf.clear();
                     }
-                    let reply = migrate(&engine, session.db, &cmd.args).await;
+                    let reply = migrate(
+                        &engine,
+                        session.db,
+                        &cmd.args,
+                        migrate_cache,
+                        limits.outbound_tls.as_ref(),
+                    )
+                    .await;
                     encode_frame(&reply, &mut write_buf);
                     continue;
                 }
@@ -2129,7 +2197,13 @@ async fn wait_while_paused(engine: &CommandEngine, name: &str) {
 /// to another server with `DUMP` payloads and `RESTORE-ASKING` (which a
 /// Redis or SoliKV target accepts while it imports the slot), then delete
 /// them here unless `COPY`.
-async fn migrate(engine: &Arc<CommandEngine>, db: u32, args: &[Bytes]) -> RespFrame {
+async fn migrate(
+    engine: &Arc<CommandEngine>,
+    db: u32,
+    args: &[Bytes],
+    cache: &MigrateCache,
+    tls: Option<&crate::tls::Outbound>,
+) -> RespFrame {
     if args.len() < 5 {
         return RespFrame::error("ERR wrong number of arguments for 'migrate' command");
     }
@@ -2202,9 +2276,20 @@ async fn migrate(engine: &Arc<CommandEngine>, db: u32, args: &[Bytes]) -> RespFr
     if items.is_empty() {
         return RespFrame::SimpleString(Bytes::from_static(b"NOKEY"));
     }
+    // A cached connection is tried first; one that fails before anything
+    // came back (closed by the target meanwhile) is retried on a fresh one.
+    let cached = cache.take(&host, port);
+    let reused = cached.is_some();
     let io = async {
-        let mut sock = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
-        let _ = sock.set_nodelay(true);
+        let mut sock = match cached {
+            Some(s) => s,
+            None => {
+                cache
+                    .opened
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::tls::connect(&host, port, tls).await?
+            }
+        };
         let mut out: Vec<u8> = Vec::new();
         let mut expected = 0usize;
         if let Some((user, pass)) = &auth {
@@ -2243,16 +2328,23 @@ async fn migrate(engine: &Arc<CommandEngine>, db: u32, args: &[Bytes]) -> RespFr
                 return Err(std::io::Error::other("target closed the connection"));
             }
         }
-        Ok::<Vec<String>, std::io::Error>(replies)
+        Ok::<(Vec<String>, crate::tls::BoxStream), std::io::Error>((replies, sock))
     };
     let replies = match tokio::time::timeout(timeout, io).await {
         Err(_) => return RespFrame::error("IOERR error or timeout reading to target instance"),
+        Ok(Err(_)) if reused => {
+            // The cached link had gone stale: once more on a new one.
+            return Box::pin(migrate(engine, db, args, cache, tls)).await;
+        }
         Ok(Err(e)) => {
             return RespFrame::error(format!(
                 "IOERR error or timeout connecting to the client: {e}"
             ))
         }
-        Ok(Ok(r)) => r,
+        Ok(Ok((r, sock))) => {
+            cache.put(&host, port, sock);
+            r
+        }
     };
     // AUTH and SELECT first; then one reply per key.
     let skip = replies.len() - items.len();

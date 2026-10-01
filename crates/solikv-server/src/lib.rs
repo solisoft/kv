@@ -4,3 +4,4 @@ pub mod config_file;
 pub mod replication;
 pub mod resp_server;
 pub mod rest_server;
+pub mod tls;

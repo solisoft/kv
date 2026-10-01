@@ -131,7 +131,7 @@ fn flag_name(directive: &str) -> &str {
     match directive {
         "tls-cert-file" => "tls-cert",
         "tls-key-file" => "tls-key",
-        "tls-ca-cert-file" => "tls-client-ca",
+        "tls-ca-cert-file" => "tls-ca-cert",
         "loglevel" => "log-level",
         "lua-time-limit" => "busy-reply-threshold",
         other => other,
@@ -286,7 +286,9 @@ fn load_into(
             }
             continue;
         }
-        if IGNORED.contains(&directive.as_str()) {
+        // A directive Redis has and SoliKV ignores — unless a later version
+        // grew the flag, which then wins.
+        if IGNORED.contains(&directive.as_str()) && !known(flag_name(&directive)) {
             eprintln!(
                 "WARNING: config directive '{}' ({}:{}) has no effect in SoliKV",
                 directive,
