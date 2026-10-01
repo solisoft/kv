@@ -154,6 +154,113 @@ pub fn snapshot_encoder(
     let _ = write_entry(out, key, entry);
 }
 
+/// The encoders of a stepped snapshot in this format: whole entries, and
+/// large collections a slice at a time (see `ShardStore`'s "Large values").
+pub fn snapshot_encoders() -> solikv_core::store::SnapshotEncoders {
+    solikv_core::store::SnapshotEncoders {
+        whole: snapshot_encoder,
+        large: Some(snapshot_large),
+    }
+}
+
+/// Elements from which a list, set, hash or sorted set is serialized in
+/// slices rather than whole.
+pub const LARGE_VALUE_ELEMENTS: usize = 8192;
+
+/// The header of a large collection (database marker, expiry, type, key,
+/// element count) and the writer for its elements — byte for byte what
+/// [`write_entry`] writes, so a sliced entry loads as any other.
+pub fn snapshot_large(
+    db: u32,
+    key: &[u8],
+    entry: &KeyEntry,
+) -> Option<(Vec<u8>, Box<dyn solikv_core::store::ValueWriter>)> {
+    let len = match &entry.value {
+        RedisValue::List(l) => l.len(),
+        RedisValue::Set(s) => s.len(),
+        RedisValue::Hash(h) => h.len(),
+        RedisValue::ZSet(z) => z.len(),
+        // Streams, and the bounded types, are written whole.
+        _ => return None,
+    };
+    if len < LARGE_VALUE_ELEMENTS || entry.is_expired() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(64 + key.len());
+    out.push(SELECT_DB);
+    out.extend_from_slice(&db.to_le_bytes());
+    if let Some(exp) = entry.expires_at {
+        out.push(EXPIRY);
+        out.extend_from_slice(&exp.to_le_bytes());
+    }
+    out.push(type_byte(&entry.value));
+    // Writing into a Vec cannot fail; lengths over u32 are refused there
+    // as `write_value` refuses them.
+    write_bytes(&mut out, key).ok()?;
+    write_len(&mut out, len).ok()?;
+    Some((out, Box::new(SlicedValue { pos: 0, len })))
+}
+
+/// The elements of a large collection, from `pos` on.
+struct SlicedValue {
+    pos: usize,
+    len: usize,
+}
+
+impl solikv_core::store::ValueWriter for SlicedValue {
+    fn step(&mut self, out: &mut Vec<u8>, value: &RedisValue, budget: usize) -> (usize, bool) {
+        let end = self.len.min(self.pos.saturating_add(budget.max(1)));
+        let (from, n) = (self.pos, end - self.pos);
+        // Writing into a Vec cannot fail.
+        match value {
+            RedisValue::List(l) => {
+                debug_assert_eq!(l.len(), self.len, "a sliced value changed");
+                for item in l.range(from..end) {
+                    let _ = write_bytes(out, item);
+                }
+            }
+            RedisValue::Set(set) => {
+                debug_assert_eq!(set.len(), self.len, "a sliced value changed");
+                for i in from..end {
+                    if let Some(m) = set.get_index(i) {
+                        let _ = write_bytes(out, m);
+                    }
+                }
+            }
+            RedisValue::Hash(h) => {
+                debug_assert_eq!(h.len(), self.len, "a sliced value changed");
+                for i in from..end {
+                    if let Some((f, v)) = h.get_index(i) {
+                        let _ = write_bytes(out, f);
+                        let _ = write_bytes(out, v);
+                    }
+                }
+                if end == self.len && h.has_field_ttls() {
+                    let ttls: Vec<_> = h.field_ttls().collect();
+                    let _ = write_len(out, ttls.len());
+                    for (field, at) in ttls {
+                        let _ = write_bytes(out, field);
+                        out.extend_from_slice(&at.to_le_bytes());
+                    }
+                }
+            }
+            RedisValue::ZSet(z) => {
+                debug_assert_eq!(z.len(), self.len, "a sliced value changed");
+                for (score, member) in z.scores.range(from, end) {
+                    let _ = write_bytes(out, member);
+                    out.extend_from_slice(&score.into_inner().to_le_bytes());
+                }
+            }
+            _ => {
+                debug_assert!(false, "a sliced value changed type");
+                return (0, true);
+            }
+        }
+        self.pos = end;
+        (n, end == self.len)
+    }
+}
+
 /// One key: optional expiry, type, key, value.
 pub fn write_entry<W: Write>(w: &mut W, key: &[u8], entry: &KeyEntry) -> io::Result<()> {
     if let Some(exp) = entry.expires_at {

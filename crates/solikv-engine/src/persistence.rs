@@ -960,7 +960,7 @@ pub fn begin_snapshot_everywhere(shards: &ShardManager, at_instant: impl FnOnce(
     for i in 0..shards.num_shards() {
         let ok = shards
             .shard(i)
-            .with_store_mut_unlogged(|s| s.begin_snapshot(rdb::snapshot_encoder));
+            .with_store_mut_unlogged(|s| s.begin_snapshot_with(rdb::snapshot_encoders()));
         if !ok {
             for j in begun {
                 shards
@@ -1039,7 +1039,7 @@ fn begin_capture(
     rotate: Option<(&AofWriter, u64)>,
     cut: Option<&FunctionsCut>,
 ) -> bool {
-    if !store.begin_snapshot(rdb::snapshot_encoder) {
+    if !store.begin_snapshot_with(rdb::snapshot_encoders()) {
         return false;
     }
     if let Some((w, g)) = rotate {
@@ -1658,6 +1658,138 @@ mod tests {
         for (i, v) in live.iter().enumerate() {
             assert_eq!(&get(&e, &format!("k{i}")), v, "k{i}");
         }
+    }
+
+    /// Strings of a reply, sorted when `sorted` (sets and hashes need not
+    /// come back in the same order).
+    fn strings(r: CommandResponse, sorted: bool) -> Vec<String> {
+        let mut v: Vec<String> = match r {
+            CommandResponse::Array(items) => items
+                .into_iter()
+                .map(|i| match i {
+                    CommandResponse::BulkString(v) => String::from_utf8_lossy(&v).to_string(),
+                    CommandResponse::Integer(n) => n.to_string(),
+                    other => format!("{other:?}"),
+                })
+                .collect(),
+            other => panic!("{other:?}"),
+        };
+        if sorted {
+            v.sort();
+        }
+        v
+    }
+
+    /// Everything about the four large keys, comparable across a restart.
+    fn large_state(e: &CommandEngine) -> Vec<Vec<String>> {
+        let mut hash = strings(run(e, &["HGETALL", "H"]), false)
+            .chunks(2)
+            .map(|p| format!("{}={}", p[0], p[1]))
+            .collect::<Vec<_>>();
+        hash.sort();
+        let mut ttl_cmd = vec!["HEXPIRETIME", "H", "FIELDS", "50"];
+        let ttl_fields: Vec<String> = (0..50).map(|i| format!("f{i}")).collect();
+        ttl_cmd.extend(ttl_fields.iter().map(String::as_str));
+        vec![
+            lrange(e, "L"),
+            strings(run(e, &["SMEMBERS", "S"]), true),
+            hash,
+            strings(run(e, &["ZRANGE", "Z", "0", "-1", "WITHSCORES"]), false),
+            strings(run(e, &ttl_cmd), false),
+        ]
+    }
+
+    /// Lists, sets, hashes (with field TTLs) and sorted sets above the
+    /// slicing threshold are snapshotted a slice per step, while a writer
+    /// changes them; the log rewritten that way, and the snapshot file,
+    /// both restart to exactly the live values.
+    #[test]
+    fn large_collections_snapshot_in_slices_and_restart_identical() {
+        let n = rdb::LARGE_VALUE_ELEMENTS * 3;
+        let dir = TmpDir::new("large");
+        let e = start(&dir.0, ShardManager::new(2), true);
+        for chunk in (0..n).step_by(1000) {
+            let items: Vec<String> = (chunk..chunk + 1000).map(|i| format!("m{i}")).collect();
+            let mut l = vec!["RPUSH", "L"];
+            let mut st = vec!["SADD", "S"];
+            l.extend(items.iter().map(String::as_str));
+            st.extend(items.iter().map(String::as_str));
+            run(&e, &l);
+            run(&e, &st);
+            let pairs: Vec<String> = (chunk..chunk + 1000)
+                .flat_map(|i| [format!("f{i}"), format!("v{i}")])
+                .collect();
+            let mut h = vec!["HSET", "H"];
+            h.extend(pairs.iter().map(String::as_str));
+            run(&e, &h);
+            let scored: Vec<String> = (chunk..chunk + 1000)
+                .flat_map(|i| [format!("{}.5", i % 977), format!("m{i}")])
+                .collect();
+            let mut z = vec!["ZADD", "Z"];
+            z.extend(scored.iter().map(String::as_str));
+            run(&e, &z);
+        }
+        let mut hexp = vec!["HEXPIRE", "H", "3600", "FIELDS", "50"];
+        let fields: Vec<String> = (0..50).map(|i| format!("f{i}")).collect();
+        hexp.extend(fields.iter().map(String::as_str));
+        run(&e, &hexp);
+
+        let writer = {
+            let e = e.clone();
+            std::thread::spawn(move || {
+                for i in 0..4000 {
+                    let m = format!("m{}", (i * 7919) % n);
+                    match i % 8 {
+                        0 => run(&e, &["LPUSH", "L", &format!("w{i}")]),
+                        1 => run(&e, &["SREM", "S", &m]),
+                        2 => run(&e, &["SADD", "S", &format!("w{i}")]),
+                        3 => run(&e, &["HSET", "H", &format!("w{i}"), "x"]),
+                        4 => run(&e, &["HDEL", "H", &format!("f{}", 100 + (i * 13) % n)]),
+                        5 => run(&e, &["ZADD", "Z", "-1", &m]),
+                        6 => run(&e, &["ZREM", "Z", &format!("m{}", (i * 31) % n)]),
+                        _ => run(&e, &["RPOP", "L"]),
+                    };
+                }
+            })
+        };
+        for _ in 0..3 {
+            let _ = run(&e, &["BGREWRITEAOF"]);
+            wait_rewrite(&e);
+            let _ = run(&e, &["BGSAVE"]);
+        }
+        writer.join().unwrap();
+        let _ = run(&e, &["BGREWRITEAOF"]);
+        wait_rewrite(&e);
+        // And a snapshot file of the final state.
+        let stats = &e.persistence().stats;
+        while stats.rdb_bgsave_in_progress.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(matches!(
+            run(&e, &["BGSAVE"]),
+            CommandResponse::SimpleString(_) | CommandResponse::Ok
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        while stats.rdb_bgsave_in_progress.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(stats.rdb_last_bgsave_ok.load(Ordering::Relaxed));
+        let live = large_state(&e);
+        assert_eq!(live[0].len() as i64, int(run(&e, &["LLEN", "L"])));
+        assert!(
+            live[4].iter().all(|t| t.parse::<i64>().unwrap() > 0),
+            "field TTLs"
+        );
+        stop(&e);
+
+        // From the rewritten log.
+        let e = start(&dir.0, ShardManager::new(2), true);
+        assert_eq!(large_state(&e), live, "log");
+        stop(&e);
+        // From the snapshot file alone.
+        let e = start(&dir.0, ShardManager::new(2), false);
+        assert_eq!(large_state(&e), live, "snapshot");
+        stop(&e);
     }
 
     #[test]

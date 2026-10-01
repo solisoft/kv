@@ -83,11 +83,46 @@ impl EvictionPolicy {
 pub type SnapshotEncoder =
     fn(out: &mut Vec<u8>, cur_db: &mut u32, db: u32, key: &[u8], entry: &KeyEntry);
 
+/// Serializes one large value a slice at a time (see "Large values" on
+/// [`ShardStore`]). Supplied by the persistence layer, with the bytes that
+/// precede the value's first element.
+pub trait ValueWriter: Send {
+    /// Append up to `budget` more elements of `value` — the same value, not
+    /// changed since the writer began — to `out`. Returns how many it wrote,
+    /// and whether the value is now complete.
+    fn step(&mut self, out: &mut Vec<u8>, value: &RedisValue, budget: usize) -> (usize, bool);
+}
+
+/// Begins the sliced serialization of `key`'s entry, if it is large enough
+/// to need one: everything up to the value's first element (preceded by a
+/// database marker, always), and the writer for the rest. `None`: write it
+/// whole with the [`SnapshotEncoder`] (small, or expired).
+pub type LargeEncoder =
+    fn(db: u32, key: &[u8], entry: &KeyEntry) -> Option<(Vec<u8>, Box<dyn ValueWriter>)>;
+
+/// The encoders of a snapshot.
+#[derive(Clone, Copy)]
+pub struct SnapshotEncoders {
+    pub whole: SnapshotEncoder,
+    pub large: Option<LargeEncoder>,
+}
+
+/// Elements of a large value serialized per unit of a step's budget (a
+/// unit is one whole entry).
+const ELEMENTS_PER_UNIT: usize = 16;
+
+/// A large entry being serialized across steps.
+struct Pending {
+    db: u32,
+    key: Bytes,
+    writer: Box<dyn ValueWriter>,
+}
+
 /// A snapshot being taken in steps (see [`ShardStore::begin_snapshot`]).
-#[derive(Debug)]
 struct Snapshot {
     epoch: u32,
     encoder: SnapshotEncoder,
+    large: Option<LargeEncoder>,
     /// Serialized entries not yet handed to the snapshot writer.
     out: Vec<u8>,
     /// Database the last entry in the output stream belonged to.
@@ -95,6 +130,66 @@ struct Snapshot {
     /// Databases still to walk, each with its cursor (next position is
     /// `cursor - 1`, walking down).
     walk: Vec<(u32, usize)>,
+    /// The large entry in progress, if any (one at a time: the walk waits
+    /// for it). Its bytes go straight to `out`, step after step, so no copy
+    /// of it builds up here.
+    pending: Option<Pending>,
+    /// Entries saved by commands while a large entry is in progress: they
+    /// follow it into `out` once it is complete, so entries never
+    /// interleave.
+    side: Vec<u8>,
+    /// Database of the last entry in `side` (`u32::MAX`: none yet).
+    side_db: u32,
+}
+
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("epoch", &self.epoch)
+            .field("walk", &self.walk)
+            .field("pending", &self.pending.as_ref().map(|p| (p.db, &p.key)))
+            .finish()
+    }
+}
+
+impl Snapshot {
+    /// Whether `key` of `db` is the large entry in progress.
+    fn is_pending(&self, db: u32, key: &[u8]) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|p| p.db == db && p.key.as_ref() == key)
+    }
+
+    /// Finish the large entry in progress with the rest of `value`.
+    fn finish_pending(&mut self, value: &RedisValue) {
+        if let Some(mut p) = self.pending.take() {
+            let (_, done) = p.writer.step(&mut self.out, value, usize::MAX);
+            debug_assert!(done, "an unbounded step completes the value");
+            self.pending_done(p.db);
+        }
+    }
+
+    /// The large entry of `db` is complete in `out`: the entries saved
+    /// meanwhile follow it.
+    fn pending_done(&mut self, db: u32) {
+        self.cur_db = db;
+        if !self.side.is_empty() {
+            self.out.extend_from_slice(&self.side);
+            self.side.clear();
+            self.cur_db = self.side_db;
+        }
+        self.side_db = u32::MAX;
+    }
+
+    /// Save one whole entry: to `out`, or to `side` while a large entry is
+    /// being sliced into `out`.
+    fn encode_whole(&mut self, db: u32, key: &[u8], e: &KeyEntry) {
+        if self.pending.is_some() {
+            (self.encoder)(&mut self.side, &mut self.side_db, db, key, e);
+        } else {
+            (self.encoder)(&mut self.out, &mut self.cur_db, db, key, e);
+        }
+    }
 }
 
 /// The keyspace: positional like `IndexMap`, but grows without a pause
@@ -275,7 +370,25 @@ impl Keyspace {
 /// start. Each key present when it began is therefore written exactly once,
 /// with the value it had then.
 ///
+/// # Large values
+///
+/// One entry is the unit of that walk, so a single huge collection would
+/// still hold the shard for its whole serialization. With a
+/// [`LargeEncoder`] (see [`begin_snapshot_with`]), such an entry is instead
+/// serialized a slice of elements per step, straight into the output that
+/// each step hands to the snapshot writer, the walk pausing until it is
+/// complete; entries that commands save meanwhile wait in a side buffer
+/// and follow it, so entries never interleave. The value is not copied: it
+/// only has to stay unchanged until it is done, and the same rule that
+/// keeps every other key point-in-time ensures it — anything about to
+/// change the entry (a write, a delete, an expiry, a rename) first finishes
+/// its serialization as it still is. Reads touch nothing. A write to the
+/// huge key while it is being sliced therefore pays for the rest of it, as
+/// any first write to a key not yet reached pays for that key; every other
+/// key of the shard is served between slices.
+///
 /// [`snapshot_step`]: Self::snapshot_step
+/// [`begin_snapshot_with`]: Self::begin_snapshot_with
 #[derive(Debug)]
 pub struct ShardStore {
     ks: Keyspace,
@@ -598,7 +711,12 @@ impl ShardStore {
         };
         if e.snap != epoch {
             e.snap = epoch;
-            (snap.encoder)(&mut snap.out, &mut snap.cur_db, db, k, e);
+            if snap.is_pending(db, k) {
+                // The large entry being sliced: finish it as it still is.
+                snap.finish_pending(&e.value);
+            } else {
+                snap.encode_whole(db, k, e);
+            }
         }
     }
 
@@ -618,6 +736,17 @@ impl ShardStore {
     /// with [`snapshot_step`](Self::snapshot_step) until that reports done.
     /// One at a time: returns false if one is already running.
     pub fn begin_snapshot(&mut self, encoder: SnapshotEncoder) -> bool {
+        self.begin_snapshot_with(SnapshotEncoders {
+            whole: encoder,
+            large: None,
+        })
+    }
+
+    /// [`begin_snapshot`](Self::begin_snapshot), with an encoder for large
+    /// values: those are serialized a slice per step instead of whole in
+    /// one, so one huge key does not hold the shard for its entire
+    /// serialization (see "Large values" on [`ShardStore`]).
+    pub fn begin_snapshot_with(&mut self, encoders: SnapshotEncoders) -> bool {
         if self.snapshot.is_some() {
             return false;
         }
@@ -632,10 +761,14 @@ impl ShardStore {
         }
         self.snapshot = Some(Box::new(Snapshot {
             epoch: self.snap_epoch,
-            encoder,
+            encoder: encoders.whole,
+            large: encoders.large,
             out: Vec::new(),
             cur_db: 0,
             walk,
+            pending: None,
+            side: Vec::new(),
+            side_db: u32::MAX,
         }));
         true
     }
@@ -650,6 +783,36 @@ impl ShardStore {
         };
         let mut left = budget.max(1);
         while left > 0 {
+            // A large entry in progress goes first; the walk waits for it.
+            if let Some(p) = snap.pending.as_mut() {
+                let ks = if p.db == self.db {
+                    &mut self.ks
+                } else {
+                    &mut self.parked[p.db as usize]
+                };
+                let Some(idx) = ks.data.get_index_of(&p.key) else {
+                    // Every change to the entry finishes it first (see
+                    // `capture_slow`), so it cannot be gone.
+                    debug_assert!(false, "large snapshot entry vanished");
+                    snap.pending = None;
+                    continue;
+                };
+                let e = &mut ks.data[idx];
+                let (used, done) = p.writer.step(
+                    &mut snap.out,
+                    &e.value,
+                    left.saturating_mul(ELEMENTS_PER_UNIT),
+                );
+                left = left.saturating_sub(used.div_ceil(ELEMENTS_PER_UNIT).max(1));
+                if !done {
+                    break;
+                }
+                e.snap = snap.epoch;
+                let db = p.db;
+                snap.pending = None;
+                snap.pending_done(db);
+                continue;
+            }
             let Some(&(db, cursor)) = snap.walk.last() else {
                 break;
             };
@@ -671,12 +834,25 @@ impl ShardStore {
             while c > 0 && left > 0 {
                 c -= 1;
                 left -= 1;
-                if let Some((k, e)) = ks.data.get_index_mut(c) {
-                    if e.snap != snap.epoch {
-                        e.snap = snap.epoch;
-                        (snap.encoder)(&mut snap.out, &mut snap.cur_db, db, k, e);
-                    }
+                let Some((k, e)) = ks.data.get_index_mut(c) else {
+                    continue;
+                };
+                if e.snap == snap.epoch || snap.is_pending(db, k) {
+                    continue;
                 }
+                if let Some((head, writer)) = snap.large.and_then(|large| large(db, k, e)) {
+                    // Sliced from the next iteration on, the walk paused.
+                    snap.out.extend_from_slice(&head);
+                    snap.cur_db = db;
+                    snap.pending = Some(Pending {
+                        db,
+                        key: k.clone(),
+                        writer,
+                    });
+                    break;
+                }
+                e.snap = snap.epoch;
+                (snap.encoder)(&mut snap.out, &mut snap.cur_db, db, k, e);
             }
             if c == 0 {
                 snap.walk.pop();
@@ -685,7 +861,7 @@ impl ShardStore {
             }
         }
         let out = std::mem::take(&mut snap.out);
-        let done = snap.walk.is_empty();
+        let done = snap.walk.is_empty() && snap.pending.is_none();
         if !done {
             self.snapshot = Some(snap);
         }
@@ -1760,6 +1936,159 @@ mod tests {
         }
         assert!(!store.snapshot_running());
         assert_eq!(parse_snapshot(&out), expect);
+    }
+
+    /// Test encoders: lists as `key=a,b,c;`, sliced from 10 elements.
+    fn encode_list_for_test(
+        out: &mut Vec<u8>,
+        cur_db: &mut u32,
+        db: u32,
+        key: &[u8],
+        e: &KeyEntry,
+    ) {
+        if let RedisValue::List(l) = &e.value {
+            if db != *cur_db {
+                out.extend_from_slice(format!("[db{db}]").as_bytes());
+                *cur_db = db;
+            }
+            out.extend_from_slice(key);
+            out.push(b'=');
+            let items: Vec<&[u8]> = l.iter().map(|b| b.as_ref()).collect();
+            out.extend_from_slice(&items.join(&b","[..]));
+            out.push(b';');
+        } else {
+            encode_for_test(out, cur_db, db, key, e);
+        }
+    }
+
+    struct ListSlices {
+        pos: usize,
+    }
+
+    impl ValueWriter for ListSlices {
+        fn step(&mut self, out: &mut Vec<u8>, value: &RedisValue, budget: usize) -> (usize, bool) {
+            let RedisValue::List(l) = value else {
+                panic!("not a list");
+            };
+            let end = l.len().min(self.pos.saturating_add(budget.max(1)));
+            for (i, item) in l.range(self.pos..end).enumerate() {
+                if self.pos + i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(item);
+            }
+            let n = end - self.pos;
+            self.pos = end;
+            if end == l.len() {
+                out.push(b';');
+            }
+            (n, end == l.len())
+        }
+    }
+
+    fn large_list_for_test(
+        db: u32,
+        key: &[u8],
+        e: &KeyEntry,
+    ) -> Option<(Vec<u8>, Box<dyn ValueWriter>)> {
+        match &e.value {
+            RedisValue::List(l) if l.len() >= 10 => {
+                let mut head = format!("[db{db}]").into_bytes();
+                head.extend_from_slice(key);
+                head.push(b'=');
+                Some((head, Box::new(ListSlices { pos: 0 })))
+            }
+            _ => None,
+        }
+    }
+
+    const LIST_ENCODERS: SnapshotEncoders = SnapshotEncoders {
+        whole: encode_list_for_test,
+        large: Some(large_list_for_test),
+    };
+
+    fn big_list(n: usize) -> RedisValue {
+        RedisValue::List((0..n).map(|i| b(&format!("e{i}"))).collect())
+    }
+
+    fn joined(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("e{i}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// A huge list is serialized a slice per step (the shard is free in
+    /// between, reads of it included), and the snapshot holds it as it was
+    /// when the snapshot began — also when it is written to, or deleted,
+    /// half-way through.
+    #[test]
+    fn large_values_are_sliced_and_stay_point_in_time() {
+        // Alone in its shard: whole, it would be one step; sliced at 32
+        // elements a step, it takes 1000 / 32.
+        let mut store = ShardStore::new();
+        store.set(b("big"), big_list(1000), None);
+        assert!(store.begin_snapshot_with(LIST_ENCODERS));
+        let mut out = Vec::new();
+        let mut steps = 0;
+        loop {
+            let (chunk, done) = store.snapshot_step(2);
+            assert!(
+                chunk.len() < 1000,
+                "one step wrote {} bytes: not sliced",
+                chunk.len()
+            );
+            out.extend(chunk);
+            steps += 1;
+            if done {
+                break;
+            }
+        }
+        assert!(steps >= 1000 / 32, "not sliced: {steps} steps");
+        assert_eq!(parse_snapshot(&out).get("0/big"), Some(&joined(1000)));
+
+        for change in ["none", "write", "delete", "flush"] {
+            let mut store = ShardStore::new();
+            let mut expect = std::collections::BTreeMap::new();
+            for i in 0..200 {
+                store.set(b(&format!("k{i}")), s(&format!("v{i}")), None);
+                expect.insert(format!("0/k{i}"), format!("v{i}"));
+            }
+            store.set(b("big"), big_list(1000), None);
+            expect.insert("0/big".into(), joined(1000));
+            assert!(store.begin_snapshot_with(LIST_ENCODERS));
+            let mut out = Vec::new();
+            let mut steps = 0;
+            loop {
+                // Budget 2: 32 elements a step.
+                let (chunk, done) = store.snapshot_step(2);
+                out.extend(chunk);
+                steps += 1;
+                if done {
+                    break;
+                }
+                // Reads are free; other keys keep changing.
+                assert!(store.get(&b("big")).is_some() || change != "none");
+                store.set(b(&format!("k{}", steps % 200)), s("changed"), None);
+                if steps == 10 {
+                    match change {
+                        "write" => {
+                            if let Some(e) = store.get_mut(&b("big")) {
+                                if let RedisValue::List(l) = &mut e.value {
+                                    l.push_front(b("new"));
+                                }
+                            }
+                        }
+                        "delete" => {
+                            store.del(&b("big"));
+                        }
+                        "flush" => store.flush_all(),
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(parse_snapshot(&out), expect, "{change}");
+        }
     }
 
     #[test]
