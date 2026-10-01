@@ -26,6 +26,8 @@ fn random_positions(len: usize, count: i64) -> Vec<usize> {
 
 impl ShardStore {
     fn peek_value(&mut self, key: &Bytes) -> Option<&RedisValue> {
+        // A hash's due fields go first (no-op for anything else).
+        self.purge_hash_fields_in(self.db(), key);
         self.get(key).map(|e| &e.value)
     }
 

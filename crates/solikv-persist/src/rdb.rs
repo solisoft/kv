@@ -71,6 +71,10 @@ const TYPE_BLOOM: u8 = 6;
 const TYPE_STREAM: u8 = 7;
 /// A stream followed by the Redis 7 metadata ([`write_stream_meta`]).
 const TYPE_STREAM2: u8 = 8;
+/// A hash with field expiry (`HEXPIRE`): `TYPE_HASH`'s body, then the
+/// number of fields with an expiry and, for each, the field and its
+/// deadline (unix ms, u64 LE). Hashes without any stay `TYPE_HASH`.
+const TYPE_HASH_TTL: u8 = 9;
 
 // Framing
 const SELECT_DB: u8 = 0xFB;
@@ -194,6 +198,7 @@ fn type_byte(value: &RedisValue) -> u8 {
     match value {
         RedisValue::String(_) => TYPE_STRING,
         RedisValue::List(_) => TYPE_LIST,
+        RedisValue::Hash(h) if h.has_field_ttls() => TYPE_HASH_TTL,
         RedisValue::Hash(_) => TYPE_HASH,
         RedisValue::Set(_) => TYPE_SET,
         RedisValue::ZSet(_) => TYPE_ZSET,
@@ -218,6 +223,14 @@ fn write_value<W: Write>(w: &mut W, value: &RedisValue) -> io::Result<()> {
             for (field, value) in hash.iter() {
                 write_bytes(w, field)?;
                 write_bytes(w, value)?;
+            }
+            if hash.has_field_ttls() {
+                let ttls: Vec<_> = hash.field_ttls().collect();
+                write_len(w, ttls.len())?;
+                for (field, at) in ttls {
+                    write_bytes(w, field)?;
+                    w.write_all(&at.to_le_bytes())?;
+                }
             }
             Ok(())
         }
@@ -420,14 +433,23 @@ fn read_value<R: Read>(r: &mut R, type_byte: u8) -> io::Result<RedisValue> {
             }
             RedisValue::List(list)
         }
-        TYPE_HASH => {
+        TYPE_HASH | TYPE_HASH_TTL => {
             let len = sanitize_collection_len(read_len(r)?)?;
-            let mut hash =
-                HashValue::with_capacity_and_hasher(len.min(PREALLOC_CAP), Default::default());
+            let mut hash = HashValue::with_capacity(len.min(PREALLOC_CAP));
             for _ in 0..len {
                 let field = read_bytes(r)?;
                 let value = read_bytes(r)?;
                 hash.insert(field, value);
+            }
+            if type_byte == TYPE_HASH_TTL {
+                let n = sanitize_collection_len(read_len(r)?)?;
+                for _ in 0..n {
+                    let field = read_bytes(r)?;
+                    let at = read_u64(r)?;
+                    if !hash.set_field_ttl(&field, at) {
+                        return Err(invalid("expiry for a field the hash does not have"));
+                    }
+                }
             }
             RedisValue::hash(hash)
         }
@@ -1237,5 +1259,30 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, vec!["old-0.rdb", "old-2.rdb", "old-10.rdb"]);
+    }
+
+    #[test]
+    fn hash_field_expiry_survives_encoding() {
+        let mut h = solikv_core::types::HashValue::default();
+        h.insert(Bytes::from("a"), Bytes::from("1"));
+        h.insert(Bytes::from("b"), Bytes::from("2"));
+        h.set_field_ttl(&Bytes::from("a"), 4_102_444_800_000);
+        let e = solikv_core::types::KeyEntry::new(RedisValue::hash(h));
+        let back = decode_entry(&encode_entry(&e)).unwrap();
+        let RedisValue::Hash(h) = back.value else {
+            panic!()
+        };
+        assert_eq!(h.len(), 2);
+        assert_eq!(h.field_ttl(b"a"), Some(4_102_444_800_000));
+        assert_eq!(h.field_ttl(b"b"), None);
+        // And DUMP/RESTORE keeps it too (SoliKV's own payload).
+        let mut h2 = solikv_core::types::HashValue::default();
+        h2.insert(Bytes::from("x"), Bytes::from("y"));
+        h2.set_field_ttl(&Bytes::from("x"), 4_102_444_800_000);
+        let p = crate::dump::dump(&RedisValue::hash(h2));
+        let RedisValue::Hash(h2) = crate::dump::restore(&p).unwrap() else {
+            panic!()
+        };
+        assert_eq!(h2.field_ttl(b"x"), Some(4_102_444_800_000));
     }
 }

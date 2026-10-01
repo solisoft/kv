@@ -107,7 +107,10 @@ pub fn dump(value: &RedisValue) -> Vec<u8> {
                 write_str(&mut out, e);
             }
         }
-        RedisValue::Hash(h) => {
+        // A hash with field expiry goes out in SoliKV's own encoding (below),
+        // which keeps the expiries: a payload Redis would misread is worse
+        // than one it refuses.
+        RedisValue::Hash(h) if !h.has_field_ttls() => {
             out.push(TYPE_HASH);
             write_len(&mut out, h.len());
             for (f, v) in h.iter() {

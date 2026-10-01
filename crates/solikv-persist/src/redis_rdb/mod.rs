@@ -244,10 +244,7 @@ pub(crate) fn read_value<R: io::Read>(
         }
         TYPE_HASH => {
             let len = reader.read_length()?;
-            let mut hash = HashValue::with_capacity_and_hasher(
-                len.min(parser::MAX_PREALLOC),
-                Default::default(),
-            );
+            let mut hash = HashValue::with_capacity(len.min(parser::MAX_PREALLOC));
             for _ in 0..len {
                 let field = reader.read_string()?;
                 let value = reader.read_string()?;
@@ -303,8 +300,7 @@ pub(crate) fn read_value<R: io::Read>(
                     "HASH_ZIPLIST: odd number of entries",
                 ));
             }
-            let mut hash =
-                HashValue::with_capacity_and_hasher(entries.len() / 2, Default::default());
+            let mut hash = HashValue::with_capacity(entries.len() / 2);
             for pair in entries.as_chunks::<2>().0 {
                 hash.insert(pair[0].clone(), pair[1].clone());
             }
@@ -331,8 +327,7 @@ pub(crate) fn read_value<R: io::Read>(
                     "HASH_LISTPACK: odd number of entries",
                 ));
             }
-            let mut hash =
-                HashValue::with_capacity_and_hasher(entries.len() / 2, Default::default());
+            let mut hash = HashValue::with_capacity(entries.len() / 2);
             for pair in entries.as_chunks::<2>().0 {
                 hash.insert(pair[0].clone(), pair[1].clone());
             }

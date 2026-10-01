@@ -182,6 +182,11 @@ fn logged_verbatim(name: &str, args: &[Bytes]) -> bool {
             | "GETEX"
             | "SPOP"
             | "XADD"
+            | "HEXPIRE"
+            | "HPEXPIRE"
+            | "HEXPIREAT"
+            | "HPEXPIREAT"
+            | "HPERSIST"
     ) && !(name == "SET" && args.len() > 2)
 }
 
@@ -302,6 +307,7 @@ pub(crate) fn log_under_lock(
     db: u32,
     resp: &CommandResponse,
     lazy_expired: &[(u32, Bytes)],
+    expired_fields: &[(u32, Bytes, Vec<Bytes>)],
     explicit: Option<&mut Effects>,
     active_expired: &[(u32, Bytes)],
 ) {
@@ -313,6 +319,16 @@ pub(crate) fn log_under_lock(
     };
     for (d, k) in lazy_expired {
         out.emit(*d, |buf| encode_into(buf, b"DEL", &[k]));
+    }
+    // Hash fields that expired (on access or in the active cycle): before
+    // the command that found them, as `HDEL`s.
+    for (d, k, fields) in expired_fields {
+        out.emit(*d, |buf| {
+            let mut args: Vec<&[u8]> = Vec::with_capacity(1 + fields.len());
+            args.push(k);
+            args.extend(fields.iter().map(|f| f.as_ref()));
+            encode_into(buf, b"HDEL", &args)
+        });
     }
     match explicit {
         Some(fx) => {
@@ -607,6 +623,72 @@ pub(crate) fn aof_form<'a>(
             let idx = xadd_id_index(args)?;
             out[idx] = id.to_vec();
             Some(enc("XADD", &out))
+        }
+        "HEXPIRE" | "HPEXPIRE" | "HEXPIREAT" | "HPEXPIREAT" => {
+            // Per-field codes: 1 set, 2 deleted (deadline already past); the
+            // others changed nothing. All fields share one deadline, so a
+            // command sets or deletes, never both.
+            let CommandResponse::Array(codes) = resp else {
+                return None;
+            };
+            let fields = &args[args.len() - codes.len()..];
+            let pick = |want: i64| -> Vec<Vec<u8>> {
+                fields
+                    .iter()
+                    .zip(codes)
+                    .filter(|(_, c)| matches!(c, CommandResponse::Integer(n) if *n == want))
+                    .map(|(f, _)| f.to_vec())
+                    .collect()
+            };
+            let deleted = pick(2);
+            if !deleted.is_empty() {
+                let mut out = vec![args[0].to_vec()];
+                out.extend(deleted);
+                return Some(enc("HDEL", &out));
+            }
+            let set = pick(1);
+            if set.is_empty() {
+                return None;
+            }
+            let at = match name {
+                "HEXPIRE" | "HPEXPIRE" => abs_ms(&args[1], name == "HEXPIRE")?,
+                "HEXPIREAT" => parse_i64(&args[1])?
+                    .checked_mul(1000)?
+                    .max(0)
+                    .to_string()
+                    .into_bytes(),
+                _ => args[1].to_vec(),
+            };
+            let mut out = vec![
+                args[0].to_vec(),
+                at,
+                b"FIELDS".to_vec(),
+                set.len().to_string().into_bytes(),
+            ];
+            out.extend(set);
+            Some(enc("HPEXPIREAT", &out))
+        }
+        "HPERSIST" => {
+            let CommandResponse::Array(codes) = resp else {
+                return None;
+            };
+            let fields = &args[args.len() - codes.len()..];
+            let done: Vec<Vec<u8>> = fields
+                .iter()
+                .zip(codes)
+                .filter(|(_, c)| matches!(c, CommandResponse::Integer(1)))
+                .map(|(f, _)| f.to_vec())
+                .collect();
+            if done.is_empty() {
+                return None;
+            }
+            let mut out = vec![
+                args[0].to_vec(),
+                b"FIELDS".to_vec(),
+                done.len().to_string().into_bytes(),
+            ];
+            out.extend(done);
+            Some(enc("HPERSIST", &out))
         }
         _ => Some(Record::Verbatim(name, args)),
     }

@@ -115,6 +115,10 @@ struct Keyspace {
     /// `CLUSTER COUNTKEYSINSLOT` and `GETKEYSINSLOT`, which resharding calls
     /// once per batch of keys, would otherwise scan the whole keyspace.
     slots: Option<Box<SlotIndex>>,
+    /// Keys whose hash has fields with an expiry (`HEXPIRE`): sampled by
+    /// active expiry. May hold keys that no longer qualify; the cycle drops
+    /// those when it meets them.
+    hfe: IndexSet<Bytes, FastHasher>,
 }
 
 /// See `Keyspace::slots`.
@@ -179,6 +183,14 @@ impl Keyspace {
                 self.volatile.swap_remove(&k);
             }
         }
+        // A hash arriving with field expiry (RENAME, COPY, MOVE, RESTORE, a
+        // loaded snapshot): make sure active expiry samples it.
+        if let Some((k, e)) = self.data.get_index(idx) {
+            if matches!(&e.value, RedisValue::Hash(h) if h.has_field_ttls()) {
+                let k = k.clone();
+                self.hfe.insert(k);
+            }
+        }
         old
     }
 
@@ -189,6 +201,9 @@ impl Keyspace {
         }
         if e.expires_at.is_some() {
             self.volatile.swap_remove(&k);
+        }
+        if matches!(&e.value, RedisValue::Hash(h) if h.has_field_ttls()) {
+            self.hfe.swap_remove(&k);
         }
         Some((k, e))
     }
@@ -262,6 +277,9 @@ pub struct ShardStore {
     /// this, with the database each was in. Drained by `ShardHandle`, which
     /// logs and announces them.
     pub expired_buffer: Vec<(u32, Bytes)>,
+    /// Hash fields expired since the owner last drained this: database,
+    /// key, fields. Logged as `HDEL` and announced as `hexpired`.
+    pub expired_fields: Vec<(u32, Bytes, Vec<Bytes>)>,
     snapshot: Option<Box<Snapshot>>,
     /// Epoch of the latest snapshot begun (entries' `snap` compare to it).
     snap_epoch: u32,
@@ -280,6 +298,7 @@ impl ShardStore {
             log_seq: 0,
             parked: Vec::new(),
             expired_buffer: Vec::new(),
+            expired_fields: Vec::new(),
             snapshot: None,
             snap_epoch: 0,
             rng: seed(),
@@ -1010,7 +1029,121 @@ impl ShardStore {
                 }
             }
         }
+        if start.elapsed() < budget {
+            self.active_expire_fields(start, budget);
+        }
         removed
+    }
+
+    // ---- Hash field expiry ----
+
+    /// Position of `key` in the selected database, expiring it first if its
+    /// TTL has passed (as `get` does).
+    pub(crate) fn index_of_live(&mut self, key: &Bytes) -> Option<usize> {
+        let idx = self.ks.data.get_index_of(key)?;
+        if self.ks.data[idx].is_expired() {
+            self.expire_index(idx);
+            return None;
+        }
+        Some(idx)
+    }
+
+    pub(crate) fn entry_value(&self, idx: usize) -> &RedisValue {
+        &self.ks.data[idx].value
+    }
+
+    /// Mutable value at `idx`: call [`capture_index`](Self::capture_index)
+    /// first, so a running snapshot keeps the old version.
+    pub(crate) fn entry_value_mut(&mut self, idx: usize) -> &mut RedisValue {
+        &mut self.ks.data[idx].value
+    }
+
+    pub(crate) fn capture_index(&mut self, idx: usize) {
+        self.capture(idx);
+    }
+
+    /// Note that `key`'s hash now has a field with an expiry, so active
+    /// expiry samples it.
+    pub(crate) fn note_field_ttl(&mut self, key: &Bytes) {
+        self.ks.hfe.insert(key.clone());
+    }
+
+    /// Expire `key`'s due hash fields, in database `db`: on access, before
+    /// a hash command reads or changes it, and from the active cycle. The
+    /// fields go to `expired_fields` (logged as `HDEL`); a hash left empty
+    /// is removed, as `HDEL` of its last field would. Nothing expires while
+    /// loading or on a replica (the master's `HDEL`s do it).
+    pub(crate) fn purge_hash_fields_in(&mut self, db: u32, key: &Bytes) {
+        if is_loading() || self.replica_expiry {
+            return;
+        }
+        let now = now_millis();
+        let Some(ks) = self.keyspace(db) else { return };
+        let Some(idx) = ks.data.get_index_of(key) else {
+            return;
+        };
+        if !matches!(&ks.data[idx].value, RedisValue::Hash(h) if h.needs_purge(now)) {
+            return;
+        }
+        self.capture_parked(db, idx);
+        let Some(ks) = self.keyspace_mut(db) else {
+            return;
+        };
+        let RedisValue::Hash(h) = &mut ks.data[idx].value else {
+            return;
+        };
+        let gone = h.purge_expired(now);
+        let (empty, has_ttls) = (h.is_empty(), h.has_field_ttls());
+        if !has_ttls {
+            ks.hfe.swap_remove(key);
+        }
+        if empty {
+            ks.remove_index(idx);
+        }
+        if !gone.is_empty() {
+            self.expired_fields.push((db, key.clone(), gone));
+        }
+    }
+
+    /// One pass of field expiry over the hashes with field TTLs in each
+    /// database: like the key cycle, sample, and go on while a quarter or
+    /// more of the sample had something due.
+    fn active_expire_fields(&mut self, start: Instant, budget: Duration) {
+        let span = self.db_span();
+        for db in 0..span {
+            while let Some(ks) = self.keyspace(db) {
+                let n = ks.hfe.len();
+                if n == 0 {
+                    break;
+                }
+                let sample = EXPIRE_SAMPLE.min(n);
+                let before = self.expired_fields.len();
+                for _ in 0..sample {
+                    let r = self.next_rand() as usize;
+                    let Some(ks) = self.keyspace(db) else { break };
+                    if ks.hfe.is_empty() {
+                        break;
+                    }
+                    let Some(key) = ks.hfe.get_index(r % ks.hfe.len()).cloned() else {
+                        break;
+                    };
+                    let live = ks.data.get(&key).is_some_and(
+                        |e| matches!(&e.value, RedisValue::Hash(h) if h.has_field_ttls()),
+                    );
+                    if !live {
+                        if let Some(ks) = self.keyspace_mut(db) {
+                            ks.hfe.swap_remove(&key);
+                        }
+                        continue;
+                    }
+                    self.purge_hash_fields_in(db, &key);
+                }
+                let due = self.expired_fields.len() - before;
+                if start.elapsed() >= budget || due * 4 <= sample {
+                    break;
+                }
+            }
+        }
     }
 
     /// Run active expiry: one cycle with a 1 ms budget (tests; the server

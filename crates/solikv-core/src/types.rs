@@ -21,7 +21,184 @@ pub type FastHasher = foldhash::fast::RandomState;
 
 /// A hash's fields. Insertion-indexed so `HSCAN` walks it by position and
 /// `HRANDFIELD` picks a field in O(1).
-pub type HashValue = IndexMap<Bytes, Bytes, FastHasher>;
+pub type HashFields = IndexMap<Bytes, Bytes, FastHasher>;
+
+/// A hash: its fields, and the expiry times of those that have one
+/// (`HEXPIRE`, Redis 7.4).
+///
+/// Reading goes through `Deref` to the field map. Changing does not: there
+/// is deliberately no `DerefMut`, so every write goes through a method here
+/// that keeps the two in step — overwriting a field clears its expiry, as in
+/// Redis, and removing one forgets it. Hashes without field expiry carry a
+/// `None` and pay nothing else.
+#[derive(Debug, Clone)]
+pub struct HashValue {
+    fields: HashFields,
+    /// Field → absolute expiry, unix ms. Boxed so a hash without field
+    /// expiry (nearly all) carries one pointer, not an empty map's worth.
+    #[allow(clippy::box_collection)]
+    ttl: Option<Box<HashMap<Bytes, u64, FastHasher>>>,
+    /// No field expires before this (a lower bound: removals leave it as
+    /// it was). Lets a read skip the expiry map until something is due.
+    next_expiry: u64,
+}
+
+impl Default for HashValue {
+    fn default() -> Self {
+        Self::from(HashFields::default())
+    }
+}
+
+impl std::ops::Deref for HashValue {
+    type Target = HashFields;
+    #[inline]
+    fn deref(&self) -> &HashFields {
+        &self.fields
+    }
+}
+
+impl<'a> IntoIterator for &'a HashValue {
+    type Item = (&'a Bytes, &'a Bytes);
+    type IntoIter = indexmap::map::Iter<'a, Bytes, Bytes>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.fields.iter()
+    }
+}
+
+impl FromIterator<(Bytes, Bytes)> for HashValue {
+    fn from_iter<I: IntoIterator<Item = (Bytes, Bytes)>>(iter: I) -> Self {
+        Self {
+            fields: iter.into_iter().collect(),
+            ttl: None,
+            next_expiry: u64::MAX,
+        }
+    }
+}
+
+impl From<HashFields> for HashValue {
+    fn from(fields: HashFields) -> Self {
+        Self {
+            fields,
+            ttl: None,
+            next_expiry: u64::MAX,
+        }
+    }
+}
+
+impl HashValue {
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            fields: HashFields::with_capacity_and_hasher(n, Default::default()),
+            ttl: None,
+            next_expiry: u64::MAX,
+        }
+    }
+
+    /// Set a field; an expiry it had is dropped (Redis: writing a field
+    /// makes it persistent). Returns the previous value.
+    #[inline]
+    pub fn insert(&mut self, field: Bytes, value: Bytes) -> Option<Bytes> {
+        if let Some(t) = &mut self.ttl {
+            t.remove(&field);
+            if t.is_empty() {
+                self.ttl = None;
+            }
+        }
+        self.fields.insert(field, value)
+    }
+
+    /// Set a field only if it is absent. Whether it was set.
+    pub fn insert_if_absent(&mut self, field: Bytes, value: Bytes) -> bool {
+        match self.fields.entry(field) {
+            indexmap::map::Entry::Vacant(e) => {
+                e.insert(value);
+                true
+            }
+            indexmap::map::Entry::Occupied(_) => false,
+        }
+    }
+
+    /// Remove a field (and its expiry). Moves the last field into its slot.
+    pub fn swap_remove(&mut self, field: &[u8]) -> Option<Bytes> {
+        let v = self.fields.swap_remove(field)?;
+        if let Some(t) = &mut self.ttl {
+            t.remove(field);
+            if t.is_empty() {
+                self.ttl = None;
+            }
+        }
+        Some(v)
+    }
+
+    /// Whether any field has an expiry.
+    #[inline]
+    pub fn has_field_ttls(&self) -> bool {
+        self.ttl.is_some()
+    }
+
+    /// `field`'s expiry (unix ms), if it has one.
+    pub fn field_ttl(&self, field: &[u8]) -> Option<u64> {
+        self.ttl.as_ref()?.get(field).copied()
+    }
+
+    /// Every field with an expiry, with it.
+    pub fn field_ttls(&self) -> impl Iterator<Item = (&Bytes, u64)> {
+        self.ttl
+            .iter()
+            .flat_map(|t| t.iter().map(|(f, at)| (f, *at)))
+    }
+
+    /// Give an existing field an expiry (unix ms). False if no such field.
+    pub fn set_field_ttl(&mut self, field: &Bytes, at: u64) -> bool {
+        if !self.fields.contains_key(field) {
+            return false;
+        }
+        self.ttl
+            .get_or_insert_with(Default::default)
+            .insert(field.clone(), at);
+        self.next_expiry = self.next_expiry.min(at);
+        true
+    }
+
+    /// Whether a field may be due at `now` (cheap: one compare).
+    #[inline]
+    pub fn needs_purge(&self, now: u64) -> bool {
+        self.ttl.is_some() && now >= self.next_expiry
+    }
+
+    /// Drop `field`'s expiry. Whether it had one.
+    pub fn persist_field(&mut self, field: &[u8]) -> bool {
+        let Some(t) = &mut self.ttl else {
+            return false;
+        };
+        let had = t.remove(field).is_some();
+        if t.is_empty() {
+            self.ttl = None;
+        }
+        had
+    }
+
+    /// Remove the fields whose expiry is at or before `now`; returns them.
+    pub fn purge_expired(&mut self, now: u64) -> Vec<Bytes> {
+        let Some(t) = &self.ttl else {
+            return Vec::new();
+        };
+        let gone: Vec<Bytes> = t
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(f, _)| f.clone())
+            .collect();
+        for f in &gone {
+            self.swap_remove(f);
+        }
+        self.next_expiry = self
+            .ttl
+            .as_ref()
+            .and_then(|t| t.values().min().copied())
+            .unwrap_or(u64::MAX);
+        gone
+    }
+}
 
 /// A set's members. Insertion-indexed for `SSCAN`, `SPOP` and
 /// `SRANDMEMBER` (random member in O(1)).

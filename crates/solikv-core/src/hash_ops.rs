@@ -6,6 +6,7 @@ use crate::types::*;
 
 impl ShardStore {
     fn get_or_create_hash(&mut self, key: &Bytes) -> Result<&mut HashValue, CommandResponse> {
+        self.purge_hash_fields_in(self.db(), key);
         let exists = match self.get(key) {
             Some(entry) if !matches!(entry.value, RedisValue::Hash(_)) => {
                 return Err(CommandResponse::wrong_type())
@@ -26,6 +27,7 @@ impl ShardStore {
     }
 
     fn get_hash(&mut self, key: &Bytes) -> Result<Option<&HashValue>, CommandResponse> {
+        self.purge_hash_fields_in(self.db(), key);
         match self.get(key) {
             None => Ok(None),
             Some(entry) => match &entry.value {
@@ -61,6 +63,7 @@ impl ShardStore {
     }
 
     pub fn hash_hdel(&mut self, key: &Bytes, fields: &[Bytes]) -> CommandResponse {
+        self.purge_hash_fields_in(self.db(), key);
         let entry = match self.get_mut(key) {
             None => return CommandResponse::integer(0),
             Some(e) => e,
@@ -209,12 +212,151 @@ impl ShardStore {
             Ok(h) => h,
             Err(e) => return e,
         };
-        if let indexmap::map::Entry::Vacant(e) = hash.entry(field) {
-            e.insert(value);
-            CommandResponse::integer(1)
-        } else {
-            CommandResponse::integer(0)
+        CommandResponse::integer(hash.insert_if_absent(field, value) as i64)
+    }
+
+    /// `HEXPIRE`-family core: give each of `fields` the expiry `at` (unix
+    /// ms) where `cond` allows, as Redis 7.4 does: per field `-2` (no such
+    /// field or key), `0` (condition not met), `1` (set) or `2` (deleted:
+    /// `at` is already past). For GT/LT a field without an expiry counts as
+    /// an infinite one.
+    pub fn hash_field_expire(
+        &mut self,
+        key: &Bytes,
+        at: u64,
+        cond: crate::store::ExpireCond,
+        fields: &[Bytes],
+    ) -> CommandResponse {
+        self.purge_hash_fields_in(self.db(), key);
+        let Some(idx) = self.index_of_live(key) else {
+            return CommandResponse::array(
+                fields
+                    .iter()
+                    .map(|_| CommandResponse::integer(-2))
+                    .collect(),
+            );
+        };
+        if !matches!(self.entry_value(idx), RedisValue::Hash(_)) {
+            return CommandResponse::wrong_type();
         }
+        self.capture_index(idx);
+        let now = now_millis();
+        let mut out = Vec::with_capacity(fields.len());
+        let mut deleted = Vec::new();
+        let mut set_any = false;
+        {
+            let RedisValue::Hash(h) = self.entry_value_mut(idx) else {
+                unreachable!()
+            };
+            for f in fields {
+                if !h.contains_key(f) {
+                    out.push(CommandResponse::integer(-2));
+                    continue;
+                }
+                let current = h.field_ttl(f);
+                let refused = (cond.nx && current.is_some())
+                    || (cond.xx && current.is_none())
+                    || (cond.gt && current.is_none_or(|cur| at <= cur))
+                    || (cond.lt && current.is_some_and(|cur| at >= cur));
+                if refused {
+                    out.push(CommandResponse::integer(0));
+                } else if at <= now && !is_loading() {
+                    h.swap_remove(f);
+                    deleted.push(f.clone());
+                    out.push(CommandResponse::integer(2));
+                } else {
+                    h.set_field_ttl(f, at);
+                    set_any = true;
+                    out.push(CommandResponse::integer(1));
+                }
+            }
+        }
+        if set_any {
+            self.note_field_ttl(key);
+        }
+        let empty = matches!(self.entry_value(idx), RedisValue::Hash(h) if h.is_empty());
+        if empty {
+            self.del(key);
+        }
+        CommandResponse::array(out)
+    }
+
+    /// `HTTL`/`HPTTL`/`HEXPIRETIME`/`HPEXPIRETIME`: per field `-2` (no such
+    /// field or key), `-1` (no expiry), else the time left (`absolute`:
+    /// the deadline), in ms or, rounded up, seconds.
+    pub fn hash_field_ttl(
+        &mut self,
+        key: &Bytes,
+        fields: &[Bytes],
+        millis: bool,
+        absolute: bool,
+    ) -> CommandResponse {
+        let h = match self.get_hash(key) {
+            Err(e) => return e,
+            Ok(None) => {
+                return CommandResponse::array(
+                    fields
+                        .iter()
+                        .map(|_| CommandResponse::integer(-2))
+                        .collect(),
+                )
+            }
+            Ok(Some(h)) => h,
+        };
+        let now = now_millis();
+        let out = fields
+            .iter()
+            .map(|f| {
+                if !h.contains_key(f) {
+                    return CommandResponse::integer(-2);
+                }
+                let Some(at) = h.field_ttl(f) else {
+                    return CommandResponse::integer(-1);
+                };
+                let v = match (absolute, millis) {
+                    (true, true) => at as i64,
+                    (true, false) => (at / 1000) as i64,
+                    (false, true) => at.saturating_sub(now) as i64,
+                    (false, false) => (at.saturating_sub(now) as i64 + 999) / 1000,
+                };
+                CommandResponse::integer(v)
+            })
+            .collect();
+        CommandResponse::array(out)
+    }
+
+    /// `HPERSIST`: per field `-2` (no such field or key), `-1` (it had no
+    /// expiry) or `1` (expiry removed).
+    pub fn hash_field_persist(&mut self, key: &Bytes, fields: &[Bytes]) -> CommandResponse {
+        self.purge_hash_fields_in(self.db(), key);
+        let Some(idx) = self.index_of_live(key) else {
+            return CommandResponse::array(
+                fields
+                    .iter()
+                    .map(|_| CommandResponse::integer(-2))
+                    .collect(),
+            );
+        };
+        if !matches!(self.entry_value(idx), RedisValue::Hash(_)) {
+            return CommandResponse::wrong_type();
+        }
+        self.capture_index(idx);
+        let RedisValue::Hash(h) = self.entry_value_mut(idx) else {
+            unreachable!()
+        };
+        let out = fields
+            .iter()
+            .map(|f| {
+                if !h.contains_key(f) {
+                    CommandResponse::integer(-2)
+                } else if h.persist_field(f) {
+                    CommandResponse::integer(1)
+                } else {
+                    CommandResponse::integer(-1)
+                }
+            })
+            .collect();
+        CommandResponse::array(out)
     }
 
     /// `HSCAN key cursor [MATCH pattern] [COUNT count]`: visits `count`
@@ -404,5 +546,145 @@ mod tests {
         store.hash_hset(&key, vec![(Bytes::from("f1"), Bytes::from("v1"))]);
         store.hash_hdel(&key, &[Bytes::from("f1")]);
         assert!(!store.exists(&key));
+    }
+
+    fn b(s: &str) -> Bytes {
+        Bytes::from(s.to_string())
+    }
+
+    fn ints(r: CommandResponse) -> Vec<i64> {
+        match r {
+            CommandResponse::Array(items) => items
+                .into_iter()
+                .map(|i| match i {
+                    CommandResponse::Integer(n) => n,
+                    other => panic!("{other:?}"),
+                })
+                .collect(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn hash_with(store: &mut ShardStore, key: &str, fields: &[&str]) {
+        let pairs = fields.iter().map(|f| (b(f), b("v"))).collect();
+        store.hash_hset(&b(key), pairs);
+    }
+
+    #[test]
+    fn field_expiry_codes_follow_redis() {
+        let mut store = ShardStore::new();
+        hash_with(&mut store, "h", &["a", "b"]);
+        let later = now_millis() + 100_000;
+        let none = crate::store::ExpireCond::default();
+        // a set, b set, c missing.
+        assert_eq!(
+            ints(store.hash_field_expire(&b("h"), later, none, &[b("a"), b("b"), b("c")])),
+            vec![1, 1, -2]
+        );
+        // NX refuses fields that have one; XX refuses those without.
+        let nx = crate::store::ExpireCond {
+            nx: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            ints(store.hash_field_expire(&b("h"), later, nx, &[b("a")])),
+            vec![0]
+        );
+        // GT: only a later deadline; LT: only an earlier one.
+        let gt = crate::store::ExpireCond {
+            gt: true,
+            ..Default::default()
+        };
+        let lt = crate::store::ExpireCond {
+            lt: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            ints(store.hash_field_expire(&b("h"), later - 1, gt, &[b("a")])),
+            vec![0]
+        );
+        assert_eq!(
+            ints(store.hash_field_expire(&b("h"), later - 1, lt, &[b("a")])),
+            vec![1]
+        );
+        // A deadline already past deletes the field.
+        assert_eq!(
+            ints(store.hash_field_expire(&b("h"), 1, none, &[b("b")])),
+            vec![2]
+        );
+        assert!(matches!(
+            store.hash_hlen(&b("h")),
+            CommandResponse::Integer(1)
+        ));
+        // Missing key: -2 per field.
+        assert_eq!(
+            ints(store.hash_field_expire(&b("nope"), later, none, &[b("x"), b("y")])),
+            vec![-2, -2]
+        );
+    }
+
+    #[test]
+    fn ttl_persist_and_overwrite() {
+        let mut store = ShardStore::new();
+        hash_with(&mut store, "h", &["a", "b"]);
+        let at = now_millis() + 50_000;
+        store.hash_field_expire(&b("h"), at, Default::default(), &[b("a")]);
+        let ttl = ints(store.hash_field_ttl(&b("h"), &[b("a"), b("b"), b("c")], false, false));
+        assert!(ttl[0] > 40 && ttl[0] <= 50, "{ttl:?}");
+        assert_eq!(&ttl[1..], &[-1, -2]);
+        assert_eq!(
+            ints(store.hash_field_ttl(&b("h"), &[b("a")], true, true)),
+            vec![at as i64]
+        );
+        // Writing the field drops its expiry (Redis 7.4).
+        store.hash_hset(&b("h"), vec![(b("a"), b("new"))]);
+        assert_eq!(
+            ints(store.hash_field_ttl(&b("h"), &[b("a")], false, false)),
+            vec![-1]
+        );
+        store.hash_field_expire(&b("h"), at, Default::default(), &[b("b")]);
+        assert_eq!(
+            ints(store.hash_field_persist(&b("h"), &[b("b"), b("a"), b("z")])),
+            vec![1, -1, -2]
+        );
+    }
+
+    #[test]
+    fn due_fields_vanish_on_access_and_are_reported() {
+        let mut store = ShardStore::new();
+        hash_with(&mut store, "h", &["a", "b"]);
+        store.hash_field_expire(&b("h"), now_millis() + 30, Default::default(), &[b("a")]);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(matches!(
+            store.hash_hget(&b("h"), &b("a")),
+            CommandResponse::Nil
+        ));
+        assert!(matches!(
+            store.hash_hlen(&b("h")),
+            CommandResponse::Integer(1)
+        ));
+        assert_eq!(store.expired_fields, vec![(0, b("h"), vec![b("a")])]);
+        // The last field going removes the key.
+        store.expired_fields.clear();
+        store.hash_field_expire(&b("h"), now_millis() + 30, Default::default(), &[b("b")]);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(matches!(store.hash_hgetall(&b("h")), CommandResponse::Array(v) if v.is_empty()));
+        assert!(!store.exists(&b("h")));
+    }
+
+    #[test]
+    fn the_active_cycle_expires_fields_nobody_reads() {
+        let mut store = ShardStore::new();
+        for i in 0..50 {
+            let k = format!("h{i}");
+            hash_with(&mut store, &k, &["a", "b"]);
+            store.hash_field_expire(&b(&k), now_millis() + 20, Default::default(), &[b("a")]);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        for _ in 0..20 {
+            store.active_expire_cycle(std::time::Duration::from_millis(50));
+        }
+        let expired: usize = store.expired_fields.iter().map(|(_, _, f)| f.len()).sum();
+        assert_eq!(expired, 50);
     }
 }

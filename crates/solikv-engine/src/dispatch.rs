@@ -914,7 +914,7 @@ impl CommandEngine {
     }
 
     /// Map a completed command to its notification event(s) and emit them.
-    fn emit_notifications(&self, name: &str, args: &[Bytes], _response: &CommandResponse) {
+    fn emit_notifications(&self, name: &str, args: &[Bytes], response: &CommandResponse) {
         let flags = self.notify_flags.load(Ordering::Relaxed);
         if flags == 0 {
             return;
@@ -960,7 +960,7 @@ impl CommandEngine {
                 }
             }
             "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => {
-                if !matches!(_response, CommandResponse::Integer(1)) {
+                if !matches!(response, CommandResponse::Integer(1)) {
                     return;
                 }
                 if let Some(key) = args.first() {
@@ -1050,7 +1050,7 @@ impl CommandEngine {
                 }
             }
             "LMOVE" | "RPOPLPUSH" if args.len() >= 2 => {
-                if matches!(_response, CommandResponse::BulkString(_)) {
+                if matches!(response, CommandResponse::BulkString(_)) {
                     let (from_left, to_left) = if name == "RPOPLPUSH" {
                         (false, true)
                     } else {
@@ -1076,7 +1076,7 @@ impl CommandEngine {
                 }
             }
             "COPY" if args.len() >= 2 => {
-                if matches!(_response, CommandResponse::Integer(1)) {
+                if matches!(response, CommandResponse::Integer(1)) {
                     self.notify_keyspace_event(NOTIFY_GENERIC, "copy_to", &args[1]);
                 }
             }
@@ -1088,7 +1088,7 @@ impl CommandEngine {
             "SORT" => {
                 if let Some(p) = args.iter().position(|a| a.eq_ignore_ascii_case(b"STORE")) {
                     if let Some(dest) = args.get(p + 1) {
-                        let ev = if matches!(_response, CommandResponse::Integer(0)) {
+                        let ev = if matches!(response, CommandResponse::Integer(0)) {
                             "del"
                         } else {
                             "sortstore"
@@ -1131,6 +1131,18 @@ impl CommandEngine {
             "HINCRBYFLOAT" => {
                 if let Some(key) = args.first() {
                     self.notify_keyspace_event(NOTIFY_HASH, "hincrbyfloat", key);
+                }
+            }
+            "HEXPIRE" | "HPEXPIRE" | "HEXPIREAT" | "HPEXPIREAT" | "HPERSIST" => {
+                let changed = matches!(response, CommandResponse::Array(codes)
+                    if codes.iter().any(|c| matches!(c, CommandResponse::Integer(1) | CommandResponse::Integer(2))));
+                if let (true, Some(key)) = (changed, args.first()) {
+                    let event = if name == "HPERSIST" {
+                        "hpersist"
+                    } else {
+                        "hexpire"
+                    };
+                    self.notify_keyspace_event(NOTIFY_HASH, event, key);
                 }
             }
             "HSETNX" => {
@@ -1207,10 +1219,10 @@ impl CommandEngine {
                 let ev = match Upper::new(&args[0]).as_str() {
                     "CREATE" => Some("xgroup-create"),
                     "SETID" => Some("xgroup-setid"),
-                    "DESTROY" if matches!(_response, CommandResponse::Integer(1)) => {
+                    "DESTROY" if matches!(response, CommandResponse::Integer(1)) => {
                         Some("xgroup-destroy")
                     }
-                    "CREATECONSUMER" if matches!(_response, CommandResponse::Integer(1)) => {
+                    "CREATECONSUMER" if matches!(response, CommandResponse::Integer(1)) => {
                         Some("xgroup-createconsumer")
                     }
                     "DELCONSUMER" => Some("xgroup-delconsumer"),
@@ -2908,6 +2920,11 @@ impl CommandEngine {
             Cmd::ZRANDMEMBER => self.randmember(false, args),
             Cmd::HRANDFIELD => self.randmember(true, args),
             Cmd::HSTRLEN => self.hstrlen(args),
+            Cmd::HEXPIRE | Cmd::HPEXPIRE | Cmd::HEXPIREAT | Cmd::HPEXPIREAT => {
+                self.hexpire(id, args)
+            }
+            Cmd::HTTL | Cmd::HPTTL | Cmd::HEXPIRETIME | Cmd::HPEXPIRETIME => self.httl(id, args),
+            Cmd::HPERSIST => self.hpersist(args),
             Cmd::SMISMEMBER => self.smismember(args),
             Cmd::SINTERCARD => self.sintercard(args),
             Cmd::ZSCAN => {

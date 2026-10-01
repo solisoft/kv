@@ -891,6 +891,98 @@ impl CommandEngine {
         })
     }
 
+    /// `HEXPIRE key seconds [NX|XX|GT|LT] FIELDS numfields field…` and its
+    /// `HPEXPIRE`/`HEXPIREAT`/`HPEXPIREAT` forms (Redis 7.4).
+    pub(super) fn hexpire(&self, id: crate::commands::Cmd, args: &[Bytes]) -> CommandResponse {
+        use crate::commands::Cmd;
+        let name = match id {
+            Cmd::HEXPIRE => "hexpire",
+            Cmd::HPEXPIRE => "hpexpire",
+            Cmd::HEXPIREAT => "hexpireat",
+            _ => "hpexpireat",
+        };
+        if args.len() < 5 {
+            return CommandResponse::wrong_arity(name);
+        }
+        let key = args[0].clone();
+        let Some(amount) = std::str::from_utf8(&args[1])
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        else {
+            return CommandResponse::error("ERR value is not an integer or out of range");
+        };
+        if amount < 0 {
+            return CommandResponse::error(format!(
+                "ERR invalid expire time in '{}' command",
+                name
+            ));
+        }
+        let mut cond = solikv_core::store::ExpireCond::default();
+        let mut at = 2;
+        match Upper::new(&args[2]).as_str() {
+            "NX" => cond.nx = true,
+            "XX" => cond.xx = true,
+            "GT" => cond.gt = true,
+            "LT" => cond.lt = true,
+            _ => at = 1,
+        }
+        let fields = match parse_fields(&args[at + 1..]) {
+            Ok(f) => f,
+            Err(e) => return e,
+        };
+        let now = solikv_core::now_millis() as i128;
+        let deadline: i128 = match id {
+            Cmd::HEXPIRE => now + amount as i128 * 1000,
+            Cmd::HPEXPIRE => now + amount as i128,
+            Cmd::HEXPIREAT => amount as i128 * 1000,
+            _ => amount as i128,
+        };
+        if deadline > (i64::MAX / 2) as i128 {
+            return CommandResponse::error(format!(
+                "ERR invalid expire time in '{}' command",
+                name
+            ));
+        }
+        let deadline = deadline as u64;
+        self.shards
+            .shard_for_key(&key)
+            .execute(move |s| s.hash_field_expire(&key, deadline, cond, &fields))
+    }
+
+    /// `HTTL`/`HPTTL`/`HEXPIRETIME`/`HPEXPIRETIME key FIELDS numfields field…`.
+    pub(super) fn httl(&self, id: crate::commands::Cmd, args: &[Bytes]) -> CommandResponse {
+        use crate::commands::Cmd;
+        if args.len() < 4 {
+            let name = crate::commands::spec(id).map_or("httl", |s| s.name);
+            return CommandResponse::wrong_arity(&name.to_lowercase());
+        }
+        let key = args[0].clone();
+        let fields = match parse_fields(&args[1..]) {
+            Ok(f) => f,
+            Err(e) => return e,
+        };
+        let millis = matches!(id, Cmd::HPTTL | Cmd::HPEXPIRETIME);
+        let absolute = matches!(id, Cmd::HEXPIRETIME | Cmd::HPEXPIRETIME);
+        self.shards
+            .shard_for_key(&key)
+            .execute(move |s| s.hash_field_ttl(&key, &fields, millis, absolute))
+    }
+
+    /// `HPERSIST key FIELDS numfields field…`.
+    pub(super) fn hpersist(&self, args: &[Bytes]) -> CommandResponse {
+        if args.len() < 4 {
+            return CommandResponse::wrong_arity("hpersist");
+        }
+        let key = args[0].clone();
+        let fields = match parse_fields(&args[1..]) {
+            Ok(f) => f,
+            Err(e) => return e,
+        };
+        self.shards
+            .shard_for_key(&key)
+            .execute(move |s| s.hash_field_persist(&key, &fields))
+    }
+
     pub(super) fn hstrlen(&self, args: &[Bytes]) -> CommandResponse {
         if args.len() != 2 {
             return CommandResponse::wrong_arity("hstrlen");
@@ -901,6 +993,32 @@ impl CommandEngine {
             .shard_for_key(&key)
             .execute(move |s| s.hash_hstrlen(&key, &field))
     }
+}
+
+/// `FIELDS numfields field…`, as the hash field expiry commands take it.
+fn parse_fields(args: &[Bytes]) -> Result<Vec<Bytes>, CommandResponse> {
+    if args.is_empty() || !Upper::new(&args[0]).as_str().eq("FIELDS") {
+        return Err(CommandResponse::error(
+            "ERR Mandatory argument FIELDS is missing or not at the right position",
+        ));
+    }
+    let n = args
+        .get(1)
+        .and_then(|a| std::str::from_utf8(a).ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .ok_or_else(|| CommandResponse::error("ERR value is not an integer or out of range"))?;
+    if n <= 0 {
+        return Err(CommandResponse::error(
+            "ERR Parameter `numFields` should be greater than 0",
+        ));
+    }
+    let fields = &args[2..];
+    if fields.len() as i64 != n {
+        return Err(CommandResponse::error(
+            "ERR The `numfields` parameter must match the number of arguments",
+        ));
+    }
+    Ok(fields.to_vec())
 }
 
 // ---------------------------------------------------------------------------

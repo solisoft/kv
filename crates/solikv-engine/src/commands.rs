@@ -472,6 +472,15 @@ commands! {
     HSCAN = "HSCAN", -3, RO, K1;
     HSTRLEN = "HSTRLEN", 3, ROF, K1;
     HRANDFIELD = "HRANDFIELD", -2, RO, K1;
+    HEXPIRE = "HEXPIRE", -6, WF, K1;
+    HPEXPIRE = "HPEXPIRE", -6, WF, K1;
+    HEXPIREAT = "HEXPIREAT", -6, WF, K1;
+    HPEXPIREAT = "HPEXPIREAT", -6, WF, K1;
+    HTTL = "HTTL", -5, ROF, K1;
+    HPTTL = "HPTTL", -5, ROF, K1;
+    HEXPIRETIME = "HEXPIRETIME", -5, ROF, K1;
+    HPEXPIRETIME = "HPEXPIRETIME", -5, ROF, K1;
+    HPERSIST = "HPERSIST", -5, WF, K1;
     SSCAN = "SSCAN", -3, RO, K1;
     // Sets
     SADD = "SADD", -3, WDF, K1;

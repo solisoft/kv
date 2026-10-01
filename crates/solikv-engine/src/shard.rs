@@ -11,7 +11,7 @@ use solikv_core::CommandResponse;
 use solikv_persist::AofWriter;
 
 use crate::aof_log::Effects;
-use crate::dispatch::{NOTIFY_EXPIRED, NOTIFY_KEYEVENT, NOTIFY_KEYSPACE};
+use crate::dispatch::{NOTIFY_EXPIRED, NOTIFY_HASH, NOTIFY_KEYEVENT, NOTIFY_KEYSPACE};
 use crate::watch::WatchRegistry;
 
 /// Reply to every command once the server has started shutting down.
@@ -327,16 +327,25 @@ impl ShardHandle {
         let aof = self.shared.aof.get();
         let repl = self.repl_sink();
         let db = current_db();
-        let (result, lazy_expired) = self.locked(|store, _| {
+        let (result, lazy_expired, expired_fields) = self.locked(|store, _| {
             // Checked under the lock: once `freeze` has taken and released
             // this lock, nothing changes the store again.
             if self.shared.frozen.load(Ordering::Relaxed) {
-                return (CommandResponse::error(SHUTTING_DOWN), Vec::new());
+                return (
+                    CommandResponse::error(SHUTTING_DOWN),
+                    Vec::new(),
+                    Vec::new(),
+                );
             }
             store.select(db);
             let mut effects = Effects::new(aof.is_some() || repl.is_some());
             let result = f(store, &mut effects);
             let lazy_expired = std::mem::take(&mut store.expired_buffer);
+            let expired_fields = if store.expired_fields.is_empty() {
+                Vec::new()
+            } else {
+                std::mem::take(&mut store.expired_fields)
+            };
             if aof.is_some() || repl.is_some() {
                 crate::aof_log::log_under_lock(
                     aof,
@@ -346,6 +355,7 @@ impl ShardHandle {
                     db,
                     &result,
                     &lazy_expired,
+                    &expired_fields,
                     explicit.then_some(&mut effects),
                     &[],
                 );
@@ -359,9 +369,13 @@ impl ShardHandle {
                 for (d, k) in lazy_expired.iter() {
                     watch.touch(*d, k);
                 }
+                for (d, k, _) in expired_fields.iter() {
+                    watch.touch(*d, k);
+                }
             }
-            (result, lazy_expired)
+            (result, lazy_expired, expired_fields)
         });
+        self.emit_field_expirations(&expired_fields);
 
         if !lazy_expired.is_empty() {
             self.shared
@@ -381,14 +395,15 @@ impl ShardHandle {
     ) -> Vec<(u32, Bytes)> {
         let aof = self.shared.aof.get();
         let repl = self.repl_sink();
-        self.locked(|store, _| {
+        let (removed, fields) = self.locked(|store, _| {
             if self.shared.frozen.load(Ordering::Relaxed) {
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             }
             let mut removed = std::mem::take(&mut store.expired_buffer);
             removed.extend(remove(store));
-            if removed.is_empty() {
-                return removed;
+            let fields = std::mem::take(&mut store.expired_fields);
+            if removed.is_empty() && fields.is_empty() {
+                return (removed, fields);
             }
             if aof.is_some() || repl.is_some() {
                 let db = store.db();
@@ -400,6 +415,7 @@ impl ShardHandle {
                     db,
                     &CommandResponse::Ok,
                     &[],
+                    &fields,
                     None,
                     &removed,
                 );
@@ -409,9 +425,14 @@ impl ShardHandle {
                 for (d, k) in removed.iter() {
                     watch.touch(*d, k);
                 }
+                for (d, k, _) in fields.iter() {
+                    watch.touch(*d, k);
+                }
             }
-            removed
-        })
+            (removed, fields)
+        });
+        self.emit_field_expirations(&fields);
+        removed
     }
 
     /// One active-expiry cycle on this shard (Redis' `activeExpireCycle`,
@@ -459,6 +480,16 @@ impl ShardHandle {
     /// This shard's position, which is also its log's number.
     pub fn index(&self) -> u32 {
         self.index
+    }
+
+    /// `hexpired` events for hash fields that expired (Redis 7.4 sends one
+    /// per key, whatever the number of fields).
+    fn emit_field_expirations(&self, fields: &[(u32, Bytes, Vec<Bytes>)]) {
+        if fields.is_empty() {
+            return;
+        }
+        let keys: Vec<(u32, Bytes)> = fields.iter().map(|(d, k, _)| (*d, k.clone())).collect();
+        self.emit_notifications(&keys, NOTIFY_HASH, "hexpired");
     }
 
     fn emit_expired_notifications(&self, keys: &[(u32, Bytes)]) {
