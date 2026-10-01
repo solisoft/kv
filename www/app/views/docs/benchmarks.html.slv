@@ -1,135 +1,214 @@
 <div class="space-y-12">
     <div>
         <h1 class="text-4xl font-bold mb-4">Benchmarks</h1>
-        <p class="text-lg text-slate-400">SoliKV (AOF everysec) vs Redis 7.0.15 (AOF everysec) &mdash; measured with <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">redis-benchmark</code> and <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">oha</code> on the same machine (2026-07-16)</p>
-    </div>
-
-    <!-- Version note -->
-    <div class="p-6 rounded-xl bg-amber-500/10 border border-amber-500/30">
-        <p class="text-slate-300">These figures were measured on <strong class="text-amber-400">SoliKV 0.4.1</strong>. Version 0.5 rebuilt persistence, the command path and the data structures; its before/after measurements are recorded in <code class="text-xs">benches/RESULTS.md</code> in the repository and will replace this page.</p>
+        <p class="text-lg text-slate-400">SoliKV after the audit fixes against SoliKV 0.4.3 &mdash; same machine, same build settings, alternating runs on fresh servers, measured with <code class="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded text-xs">redis-benchmark</code> 7.4.2 and a load generator for targeted workloads (2026-10-01)</p>
     </div>
 
     <!-- Highlight -->
     <div class="p-6 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-3">
-        <p class="text-slate-300">All SoliKV numbers below include <strong class="text-emerald-400">AOF persistence</strong> (<code class="text-xs">appendfsync everysec</code>). Redis was configured the same way for a fair comparison.</p>
-        <p class="text-slate-300">Headline: pipelined <strong class="text-emerald-400">SET is 1.45–1.6M req/s</strong> (+56–80% vs Redis 7/8). With <code class="text-xs">--solo</code> (Redis-shaped, no mutex), standard SET <strong class="text-emerald-400">beats Redis 8.6</strong> (~103K vs ~102K AOF everysec on this host).</p>
+        <p class="text-slate-300">The largest gains are where the data structures changed: strings edited in place, sorted sets with rank indexes, scans that no longer copy the collection. Growing a bitmap with SETBIT went from <strong class="text-emerald-400">40.96 s to 105.3 ms</strong>; ZRANK on a 200k-member sorted set is <strong class="text-emerald-400">×74 faster</strong>.</p>
+        <p class="text-slate-300">Writes to one hot key from six client threads are faster for SET, INCR, HSET and ZADD, and the server now reclaims expired keys on its own. One-command-at-a-time and pipelined throughput is unchanged: a single benchmark client is the limit for both versions. All numbers include AOF persistence (<code class="text-xs">appendfsync everysec</code>).</p>
     </div>
 
-    <!-- Solo vs Redis 8 -->
-    <div>
-        <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
-            <span class="w-10 h-10 rounded-xl bg-amber-500/20 flex items-center justify-center">
-                <svg class="w-5 h-5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
-            </span>
-            Solo mode vs Redis 8.6 (AOF everysec, 50 clients)
-        </h2>
-        <p class="text-sm text-slate-500 mb-4"><code class="text-indigo-400">--solo</code>: 1 shard, unlocked store, 1 Tokio worker &mdash; same shape as Redis&rsquo;s single-threaded loop.</p>
-        <div class="overflow-x-auto">
-            <table class="w-full text-left">
-                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">SoliKV --solo</th><th class="py-3 pr-4 text-slate-400 font-medium">Redis 8.6</th><th class="py-3 text-slate-400 font-medium">Delta</th></tr></thead>
-                <tbody class="text-slate-300">
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">PING</td><td class="py-3 pr-4 font-mono text-emerald-400">103K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">98K req/s</td><td class="py-3 text-emerald-400">+5%</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">SET</td><td class="py-3 pr-4 font-mono text-emerald-400">103K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">102K req/s</td><td class="py-3 text-emerald-400">+0.8%</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">GET</td><td class="py-3 pr-4 font-mono text-slate-300">102K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">104K req/s</td><td class="py-3 text-slate-400">−1.7%</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">Pipeline SET (P=16)</td><td class="py-3 pr-4 font-mono text-emerald-400">1.45M req/s</td><td class="py-3 pr-4 font-mono text-slate-400">0.93M req/s</td><td class="py-3 text-emerald-400">+56%</td></tr>
-                    <tr><td class="py-3 pr-4">Pipeline GET (P=16)</td><td class="py-3 pr-4 font-mono text-slate-300">1.60M req/s</td><td class="py-3 pr-4 font-mono text-slate-400">1.61M req/s</td><td class="py-3 text-slate-400">tied</td></tr>
-                </tbody>
-            </table>
-        </div>
-        <p class="text-sm text-slate-500 mt-3">Use multi-shard (default) for multi-core production; use <code class="text-xs">--solo</code> when you want maximum single-core / redis-benchmark parity.</p>
+    <div class="grid grid-cols-2 md:grid-cols-3 gap-4">
+        <div class="p-4 rounded-xl bg-white/5"><div class="text-2xl font-bold font-mono text-emerald-400">×389</div><div class="text-sm text-slate-400 mt-2">SETBIT growing a 10 MB bitmap</div></div>
+        <div class="p-4 rounded-xl bg-white/5"><div class="text-2xl font-bold font-mono text-emerald-400">×126</div><div class="text-sm text-slate-400 mt-2">ZRANGE deep inside a 200k sorted set</div></div>
+        <div class="p-4 rounded-xl bg-white/5"><div class="text-2xl font-bold font-mono text-emerald-400">×74</div><div class="text-sm text-slate-400 mt-2">ZRANK on a 200k sorted set</div></div>
+        <div class="p-4 rounded-xl bg-white/5"><div class="text-2xl font-bold font-mono text-emerald-400">3.81M/s</div><div class="text-sm text-slate-400 mt-2">SET on one hot key (was 2.96M/s)</div></div>
+        <div class="p-4 rounded-xl bg-white/5"><div class="text-2xl font-bold font-mono text-emerald-400">+148%</div><div class="text-sm text-slate-400 mt-2">INCR on one hot key</div></div>
+        <div class="p-4 rounded-xl bg-white/5"><div class="text-2xl font-bold font-mono text-emerald-400">190,201 → 0</div><div class="text-sm text-slate-400 mt-2">expired keys left on an idle server</div></div>
     </div>
 
-    <!-- Standard Operations -->
+    <!-- Targeted workloads -->
     <div>
         <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
-            <span class="w-10 h-10 rounded-xl bg-emerald-500/20 flex items-center justify-center">
-                <svg class="w-5 h-5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
-            </span>
-            Standard Commands (200K ops, 50 clients)
+            <span class="w-10 h-10 rounded-xl bg-emerald-500/20 flex items-center justify-center"><svg class="w-5 h-5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg></span>
+            Targeted workloads
         </h2>
-        <div class="overflow-x-auto">
+        <p class="text-sm text-slate-500 mb-4">Workloads whose cost depended on how values were stored. Durations are for the whole workload; rates are operations per second.</p>
+            <div class="overflow-x-auto">
             <table class="w-full text-left">
-                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">SoliKV+AOF</th><th class="py-3 pr-4 text-slate-400 font-medium">Redis 7.0+AOF</th><th class="py-3 text-slate-400 font-medium">Delta</th></tr></thead>
-                <tbody class="text-slate-300">
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">PING</td><td class="py-3 pr-4 font-mono text-emerald-400">109K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">108K req/s</td><td class="py-3 text-emerald-400">+0.6%</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">SET</td><td class="py-3 pr-4 font-mono text-slate-300">106K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">108K req/s</td><td class="py-3 text-slate-400">−1.5%</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">GET</td><td class="py-3 pr-4 font-mono text-emerald-400">108K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">108K req/s</td><td class="py-3 text-emerald-400">+0.8%</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">INCR</td><td class="py-3 pr-4 font-mono text-slate-300">108K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">108K req/s</td><td class="py-3 text-slate-400">tied</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">LPUSH</td><td class="py-3 pr-4 font-mono text-slate-300">108K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">108K req/s</td><td class="py-3 text-slate-400">−0.5%</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">RPUSH</td><td class="py-3 pr-4 font-mono text-slate-300">108K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">108K req/s</td><td class="py-3 text-slate-400">−0.6%</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">LPOP</td><td class="py-3 pr-4 font-mono text-slate-300">108K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">109K req/s</td><td class="py-3 text-slate-400">−0.5%</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">RPOP</td><td class="py-3 pr-4 font-mono text-emerald-400">109K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">108K req/s</td><td class="py-3 text-emerald-400">+0.4%</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">SADD</td><td class="py-3 pr-4 font-mono text-slate-300">108K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">108K req/s</td><td class="py-3 text-slate-400">−0.6%</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">HSET</td><td class="py-3 pr-4 font-mono text-slate-300">107K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">108K req/s</td><td class="py-3 text-slate-400">−1.0%</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">ZADD</td><td class="py-3 pr-4 font-mono text-emerald-400">108K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">108K req/s</td><td class="py-3 text-emerald-400">+0.2%</td></tr>
-                    <tr><td class="py-3 pr-4">MSET (10 keys)</td><td class="py-3 pr-4 font-mono text-emerald-400">108K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">105K req/s</td><td class="py-3 text-emerald-400">+2.3%</td></tr>
-                </tbody>
+            <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Workload</th><th class="py-3 pr-4 text-slate-400 font-medium">Before</th><th class="py-3 pr-4 text-slate-400 font-medium">After</th><th class="py-3 pr-4 text-slate-400 font-medium">Speedup</th></tr></thead>
+            <tbody class="text-slate-300">
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">Growing a bitmap with SETBIT<br><span class="text-xs text-slate-500">100k SETBITs at rising offsets, 10 MB at the end</span></td><td class="py-3 pr-4 font-mono text-slate-400">40.96 s</td><td class="py-3 pr-4 font-mono text-emerald-400">105.3 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">×389</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">ZRANGE by index, deep<br><span class="text-xs text-slate-500">10 members from rank 100k–190k of 200k</span></td><td class="py-3 pr-4 font-mono text-slate-400">3.2K/s</td><td class="py-3 pr-4 font-mono text-emerald-400">405.5K/s</td><td class="py-3 pr-4 font-mono text-emerald-400">×126</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">Building a string with APPEND<br><span class="text-xs text-slate-500">20k appends of 512 B, 10 MB at the end</span></td><td class="py-3 pr-4 font-mono text-slate-400">2.89 s</td><td class="py-3 pr-4 font-mono text-emerald-400">23.0 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">×126</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">A full ZSCAN<br><span class="text-xs text-slate-500">sorted set of 50k members, COUNT 100</span></td><td class="py-3 pr-4 font-mono text-slate-400">2.59 s</td><td class="py-3 pr-4 font-mono text-emerald-400">20.7 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">×125</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">SINTER, large with small<br><span class="text-xs text-slate-500">100k-member set with a 100-member set</span></td><td class="py-3 pr-4 font-mono text-slate-400">0.9K/s</td><td class="py-3 pr-4 font-mono text-emerald-400">75.5K/s</td><td class="py-3 pr-4 font-mono text-emerald-400">×81</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">ZRANK<br><span class="text-xs text-slate-500">random members of a 200k-member sorted set</span></td><td class="py-3 pr-4 font-mono text-slate-400">7.9K/s</td><td class="py-3 pr-4 font-mono text-emerald-400">583.0K/s</td><td class="py-3 pr-4 font-mono text-emerald-400">×74</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">A full HSCAN<br><span class="text-xs text-slate-500">hash of 50k fields, COUNT 100</span></td><td class="py-3 pr-4 font-mono text-slate-400">698.4 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">18.4 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">×38</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">Emptying a set with SPOP<br><span class="text-xs text-slate-500">100k members, one SPOP at a time</span></td><td class="py-3 pr-4 font-mono text-slate-400">275.6 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">113.6 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">×2.4</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">One RPUSH of 100k elements<br><span class="text-xs text-slate-500">a single 1.3 MB command</span></td><td class="py-3 pr-4 font-mono text-slate-400">15.4 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">12.0 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">×1.3</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">One MSET of 10k pairs<br><span class="text-xs text-slate-500">a single 10k-pair command</span></td><td class="py-3 pr-4 font-mono text-slate-400">4.25 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">3.31 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">×1.3</td></tr>
+            <tr><td class="py-3 pr-4">DEL of 1000 keys<br><span class="text-xs text-slate-500">keys spread over all shards</span></td><td class="py-3 pr-4 font-mono text-slate-400">234 µs</td><td class="py-3 pr-4 font-mono text-emerald-400">211 µs</td><td class="py-3 pr-4 font-mono text-emerald-400">×1.1</td></tr>
+            </tbody>
             </table>
-        </div>
-        <p class="text-sm text-slate-500 mt-3">With 50 concurrent clients, both servers are largely client/protocol bound (~108K req/s). Deltas within ±2% are noise. MSET benefits from multi-shard key routing (each pair hashed to its shard).</p>
+            </div>
     </div>
 
-    <!-- Pipeline Operations -->
+    <!-- Hot key -->
     <div>
         <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
-            <span class="w-10 h-10 rounded-xl bg-indigo-500/20 flex items-center justify-center">
-                <svg class="w-5 h-5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
-            </span>
-            Pipeline (P=16, 500K ops, 50 clients)
+            <span class="w-10 h-10 rounded-xl bg-amber-500/20 flex items-center justify-center"><svg class="w-5 h-5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 18.657A8 8 0 016.343 7.343S7 9 9 10c0-2 .5-5 2.986-7C14 5 16.09 5.777 17.656 7.343A7.975 7.975 0 0120 13a7.975 7.975 0 01-2.343 5.657z" /></svg></span>
+            One hot key (6 client threads, 96 connections, P=32, 20M ops)
         </h2>
-        <div class="overflow-x-auto">
+        <p class="text-sm text-slate-500 mb-4">Every write to one key goes through one shard lock, so this measures how much work happens while that lock is held. AOF on.</p>
+            <div class="overflow-x-auto">
             <table class="w-full text-left">
-                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">SoliKV+AOF</th><th class="py-3 pr-4 text-slate-400 font-medium">Redis 7.0+AOF</th><th class="py-3 text-slate-400 font-medium">Delta</th></tr></thead>
-                <tbody class="text-slate-300">
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">SET</td><td class="py-3 pr-4 font-mono text-emerald-400">1.60M req/s</td><td class="py-3 pr-4 font-mono text-slate-400">1.02M req/s</td><td class="py-3 text-emerald-400">+57%</td></tr>
-                    <tr><td class="py-3 pr-4">GET</td><td class="py-3 pr-4 font-mono text-emerald-400">1.63M req/s</td><td class="py-3 pr-4 font-mono text-slate-400">1.62M req/s</td><td class="py-3 text-emerald-400">+1.0%</td></tr>
-                </tbody>
+            <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Before</th><th class="py-3 pr-4 text-slate-400 font-medium">After</th><th class="py-3 pr-4 text-slate-400 font-medium">Change</th></tr></thead>
+            <tbody class="text-slate-300">
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">SET</td><td class="py-3 pr-4 font-mono text-slate-400">2.96M/s</td><td class="py-3 pr-4 font-mono text-emerald-400">3.81M/s</td><td class="py-3 pr-4 font-mono text-emerald-400">+29%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">INCR</td><td class="py-3 pr-4 font-mono text-slate-400">1.40M/s</td><td class="py-3 pr-4 font-mono text-emerald-400">3.48M/s</td><td class="py-3 pr-4 font-mono text-emerald-400">+148%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">HSET</td><td class="py-3 pr-4 font-mono text-slate-400">2.05M/s</td><td class="py-3 pr-4 font-mono text-emerald-400">3.33M/s</td><td class="py-3 pr-4 font-mono text-emerald-400">+63%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">ZADD</td><td class="py-3 pr-4 font-mono text-slate-400">2.35M/s</td><td class="py-3 pr-4 font-mono text-emerald-400">3.20M/s</td><td class="py-3 pr-4 font-mono text-emerald-400">+36%</td></tr>
+            <tr><td class="py-3 pr-4">LPUSH</td><td class="py-3 pr-4 font-mono text-slate-400">3.33M/s</td><td class="py-3 pr-4 font-mono text-amber-400">2.50M/s</td><td class="py-3 pr-4 font-mono text-amber-400">−25%</td></tr>
+            </tbody>
             </table>
-        </div>
-        <p class="text-sm text-slate-500 mt-3">Pipeline is where SoliKV’s RESP batch fast-path pays off: decode a full pipeline, execute pure engine commands, write responses in one buffer. Pipelined SET is substantially ahead of Redis on this host; pipelined GET is essentially tied.</p>
+            </div>
+        <p class="text-sm text-slate-500 mt-3">LPUSH is the one write that got slower. The new server compacts its AOF automatically, and each rewrite has to save the single 20M-element list while writers to that key wait. With <code class="text-xs">--auto-aof-rewrite-percentage 0</code> the same test ran at 3.08M/s against 2.58&ndash;2.67M/s for 0.4.3. The old server never compacted its AOF, which is also why it applied writes twice on restart.</p>
     </div>
 
-    <!-- REST API Benchmarks -->
+    <!-- Latency while saving -->
     <div>
         <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
-            <span class="w-10 h-10 rounded-xl bg-purple-500/20 flex items-center justify-center">
-                <svg class="w-5 h-5 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" /></svg>
-            </span>
-            REST API (oha, 10s duration)
+            <span class="w-10 h-10 rounded-xl bg-cyan-500/20 flex items-center justify-center"><svg class="w-5 h-5 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg></span>
+            Latency while the server saves
         </h2>
-        <div class="overflow-x-auto">
+        <p class="text-sm text-slate-500 mb-4">GET/SET latency seen by other clients during a snapshot and right after a large FLUSHALL. The old server serialized a whole shard under its lock; the new one saves in steps and slices huge keys.</p>
+            <div class="overflow-x-auto">
             <table class="w-full text-left">
-                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Operation</th><th class="py-3 pr-4 text-slate-400 font-medium">SoliKV+AOF</th><th class="py-3 text-slate-400 font-medium">Notes</th></tr></thead>
-                <tbody class="text-slate-300">
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">GET /kv/:key</td><td class="py-3 pr-4 font-mono text-emerald-400">485K req/s</td><td class="py-3 text-slate-500">100 connections, keep-alive</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">PUT /kv/:key</td><td class="py-3 pr-4 font-mono text-emerald-400">449K req/s</td><td class="py-3 text-slate-500">100 connections, write + AOF</td></tr>
-                    <tr><td class="py-3 pr-4">PUT /kv/:key</td><td class="py-3 pr-4 font-mono text-emerald-400">489K req/s</td><td class="py-3 text-slate-500">200 connections</td></tr>
-                </tbody>
+            <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Measurement</th><th class="py-3 pr-4 text-slate-400 font-medium">Before</th><th class="py-3 pr-4 text-slate-400 font-medium">After</th></tr></thead>
+            <tbody class="text-slate-300">
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">BGSAVE, worst GET<br><span class="text-xs text-slate-500">1M keys over 16 shards, 16 clients</span></td><td class="py-3 pr-4 font-mono text-slate-400">14.1 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">3.27 ms</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">BGSAVE, GET p99.9<br><span class="text-xs text-slate-500">1M keys over 16 shards, 16 clients</span></td><td class="py-3 pr-4 font-mono text-slate-400">2.43 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">795 µs</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">SAVE, worst GET<br><span class="text-xs text-slate-500">other clients while SAVE runs</span></td><td class="py-3 pr-4 font-mono text-slate-400">200.0 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">74.2 ms</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">SAVE, GET p99.9<br><span class="text-xs text-slate-500">other clients while SAVE runs</span></td><td class="py-3 pr-4 font-mono text-slate-400">2.46 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">664 µs</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">BGSAVE in --solo mode, worst GET<br><span class="text-xs text-slate-500">1M keys, single-threaded engine</span></td><td class="py-3 pr-4 font-mono text-slate-400">1.21 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">1.51 ms</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">BGSAVE in --solo mode, GET p99.9<br><span class="text-xs text-slate-500">1M keys, single-threaded engine</span></td><td class="py-3 pr-4 font-mono text-slate-400">181 µs</td><td class="py-3 pr-4 font-mono text-emerald-400">275 µs</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">Refill after FLUSHALL, worst SET<br><span class="text-xs text-slate-500">1M keys flushed, then 16 clients write</span></td><td class="py-3 pr-4 font-mono text-slate-400">220.9 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">88.1 ms</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">Refill after FLUSHALL, SET p99.9<br><span class="text-xs text-slate-500">1M keys flushed, then 16 clients write</span></td><td class="py-3 pr-4 font-mono text-slate-400">8.66 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">4.16 ms</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">BGSAVE of a 2M-element list, worst<br><span class="text-xs text-slate-500">GET/LPUSH on other keys of that shard</span></td><td class="py-3 pr-4 font-mono text-slate-400">15.7 ms</td><td class="py-3 pr-4 font-mono text-emerald-400">1.99 ms</td></tr>
+            <tr><td class="py-3 pr-4">BGSAVE of a 2M-element list, p99.9<br><span class="text-xs text-slate-500">GET/LPUSH on other keys of that shard</span></td><td class="py-3 pr-4 font-mono text-slate-400">66 µs</td><td class="py-3 pr-4 font-mono text-emerald-400">217 µs</td></tr>
+            </tbody>
             </table>
-        </div>
-        <p class="text-sm text-slate-500 mt-3">REST API via Axum/Tokio. HTTP JSON overhead is higher than RESP; still half a million requests per second on this host.</p>
+            </div>
+        <p class="text-sm text-slate-500 mt-3">Expired keys still resident 3 s after 200k keys with a 200 ms TTL expired, on an idle server: <span class="font-mono text-emerald-400">190,201 → 0</span>.</p>
     </div>
 
-    <!-- Sustained Load -->
+    <!-- Everyday commands -->
     <div>
         <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
-            <span class="w-10 h-10 rounded-xl bg-cyan-500/20 flex items-center justify-center">
-                <svg class="w-5 h-5 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-            </span>
-            Sustained Load (1M SET, 50 clients)
+            <span class="w-10 h-10 rounded-xl bg-indigo-500/20 flex items-center justify-center"><svg class="w-5 h-5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg></span>
+            Everyday commands
         </h2>
-        <div class="overflow-x-auto">
+        <p class="text-sm text-slate-500 mb-4">Standard <code class="text-xs">redis-benchmark</code>, 50 clients. A single benchmark process saturates before either server, so these tables show that nothing regressed; differences within &plusmn;3% are noise.</p>
+        <div class="grid md:grid-cols-2 gap-4">
+            <div>
+                <h3 class="font-semibold mb-2">One command at a time (200k ops)</h3>
+            <div class="overflow-x-auto">
             <table class="w-full text-left">
-                <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Metric</th><th class="py-3 pr-4 text-slate-400 font-medium">SoliKV+AOF</th><th class="py-3 text-slate-400 font-medium">Redis 7.0+AOF</th></tr></thead>
-                <tbody class="text-slate-300">
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">Throughput</td><td class="py-3 pr-4 font-mono text-emerald-400">108K req/s steady</td><td class="py-3 font-mono text-slate-400">108K req/s steady</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">p50 latency</td><td class="py-3 pr-4 font-mono text-emerald-400">0.239 ms</td><td class="py-3 font-mono text-slate-400">0.239 ms</td></tr>
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4">p99 latency</td><td class="py-3 pr-4 font-mono text-emerald-400">0.447 ms</td><td class="py-3 font-mono text-slate-400">0.447 ms</td></tr>
-                    <tr><td class="py-3 pr-4">max latency*</td><td class="py-3 pr-4 font-mono text-slate-300">~8 ms</td><td class="py-3 font-mono text-slate-400">~0.7 ms</td></tr>
-                </tbody>
+            <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Before</th><th class="py-3 pr-4 text-slate-400 font-medium">After</th><th class="py-3 pr-4 text-slate-400 font-medium">Change</th></tr></thead>
+            <tbody class="text-slate-300">
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">PING INLINE</td><td class="py-3 pr-4 font-mono text-slate-400">122.8K</td><td class="py-3 pr-4 font-mono text-slate-300">122.2K</td><td class="py-3 pr-4 font-mono text-slate-300">−0.4%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">PING MBULK</td><td class="py-3 pr-4 font-mono text-slate-400">122.3K</td><td class="py-3 pr-4 font-mono text-slate-300">121.1K</td><td class="py-3 pr-4 font-mono text-slate-300">−1.0%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">SET</td><td class="py-3 pr-4 font-mono text-slate-400">122.9K</td><td class="py-3 pr-4 font-mono text-slate-300">121.1K</td><td class="py-3 pr-4 font-mono text-slate-300">−1.5%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">GET</td><td class="py-3 pr-4 font-mono text-slate-400">122.5K</td><td class="py-3 pr-4 font-mono text-slate-300">122.4K</td><td class="py-3 pr-4 font-mono text-slate-300">−0.1%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">INCR</td><td class="py-3 pr-4 font-mono text-slate-400">122.1K</td><td class="py-3 pr-4 font-mono text-slate-300">122.3K</td><td class="py-3 pr-4 font-mono text-slate-300">+0.2%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">LPUSH</td><td class="py-3 pr-4 font-mono text-slate-400">121.7K</td><td class="py-3 pr-4 font-mono text-slate-300">122.0K</td><td class="py-3 pr-4 font-mono text-slate-300">+0.2%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">RPUSH</td><td class="py-3 pr-4 font-mono text-slate-400">122.1K</td><td class="py-3 pr-4 font-mono text-slate-300">121.1K</td><td class="py-3 pr-4 font-mono text-slate-300">−0.8%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">LPOP</td><td class="py-3 pr-4 font-mono text-slate-400">123.3K</td><td class="py-3 pr-4 font-mono text-slate-300">122.3K</td><td class="py-3 pr-4 font-mono text-slate-300">−0.8%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">RPOP</td><td class="py-3 pr-4 font-mono text-slate-400">122.2K</td><td class="py-3 pr-4 font-mono text-slate-300">121.5K</td><td class="py-3 pr-4 font-mono text-slate-300">−0.6%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">SADD</td><td class="py-3 pr-4 font-mono text-slate-400">124.7K</td><td class="py-3 pr-4 font-mono text-slate-300">121.1K</td><td class="py-3 pr-4 font-mono text-slate-300">−2.8%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">HSET</td><td class="py-3 pr-4 font-mono text-slate-400">122.3K</td><td class="py-3 pr-4 font-mono text-slate-300">121.7K</td><td class="py-3 pr-4 font-mono text-slate-300">−0.5%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">ZADD</td><td class="py-3 pr-4 font-mono text-slate-400">122.5K</td><td class="py-3 pr-4 font-mono text-slate-300">122.9K</td><td class="py-3 pr-4 font-mono text-slate-300">+0.4%</td></tr>
+            <tr><td class="py-3 pr-4">MSET</td><td class="py-3 pr-4 font-mono text-slate-400">121.2K</td><td class="py-3 pr-4 font-mono text-slate-300">122.6K</td><td class="py-3 pr-4 font-mono text-slate-300">+1.2%</td></tr>
+            </tbody>
             </table>
+            </div>
+            </div>
+            <div>
+                <h3 class="font-semibold mb-2">Pipelined, P=16 (2M ops)</h3>
+            <div class="overflow-x-auto">
+            <table class="w-full text-left">
+            <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">Before</th><th class="py-3 pr-4 text-slate-400 font-medium">After</th><th class="py-3 pr-4 text-slate-400 font-medium">Change</th></tr></thead>
+            <tbody class="text-slate-300">
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">SET</td><td class="py-3 pr-4 font-mono text-slate-400">1.78M</td><td class="py-3 pr-4 font-mono text-slate-300">1.78M</td><td class="py-3 pr-4 font-mono text-slate-300">+0.0%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">GET</td><td class="py-3 pr-4 font-mono text-slate-400">1.81M</td><td class="py-3 pr-4 font-mono text-slate-300">1.78M</td><td class="py-3 pr-4 font-mono text-slate-300">−1.7%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">INCR</td><td class="py-3 pr-4 font-mono text-slate-400">1.70M</td><td class="py-3 pr-4 font-mono text-slate-300">1.76M</td><td class="py-3 pr-4 font-mono text-slate-300">+3.8%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">LPUSH</td><td class="py-3 pr-4 font-mono text-slate-400">1.75M</td><td class="py-3 pr-4 font-mono text-slate-300">1.77M</td><td class="py-3 pr-4 font-mono text-slate-300">+1.0%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">SADD</td><td class="py-3 pr-4 font-mono text-slate-400">1.80M</td><td class="py-3 pr-4 font-mono text-slate-300">1.78M</td><td class="py-3 pr-4 font-mono text-slate-300">−1.2%</td></tr>
+            <tr class="border-b border-white/5"><td class="py-3 pr-4">HSET</td><td class="py-3 pr-4 font-mono text-slate-400">1.76M</td><td class="py-3 pr-4 font-mono text-slate-300">1.79M</td><td class="py-3 pr-4 font-mono text-slate-300">+1.8%</td></tr>
+            <tr><td class="py-3 pr-4">ZADD</td><td class="py-3 pr-4 font-mono text-slate-400">1.79M</td><td class="py-3 pr-4 font-mono text-slate-300">1.77M</td><td class="py-3 pr-4 font-mono text-slate-300">−1.1%</td></tr>
+            </tbody>
+            </table>
+            </div>
+            </div>
         </div>
-        <p class="text-sm text-slate-500 mt-3">*Sampled over 200k ops. Steady throughput and p50/p99 match Redis. SoliKV can show higher rare max latency (AOF backpressure / active-expiry ticks under the shard mutex). Capped expiry (20 keys/tick) and AOF backpressure keep the common path stable.</p>
+    </div>
+
+    <!-- Caveats -->
+    <div class="p-6 rounded-xl bg-amber-500/10 border border-amber-500/30 space-y-3">
+        <h2 class="text-xl font-semibold text-amber-400">Reading these numbers</h2>
+        <p class="text-slate-300">Client and server share one 16-thread CPU, and data directories were on tmpfs, so <code class="text-xs">fsync</code> is nearly free. On a real disk, AOF-heavy numbers are lower for both versions.</p>
+        <p class="text-slate-300"><code class="text-xs">redis-benchmark</code> reports hot-key throughput in steps of its 0.25 s timer, about 4% at 20M operations, which is why runs often repeat the same value.</p>
+        <p class="text-slate-300">The <code class="text-xs">--solo</code> BGSAVE rows come from a separate run with that scenario alone. 0.4.3's low figures there came from a data race: a second thread was let into the unsynchronized store during the save. That race is fixed.</p>
+        <p class="text-slate-300">SAVE's worst GET is inflated for both versions by the scenarios that run before it. Run alone it measured 2.6&ndash;2.8 ms after against 4.2&ndash;6.0 ms before.</p>
+        <p class="text-slate-300">Cluster mode, replication, TLS and the REST API were not re-measured.</p>
+    </div>
+
+    <!-- Historical -->
+    <div>
+        <h2 class="text-2xl font-semibold mb-4 flex items-center gap-3">
+            <span class="w-10 h-10 rounded-xl bg-purple-500/20 flex items-center justify-center"><svg class="w-5 h-5 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg></span>
+            0.4.1 against Redis (2026-07-16)
+        </h2>
+        <p class="text-sm text-slate-500 mb-4">Measured before the audit fixes and not repeated since. Kept for reference.</p>
+        <div class="p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 mb-4">
+            <p class="text-sm text-slate-300">The pipelined SET lead below (+56&ndash;80%) was not a like-for-like comparison: 0.4.1 replied before its AOF bytes were written (they were only queued), while Redis writes its AOF buffer before replying.</p>
+        </div>
+        <div class="grid md:grid-cols-2 gap-4">
+            <div>
+                <h3 class="font-semibold mb-2">Pipeline, P=16, vs Redis 7.0 (AOF everysec)</h3>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left">
+                        <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">SoliKV 0.4.1</th><th class="py-3 pr-4 text-slate-400 font-medium">Redis 7.0</th></tr></thead>
+                        <tbody class="text-slate-300">
+                            <tr class="border-b border-white/5"><td class="py-3 pr-4">SET</td><td class="py-3 pr-4 font-mono">1.60M req/s</td><td class="py-3 pr-4 font-mono text-slate-400">1.02M req/s</td></tr>
+                            <tr><td class="py-3 pr-4">GET</td><td class="py-3 pr-4 font-mono">1.63M req/s</td><td class="py-3 pr-4 font-mono text-slate-400">1.62M req/s</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div>
+                <h3 class="font-semibold mb-2"><code class="text-xs">--solo</code> vs Redis 8.6 (AOF everysec)</h3>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left">
+                        <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Command</th><th class="py-3 pr-4 text-slate-400 font-medium">SoliKV 0.4.1</th><th class="py-3 pr-4 text-slate-400 font-medium">Redis 8.6</th></tr></thead>
+                        <tbody class="text-slate-300">
+                            <tr class="border-b border-white/5"><td class="py-3 pr-4">PING</td><td class="py-3 pr-4 font-mono">103K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">98K req/s</td></tr>
+                            <tr class="border-b border-white/5"><td class="py-3 pr-4">SET</td><td class="py-3 pr-4 font-mono">103K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">102K req/s</td></tr>
+                            <tr class="border-b border-white/5"><td class="py-3 pr-4">GET</td><td class="py-3 pr-4 font-mono">102K req/s</td><td class="py-3 pr-4 font-mono text-slate-400">104K req/s</td></tr>
+                            <tr class="border-b border-white/5"><td class="py-3 pr-4">Pipeline SET</td><td class="py-3 pr-4 font-mono">1.45M req/s</td><td class="py-3 pr-4 font-mono text-slate-400">0.93M req/s</td></tr>
+                            <tr><td class="py-3 pr-4">Pipeline GET</td><td class="py-3 pr-4 font-mono">1.60M req/s</td><td class="py-3 pr-4 font-mono text-slate-400">1.61M req/s</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div>
+                <h3 class="font-semibold mb-2">REST API (oha, 10 s, keep-alive)</h3>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left">
+                        <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Operation</th><th class="py-3 pr-4 text-slate-400 font-medium">Connections</th><th class="py-3 pr-4 text-slate-400 font-medium">SoliKV 0.4.1</th></tr></thead>
+                        <tbody class="text-slate-300">
+                            <tr class="border-b border-white/5"><td class="py-3 pr-4">GET /kv/:key</td><td class="py-3 pr-4 font-mono text-slate-400">100</td><td class="py-3 pr-4 font-mono">485K req/s</td></tr>
+                            <tr class="border-b border-white/5"><td class="py-3 pr-4">PUT /kv/:key</td><td class="py-3 pr-4 font-mono text-slate-400">100</td><td class="py-3 pr-4 font-mono">449K req/s</td></tr>
+                            <tr><td class="py-3 pr-4">PUT /kv/:key</td><td class="py-3 pr-4 font-mono text-slate-400">200</td><td class="py-3 pr-4 font-mono">489K req/s</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <p class="text-sm text-slate-500 mt-3">One command at a time, 0.4.1 and Redis 7.0 / 8.6 were within 1&ndash;3% of each other on every command (~108K req/s with 50 clients). Full tables are in <code class="text-indigo-400">benches/RESULTS.md</code>.</p>
     </div>
 
     <!-- Optimizations -->
@@ -175,18 +254,16 @@
     <div>
         <h2 class="text-2xl font-semibold mb-4">Reproduce</h2>
         <div class="rounded-xl bg-slate-900 border border-white/10 p-5 font-mono text-sm text-slate-300 space-y-2 overflow-x-auto">
-            <div class="text-slate-500"># build + run SoliKV with AOF</div>
-            <div>cargo build --release -p solikv-server</div>
-            <div>./target/release/solikv --bind 127.0.0.1 --port 6390 --rest-port 5030 \</div>
-            <div class="pl-4">--dir /tmp/solikv-bench --appendonly true --appendfsync everysec --protected-mode no</div>
-            <div class="text-slate-500 pt-2"># compare RESP throughput</div>
-            <div>./scripts/bench_compare.sh 50 200000 6390 6381</div>
-            <div class="text-slate-500 pt-2"># solo mode (vs Redis 8 style single-thread)</div>
-            <div>./target/release/solikv --solo --bind 127.0.0.1 --port 6390 --protected-mode no ...</div>
-            <div class="text-slate-500 pt-2"># REST</div>
-            <div>env -u NO_COLOR oha -z 10s -c 100 --no-tui http://127.0.0.1:5030/kv/mykey</div>
+            <div class="text-slate-500"># build both versions the same way (fat LTO, one codegen unit)</div>
+            <div>rbuild --faithful --no-link kv &amp;&amp; cp target/remote/release/solikv /tmp/solikv-before</div>
+            <div class="text-slate-500"># ...check out the other revision...</div>
+            <div>rbuild --faithful --no-link kv &amp;&amp; cp target/remote/release/solikv /tmp/solikv-after</div>
+            <div class="text-slate-500 pt-2"># alternating rounds on fresh servers, then the tables</div>
+            <div>cd benches &amp;&amp; (cd loadgen &amp;&amp; go build -o loadgen .)</div>
+            <div>python3 compare.py /tmp/solikv-before /tmp/solikv-after results/ --rounds 3</div>
+            <div>python3 report.py results/</div>
         </div>
-        <p class="text-sm text-slate-500 mt-3">Raw numbers and methodology: <code class="text-indigo-400">benches/RESULTS.md</code> in the repository.</p>
+        <p class="text-sm text-slate-500 mt-3">Requirements, scenarios and options: <code class="text-indigo-400">benches/README.md</code>. Raw tables and method: <code class="text-indigo-400">benches/RESULTS.md</code>.</p>
     </div>
 
     <!-- Test Environment -->
@@ -203,31 +280,35 @@
             </div>
             <div>
                 <div class="text-slate-500 text-xs uppercase mb-1">OS</div>
-                <div class="text-white">Linux x86_64</div>
+                <div class="text-white">Linux 7.2 x86_64</div>
             </div>
             <div>
-                <div class="text-slate-500 text-xs uppercase mb-1">Tool</div>
-                <div class="text-white">redis-benchmark / oha</div>
+                <div class="text-slate-500 text-xs uppercase mb-1">Tools</div>
+                <div class="text-white">redis-benchmark 7.4.2, benches/loadgen</div>
             </div>
             <div>
-                <div class="text-slate-500 text-xs uppercase mb-1">Baseline</div>
-                <div class="text-white">Redis 7.0.15 (AOF everysec)</div>
+                <div class="text-slate-500 text-xs uppercase mb-1">Before</div>
+                <div class="text-white">main 6645a90 (0.4.3)</div>
+            </div>
+            <div>
+                <div class="text-slate-500 text-xs uppercase mb-1">After</div>
+                <div class="text-white">claude/audit-fixes 7109ba1</div>
             </div>
             <div>
                 <div class="text-slate-500 text-xs uppercase mb-1">Build</div>
-                <div class="text-white">cargo build --release</div>
+                <div class="text-white">rbuild --faithful (fat LTO)</div>
+            </div>
+            <div>
+                <div class="text-slate-500 text-xs uppercase mb-1">Persistence</div>
+                <div class="text-white">AOF everysec, data on tmpfs</div>
             </div>
             <div>
                 <div class="text-slate-500 text-xs uppercase mb-1">Date</div>
-                <div class="text-white">2026-07-16</div>
-            </div>
-            <div>
-                <div class="text-slate-500 text-xs uppercase mb-1">SoliKV</div>
-                <div class="text-white">0.4.1 + multi-shard perf fixes</div>
+                <div class="text-white">2026-10-01</div>
             </div>
         </div>
         <div class="mt-4 text-sm text-slate-500">
-            Both servers on loopback with AOF everysec. Absolute req/s are machine-specific; use deltas and re-run scripts after changes. Numbers are stable post-warmup throughput.
+            Client and server on the same host over loopback, 16 shards (the default). Three rounds alternating both versions; medians shown. Absolute numbers are machine-specific.
         </div>
     </div>
 </div>

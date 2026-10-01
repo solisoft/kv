@@ -861,6 +861,10 @@ video {
   flex-shrink: 0;
 }
 
+.grow {
+  flex-grow: 1;
+}
+
 @keyframes pulse {
   50% {
     opacity: .5;
@@ -1395,10 +1399,6 @@ video {
 
 .pb-24 {
   padding-bottom: 6rem;
-}
-
-.pl-4 {
-  padding-left: 1rem;
 }
 
 .pr-4 {
