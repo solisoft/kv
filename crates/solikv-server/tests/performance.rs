@@ -26,15 +26,23 @@ fn next_port() -> u16 {
 async fn start_with(
     configure: impl FnOnce(solikv_engine::CommandEngine) -> solikv_engine::CommandEngine,
 ) -> (u16, Arc<solikv_engine::CommandEngine>) {
+    start_sized(4, 50, configure).await
+}
+
+async fn start_sized(
+    num_shards: usize,
+    hz: u32,
+    configure: impl FnOnce(solikv_engine::CommandEngine) -> solikv_engine::CommandEngine,
+) -> (u16, Arc<solikv_engine::CommandEngine>) {
     let port = next_port();
     let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
-    let shards = Arc::new(solikv_engine::ShardManager::new(4));
+    let shards = Arc::new(solikv_engine::ShardManager::new(num_shards));
     let engine = Arc::new(configure(solikv_engine::CommandEngine::new(
         shards.clone(),
         pubsub.clone(),
     )));
     engine.init_self_ref(Arc::downgrade(&engine));
-    solikv_engine::shard::spawn_active_expiry(shards, 50);
+    solikv_engine::shard::spawn_active_expiry(shards, hz);
     let addr = format!("127.0.0.1:{}", port);
     let e = engine.clone();
     tokio::spawn(async move {
@@ -131,6 +139,41 @@ async fn keys_expire_on_an_idle_server() {
     assert_eq!(left, ":0\r\n");
     let info = ask(&mut s, &[b"INFO", b"stats"]).await;
     assert!(info.contains("expired_keys:20000"), "{info}");
+}
+
+/// One shard at the default `hz` (the `--solo` shape) must keep up with a
+/// burst of expiries: a fixed 1 ms per shard per tick reclaimed under 10%
+/// of 200k expired keys in 3 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shard_reclaims_a_burst_of_expired_keys() {
+    let (port, _) = start_sized(1, 10, |e| e).await;
+    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    const N: usize = 200_000;
+    let mut batch = Vec::new();
+    for i in 0..N {
+        let k = format!("b{i}");
+        batch.extend(cmd(&[b"SET", k.as_bytes(), b"v", b"PX", b"500"]));
+    }
+    let (mut rd, mut wr) = s.split();
+    let writer = async { wr.write_all(&batch).await.unwrap() };
+    let reader = async {
+        let mut got = 0;
+        let mut buf = vec![0u8; 1 << 16];
+        while got < N * 5 {
+            got += rd.read(&mut buf).await.unwrap();
+        }
+    };
+    tokio::join!(writer, reader);
+    // Nobody touches the keys: the timer alone must reclaim them.
+    let mut left = String::new();
+    for _ in 0..60 {
+        sleep(Duration::from_millis(100)).await;
+        left = ask(&mut s, &[b"DBSIZE"]).await;
+        if left == ":0\r\n" {
+            break;
+        }
+    }
+    assert_eq!(left, ":0\r\n", "expired keys left after 6 s");
 }
 
 #[tokio::test]

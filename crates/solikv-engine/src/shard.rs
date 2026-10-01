@@ -1017,11 +1017,23 @@ pub fn spawn_active_expiry(shards: Arc<ShardManager>, hz: u32) -> tokio::task::J
             if !shards.active_expire_enabled() {
                 continue;
             }
-            for shard in shards.all_shards() {
-                shard.active_expire_cycle(budget);
-                // Let the connections this worker also serves run between
-                // shards.
-                tokio::task::yield_now().await;
+            // Like Redis' slow cycle, spend up to 25% of the period on expiry
+            // while shards keep finding expired keys, in 1 ms lock holds.
+            // A single fixed pass per tick gave each shard 1 ms: enough with
+            // 16 shards, but one shard (`--solo`) reclaimed 10 ms worth of
+            // keys per second and fell behind any real expiry rate.
+            let deadline = std::time::Instant::now() + period / 4;
+            loop {
+                let mut removed = 0;
+                for shard in shards.all_shards() {
+                    removed += shard.active_expire_cycle(budget);
+                    // Let the connections this worker also serves run
+                    // between shards.
+                    tokio::task::yield_now().await;
+                }
+                if removed == 0 || std::time::Instant::now() >= deadline {
+                    break;
+                }
             }
         }
     })
