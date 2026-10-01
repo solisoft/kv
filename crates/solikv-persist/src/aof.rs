@@ -51,7 +51,7 @@
 use bytes::Bytes;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::stats::PersistStats;
@@ -352,6 +352,14 @@ struct Inner {
     policy: std::sync::atomic::AtomicU8,
     /// `sync()` requests waiting for the next fsync.
     syncs: parking_lot::Mutex<Vec<std::sync::mpsc::SyncSender<io::Result<()>>>>,
+    /// Group commit under `appendfsync always` (see [`AofWriter::durable`]):
+    /// records appended while the policy is `always`, counted after each is
+    /// in its thread's buffer…
+    appended: AtomicU64,
+    /// …and how many of them are on disk and fsynced. The writer publishes
+    /// the `appended` value it read at the start of a pass once that pass is
+    /// fsynced: everything appended before a pass starts is written by it.
+    durable: tokio::sync::watch::Sender<u64>,
     thread: std::sync::OnceLock<std::thread::Thread>,
     /// Set when the last handle is dropped.
     closed: std::sync::atomic::AtomicBool,
@@ -533,10 +541,43 @@ impl AofWriter {
             data[at + ENTRY_HEADER - 4..at + ENTRY_HEADER].copy_from_slice(&len.to_le_bytes());
         });
         if self.inner.policy() == FsyncPolicy::Always {
+            // Counted once the record is in the buffer (its lock released),
+            // so a pass that reads this count drains the record too.
+            self.inner.appended.fetch_add(1, Ordering::Release);
             if let Some(t) = self.inner.thread.get() {
                 t.unpark();
             }
         }
+    }
+
+    /// The group-commit mark a reply must wait for under `appendfsync
+    /// always`, or `None` when it need not wait (another policy, or
+    /// everything appended so far is already fsynced).
+    ///
+    /// Redis sends no reply before the fsync of the event-loop iteration
+    /// that produced it — read replies included, so no client sees a write
+    /// a crash could still take back. Here a connection takes the mark just
+    /// before writing its replies and awaits [`durable`](Self::durable): all
+    /// replies produced meanwhile, on every connection, share one fsync.
+    #[inline]
+    pub fn durable_target(&self) -> Option<u64> {
+        if self.inner.policy() != FsyncPolicy::Always {
+            return None;
+        }
+        let target = self.inner.appended.load(Ordering::Acquire);
+        (*self.inner.durable.borrow() < target).then_some(target)
+    }
+
+    /// Wait until at least `target` records (see
+    /// [`durable_target`](Self::durable_target)) are fsynced. Returns at
+    /// once if the policy changes away from `always` meanwhile (the writer
+    /// then publishes everything as durable at its next pass).
+    pub async fn durable(&self, target: u64) {
+        let mut rx = self.inner.durable.subscribe();
+        if let Some(t) = self.inner.thread.get() {
+            t.unpark();
+        }
+        let _ = rx.wait_for(|d| *d >= target).await;
     }
 
     /// Run `f` on this thread's buffer in this writer, registered on first
@@ -652,6 +693,8 @@ pub fn spawn_aof_writer(
             .collect(),
         policy: std::sync::atomic::AtomicU8::new(policy.to_u8()),
         syncs: parking_lot::Mutex::new(Vec::new()),
+        appended: AtomicU64::new(0),
+        durable: tokio::sync::watch::Sender::new(0),
         thread: std::sync::OnceLock::new(),
         closed: std::sync::atomic::AtomicBool::new(false),
     });
@@ -739,6 +782,10 @@ fn writer_loop(inner: Arc<Inner>, mut logs: Vec<ShardLog>, dir: PathBuf, stats: 
         let closing = inner.closed.load(Ordering::Acquire);
         // Sync requests seen now are answered after this pass is on disk.
         let syncs = std::mem::take(&mut *inner.syncs.lock());
+        // Read before draining: every record counted here is in a buffer
+        // this pass drains (see `AofWriter::durable_target`).
+        let appended = inner.appended.load(Ordering::Acquire);
+        let always = inner.policy() == FsyncPolicy::Always;
 
         // Drain every thread's buffer; forget threads that have exited.
         threads.extend(
@@ -898,13 +945,39 @@ fn writer_loop(inner: Arc<Inner>, mut logs: Vec<ShardLog>, dir: PathBuf, stats: 
             }
         }
 
+        // Under `always`, also fsync anything an earlier pass left dirty
+        // (written before a switch to `always`): the mark published below
+        // vouches for the whole log.
+        let pending_always =
+            always && (*inner.durable.borrow() < appended || logs.iter().any(|l| l.dirty));
         let fsync_now = !syncs.is_empty()
             || closing
-            || (wrote && inner.policy() == FsyncPolicy::Always)
+            || (wrote && always)
+            || pending_always
             || (last_sync.elapsed() >= Duration::from_secs(1)
                 && inner.policy() == FsyncPolicy::Everysec);
         if fsync_now || last_sync.elapsed() >= Duration::from_secs(1) {
             let res = flush_all(&mut logs, fsync_now);
+            if always && fsync_now {
+                if let Err(e) = &res {
+                    // What Redis does: replies are held for this fsync, and
+                    // there is no way to tell their clients it failed and
+                    // keep serving a log that silently diverges.
+                    tracing::error!(
+                        "Can't recover from AOF fsync error when the fsync policy is \
+                         'always' ({}). Exiting...",
+                        e
+                    );
+                    std::process::exit(1);
+                }
+                inner.durable.send_if_modified(|d| {
+                    let up = *d < appended;
+                    if up {
+                        *d = appended;
+                    }
+                    up
+                });
+            }
             for ack in syncs {
                 let _ = ack.send(match &res {
                     Ok(()) => Ok(()),
@@ -926,7 +999,22 @@ fn writer_loop(inner: Arc<Inner>, mut logs: Vec<ShardLog>, dir: PathBuf, stats: 
                 }
             }
         }
+        if !always {
+            // Left `always`: nobody waits for a mark this writer no longer
+            // keeps.
+            let all = inner.appended.load(Ordering::Acquire);
+            inner.durable.send_if_modified(|d| {
+                let up = *d < all;
+                if up {
+                    *d = all;
+                }
+                up
+            });
+        }
         if closing {
+            // Waiters whose records this last pass wrote are covered; any
+            // still waiting would wait on a writer that is gone.
+            inner.durable.send_replace(u64::MAX);
             break;
         }
         match inner.policy() {
@@ -1437,6 +1525,44 @@ mod tests {
             .collect();
         assert_eq!(got.len(), want.len());
         assert!(got == want, "records out of shard order");
+    }
+
+    /// Group commit: under `always` a reply's mark is reached only once its
+    /// records are in the file; under `everysec` nothing waits.
+    #[test]
+    fn always_marks_records_durable_only_once_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let aof = dir.path().join(AOF_DIRNAME);
+        create_incr_files(&aof, 2, 1).unwrap();
+        let stats = Arc::new(PersistStats::new());
+        let w = spawn_aof_writer(&aof, 2, 1, FsyncPolicy::Always, stats).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut s0, mut s1) = (0u64, 0u64);
+        for round in 1..=50u64 {
+            w.log(0, &mut s0, "SET", &[b("a"), Bytes::from(round.to_string())]);
+            w.log(1, &mut s1, "SET", &[b("b"), Bytes::from(round.to_string())]);
+            // Taken after the appends, as a connection takes it before
+            // writing its replies; the writer may already be past it.
+            if let Some(target) = w.durable_target() {
+                assert!(target >= 2 * round);
+                rt.block_on(w.durable(target));
+            }
+            assert_eq!(w.durable_target(), None);
+            for shard in 0..2 {
+                let mut n = 0;
+                replay_log(&incr_path(&aof, 1, shard), |_| n += 1).unwrap();
+                assert_eq!(
+                    n, round,
+                    "shard {shard}: a durable record is not in the file"
+                );
+            }
+        }
+        w.set_policy(FsyncPolicy::Everysec);
+        w.log(0, &mut s0, "SET", &[b("a"), b("x")]);
+        assert_eq!(w.durable_target(), None, "only `always` holds replies");
     }
 
     /// A record for another database is preceded by `SELECT`, once.

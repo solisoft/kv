@@ -11,6 +11,11 @@ members = [
     "crates/solikv-ffi",
 ]
 
+[workspace.package]
+# One version for every crate, so `env!("CARGO_PKG_VERSION")` anywhere in
+# the workspace (INFO's solikv_version, the CLI) names the release.
+version = "0.4.3"
+
 [workspace.dependencies]
 tokio = { version = "1.43", features = ["full"] }
 bytes = "1"

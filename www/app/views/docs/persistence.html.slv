@@ -78,7 +78,7 @@
             <table class="w-full text-left">
                 <thead><tr class="border-b border-white/10"><th class="py-3 pr-4 text-slate-400 font-medium">Policy</th><th class="py-3 pr-4 text-slate-400 font-medium">Process killed (SIGKILL, OOM)</th><th class="py-3 pr-4 text-slate-400 font-medium">Machine crash / power loss</th></tr></thead>
                 <tbody class="text-slate-300">
-                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">always</td><td class="py-3 pr-4">At most the last writer pass (~1 ms)</td><td class="py-3 pr-4">Fsynced right after each write. The reply is not held until the fsync completes (Redis holds it), so writes acknowledged in the last few milliseconds can be lost</td></tr>
+                    <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">always</td><td class="py-3 pr-4">Nothing acknowledged</td><td class="py-3 pr-4">Replies are held until the fsync that covers them, as in Redis; replies produced meanwhile share one fsync (group commit)</td></tr>
                     <tr class="border-b border-white/5"><td class="py-3 pr-4 font-mono text-indigo-400">everysec</td><td class="py-3 pr-4">At most the last writer pass (~1 ms)</td><td class="py-3 pr-4">Up to about one second. Default</td></tr>
                     <tr><td class="py-3 pr-4 font-mono text-indigo-400">no</td><td class="py-3 pr-4">At most the last writer pass (~1 ms)</td><td class="py-3 pr-4">Whatever the OS had not flushed</td></tr>
                 </tbody>

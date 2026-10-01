@@ -245,6 +245,11 @@ pub async fn run_with(
         // Server info
         .route("/info", get(server_info))
         .route("/dbsize", get(dbsize))
+        // Inside auth: a refused request writes nothing to wait for.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            durable_middleware,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -532,6 +537,18 @@ async fn host_middleware(
         }
     }
     Ok(next.run(req).await)
+}
+
+/// `appendfsync always`: a response leaves only once the log holds what it
+/// may reflect, as RESP replies do (see `CommandEngine::replies_durable`).
+async fn durable_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> axum::response::Response {
+    let resp = next.run(req).await;
+    state.engine.replies_durable().await;
+    resp
 }
 
 /// Liveness: the process answers.

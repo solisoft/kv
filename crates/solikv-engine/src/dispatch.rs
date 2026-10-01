@@ -871,6 +871,19 @@ impl CommandEngine {
         &self.persistence
     }
 
+    /// Under `appendfsync always`, wait until everything appended to the log
+    /// so far is fsynced; call before sending replies (Redis' group commit:
+    /// no reply leaves before the fsync covering the writes it may reflect).
+    /// One relaxed load and a return under any other policy.
+    #[inline]
+    pub async fn replies_durable(&self) {
+        if let Some(w) = self.shards.aof() {
+            if let Some(target) = w.durable_target() {
+                w.durable(target).await;
+            }
+        }
+    }
+
     /// Resolves once a `SHUTDOWN` command has saved and the server should exit.
     pub fn shutdown_requested(&self) -> Arc<tokio::sync::Notify> {
         self.shutdown_requested.clone()
@@ -6122,18 +6135,24 @@ impl CommandEngine {
     }
 }
 
-/// Encode multi-shard SCAN cursor: high 16 bits = shard index, low 48 = local index.
-const SCAN_SHARD_SHIFT: u32 = 48;
-const SCAN_LOCAL_MASK: u64 = (1u64 << SCAN_SHARD_SHIFT) - 1;
-
-fn pack_scan_cursor(shard_idx: usize, local: usize) -> u64 {
-    ((shard_idx as u64) << SCAN_SHARD_SHIFT) | (local as u64 & SCAN_LOCAL_MASK)
+/// Multi-shard SCAN cursor: `local * num_shards + shard`.
+///
+/// `local` is the shard-local cursor (0 = start of that shard), so the
+/// global cursor grows with the shard's size rather than with a fixed bit
+/// shift: it stays below the total key count plus the shard count, well
+/// inside the 32-bit integers some clients (`redis-cli --cluster import`)
+/// parse cursors into. A cursor minted under another shard count still
+/// decodes to a valid shard and resumes there; like Redis, SCAN only
+/// promises completeness for cursors it handed out itself.
+fn pack_scan_cursor(num_shards: usize, shard_idx: usize, local: usize) -> u64 {
+    (local as u64)
+        .saturating_mul(num_shards as u64)
+        .saturating_add(shard_idx as u64)
 }
 
-fn unpack_scan_cursor(cursor: u64) -> (usize, usize) {
-    let shard = (cursor >> SCAN_SHARD_SHIFT) as usize;
-    let local = (cursor & SCAN_LOCAL_MASK) as usize;
-    (shard, local)
+fn unpack_scan_cursor(num_shards: usize, cursor: u64) -> (usize, usize) {
+    let n = num_shards.max(1) as u64;
+    ((cursor % n) as usize, (cursor / n) as usize)
 }
 
 fn multi_shard_mget(shards: &crate::shard::ShardManager, keys: &[Bytes]) -> CommandResponse {
@@ -6332,18 +6351,7 @@ fn multi_shard_scan(
         ]);
     }
 
-    let (mut shard_idx, local) = if cursor == 0 {
-        (0usize, 0usize)
-    } else {
-        unpack_scan_cursor(cursor)
-    };
-
-    if shard_idx >= num {
-        return CommandResponse::array(vec![
-            CommandResponse::bulk(Bytes::from_static(b"0")),
-            CommandResponse::array(vec![]),
-        ]);
-    }
+    let (mut shard_idx, local) = unpack_scan_cursor(num, cursor);
 
     // Scan the current shard; if it finishes, advance to the next shard (or 0 = done).
     let pat = pattern.clone();
@@ -6370,14 +6378,14 @@ fn multi_shard_scan(
     };
 
     let next_cursor = if next_local != 0 {
-        pack_scan_cursor(shard_idx, next_local)
+        pack_scan_cursor(num, shard_idx, next_local)
     } else {
         // Finished this shard — move to the next one, or complete.
         shard_idx += 1;
         if shard_idx >= num {
             0
         } else {
-            pack_scan_cursor(shard_idx, 0)
+            pack_scan_cursor(num, shard_idx, 0)
         }
     };
 
@@ -6896,6 +6904,7 @@ mod sec_tests {
                         }
                         _ => panic!("bad cursor"),
                     };
+                    assert!(cursor < (1u64 << 31), "cursor {cursor} too large");
                     if let CommandResponse::Array(keys) = &items[1] {
                         for k in keys {
                             if let CommandResponse::BulkString(b) = k {
@@ -6916,11 +6925,26 @@ mod sec_tests {
 
     #[test]
     fn test_scan_cursor_pack_unpack() {
-        assert_eq!(unpack_scan_cursor(0), (0, 0));
-        let c = pack_scan_cursor(3, 42);
-        assert_eq!(unpack_scan_cursor(c), (3, 42));
-        // shard boundary start
-        let c = pack_scan_cursor(1, 0);
-        assert_eq!(unpack_scan_cursor(c), (1, 0));
+        for num in [1usize, 3, 16, 256] {
+            assert_eq!(unpack_scan_cursor(num, 0), (0, 0));
+            for (shard, local) in [(0, 0), (num - 1, 42), (num / 2, 1), (num - 1, 0)] {
+                let c = pack_scan_cursor(num, shard, local);
+                assert_eq!(unpack_scan_cursor(num, c), (shard, local));
+            }
+        }
+        // The start of shard 0 is the start of the iteration.
+        assert_eq!(pack_scan_cursor(16, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_scan_cursor_fits_in_31_bits() {
+        // redis-cli keeps cursors in an int: under ~100M keys every cursor
+        // (any shard count up to 256) must stay below 2^31.
+        const KEYS: usize = 100_000_000;
+        for num in [1usize, 2, 16, 64, 256] {
+            let per_shard = KEYS.div_ceil(num);
+            let worst = pack_scan_cursor(num, num - 1, per_shard);
+            assert!(worst < (1u64 << 31), "{num} shards: cursor {worst}");
+        }
     }
 }

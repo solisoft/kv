@@ -1394,6 +1394,7 @@ async fn run_blocking<S: AsyncRead + AsyncWrite + Unpin>(
         solikv_engine::BlockStart::Wait(b) => b,
     };
     if !write_buf.is_empty() {
+        engine.replies_durable().await;
         socket.write_all(write_buf).await?;
         write_buf.clear();
     }
@@ -1483,6 +1484,7 @@ async fn write_out<S: AsyncWrite + Unpin>(
     soft_since: &mut Option<std::time::Instant>,
     addr: &str,
 ) -> std::io::Result<()> {
+    engine.replies_durable().await;
     let limit = engine.output_limits().get(Class::Normal);
     if limit.is_unlimited() {
         socket.write_all(buf).await?;
@@ -1930,6 +1932,7 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                     // Exit pubsub mode if no subscriptions remain
                                     if !conn.is_subscribed() {
                                         if !write_buf.is_empty() {
+                                            engine.replies_durable().await;
                                             socket.write_all(&write_buf).await?;
                                             write_buf.clear();
                                         }
@@ -2006,6 +2009,7 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                     }
                                     if !conn.is_subscribed() {
                                         if !write_buf.is_empty() {
+                                            engine.replies_durable().await;
                                             socket.write_all(&write_buf).await?;
                                             write_buf.clear();
                                         }
@@ -2082,6 +2086,7 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                     }
                                     if !conn.is_subscribed() {
                                         if !write_buf.is_empty() {
+                                            engine.replies_durable().await;
                                             socket.write_all(&write_buf).await?;
                                             write_buf.clear();
                                         }
@@ -2123,12 +2128,14 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                                     if cmd.name == "QUIT" {
                                         encode_frame(&RespFrame::ok(), &mut write_buf);
                                         if !write_buf.is_empty() {
+                                            engine.replies_durable().await;
                                             socket.write_all(&write_buf).await?;
                                         }
                                         return Ok(());
                                     }
                                     encode_frame(&RespFrame::SimpleString(Bytes::from("RESET")), &mut write_buf);
                                     if !write_buf.is_empty() {
+                                        engine.replies_durable().await;
                                         socket.write_all(&write_buf).await?;
                                         write_buf.clear();
                                     }
@@ -2162,6 +2169,7 @@ async fn handle_pubsub_mode<S: AsyncRead + AsyncWrite + Unpin>(
                 publish_counts(conn);
 
                 if !write_buf.is_empty() {
+                    engine.replies_durable().await;
                     socket.write_all(&write_buf).await?;
                     write_buf.clear();
                 }

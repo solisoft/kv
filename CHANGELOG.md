@@ -95,7 +95,17 @@ from 0.4.x*. The workspace `Cargo.toml` versions are not bumped yet.
   `ZSCAN MATCH`, `PUBSUB NUMSUB/CHANNELS/NUMPAT`, `XREADGROUP NOACK`;
   `APPEND`/`SETRANGE`/`SETBIT`/`INCR*` keep the key's TTL.
 - `SCAN` no longer skips keys that exist for the whole iteration when others
-  are deleted.
+  are deleted. On a multi-shard server its cursors are
+  `position × shards + shard`, so they stay below the key count instead of
+  carrying the shard in the high bits (which made them exceed 32 bits and
+  stopped `redis-cli --cluster import` after the first shard).
+- **`appendfsync always` holds replies until their writes are fsynced**
+  (group commit, as Redis does before replying): a reply used to leave
+  before its record even reached the file. Replies produced meanwhile on
+  every connection, and REST responses, share one fsync; an fsync error
+  under `always` stops the server, as in Redis.
+- `INFO`'s `solikv_version` reports the release: every crate now takes the
+  workspace version (it reported the engine crate's `0.1.0`).
 - Expired keys are reclaimed by a timer (`--hz`), not only when traffic hits
   the shard: an idle server kept almost all expired keys resident.
 - **Cluster dump/restore lost data**: replies split across reads were cut
@@ -197,7 +207,7 @@ before/after comparison is in `benches/RESULTS.md`.
 - Keys are placed in shards by cluster slot; existing data is re-hashed on
   load. A 0.4.x *cluster* placed keys by the wrong CRC16 and speaks the old
   bus protocol: load a copy of each old node's data directory into a 0.5
-  standalone server with `--shards 1` and copy it into a new cluster with
+  standalone server and copy it into a new cluster with
   `redis-cli --cluster import … --cluster-copy` (0.4.x's own
   `--cluster-dump` lost data).
 - Lua 5.4 → 5.1.
@@ -219,13 +229,6 @@ before/after comparison is in `benches/RESULTS.md`.
 - No Sentinel.
 - A very large stream is still serialized in one step during snapshots and
   rewrites.
-- Multi-shard `SCAN` cursors exceed 32 bits; `redis-cli --cluster import`
-  truncates them and stops after the first shard (use a `--shards 1`
-  source).
-- `appendfsync always` fsyncs right after each write but does not hold the
-  reply until the fsync completes, unlike Redis.
-- `INFO`'s `solikv_version` reports the engine crate's version (`0.1.0`)
-  instead of the server's.
 
 ## 0.4.3
 

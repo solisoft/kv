@@ -315,9 +315,10 @@ and `CONFIG REWRITE` writes them back to the file.
   unfinished block at the end of the log is not applied). A writer thread
   hands records to the kernel about every millisecond, so a process killed
   with SIGKILL loses at most that last pass, and a machine crash up to about
-  a second under `everysec`. Under `always` each write is fsynced right
-  after it runs, but the reply is not held until the fsync completes (Redis
-  holds it).
+  a second under `everysec`. Under `always` no reply (RESP or REST) leaves
+  before the fsync covering the writes it may reflect, as in Redis: replies
+  produced meanwhile share one fsync (group commit), and nothing
+  acknowledged is lost to a crash.
 - **Rewrites** (`BGREWRITEAOF`, automatic once the log has grown by
   `--auto-aof-rewrite-percentage`) snapshot each shard and switch it to a new
   log generation under one lock hold, so a snapshot and its log meet exactly
@@ -400,16 +401,8 @@ spanning shards lock them all in a fixed order, so multi-key commands,
   sorted sets; streams, HyperLogLogs and Bloom filters use a SoliKV-specific
   payload that only SoliKV restores.
 - `--import-redis-rdb` skips streams.
-- On a multi-shard server, `SCAN` cursors carry the shard index in their
-  high bits and exceed 32 bits. Clients keep them as strings or 64-bit
-  integers and work, but `redis-cli --cluster import` parses them as an
-  `int` and stops after the first shard: import from a server started with
-  `--shards 1`.
-- `appendfsync always` does not hold a reply until its write is fsynced, so a
-  machine crash can lose writes acknowledged in the last few milliseconds.
 - The `INFO` field `redis_version` reports `7.2.0` for client feature
-  detection (`solikv_version` is meant to be SoliKV's own, but currently
-  reports the engine crate's `0.1.0`).
+  detection; `solikv_version` is SoliKV's own release.
 
 ## Upgrading from 0.4.x
 
@@ -429,16 +422,14 @@ spanning shards lock them all in a fixed order, so multi-key commands,
   (receiver-bound frames, node ids, epochs), so 0.4.x and 0.5 nodes do not
   form one cluster. (0.4.x's own `--cluster-dump` lost data, so do not
   migrate with it.) For each old node, start a *copy* of its data directory
-  with 0.5 as a standalone server with one shard, then copy its keys into a
-  new 0.5 cluster:
+  with 0.5 as a standalone server, then copy its keys into a new 0.5
+  cluster:
 
   ```bash
-  solikv --dir copy-of-node-a --port 7400 --shards 1 --bind 127.0.0.1 --rest-port 0
+  solikv --dir copy-of-node-a --port 7400 --bind 127.0.0.1 --rest-port 0
   redis-cli --cluster import 127.0.0.1:7000 --cluster-from 127.0.0.1:7400 --cluster-copy
   ```
 
-  (`--shards 1` matters: see the `SCAN` cursor note under *Differences from
-  Redis*.)
 - **Cluster bus key**: use `--cluster-bus-secret[-file]`; `--cluster-password`
   still works as the bus key with a deprecation warning.
 - **Lua is 5.1** (was 5.4), like Redis: scripts using 5.4-only syntax

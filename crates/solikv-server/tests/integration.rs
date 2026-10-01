@@ -528,7 +528,10 @@ async fn test_info() {
     let mut con = client.get_multiplexed_async_connection().await.unwrap();
 
     let info: String = redis::cmd("INFO").query_async(&mut con).await.unwrap();
-    assert!(info.contains("solikv_version"));
+    assert!(
+        info.contains(&format!("solikv_version:{}\r\n", env!("CARGO_PKG_VERSION"))),
+        "INFO must report the release version"
+    );
 }
 
 #[tokio::test]

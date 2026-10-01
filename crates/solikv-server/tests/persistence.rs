@@ -372,6 +372,56 @@ fn acknowledged_writes_survive_a_killed_process() {
     assert_eq!(c.cmd(&["GET", "n"]), "$7");
 }
 
+/// `appendfsync always`: a reply leaves only after its record is written
+/// and fsynced (group commit), so a process killed the instant a reply
+/// arrives — no grace period for the writer — has every acknowledged write
+/// in its log. Several rounds on one directory: each restart replays what
+/// the rounds before it acknowledged.
+#[test]
+fn appendfsync_always_holds_replies_until_the_write_is_durable() {
+    let dir = TmpDir::new("always");
+    let args = ["--shards", "4", "--appendfsync", "always"];
+    let mut expected = 0i64;
+    for round in 0..5 {
+        let s = Server::start(&dir.0, &args);
+        let mut c = s.client();
+        assert_eq!(
+            c.cmd(&["GET", "n"]),
+            if expected == 0 {
+                "nil".to_string()
+            } else {
+                format!("${expected}")
+            }
+        );
+        // Pipelined: every reply in one batch shares one fsync.
+        let mut batch = String::new();
+        for i in 0..20 {
+            for cmd in [
+                vec!["INCR".to_string(), "n".into()],
+                vec!["SET".into(), format!("r{round}:{i}"), "v".into()],
+            ] {
+                batch.push_str(&format!("*{}\r\n", cmd.len()));
+                for a in &cmd {
+                    batch.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+                }
+            }
+        }
+        c.w.write_all(batch.as_bytes()).unwrap();
+        for i in 0..20 {
+            expected += 1;
+            assert_eq!(c.reply(), format!(":{expected}"), "round {round}, INCR {i}");
+            assert_eq!(c.reply(), "+OK");
+        }
+        // The last reply is in: kill now, without the writer's grace.
+        s.signal(nix::sys::signal::Signal::SIGKILL);
+        let _ = s.wait_exit();
+    }
+    let s = Server::start(&dir.0, &args);
+    let mut c = s.client();
+    assert_eq!(c.cmd(&["GET", "n"]), format!("${expected}"));
+    assert_eq!(c.cmd(&["DBSIZE"]), ":101");
+}
+
 /// `CONFIG SET appendonly yes` starts a log from the dataset as it is (a
 /// rewrite: what was written before is in its base, what follows in its
 /// log); `no` stops it, keeping what it had, as Redis does.
