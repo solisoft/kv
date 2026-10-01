@@ -1,7 +1,8 @@
 use bytes::Bytes;
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexSet;
 use std::time::{Duration, Instant};
 
+use crate::incmap::{IncMap, IncSet};
 use crate::types::*;
 
 /// `EXPIRE … NX|XX|GT|LT`.
@@ -12,6 +13,10 @@ pub struct ExpireCond {
     pub gt: bool,
     pub lt: bool,
 }
+
+/// Index slots each keyspace map migrates per active-expiry cycle, on top
+/// of what inserts and removals migrate (see [`IncMap`]).
+const REHASH_PER_CYCLE: usize = 4096;
 
 /// Keys a single active-expiry sample looks at (Redis'
 /// `ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP`).
@@ -92,7 +97,9 @@ struct Snapshot {
     walk: Vec<(u32, usize)>,
 }
 
-type KeyMap = IndexMap<Bytes, KeyEntry, FastHasher>;
+/// The keyspace: positional like `IndexMap`, but grows without a pause
+/// (see [`IncMap`]).
+type KeyMap = IncMap<KeyEntry>;
 
 /// A distinct, non-zero xorshift seed per store.
 fn seed() -> u64 {
@@ -110,7 +117,7 @@ struct Keyspace {
     data: KeyMap,
     /// Keys that have a TTL — Redis' `expires` dict. Sampled by active
     /// expiry and by the `volatile-*` eviction policies.
-    volatile: IndexSet<Bytes, FastHasher>,
+    volatile: IncSet,
     /// Keys by cluster hash slot, kept only in cluster mode (database 0):
     /// `CLUSTER COUNTKEYSINSLOT` and `GETKEYSINSLOT`, which resharding calls
     /// once per batch of keys, would otherwise scan the whole keyspace.
@@ -118,7 +125,7 @@ struct Keyspace {
     /// Keys whose hash has fields with an expiry (`HEXPIRE`): sampled by
     /// active expiry. May hold keys that no longer qualify; the cycle drops
     /// those when it meets them.
-    hfe: IndexSet<Bytes, FastHasher>,
+    hfe: IncSet,
 }
 
 /// See `Keyspace::slots`.
@@ -227,9 +234,16 @@ impl Keyspace {
         }
     }
 
+    /// See [`ShardStore::active_expire_cycle`].
+    fn rehash(&mut self, budget: usize) {
+        self.data.rehash(budget);
+        self.volatile.rehash(budget);
+        self.hfe.rehash(budget);
+    }
+
     fn clear(&mut self) {
         self.data = KeyMap::default();
-        self.volatile = IndexSet::default();
+        self.volatile = IncSet::default();
         if let Some(ix) = &mut self.slots {
             ix.clear();
         }
@@ -238,8 +252,9 @@ impl Keyspace {
 
 /// Per-shard key-value store. Owned by a single thread — no locking needed.
 ///
-/// Keys live in an [`IndexMap`], so SCAN/RANDOMKEY and eviction sampling
-/// address them by position in O(1) without cloning the key set.
+/// Keys live in an [`IncMap`], so SCAN/RANDOMKEY and eviction sampling
+/// address them by position in O(1) without cloning the key set, and the
+/// keyspace grows without an O(n) pause.
 ///
 /// # Logical databases
 ///
@@ -691,7 +706,7 @@ impl ShardStore {
     /// Get a reference to an entry, performing lazy expiry check.
     #[inline]
     pub fn get(&mut self, key: &Bytes) -> Option<&KeyEntry> {
-        // Single index lookup (IndexMap) instead of get + get after expiry.
+        // Single index lookup instead of get + get after expiry.
         let idx = self.ks.data.get_index_of(key)?;
         if self.ks.data[idx].is_expired() {
             self.expire_index(idx);
@@ -1007,6 +1022,13 @@ impl ShardStore {
     /// removed, with the database each was in.
     pub fn active_expire_cycle(&mut self, budget: Duration) -> Vec<(u32, Bytes)> {
         let mut removed = Vec::new();
+        // Idle time also moves index growth along (inserts drive it too):
+        // a lookup probes two tables until a migration ends.
+        for db in 0..self.db_span() {
+            if let Some(ks) = self.keyspace_mut(db) {
+                ks.rehash(REHASH_PER_CYCLE);
+            }
+        }
         // Loading: nothing expires (see `LoadingGuard`); nor on a replica.
         if is_loading() || self.keeps_expired() {
             return removed;
@@ -1298,7 +1320,7 @@ impl ShardStore {
         Ok(())
     }
 
-    /// Get a pseudo-random key in O(1) via IndexMap index access.
+    /// Get a pseudo-random key in O(1) by position.
     pub fn random_key(&mut self) -> Option<Bytes> {
         let len = self.ks.data.len();
         if len == 0 {

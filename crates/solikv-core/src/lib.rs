@@ -3,6 +3,7 @@ pub mod extra_ops;
 pub mod geo_ops;
 pub mod hash_ops;
 pub mod hll_ops;
+pub mod incmap;
 pub mod keyspace;
 pub mod list_ops;
 pub mod memory;
