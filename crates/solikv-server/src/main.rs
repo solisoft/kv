@@ -261,12 +261,12 @@ struct Args {
 
     /// Replication links (and MIGRATE) use TLS: a replica connects to its
     /// master's TLS port and checks its certificate against --tls-ca-cert.
-    #[arg(long, default_value = "no", value_parser = parse_yes_no)]
+    #[arg(long, default_value = "no", value_parser = parse_yes_no, action = clap::ArgAction::Set)]
     tls_replication: bool,
 
     /// The cluster bus uses TLS, both ways, with a certificate signed by
     /// --tls-ca-cert required of every peer. The bus keeps its HMAC envelope.
-    #[arg(long, default_value = "no", value_parser = parse_yes_no)]
+    #[arg(long, default_value = "no", value_parser = parse_yes_no, action = clap::ArgAction::Set)]
     tls_cluster: bool,
 
     /// Keyspace notification flags (e.g. "KEA" for all events, "" to disable)
@@ -292,7 +292,7 @@ struct Args {
     repl_backlog_size: u64,
 
     /// Refuse writes from clients while this node is a replica.
-    #[arg(long, default_value = "yes", value_parser = parse_yes_no)]
+    #[arg(long, default_value = "yes", value_parser = parse_yes_no, action = clap::ArgAction::Set)]
     replica_read_only: bool,
 
     /// A master refuses writes (NOREPLICAS) unless at least this many
@@ -334,8 +334,18 @@ struct Args {
 
     /// Refuse every key while some slot is unassigned or its owner failed
     /// (`cluster-require-full-coverage`).
-    #[arg(long, default_value = "yes", value_parser = parse_yes_no)]
+    #[arg(long, default_value = "yes", value_parser = parse_yes_no, action = clap::ArgAction::Set)]
     cluster_require_full_coverage: bool,
+
+    /// A replica may move to a master left without working replicas
+    /// (`cluster-allow-replica-migration`).
+    #[arg(long, default_value = "yes", value_parser = parse_yes_no, action = clap::ArgAction::Set)]
+    cluster_allow_replica_migration: bool,
+
+    /// Working replicas a master keeps before one of them may migrate
+    /// (`cluster-migration-barrier`).
+    #[arg(long, default_value_t = 1)]
+    cluster_migration_barrier: usize,
 
     /// Cluster dump: export all cluster data to file
     #[arg(long)]
@@ -435,6 +445,18 @@ fn args_with_config_file() -> Vec<std::ffi::OsString> {
 fn main() {
     solikv_core::memory::enable();
     let args = Args::parse_from(args_with_config_file());
+    // The configuration file may come first without `--config`; anywhere
+    // else a bare word is a mistake (a value given to a flag that takes
+    // none), not a file to remember for `CONFIG REWRITE`.
+    if let Some(p) = &args.config_positional {
+        if !p.exists() {
+            eprintln!(
+                "ERROR: unexpected argument '{}' (not a configuration file)",
+                p.display()
+            );
+            std::process::exit(1);
+        }
+    }
 
     if args.solo && args.cluster_enabled {
         eprintln!("ERROR: --solo is incompatible with --cluster-enabled");
@@ -881,6 +903,8 @@ async fn async_main(args: Args) {
                 node_timeout_ms: args.cluster_node_timeout.max(100),
                 require_full_coverage: args.cluster_require_full_coverage,
                 config_path: Some(args.dir.join("cluster.json")),
+                allow_replica_migration: args.cluster_allow_replica_migration,
+                migration_barrier: args.cluster_migration_barrier,
             },
         ));
         tracing::info!(node_id = %cluster.node_id(), %bus_bind, "cluster mode enabled");
@@ -1432,4 +1456,42 @@ fn read_secret_file(path: &std::path::Path) -> std::io::Result<String> {
     let mut buf = String::new();
     f.read_to_string(&mut buf)?;
     Ok(buf.trim_end_matches(['\n', '\r', ' ', '\t']).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// yes/no flags take their value: a `bool` field is a value-less switch
+    /// in clap unless told otherwise, and `--replica-read-only no` used to
+    /// turn the option *on* (the `no` went to the config-file argument).
+    #[test]
+    fn yes_no_flags_take_their_value() {
+        let a = Args::try_parse_from([
+            "solikv",
+            "--replica-read-only",
+            "no",
+            "--cluster-require-full-coverage",
+            "no",
+            "--cluster-allow-replica-migration",
+            "no",
+            "--tls-replication",
+            "yes",
+            "--tls-cluster",
+            "yes",
+        ])
+        .unwrap();
+        assert!(!a.replica_read_only);
+        assert!(!a.cluster_require_full_coverage);
+        assert!(!a.cluster_allow_replica_migration);
+        assert!(a.tls_replication);
+        assert!(a.tls_cluster);
+        assert!(a.config_positional.is_none());
+        let d = Args::try_parse_from(["solikv"]).unwrap();
+        assert!(d.replica_read_only && d.cluster_require_full_coverage);
+        assert!(d.cluster_allow_replica_migration);
+        assert!(!d.tls_replication && !d.tls_cluster);
+        let eq = Args::try_parse_from(["solikv", "--replica-read-only=no"]).unwrap();
+        assert!(!eq.replica_read_only);
+    }
 }

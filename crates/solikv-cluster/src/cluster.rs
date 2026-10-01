@@ -127,6 +127,13 @@ pub struct Node {
     pub paused: bool,
     #[serde(skip)]
     pub created: u64,
+    /// A master that has had a replica: once it has none working, it is
+    /// orphaned, and a replica may migrate to it (Redis' `MIGRATE_TO`).
+    #[serde(skip)]
+    pub had_replicas: bool,
+    /// When it was first seen orphaned (0: it is not).
+    #[serde(skip)]
+    pub orphaned_since: u64,
 }
 
 impl Node {
@@ -151,6 +158,8 @@ impl Node {
             voted_time: 0,
             paused: false,
             created: now_ms(),
+            had_replicas: false,
+            orphaned_since: 0,
         }
     }
 
@@ -221,6 +230,10 @@ struct Effects {
     publish: Vec<(Vec<u8>, Vec<u8>, bool)>,
 }
 
+/// How long a master must stay orphaned before a replica migrates to it
+/// (Redis' `CLUSTER_SLAVE_MIGRATION_DELAY`).
+pub const REPLICA_MIGRATION_DELAY_MS: u64 = 5000;
+
 /// Settings fixed at startup.
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
@@ -228,6 +241,12 @@ pub struct ClusterConfig {
     pub require_full_coverage: bool,
     /// `cluster.json`, or `None` to keep nothing on disk (tests).
     pub config_path: Option<PathBuf>,
+    /// `cluster-allow-replica-migration`: a replica may move to an
+    /// orphaned master.
+    pub allow_replica_migration: bool,
+    /// `cluster-migration-barrier`: working replicas a master keeps before
+    /// one of them may leave it.
+    pub migration_barrier: usize,
 }
 
 impl Default for ClusterConfig {
@@ -236,6 +255,8 @@ impl Default for ClusterConfig {
             node_timeout_ms: 15_000,
             require_full_coverage: true,
             config_path: None,
+            allow_replica_migration: true,
+            migration_barrier: 1,
         }
     }
 }
@@ -1288,6 +1309,91 @@ impl ClusterManager {
         }
 
         self.election_cron(st, fx, now);
+        self.replica_migration_cron(st, fx, now);
+    }
+
+    /// Replica migration, as Redis Cluster's: a master whose replicas all
+    /// failed is *orphaned*; a master with more working replicas than the
+    /// migration barrier lends one — the one with the smallest id, so the
+    /// replicas agree without talking — once the orphan has been one for
+    /// [`REPLICA_MIGRATION_DELAY_MS`].
+    fn replica_migration_cron(&self, st: &mut State, fx: &mut Effects, now: u64) {
+        let working = |n: &Node| !n.fail && !n.pfail && !n.handshake;
+        // Bookkeeping, on every node: who has had replicas, who is orphaned.
+        let replica_masters: Vec<String> = st
+            .nodes
+            .values()
+            .filter(|n| working(n))
+            .filter_map(|n| n.master.clone())
+            .collect();
+        let masters: Vec<String> = st
+            .nodes
+            .values()
+            .filter(|n| n.is_master() && !n.handshake)
+            .map(|n| n.id.clone())
+            .collect();
+        for id in &masters {
+            let has_working = replica_masters.iter().any(|m| m == id);
+            let serves = st.owners.iter().any(|o| o.as_deref() == Some(id.as_str()));
+            if let Some(n) = st.nodes.get_mut(id) {
+                if has_working {
+                    n.had_replicas = true;
+                }
+                let orphaned = !has_working && n.had_replicas && serves && !n.fail && !n.pfail;
+                if !orphaned {
+                    n.orphaned_since = 0;
+                } else if n.orphaned_since == 0 {
+                    n.orphaned_since = now;
+                    tracing::info!(master = %id, "master has no working replica: orphaned");
+                }
+            }
+        }
+
+        if !self.cfg.allow_replica_migration || !st.ok {
+            return;
+        }
+        let me = st.myself.clone();
+        let Some(my_master) = st.nodes.get(&me).and_then(|n| n.master.clone()) else {
+            return;
+        };
+        if st.nodes.get(&my_master).is_none_or(|m| m.fail || m.pfail) {
+            return;
+        }
+        // My master's working replicas, me included.
+        let mut siblings: Vec<&str> = st
+            .nodes
+            .values()
+            .filter(|n| n.master.as_deref() == Some(my_master.as_str()) && working(n))
+            .map(|n| n.id.as_str())
+            .collect();
+        if siblings.len() <= self.cfg.migration_barrier {
+            return;
+        }
+        siblings.sort_unstable();
+        if siblings.first() != Some(&me.as_str()) {
+            return;
+        }
+        let target = st
+            .nodes
+            .values()
+            .filter(|n| {
+                n.id != my_master
+                    && n.orphaned_since != 0
+                    && now.saturating_sub(n.orphaned_since) > REPLICA_MIGRATION_DELAY_MS
+            })
+            .map(|n| n.id.clone())
+            .min();
+        if let Some(target) = target {
+            tracing::info!(
+                from = %my_master,
+                to = %target,
+                "replica migration: moving to an orphaned master"
+            );
+            if let Some(n) = st.nodes.get_mut(&target) {
+                n.orphaned_since = 0;
+            }
+            self.become_replica_of(st, fx, &target);
+        }
     }
 
     fn election_cron(&self, st: &mut State, fx: &mut Effects, now: u64) {
