@@ -101,8 +101,25 @@ const DELEGATING: &[&str] = &[
     "GEORADIUSBYMEMBER",
 ];
 
-pub(crate) fn mode(name: &str, is_write: bool) -> Mode {
-    if !is_write || matches!(name, "EVAL" | "EVALSHA" | "FCALL") || DELEGATING.contains(&name) {
+/// How command `id` reaches the log: a table lookup, built once from the
+/// lists above, rather than walking them on every write.
+pub(crate) fn mode(id: crate::commands::Cmd, is_write: bool) -> Mode {
+    use std::sync::OnceLock;
+    static MODES: OnceLock<Vec<Mode>> = OnceLock::new();
+    if !is_write {
+        return Mode::Idle;
+    }
+    let modes = MODES.get_or_init(|| {
+        crate::commands::all()
+            .iter()
+            .map(|spec| mode_by_name(spec.name))
+            .collect()
+    });
+    modes.get(id as usize).copied().unwrap_or(Mode::Idle)
+}
+
+fn mode_by_name(name: &str) -> Mode {
+    if matches!(name, "EVAL" | "EVALSHA" | "FCALL") || DELEGATING.contains(&name) {
         Mode::Idle
     } else if EXPLICIT.contains(&name) {
         Mode::Explicit
@@ -281,13 +298,19 @@ pub(crate) fn log_under_lock(
     w: Option<&AofWriter>,
     repl: Option<ReplSink<'_>>,
     shard: u32,
+    seq: &mut u64,
     db: u32,
     resp: &CommandResponse,
     lazy_expired: &[(u32, Bytes)],
     explicit: Option<&mut Effects>,
     active_expired: &[(u32, Bytes)],
 ) {
-    let out = Out { w, repl, shard };
+    let mut out = Out {
+        w,
+        repl,
+        shard,
+        seq,
+    };
     for (d, k) in lazy_expired {
         out.emit(*d, |buf| encode_into(buf, b"DEL", &[k]));
     }
@@ -322,6 +345,8 @@ struct Out<'a> {
     w: Option<&'a AofWriter>,
     repl: Option<ReplSink<'a>>,
     shard: u32,
+    /// The shard's record counter (`ShardStore::log_seq`).
+    seq: &'a mut u64,
 }
 
 thread_local! {
@@ -330,15 +355,15 @@ thread_local! {
 }
 
 impl Out<'_> {
-    fn emit(&self, db: u32, write: impl FnOnce(&mut Vec<u8>)) {
+    fn emit(&mut self, db: u32, write: impl FnOnce(&mut Vec<u8>)) {
         match (self.w, self.repl) {
-            (Some(w), None) => emit_aof(w, self.shard, db, write),
+            (Some(w), None) => emit_aof(w, self.shard, self.seq, db, write),
             (w, Some(r)) => SCRATCH.with(|s| {
                 let mut buf = s.borrow_mut();
                 buf.clear();
                 write(&mut buf);
                 if let Some(w) = w {
-                    emit_aof(w, self.shard, db, |b| b.extend_from_slice(&buf));
+                    emit_aof(w, self.shard, self.seq, db, |b| b.extend_from_slice(&buf));
                 }
                 r.feed.record(self.shard, db, &buf, r.held);
                 if buf.capacity() > 64 * 1024 {
@@ -350,16 +375,16 @@ impl Out<'_> {
     }
 }
 
-fn emit_aof(w: &AofWriter, shard: u32, db: u32, write: impl FnOnce(&mut Vec<u8>)) {
+fn emit_aof(w: &AofWriter, shard: u32, seq: &mut u64, db: u32, write: impl FnOnce(&mut Vec<u8>)) {
     TX.with(|tx| {
         if let Some(opened) = tx.borrow_mut().as_mut() {
             if !opened.contains(&shard) {
                 opened.push(shard);
-                w.append(shard, |buf| encode_into(buf, b"MULTI", &[]));
+                w.append(shard, seq, |buf| encode_into(buf, b"MULTI", &[]));
             }
         }
     });
-    w.append_db(shard, db, write);
+    w.append_db(shard, seq, db, write);
 }
 
 /// Brackets a transaction's records in each shard log with `MULTI`/`EXEC`,

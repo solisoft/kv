@@ -241,6 +241,18 @@ impl Drop for CurrentClient {
 /// Default number of logical databases (`--databases`).
 pub const DEFAULT_DATABASES: u32 = 16;
 
+/// Most commands a pipelined batch runs under one shard hold: a run long
+/// enough to stop the lock changing cores on every command, short enough
+/// that the other clients of that shard wait a few microseconds at most.
+pub const BATCH_MAX: usize = 64;
+
+/// A shard held for a run of one connection's pipelined commands (see
+/// [`CommandEngine::batch_shard`]).
+pub struct BatchHold<'a> {
+    held: crate::shard::HeldShards<'a>,
+    defer: crate::blocking::DeferGuard,
+}
+
 /// The central command engine that routes commands to appropriate shards.
 pub struct CommandEngine {
     pub shards: Arc<ShardManager>,
@@ -249,7 +261,6 @@ pub struct CommandEngine {
     pub(crate) script_cache: ScriptCache,
     weak_self: OnceLock<Weak<CommandEngine>>,
     notify_flags: Arc<AtomicU16>,
-    pub replication_offset: Arc<AtomicU64>,
     /// Snapshots, the append-only log and shutdown.
     ///
     /// `SAVE`/`BGSAVE` used to write to a hardcoded `data`/`dump` in the
@@ -345,7 +356,6 @@ impl CommandEngine {
             script_cache: ScriptCache::new(),
             weak_self: OnceLock::new(),
             notify_flags: Arc::new(AtomicU16::new(0)),
-            replication_offset: Arc::new(AtomicU64::new(0)),
             persistence: Arc::new(Persistence::new(PersistConfig::default())),
             shutdown_requested: Arc::new(tokio::sync::Notify::new()),
             lua_memory_limit: DEFAULT_LUA_MEMORY_LIMIT,
@@ -629,11 +639,21 @@ impl CommandEngine {
         let shards = self.shards.all_shards();
         let n = shards.len();
         let start = (now_millis() as usize) % n;
+        // Inside a hold (EXEC, a script, a pipelined batch), evict from the
+        // held shards only: locking another one now could deadlock with a
+        // thread that holds it and waits for one of ours.
+        let holding = self.shards.holding();
         // Bounded: a command never pays for more than this many evictions.
         const MAX_EVICTIONS: usize = 4096;
         let mut empty_in_a_row = 0;
         for i in 0..MAX_EVICTIONS {
-            match shards[(start + i) % n].evict_one(policy, samples) {
+            let idx = (start + i) % n;
+            let evicted = if holding && !self.shards.is_held(idx) {
+                None
+            } else {
+                shards[idx].evict_one(policy, samples)
+            };
+            match evicted {
                 Some(_) => {
                     empty_in_a_row = 0;
                     self.shards.note_evicted(1);
@@ -757,7 +777,7 @@ impl CommandEngine {
 
     /// Writes counted since startup (for `rdb_changes_since_last_save`).
     pub fn dirty(&self) -> u64 {
-        self.replication_offset.load(Ordering::Relaxed)
+        self.stats.dirty()
     }
 
     /// Stop accepting changes, make them durable, and snapshot if configured
@@ -830,7 +850,7 @@ impl CommandEngine {
         // log it under their lock (see `aof_log`). The frame is set for every
         // command so a read nested in a script never inherits a write's.
         let response = if self.shards.logging() {
-            let mode = crate::aof_log::mode(name, write);
+            let mode = crate::aof_log::mode(id, write);
             let cmd = crate::aof_log::AutoCmd::new(name, args, mode);
             let _frame = crate::aof_log::FrameGuard::enter(mode, &cmd);
             self.dispatch(id, name, args)
@@ -843,7 +863,7 @@ impl CommandEngine {
         }
 
         if write {
-            self.replication_offset.fetch_add(1, Ordering::Relaxed);
+            self.stats.bump_dirty();
             if self.tracking.is_active() {
                 if matches!(id, Cmd::FLUSHDB | Cmd::FLUSHALL | Cmd::SWAPDB) {
                     self.tracking.flush();
@@ -4335,6 +4355,92 @@ impl CommandEngine {
     /// Execute a command for a connection: connection-level commands
     /// (`SELECT`, `MULTI`/`EXEC`, `WATCH`, `CLIENT`, `RESET`) here, the rest
     /// in the session's database.
+    /// The shard a pipelined command may run in under a batch hold
+    /// ([`batch_hold`](Self::batch_hold)), or `None` when it must run on
+    /// its own.
+    ///
+    /// # Why batches
+    ///
+    /// A connection's pipeline of commands on one hot key used to take that
+    /// key's shard lock once per command. Under several such connections the
+    /// lock then changes cores on almost every command, and once its holders
+    /// queue long enough to park, each hand-over is a futex wake: the shard
+    /// is busy handing over rather than executing. Running a run of
+    /// consecutive commands for one shard under one hold keeps the lock (and
+    /// the data) on one core for the run.
+    ///
+    /// # What may batch
+    ///
+    /// Only what can run entirely inside that one shard: every key of the
+    /// command in it (positions from the table, so no command whose keys
+    /// depend on its arguments, nor `SORT_RO`, whose `BY`/`GET` patterns
+    /// read other keys), no blocking command, nothing admin. And only where
+    /// nothing a command does on the side could lock another shard: not in
+    /// solo mode (no locks), not inside `MULTI`, not with replicas fed (a
+    /// hold opens a replication block), not under `maxmemory` (eviction
+    /// visits every shard). Blocked clients a write wakes are served after
+    /// the hold, by [`end_batch`](Self::end_batch).
+    pub fn batch_shard(&self, session: &Session, name: &str, args: &[Bytes]) -> Option<usize> {
+        if self.shards.is_solo()
+            || session.in_multi()
+            || self.shards.repl().producing()
+            || self.maxmemory.load(Ordering::Relaxed) != 0
+        {
+            return None;
+        }
+        let spec = crate::commands::lookup(name)?;
+        if spec.has(
+            crate::commands::F_BLOCKING
+                | crate::commands::F_ADMIN
+                | crate::commands::F_PUBSUB
+                | crate::commands::F_NOSCRIPT
+                | crate::commands::F_MOVABLEKEYS,
+        ) || matches!(spec.id, Cmd::SORT_RO)
+            || !spec.arity_ok(args.len())
+        {
+            return None;
+        }
+        let crate::commands::Keys::Range { first, last, step } = spec.keys else {
+            return None;
+        };
+        let argc = args.len() as i32 + 1;
+        let last = if last < 0 { argc + last } else { last };
+        let mut shard = None;
+        let mut i = first;
+        while i <= last && i < argc && step > 0 {
+            let s = self.shards.shard_index_for_key(&args[(i - 1) as usize]);
+            if shard.is_some_and(|prev| prev != s) {
+                return None;
+            }
+            shard = Some(s);
+            i += step;
+        }
+        shard
+    }
+
+    /// Hold shard `shard` for a run of commands [`batch_shard`] placed in
+    /// it; end with [`end_batch`](Self::end_batch). Keep the run short (the
+    /// server stops at [`BATCH_MAX`]) and never `.await` inside it — the
+    /// hold is not `Send`, so the compiler refuses that anyway.
+    ///
+    /// [`batch_shard`]: Self::batch_shard
+    pub fn batch_hold(&self, shard: usize) -> BatchHold<'_> {
+        BatchHold {
+            defer: crate::blocking::DeferGuard::enter(),
+            held: self.shards.lock_shards([shard]),
+        }
+    }
+
+    /// Release a batch hold, then serve the clients its writes unblocked.
+    pub fn end_batch(&self, hold: BatchHold<'_>) {
+        let BatchHold { held, defer } = hold;
+        drop(held);
+        drop(defer);
+        if self.blocking.is_active() && !crate::blocking::deferred() {
+            self.serve_blocked();
+        }
+    }
+
     pub fn execute_session(
         &self,
         session: &mut Session,

@@ -293,38 +293,39 @@ fn push_bulk(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(b"\r\n");
 }
 
-/// Most bytes a shard may have waiting for the writer before producers wait
+/// Most bytes one thread may have waiting for the writer before it waits
 /// for it (backpressure: a stalled disk must not turn into unbounded memory).
 const MAX_PENDING: usize = 64 * 1024 * 1024;
 
-/// Records a shard produced since the writer last came by.
+/// What a sequenced entry in a thread's buffer is.
+const KIND_RECORD: u8 = 0;
+const KIND_ROTATE: u8 = 1;
+
+/// `db` of a record that states no database (transaction markers).
+const NO_DB: u32 = u32::MAX;
+
+/// Entry header in a thread's buffer: shard u32, seq u64, db u32, kind u8,
+/// payload length u32 — then the payload (an encoded record, or the new
+/// generation for a rotation).
+const ENTRY_HEADER: usize = 4 + 8 + 4 + 1 + 4;
+
+/// One producer thread's entries since the writer last came by. Only that
+/// thread appends and only the writer drains, so its lock is uncontended and
+/// its memory stays in the producing core's cache — unlike a buffer per
+/// shard, which every core serving that shard would write in turn.
 #[derive(Default)]
-struct Pending {
-    data: Vec<u8>,
-    /// `(offset, generation)`: from `offset` on, records go to `generation`.
-    rotations: Vec<(usize, u64)>,
-    /// Database the shard's log is in at the end of `data`: replay starts
-    /// every file in database 0, and a `SELECT` is written whenever a record
-    /// belongs to another one (see [`AofWriter::append_db`]).
-    db: u32,
-}
-
-/// One shard's buffer, on its own cache lines: the slots sit side by side
-/// in a `Vec`, and each is written by whichever core runs its shard, so
-/// unpadded neighbours would bounce a shared line between cores on every
-/// record.
-#[repr(align(128))]
-struct Slot(parking_lot::Mutex<Pending>);
-
-impl std::ops::Deref for Slot {
-    type Target = parking_lot::Mutex<Pending>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+struct ThreadBuf {
+    data: parking_lot::Mutex<Vec<u8>>,
 }
 
 struct Inner {
-    shards: Vec<Slot>,
+    shards: u32,
+    /// Threads registered by their first append since the writer last
+    /// looked; it moves them into its own list.
+    threads: parking_lot::Mutex<Vec<Arc<ThreadBuf>>>,
+    /// Per shard, the sequence number its first record will carry (see
+    /// [`AofWriter::start_shard`]).
+    starts: Vec<std::sync::atomic::AtomicU64>,
     policy: FsyncPolicy,
     /// `sync()` requests waiting for the next fsync.
     syncs: parking_lot::Mutex<Vec<std::sync::mpsc::SyncSender<io::Result<()>>>>,
@@ -333,18 +334,35 @@ struct Inner {
     closed: std::sync::atomic::AtomicBool,
 }
 
+thread_local! {
+    /// This thread's buffer in each live writer (tests run several writers
+    /// in one process; the server has one).
+    static LOCAL: std::cell::RefCell<Vec<(std::sync::Weak<Inner>, Arc<ThreadBuf>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Handle to the append-only log writer.
 ///
-/// Producers append records to their shard's in-memory buffer while holding
-/// that shard's lock — a memcpy under an uncontended mutex, so the order in
-/// the buffer is the order the shard executed them. A dedicated thread swaps
-/// the buffers out every millisecond (right away under `appendfsync always`),
-/// writes them to the per-shard files and fsyncs by policy.
+/// # Ordering without a shared buffer
 ///
-/// This used to be a channel. A send is cheap until the receiver is parked,
-/// and then every send is a futex wake: under the shard lock, that syscall
-/// serialized a hot key's clients behind it (pipelined LPUSH on one key fell
-/// from 1.65 M to 0.66 M ops/s).
+/// A shard's records must reach its log in the order the shard executed
+/// them, so they are produced while its lock is held. They used to be
+/// appended there to one buffer per shard: under a hot key, every core
+/// serving it then wrote that buffer in turn, and each record cost the lock
+/// holder a second mutex and the buffer's cache lines fetched from the
+/// previous holder's core — inside the critical section everyone queues on
+/// (pipelined single-key writes ran ~35% slower with the log on than off).
+///
+/// Now the lock holder only takes the next number from the shard's own
+/// counter (`seq`, kept in the store it already has in cache) and copies the
+/// record into *its thread's* buffer. A dedicated thread drains every
+/// thread's buffer each millisecond (right away under `appendfsync always`),
+/// puts each shard's entries back in sequence order and writes them to the
+/// per-shard files, fsyncing by policy. An entry whose predecessor sits in a
+/// buffer drained later in the same pass waits for the next pass; since a
+/// number is only taken with the record appended in the same lock hold,
+/// everything appended before a pass begins is complete by its end, which is
+/// what [`sync`](Self::sync) relies on.
 ///
 /// The writer is an OS thread, not a Tokio task: on the solo runtime a task
 /// would share the single worker with the producers, and backpressure could
@@ -379,46 +397,78 @@ impl AofWriter {
 
     /// Shard count this writer has logs for.
     pub fn shards(&self) -> u32 {
-        self.inner.shards.len() as u32
+        self.inner.shards
     }
 
-    /// Log a command for `shard`.
-    pub fn log(&self, shard: u32, name: &str, args: &[Bytes]) {
+    /// Declare the sequence number `shard`'s first record will carry: the
+    /// value of its counter when the writer is attached. Call before any
+    /// record for that shard is appended.
+    pub fn start_shard(&self, shard: u32, seq: u64) {
+        if let Some(s) = self.inner.starts.get(shard as usize) {
+            s.store(seq, Ordering::Release);
+        }
+    }
+
+    /// Log a command for `shard`. `seq` is the shard's counter; call with the
+    /// shard's lock held, as for every append.
+    pub fn log(&self, shard: u32, seq: &mut u64, name: &str, args: &[Bytes]) {
         let args: Vec<&[u8]> = args.iter().map(|a| a.as_ref()).collect();
-        self.append(shard, |buf| encode_into(buf, name.as_bytes(), &args));
+        self.append(shard, seq, |buf| encode_into(buf, name.as_bytes(), &args));
     }
 
     /// Log a record already encoded with [`encode_command`].
-    pub fn log_raw(&self, shard: u32, record: &[u8]) {
-        self.append(shard, |buf| buf.extend_from_slice(record));
+    pub fn log_raw(&self, shard: u32, seq: &mut u64, record: &[u8]) {
+        self.append(shard, seq, |buf| buf.extend_from_slice(record));
     }
 
-    /// Encode a record straight into `shard`'s buffer. Call with the shard's
-    /// lock held.
-    pub fn append(&self, shard: u32, write: impl FnOnce(&mut Vec<u8>)) {
-        self.append_inner(shard, None, write)
+    /// Encode a record for `shard`, numbered from its counter `seq`. Call
+    /// with the shard's lock held: the lock is what makes the numbers follow
+    /// execution order.
+    pub fn append(&self, shard: u32, seq: &mut u64, write: impl FnOnce(&mut Vec<u8>)) {
+        self.push(shard, seq, NO_DB, KIND_RECORD, write)
     }
 
-    fn append_inner(&self, shard: u32, db: Option<u32>, write: impl FnOnce(&mut Vec<u8>)) {
-        let Some(slot) = self.inner.shards.get(shard as usize) else {
+    /// [`append`](Self::append) for a record that applies to database `db`:
+    /// the writer precedes it with `SELECT db` when the shard's log is in
+    /// another one, as Redis writes its AOF.
+    pub fn append_db(&self, shard: u32, seq: &mut u64, db: u32, write: impl FnOnce(&mut Vec<u8>)) {
+        self.push(shard, seq, db, KIND_RECORD, write)
+    }
+
+    /// Switch `shard`'s log to generation `gen`. Call while holding the
+    /// shard's lock, right after saving it.
+    pub fn rotate(&self, shard: u32, seq: &mut u64, gen: u64) {
+        self.push(shard, seq, NO_DB, KIND_ROTATE, |buf| {
+            buf.extend_from_slice(&gen.to_le_bytes())
+        })
+    }
+
+    #[inline]
+    fn push(&self, shard: u32, seq: &mut u64, db: u32, kind: u8, write: impl FnOnce(&mut Vec<u8>)) {
+        if shard >= self.inner.shards {
             tracing::error!("AOF record for unknown shard {}", shard);
             return;
-        };
-        let mut p = slot.lock();
-        if p.data.len() >= MAX_PENDING {
-            drop(p);
-            self.wait_for_room(slot);
-            p = slot.lock();
         }
-        if let Some(db) = db {
-            if p.db != db {
-                let n = db.to_string();
-                encode_into(&mut p.data, b"SELECT", &[n.as_bytes()]);
-                p.db = db;
+        self.with_local_buf(|tb| {
+            let mut data = tb.data.lock();
+            if data.len() >= MAX_PENDING {
+                drop(data);
+                self.wait_for_room(tb);
+                data = tb.data.lock();
             }
-        }
-        write(&mut p.data);
-        drop(p);
+            let n = *seq;
+            *seq += 1;
+            let at = data.len();
+            let mut header = [0u8; ENTRY_HEADER];
+            header[0..4].copy_from_slice(&shard.to_le_bytes());
+            header[4..12].copy_from_slice(&n.to_le_bytes());
+            header[12..16].copy_from_slice(&db.to_le_bytes());
+            header[16] = kind;
+            data.extend_from_slice(&header);
+            write(&mut data);
+            let len = (data.len() - at - ENTRY_HEADER) as u32;
+            data[at + ENTRY_HEADER - 4..at + ENTRY_HEADER].copy_from_slice(&len.to_le_bytes());
+        });
         if self.inner.policy == FsyncPolicy::Always {
             if let Some(t) = self.inner.thread.get() {
                 t.unpark();
@@ -426,18 +476,34 @@ impl AofWriter {
         }
     }
 
-    /// [`append`](Self::append) for a record that applies to database `db`:
-    /// preceded by `SELECT db` when the shard's log is in another one, as
-    /// Redis writes its AOF. Call with the shard's lock held.
-    pub fn append_db(&self, shard: u32, db: u32, write: impl FnOnce(&mut Vec<u8>)) {
-        self.append_inner(shard, Some(db), write)
+    /// Run `f` on this thread's buffer in this writer, registered on first
+    /// use. Borrowed, not cloned: an `Arc` clone per record would be two
+    /// atomic operations under the shard lock for nothing.
+    #[inline]
+    fn with_local_buf<R>(&self, f: impl FnOnce(&ThreadBuf) -> R) -> R {
+        LOCAL.with(|l| {
+            let me = Arc::as_ptr(&self.inner);
+            {
+                let l = l.borrow();
+                if let Some((_, tb)) = l.iter().find(|(w, _)| std::ptr::eq(w.as_ptr(), me)) {
+                    return f(tb);
+                }
+            }
+            let tb = Arc::new(ThreadBuf::default());
+            self.inner.threads.lock().push(tb.clone());
+            let mut lm = l.borrow_mut();
+            lm.retain(|(w, _)| w.strong_count() > 0);
+            lm.push((Arc::downgrade(&self.inner), tb.clone()));
+            drop(lm);
+            f(&tb)
+        })
     }
 
     /// Backpressure: the disk is behind; wait for the writer to catch up.
     /// Never drops writes, so durability is preserved under load.
-    fn wait_for_room(&self, slot: &parking_lot::Mutex<Pending>) {
+    fn wait_for_room(&self, tb: &ThreadBuf) {
         let wait = || {
-            while slot.lock().data.len() >= MAX_PENDING {
+            while tb.data.lock().len() >= MAX_PENDING {
                 if let Some(t) = self.inner.thread.get() {
                     t.unpark();
                 }
@@ -456,18 +522,6 @@ impl AofWriter {
             tokio::task::block_in_place(wait)
         } else {
             wait()
-        }
-    }
-
-    /// Switch `shard`'s log to generation `gen`. Call while holding the
-    /// shard's lock, right after saving it.
-    pub fn rotate(&self, shard: u32, gen: u64) {
-        if let Some(slot) = self.inner.shards.get(shard as usize) {
-            let mut p = slot.lock();
-            let at = p.data.len();
-            p.rotations.push((at, gen));
-            // The new file replays from database 0.
-            p.db = 0;
         }
     }
 
@@ -509,6 +563,8 @@ impl ShardLog {
 
 /// Spawn the writer thread, appending to generation `gen`'s per-shard files
 /// in `aof_dir`. When every handle is dropped it flushes, fsyncs and exits.
+/// Each shard's numbering starts at 0 unless [`AofWriter::start_shard`] says
+/// otherwise.
 pub fn spawn_aof_writer(
     aof_dir: &Path,
     shards: u32,
@@ -523,15 +579,10 @@ pub fn spawn_aof_writer(
     }
     let dir = aof_dir.to_path_buf();
     let inner = Arc::new(Inner {
-        // Appending may continue a file that ended in any database: the first
-        // record of each shard always states its own.
-        shards: (0..shards)
-            .map(|_| {
-                Slot(parking_lot::Mutex::new(Pending {
-                    db: u32::MAX,
-                    ..Pending::default()
-                }))
-            })
+        shards,
+        threads: parking_lot::Mutex::new(Vec::new()),
+        starts: (0..shards)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect(),
         policy,
         syncs: parking_lot::Mutex::new(Vec::new()),
@@ -550,6 +601,30 @@ pub fn spawn_aof_writer(
         inner,
         single_threaded: false,
     })
+}
+
+/// One sequenced entry, as the writer orders them.
+struct Entry {
+    seq: u64,
+    db: u32,
+    kind: u8,
+    /// Where the payload is: in this pass's drained buffer `buf` at
+    /// `off..off+len`, or (`buf == usize::MAX`) in `held[off]`.
+    buf: usize,
+    off: usize,
+    len: usize,
+}
+
+/// A shard's position in its sequence, and what it is waiting on.
+struct ShardOrder {
+    /// The number the next entry written must carry; `None` until the
+    /// first entry, when it is read from `starts`.
+    next: Option<u64>,
+    /// Database the log is in (`NO_DB` until the first record states one:
+    /// appending may continue a file that ended in any database).
+    db: u32,
+    /// Entries that arrived ahead of a predecessor, with their payloads.
+    held: Vec<(u64, u32, u8, Vec<u8>)>,
 }
 
 fn writer_loop(inner: Arc<Inner>, mut logs: Vec<ShardLog>, dir: PathBuf, stats: Arc<PersistStats>) {
@@ -578,49 +653,183 @@ fn writer_loop(inner: Arc<Inner>, mut logs: Vec<ShardLog>, dir: PathBuf, stats: 
         }
         result
     };
-    // Swapped in for each shard's buffer, so capacity is reused both ways.
-    let mut spare = Pending::default();
+    let mut order: Vec<ShardOrder> = (0..inner.shards)
+        .map(|_| ShardOrder {
+            next: None,
+            db: NO_DB,
+            held: Vec::new(),
+        })
+        .collect();
+    // Each thread's second buffer: swapped with the one it fills, drained,
+    // and swapped back to the same thread — a buffer never moves to another
+    // core, whose cache would then pay for every line it writes.
+    let mut threads: Vec<(Arc<ThreadBuf>, Vec<u8>)> = Vec::new();
+    // Indexes into `threads` of the buffers this pass drained.
+    let mut drained: Vec<usize> = Vec::new();
+    let mut per_shard: Vec<Vec<Entry>> = (0..inner.shards).map(|_| Vec::new()).collect();
+    let mut select = Vec::new();
 
     loop {
         let closing = inner.closed.load(Ordering::Acquire);
         // Sync requests seen now are answered after this pass is on disk.
         let syncs = std::mem::take(&mut *inner.syncs.lock());
 
-        let mut wrote = false;
-        for (s, slot) in inner.shards.iter().enumerate() {
+        // Drain every thread's buffer; forget threads that have exited.
+        threads.extend(
+            std::mem::take(&mut *inner.threads.lock())
+                .into_iter()
+                .map(|tb| (tb, Vec::new())),
+        );
+        let mut t = 0;
+        while t < threads.len() {
+            let (tb, back) = &mut threads[t];
+            // Read before draining: once only this list holds the buffer, its
+            // thread has exited and appends nothing more, so this drain is
+            // its last. (The fence pairs with the release in the thread's
+            // `Arc` drop, after its last append.)
+            let alive = Arc::strong_count(tb) > 1;
+            std::sync::atomic::fence(Ordering::Acquire);
             {
-                let mut p = slot.lock();
-                if p.data.is_empty() && p.rotations.is_empty() {
-                    continue;
+                let mut data = tb.data.lock();
+                if !data.is_empty() {
+                    std::mem::swap(&mut *data, back);
                 }
-                // The buffers only: `db` describes the log, not the batch.
-                std::mem::swap(&mut p.data, &mut spare.data);
-                std::mem::swap(&mut p.rotations, &mut spare.rotations);
             }
+            if !back.is_empty() {
+                drained.push(t);
+            }
+            if !alive && back.is_empty() {
+                threads.swap_remove(t);
+                continue;
+            }
+            t += 1;
+        }
+        for &t in &drained {
+            let buf = &threads[t].1;
+            let mut at = 0;
+            while at + ENTRY_HEADER <= buf.len() {
+                let shard = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()) as usize;
+                let seq = u64::from_le_bytes(buf[at + 4..at + 12].try_into().unwrap());
+                let db = u32::from_le_bytes(buf[at + 12..at + 16].try_into().unwrap());
+                let kind = buf[at + 16];
+                let len = u32::from_le_bytes(buf[at + 17..at + 21].try_into().unwrap()) as usize;
+                per_shard[shard].push(Entry {
+                    seq,
+                    db,
+                    kind,
+                    buf: t,
+                    off: at + ENTRY_HEADER,
+                    len,
+                });
+                at += ENTRY_HEADER + len;
+            }
+        }
+
+        let mut wrote = false;
+        for (s, entries) in per_shard.iter_mut().enumerate() {
+            let ord = &mut order[s];
+            if entries.is_empty() && ord.held.is_empty() {
+                continue;
+            }
+            for (i, (seq, db, kind, _)) in ord.held.iter().enumerate() {
+                entries.push(Entry {
+                    seq: *seq,
+                    db: *db,
+                    kind: *kind,
+                    buf: usize::MAX,
+                    off: i,
+                    len: 0,
+                });
+            }
+            // Each thread's entries are already in order: mostly a merge.
+            entries.sort_unstable_by_key(|e| e.seq);
+            let mut next = ord
+                .next
+                .unwrap_or_else(|| inner.starts[s].load(Ordering::Acquire));
             let log = &mut logs[s];
-            let mut from = 0;
-            for &(at, g) in &spare.rotations {
-                if at > from {
-                    report(log.w.write_all(&spare.data[from..at]), "write");
-                    log.dirty = true;
+            let mut written = 0u64;
+            let mut stop = entries.len();
+            for (i, e) in entries.iter().enumerate() {
+                if e.seq != next {
+                    // A predecessor is in a buffer this pass drained before
+                    // it was appended: wait for the next pass.
+                    stop = i;
+                    break;
                 }
-                from = at;
-                report(log.flush(true), "fsync");
-                match ShardLog::open(&incr_path(&dir, g, s as u32)) {
-                    Ok(new) => *log = new,
-                    Err(e) => report(Err(e), "rotate"),
+                next += 1;
+                let payload: &[u8] = if e.buf == usize::MAX {
+                    &ord.held[e.off].3
+                } else {
+                    &threads[e.buf].1[e.off..e.off + e.len]
+                };
+                match e.kind {
+                    KIND_ROTATE => {
+                        let gen = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                        report(log.flush(true), "fsync");
+                        match ShardLog::open(&incr_path(&dir, gen, s as u32)) {
+                            Ok(new) => *log = new,
+                            Err(err) => report(Err(err), "rotate"),
+                        }
+                        // The new file replays from database 0.
+                        ord.db = 0;
+                    }
+                    _ => {
+                        if e.db != NO_DB && e.db != ord.db {
+                            select.clear();
+                            let n = e.db.to_string();
+                            encode_into(&mut select, b"SELECT", &[n.as_bytes()]);
+                            report(log.w.write_all(&select), "write");
+                            written += select.len() as u64;
+                            ord.db = e.db;
+                        }
+                        report(log.w.write_all(payload), "write");
+                        written += payload.len() as u64;
+                        log.dirty = true;
+                    }
                 }
             }
-            if spare.data.len() > from {
-                report(log.w.write_all(&spare.data[from..]), "write");
-                log.dirty = true;
+            ord.next = Some(next);
+            let mut held = Vec::new();
+            for e in &entries[stop..] {
+                let payload = if e.buf == usize::MAX {
+                    std::mem::take(&mut ord.held[e.off].3)
+                } else {
+                    threads[e.buf].1[e.off..e.off + e.len].to_vec()
+                };
+                held.push((e.seq, e.db, e.kind, payload));
             }
-            stats
-                .aof_current_size
-                .fetch_add(spare.data.len() as u64, Ordering::Relaxed);
-            spare.data.clear();
-            spare.rotations.clear();
-            wrote = true;
+            if closing && !held.is_empty() {
+                // Every producer is gone, so no predecessor can still come:
+                // a gap here is a bug. Keep the records rather than lose them.
+                tracing::error!(
+                    "AOF shard {}: {} record(s) after a missing sequence number {}; \
+                     writing them anyway",
+                    s,
+                    held.len(),
+                    next
+                );
+                for (_, _, kind, payload) in held.drain(..) {
+                    if kind == KIND_RECORD {
+                        report(log.w.write_all(&payload), "write");
+                        written += payload.len() as u64;
+                        log.dirty = true;
+                    }
+                }
+            }
+            ord.held = held;
+            entries.clear();
+            if written > 0 {
+                stats.aof_current_size.fetch_add(written, Ordering::Relaxed);
+                wrote = true;
+            }
+        }
+        for t in drained.drain(..) {
+            let back = &mut threads[t].1;
+            back.clear();
+            // Not a spike's worth of memory kept for good.
+            if back.capacity() > 4 * 1024 * 1024 {
+                *back = Vec::new();
+            }
         }
 
         let fsync_now = !syncs.is_empty()
@@ -1092,11 +1301,12 @@ mod tests {
         create_incr_files(&aof, 1, 2).unwrap();
         let stats = Arc::new(PersistStats::new());
         let w = spawn_aof_writer(&aof, 2, 1, FsyncPolicy::Everysec, stats).unwrap();
-        w.log(0, "SET", &[b("a"), b("1")]);
-        w.log(1, "SET", &[b("b"), b("1")]);
-        w.rotate(0, 2);
-        w.log(0, "SET", &[b("a"), b("2")]);
-        w.log(1, "SET", &[b("b"), b("2")]);
+        let (mut s0, mut s1) = (0, 0);
+        w.log(0, &mut s0, "SET", &[b("a"), b("1")]);
+        w.log(1, &mut s1, "SET", &[b("b"), b("1")]);
+        w.rotate(0, &mut s0, 2);
+        w.log(0, &mut s0, "SET", &[b("a"), b("2")]);
+        w.log(1, &mut s1, "SET", &[b("b"), b("2")]);
         w.sync().unwrap();
 
         let read = |g, s| {
@@ -1107,5 +1317,77 @@ mod tests {
         assert_eq!(read(1, 0), vec![b("1")]);
         assert_eq!(read(2, 0), vec![b("2")]);
         assert_eq!(read(1, 1), vec![b("1"), b("2")]);
+    }
+
+    /// Many threads take turns on one shard, as a hot key's clients do: the
+    /// log must hold their records in the order the shard numbered them,
+    /// though each thread's records sit in its own buffer.
+    #[test]
+    fn records_from_many_threads_land_in_shard_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let aof = dir.path().join(AOF_DIRNAME);
+        create_incr_files(&aof, 1, 1).unwrap();
+        let stats = Arc::new(PersistStats::new());
+        let w = spawn_aof_writer(&aof, 1, 1, FsyncPolicy::Everysec, stats).unwrap();
+        // Start where a store that already logged 7 records would.
+        w.start_shard(0, 7);
+        let shard = Arc::new(parking_lot::Mutex::new(7u64));
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let (w, shard) = (w.clone(), shard.clone());
+                std::thread::spawn(move || {
+                    for i in 0..2000 {
+                        let mut seq = shard.lock();
+                        let v = format!("{}", *seq);
+                        w.log(0, &mut seq, "SET", &[b("k"), Bytes::from(v)]);
+                        if i % 500 == 0 && t % 2 == 0 {
+                            drop(seq);
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        w.sync().unwrap();
+        let mut got = Vec::new();
+        replay_log(&incr_path(&aof, 1, 0), |c| got.push(c[2].clone())).unwrap();
+        let want: Vec<Bytes> = (7..7 + 16000)
+            .map(|n: u64| Bytes::from(n.to_string()))
+            .collect();
+        assert_eq!(got.len(), want.len());
+        assert!(got == want, "records out of shard order");
+    }
+
+    /// A record for another database is preceded by `SELECT`, once.
+    #[test]
+    fn the_writer_selects_the_database_of_each_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let aof = dir.path().join(AOF_DIRNAME);
+        create_incr_files(&aof, 1, 1).unwrap();
+        let stats = Arc::new(PersistStats::new());
+        let w = spawn_aof_writer(&aof, 1, 1, FsyncPolicy::Everysec, stats).unwrap();
+        let mut seq = 0;
+        for db in [0u32, 0, 3, 3, 0] {
+            w.append_db(0, &mut seq, db, |buf| {
+                encode_into(buf, b"SET", &[b"k", b"v"])
+            });
+        }
+        w.sync().unwrap();
+        let mut got = Vec::new();
+        replay_log(&incr_path(&aof, 1, 0), |c| {
+            got.push(format!(
+                "{} {}",
+                String::from_utf8_lossy(&c[0]),
+                String::from_utf8_lossy(&c[1])
+            ))
+        })
+        .unwrap();
+        assert_eq!(
+            got,
+            vec!["SELECT 0", "SET k", "SET k", "SELECT 3", "SET k", "SET k", "SELECT 0", "SET k"]
+        );
     }
 }

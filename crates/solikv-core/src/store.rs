@@ -251,6 +251,10 @@ pub struct ShardStore {
     ks: Keyspace,
     /// Which database `ks` is.
     db: u32,
+    /// Number of the next record this shard logs (see
+    /// `solikv_persist::AofWriter`): here, beside fields every command
+    /// touches, because it is taken under the shard lock on every write.
+    pub log_seq: u64,
     /// Every other database, by index; `parked[db]` is an empty placeholder
     /// for the selected one. Grows on demand to the highest database used.
     parked: Vec<Keyspace>,
@@ -273,6 +277,7 @@ impl ShardStore {
         Self {
             ks: Keyspace::default(),
             db: 0,
+            log_seq: 0,
             parked: Vec::new(),
             expired_buffer: Vec::new(),
             snapshot: None,

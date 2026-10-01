@@ -98,6 +98,8 @@ struct ThreadBlock {
     cmds: Box<[CmdCounters]>,
     hits: AtomicU64,
     misses: AtomicU64,
+    /// Writes executed (`rdb_changes_since_last_save`, save points).
+    dirty: AtomicU64,
 }
 
 /// Single-writer increment: only the owning thread writes its block.
@@ -118,6 +120,7 @@ fn new_block() -> Arc<ThreadBlock> {
         cmds: (0..n).map(|_| CmdCounters::default()).collect(),
         hits: AtomicU64::new(0),
         misses: AtomicU64::new(0),
+        dirty: AtomicU64::new(0),
     })
 }
 
@@ -245,6 +248,22 @@ impl Stats {
                 bump(&c.rejected, 1);
             }
         });
+    }
+
+    /// Count one executed write. Per thread: every core writes, and one
+    /// shared counter would be a cache line all of them fight over.
+    #[inline]
+    pub fn bump_dirty(&self) {
+        self.with_block(|m| bump(&m.dirty, 1));
+    }
+
+    /// Writes executed since startup (never reset by `CONFIG RESETSTAT`).
+    pub fn dirty(&self) -> u64 {
+        self.blocks
+            .lock()
+            .iter()
+            .map(|b| b.dirty.load(Ordering::Relaxed))
+            .sum()
     }
 
     #[inline]

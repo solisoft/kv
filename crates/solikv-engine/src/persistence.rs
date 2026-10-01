@@ -612,11 +612,11 @@ fn capture_shard(
     i: usize,
     rotate: Option<(&AofWriter, u64)>,
 ) -> io::Result<Vec<u8>> {
-    shards.shard(i).with_store(|store| {
+    shards.shard(i).with_store_mut_unlogged(|store| {
         let mut body = Vec::new();
         rdb::serialize_store(store, &mut body)?;
         if let Some((w, g)) = rotate {
-            w.rotate(i as u32, g);
+            w.rotate(i as u32, &mut store.log_seq, g);
         }
         Ok(body)
     })
@@ -682,7 +682,7 @@ fn capture_shard_stepped(
             return false;
         }
         if let Some((w, g)) = rotate {
-            w.rotate(i as u32, g);
+            w.rotate(i as u32, &mut store.log_seq, g);
         }
         true
     });

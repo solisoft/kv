@@ -342,6 +342,7 @@ impl ShardHandle {
                     aof,
                     repl,
                     self.index,
+                    &mut store.log_seq,
                     db,
                     &result,
                     &lazy_expired,
@@ -390,11 +391,13 @@ impl ShardHandle {
                 return removed;
             }
             if aof.is_some() || repl.is_some() {
+                let db = store.db();
                 crate::aof_log::log_under_lock(
                     aof,
                     repl,
                     self.index,
-                    store.db(),
+                    &mut store.log_seq,
+                    db,
                     &CommandResponse::Ok,
                     &[],
                     None,
@@ -449,7 +452,7 @@ impl ShardHandle {
     /// markers).
     pub(crate) fn log_marker(&self, record: &[u8]) {
         if let Some(w) = self.shared.aof.get() {
-            self.with_store(|_| w.log_raw(self.index, record));
+            self.locked(|store, _| w.log_raw(self.index, &mut store.log_seq, record));
         }
     }
 
@@ -605,6 +608,15 @@ impl ShardManager {
     /// Start logging every change to `writer`. Once only: returns false if a
     /// writer was already attached.
     pub fn attach_aof(&self, writer: AofWriter) -> bool {
+        if self.shared.aof.get().is_some() {
+            return false;
+        }
+        // Each shard's numbering continues from its counter. Nothing is
+        // numbered until the writer is attached, so the counters cannot move
+        // between here and the `set`.
+        for (i, shard) in self.shards.iter().enumerate() {
+            shard.with_store(|s| writer.start_shard(i as u32, s.log_seq));
+        }
         self.shared.aof.set(writer).is_ok()
     }
 
@@ -821,6 +833,19 @@ impl ShardManager {
 
     pub fn shard(&self, idx: usize) -> &ShardHandle {
         &self.shards[idx % self.num_shards]
+    }
+
+    /// Whether this thread holds any of this manager's shards
+    /// ([`lock_shards`](Self::lock_shards)): it must then lock no other one,
+    /// or it would take locks out of the ascending order that keeps two
+    /// holders from waiting on each other.
+    pub fn holding(&self) -> bool {
+        HELD_OWNER.with(|o| o.get()) == Arc::as_ptr(&self.shared) as usize
+    }
+
+    /// Whether this thread holds shard `idx`.
+    pub fn is_held(&self, idx: usize) -> bool {
+        held_store(&self.shared, idx as u32).is_some()
     }
 
     pub fn all_shards(&self) -> &[ShardHandle] {

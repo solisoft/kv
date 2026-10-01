@@ -394,7 +394,77 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         if fast_path {
             // Pre-reserve write buffer for batch responses
             write_buf.reserve(commands.len() * 16);
-            for cmd in commands {
+            let mut cmds = commands.into_iter().peekable();
+            // The batch shard of `cmds.peek()`, when already worked out.
+            let mut known: Option<Option<usize>> = None;
+            while let Some(cmd) = cmds.next() {
+                // A run of pipelined commands for one shard runs under one
+                // hold of its lock (see `CommandEngine::batch_shard`).
+                let batching =
+                    cluster.is_none() && !engine.writes_paused() && !engine.script_running();
+                let shard = match known.take() {
+                    Some(s) if batching => s,
+                    _ if batching => engine.batch_shard(&session, &cmd.name, &cmd.args),
+                    _ => None,
+                };
+                if let Some(shard) = shard {
+                    let next = cmds
+                        .peek()
+                        .and_then(|n| engine.batch_shard(&session, &n.name, &n.args));
+                    if next == Some(shard) {
+                        let hold = engine.batch_hold(shard);
+                        let mut cmd = cmd;
+                        let mut run = 0;
+                        loop {
+                            let resp = engine.execute_session(&mut session, &cmd.name, &cmd.args);
+                            if session.reply_allowed() {
+                                encode_for(
+                                    session.resp,
+                                    &cmd.name,
+                                    &cmd.args,
+                                    resp,
+                                    &mut write_buf,
+                                );
+                            }
+                            run += 1;
+                            if run >= solikv_engine::dispatch::BATCH_MAX
+                                || write_buf.len() >= FLUSH_AT
+                            {
+                                // The next one is known to be for this shard.
+                                known = Some(Some(shard));
+                                break;
+                            }
+                            let Some(n) = cmds.next() else { break };
+                            cmd = n;
+                            let ns = cmds
+                                .peek()
+                                .and_then(|n| engine.batch_shard(&session, &n.name, &n.args));
+                            if ns != Some(shard) {
+                                // `cmd` is the run's last; run it, then stop.
+                                let resp =
+                                    engine.execute_session(&mut session, &cmd.name, &cmd.args);
+                                if session.reply_allowed() {
+                                    encode_for(
+                                        session.resp,
+                                        &cmd.name,
+                                        &cmd.args,
+                                        resp,
+                                        &mut write_buf,
+                                    );
+                                }
+                                known = Some(ns);
+                                break;
+                            }
+                        }
+                        engine.end_batch(hold);
+                        if write_buf.len() >= FLUSH_AT {
+                            socket.write_all(&write_buf).await?;
+                            write_buf.clear();
+                        }
+                        continue;
+                    }
+                    known = Some(next);
+                }
                 // Cluster mode: MOVED, ASK, CROSSSLOT, CLUSTERDOWN.
                 if let Some(redirect) = cluster_redirect(
                     &cluster,
