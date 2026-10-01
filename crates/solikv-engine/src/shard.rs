@@ -38,6 +38,8 @@ struct Shared {
     active_expire_off: AtomicBool,
     /// Active expiry cycles per second (`hz`; 0 = unset, meaning 10).
     hz: std::sync::atomic::AtomicU32,
+    /// The replication stream (see `crate::replication`).
+    repl: Arc<crate::replication::ReplFeed>,
 }
 
 /// See `Shared::removed_hook`.
@@ -130,10 +132,16 @@ pub struct HeldShards<'a> {
     guards: Vec<(u32, MutexGuard<'a, ShardStore>)>,
     /// Whether this guard made this thread an owner (outermost guard).
     outermost: bool,
+    /// The replication stream this hold opened a block in: its records are
+    /// sent as one `MULTI … EXEC` when the hold ends, still under the locks.
+    repl: Option<Arc<crate::replication::ReplFeed>>,
 }
 
 impl Drop for HeldShards<'_> {
     fn drop(&mut self) {
+        if let Some(feed) = self.repl.take() {
+            feed.end_tx();
+        }
         HELD.with(|h| {
             let mut h = h.borrow_mut();
             for (i, _) in &self.guards {
@@ -273,6 +281,21 @@ impl ShardHandle {
         }
     }
 
+    /// The replication stream, when writes must be recorded in it, with
+    /// whether this shard is part of this thread's multi-shard hold (its
+    /// records then join the hold's block).
+    #[inline]
+    fn repl_sink(&self) -> Option<crate::aof_log::ReplSink<'_>> {
+        let feed = &self.shared.repl;
+        if !feed.producing() {
+            return None;
+        }
+        Some(crate::aof_log::ReplSink {
+            feed,
+            held: held_store(&self.shared, self.index).is_some(),
+        })
+    }
+
     /// Run a command against the store.
     ///
     /// With the append-only log on, the command (see `aof_log`) and any key
@@ -302,6 +325,7 @@ impl ShardHandle {
         F: FnOnce(&mut ShardStore, &mut Effects) -> CommandResponse,
     {
         let aof = self.shared.aof.get();
+        let repl = self.repl_sink();
         let db = current_db();
         let (result, lazy_expired) = self.locked(|store, _| {
             // Checked under the lock: once `freeze` has taken and released
@@ -310,12 +334,13 @@ impl ShardHandle {
                 return (CommandResponse::error(SHUTTING_DOWN), Vec::new());
             }
             store.select(db);
-            let mut effects = Effects::new(aof.is_some());
+            let mut effects = Effects::new(aof.is_some() || repl.is_some());
             let result = f(store, &mut effects);
             let lazy_expired = std::mem::take(&mut store.expired_buffer);
-            if let Some(w) = aof {
+            if aof.is_some() || repl.is_some() {
                 crate::aof_log::log_under_lock(
-                    w,
+                    aof,
+                    repl,
                     self.index,
                     db,
                     &result,
@@ -354,6 +379,7 @@ impl ShardHandle {
         remove: impl FnOnce(&mut ShardStore) -> Vec<(u32, Bytes)>,
     ) -> Vec<(u32, Bytes)> {
         let aof = self.shared.aof.get();
+        let repl = self.repl_sink();
         self.locked(|store, _| {
             if self.shared.frozen.load(Ordering::Relaxed) {
                 return Vec::new();
@@ -363,9 +389,10 @@ impl ShardHandle {
             if removed.is_empty() {
                 return removed;
             }
-            if let Some(w) = aof {
+            if aof.is_some() || repl.is_some() {
                 crate::aof_log::log_under_lock(
-                    w,
+                    aof,
+                    repl,
                     self.index,
                     store.db(),
                     &CommandResponse::Ok,
@@ -585,6 +612,26 @@ impl ShardManager {
         self.shared.aof.get()
     }
 
+    /// The replication stream.
+    pub fn repl(&self) -> &Arc<crate::replication::ReplFeed> {
+        &self.shared.repl
+    }
+
+    /// Whether writes produce effect records (for the log or replicas).
+    #[inline]
+    pub fn logging(&self) -> bool {
+        self.shared.aof.get().is_some() || self.shared.repl.producing()
+    }
+
+    /// Replica expiry semantics on every store: an expired key reads as
+    /// missing and is not deleted (the master's `DEL` removes it), and the
+    /// active cycle does not run. Off again on promotion.
+    pub fn set_replica_expiry(&self, on: bool) {
+        for shard in &self.shards {
+            shard.with_store_mut_unlogged(|s| s.set_replica_expiry(on));
+        }
+    }
+
     /// Stop every store from changing: set the flag each command checks under
     /// its shard's lock, then take and release each lock. When this returns,
     /// every change made so far has also been handed to the log writer (same
@@ -714,7 +761,15 @@ impl ShardManager {
         if outermost {
             HELD_OWNER.with(|o| o.set(me));
         }
-        HeldShards { guards, outermost }
+        let repl = (outermost && self.shared.repl.producing()).then(|| {
+            self.shared.repl.begin_tx();
+            self.shared.repl.clone()
+        });
+        HeldShards {
+            guards,
+            outermost,
+            repl,
+        }
     }
 
     /// Shard `idx`'s store while `held` holds it (shared borrow, for
@@ -748,6 +803,15 @@ impl ShardManager {
     /// [`lock_shards`](Self::lock_shards) for every shard.
     pub fn lock_all(&self) -> HeldShards<'_> {
         self.lock_shards(0..self.num_shards)
+    }
+
+    /// The shard holding the keys of cluster slot `slot` (keys go to the
+    /// shard of their slot, see `HASH_SCHEME`).
+    pub fn shard_for_slot(&self, slot: u16) -> &ShardHandle {
+        if self.solo || self.num_shards == 1 {
+            return &self.shards[0];
+        }
+        &self.shards[slot as usize % self.num_shards]
     }
 
     #[inline]

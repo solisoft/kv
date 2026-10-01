@@ -622,6 +622,44 @@ fn capture_shard(
     })
 }
 
+/// Begin a point-in-time snapshot of every shard at one instant, and run
+/// `at_instant` inside that instant (replication registers its replica
+/// there, so the snapshot and the stream that follows it meet exactly).
+/// Each shard's snapshot is then serialized with [`snapshot_step`], a step
+/// at a time, while commands keep running (see `capture_shard_stepped`).
+///
+/// False — and nothing begun — when a shard already has a snapshot running
+/// (a `BGSAVE`); the caller retries.
+pub fn begin_snapshot_everywhere(shards: &ShardManager, at_instant: impl FnOnce()) -> bool {
+    let _held = shards.lock_all();
+    let mut begun = Vec::new();
+    for i in 0..shards.num_shards() {
+        let ok = shards
+            .shard(i)
+            .with_store_mut_unlogged(|s| s.begin_snapshot(rdb::snapshot_encoder));
+        if !ok {
+            for j in begun {
+                shards
+                    .shard(j)
+                    .with_store_mut_unlogged(|s: &mut solikv_core::ShardStore| s.abort_snapshot());
+            }
+            return false;
+        }
+        begun.push(i);
+    }
+    at_instant();
+    true
+}
+
+/// One step of shard `i`'s snapshot begun by [`begin_snapshot_everywhere`]:
+/// the bytes serialized, and whether the shard is done. In solo mode, call
+/// it on the runtime's thread only.
+pub fn snapshot_step(shards: &ShardManager, i: usize) -> (Vec<u8>, bool) {
+    shards
+        .shard(i)
+        .with_store_mut_unlogged(|s| s.snapshot_step(SNAPSHOT_STEP))
+}
+
 /// Entries serialized per lock hold by a stepped snapshot: small enough
 /// that commands queued on the shard wait well under a millisecond.
 const SNAPSHOT_STEP: usize = 1024;

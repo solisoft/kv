@@ -302,7 +302,19 @@ pub struct CommandEngine {
     /// Settings the engine does not act on but `CONFIG GET` reports (bind,
     /// logfile, …), as the server started with them.
     static_config: parking_lot::RwLock<Vec<(String, String)>>,
+    /// The server's replication link (`REPLICAOF`), once installed.
+    repl_ctl: OnceLock<Arc<dyn crate::replication::ReplController>>,
+    /// `replica-read-only`: clients of a replica may not write.
+    replica_read_only: std::sync::atomic::AtomicBool,
+    /// Told about every `PUBLISH` and `SPUBLISH` (cluster mode relays them
+    /// to the other nodes, as Redis Cluster does).
+    publish_hook: OnceLock<PublishHook>,
+    /// Clients' writes wait until this wall-clock ms (manual failover).
+    writes_paused_until: AtomicU64,
 }
+
+/// See `CommandEngine::set_publish_hook`: `(channel, message, shard)`.
+pub type PublishHook = Box<dyn Fn(&[u8], &[u8], bool) + Send + Sync>;
 
 /// The `maxmemory-policy` values, in the order `maxmemory_policy` stores
 /// them.
@@ -355,7 +367,100 @@ impl CommandEngine {
             idle_timeout: AtomicU64::new(0),
             config_file: parking_lot::RwLock::new(None),
             static_config: parking_lot::RwLock::new(Vec::new()),
+            repl_ctl: OnceLock::new(),
+            replica_read_only: std::sync::atomic::AtomicBool::new(true),
+            publish_hook: OnceLock::new(),
+            writes_paused_until: AtomicU64::new(0),
         }
+    }
+
+    /// Hold clients' writes for `ms` (0 releases them now).
+    pub fn pause_writes(&self, ms: u64) {
+        let until = if ms == 0 {
+            0
+        } else {
+            solikv_core::now_millis().saturating_add(ms)
+        };
+        self.writes_paused_until.store(until, Ordering::Release);
+    }
+
+    /// Whether clients' writes must wait now (one relaxed load when not).
+    #[inline]
+    pub fn writes_paused(&self) -> bool {
+        let until = self.writes_paused_until.load(Ordering::Relaxed);
+        until != 0 && solikv_core::now_millis() < until
+    }
+
+    /// Whether `key` exists (live) in database `db`.
+    pub fn key_exists(&self, db: u32, key: &[u8]) -> bool {
+        let _db = DbGuard::enter(db);
+        self.shards
+            .shard_for_key_bytes(key)
+            .with_store(|s| s.peek_in(db, key).is_some())
+    }
+
+    /// Cluster mode: index database 0's keys by hash slot.
+    pub fn enable_slot_index(&self) {
+        for i in 0..self.shards.num_shards() {
+            self.shards
+                .shard(i)
+                .with_store_mut_unlogged(|s| s.enable_slot_index());
+        }
+    }
+
+    /// `CLUSTER COUNTKEYSINSLOT`.
+    pub fn count_keys_in_slot(&self, slot: u16) -> u64 {
+        self.shards
+            .shard_for_slot(slot)
+            .with_store(|s| s.count_in_slot(slot)) as u64
+    }
+
+    /// `CLUSTER GETKEYSINSLOT`.
+    pub fn keys_in_slot(&self, slot: u16, count: usize) -> Vec<Bytes> {
+        self.shards
+            .shard_for_slot(slot)
+            .with_store(|s| s.keys_in_slot(slot, count))
+    }
+
+    /// Put `entry` at `key` in database `db`, logged like any write (a
+    /// replica loading its master's snapshot, or a `#PUT` record of its
+    /// stream).
+    pub fn put_entry(&self, db: u32, key: Bytes, entry: solikv_core::types::KeyEntry) {
+        let _db = DbGuard::enter(db);
+        self.shards
+            .shard_for_key(&key)
+            .execute_with_effects(|store, fx| {
+                store.insert_entry(key.clone(), entry);
+                fx.put_key(store, &key);
+                CommandResponse::ok()
+            });
+    }
+
+    /// Install the hook every `PUBLISH` calls (once).
+    pub fn set_publish_hook(&self, hook: PublishHook) {
+        let _ = self.publish_hook.set(hook);
+    }
+
+    /// The replication stream of this node.
+    pub fn repl(&self) -> &Arc<crate::replication::ReplFeed> {
+        self.shards.repl()
+    }
+
+    /// Install the server's replication link (once).
+    pub fn set_repl_controller(&self, ctl: Arc<dyn crate::replication::ReplController>) {
+        let _ = self.repl_ctl.set(ctl);
+    }
+
+    pub fn repl_controller(&self) -> Option<&Arc<dyn crate::replication::ReplController>> {
+        self.repl_ctl.get()
+    }
+
+    pub fn set_replica_read_only(&self, on: bool) {
+        self.replica_read_only.store(on, Ordering::Relaxed);
+    }
+
+    pub fn replica_read_only(&self) -> bool {
+        self.replica_read_only.load(Ordering::Relaxed)
     }
 
     pub fn acl(&self) -> &Arc<crate::acl::Acl> {
@@ -694,8 +799,22 @@ impl CommandEngine {
         let write = spec.is_some_and(|s| s.is_write())
             || matches!(id, Cmd::EVAL | Cmd::EVALSHA | Cmd::FCALL);
 
+        // A read-only replica takes writes from its master only. Scripts are
+        // let in: the writes they attempt come back through here.
+        if write
+            && self.shards.repl().is_replica()
+            && !matches!(id, Cmd::EVAL | Cmd::EVALSHA | Cmd::FCALL)
+            && self.replica_read_only.load(Ordering::Relaxed)
+            && !crate::replication::applying_master_stream()
+            && !solikv_core::is_loading()
+        {
+            return CommandResponse::error("READONLY You can't write against a read only replica.");
+        }
+
         if self.maxmemory.load(Ordering::Relaxed) != 0
             && spec.is_some_and(|c| c.has(crate::commands::F_DENYOOM))
+            // A replica's memory follows its master's (`replica-ignore-maxmemory`).
+            && !self.shards.repl().is_replica()
         {
             if let Err(oom) = self.free_memory() {
                 return oom;
@@ -710,7 +829,7 @@ impl CommandEngine {
         // With the log on, tell the shards what this command logs as; they
         // log it under their lock (see `aof_log`). The frame is set for every
         // command so a read nested in a script never inherits a write's.
-        let response = if self.shards.aof().is_some() {
+        let response = if self.shards.logging() {
             let mode = crate::aof_log::mode(name, write);
             let cmd = crate::aof_log::AutoCmd::new(name, args, mode);
             let _frame = crate::aof_log::FrameGuard::enter(mode, &cmd);
@@ -1272,6 +1391,9 @@ impl CommandEngine {
             Cmd::LATENCY => self.stats.latency_command(args),
             Cmd::MEMORY => self.memory_command(args),
             Cmd::SPUBLISH => {
+                if let Some(hook) = self.publish_hook.get() {
+                    hook(&args[0], &args[1], true);
+                }
                 let n = self.pubsub.publish_shard(&args[0], args[1].clone());
                 CommandResponse::integer(n as i64)
             }
@@ -1281,18 +1403,33 @@ impl CommandEngine {
                 if args.len() != 2 {
                     return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
-                // Already a master: `NO ONE` is true as it stands. Anything
-                // else used to answer OK and replicate nothing.
+                let Some(ctl) = self.repl_ctl.get() else {
+                    if args[0].eq_ignore_ascii_case(b"NO") && args[1].eq_ignore_ascii_case(b"ONE") {
+                        return CommandResponse::ok();
+                    }
+                    return CommandResponse::error(
+                        "ERR replication is not available in this server configuration",
+                    );
+                };
                 if args[0].eq_ignore_ascii_case(b"NO") && args[1].eq_ignore_ascii_case(b"ONE") {
-                    return CommandResponse::ok();
+                    return match ctl.no_one() {
+                        Ok(()) => CommandResponse::ok(),
+                        Err(e) => CommandResponse::error(e),
+                    };
                 }
-                CommandResponse::error("ERR replication is not supported by this server yet")
+                let host = String::from_utf8_lossy(&args[0]).to_string();
+                let Some(port) = std::str::from_utf8(&args[1])
+                    .ok()
+                    .and_then(|p| p.parse::<u16>().ok())
+                else {
+                    return CommandResponse::error("ERR Invalid master port");
+                };
+                match ctl.replicaof(host, port) {
+                    Ok(()) => CommandResponse::ok(),
+                    Err(e) => CommandResponse::error(e),
+                }
             }
-            Cmd::ROLE => CommandResponse::array(vec![
-                CommandResponse::bulk_string("master"),
-                CommandResponse::integer(self.replication_offset.load(Ordering::Relaxed) as i64),
-                CommandResponse::array(vec![]),
-            ]),
+            Cmd::ROLE => self.role_reply(),
 
             // ---- String commands ----
             Cmd::GET => {
@@ -1978,7 +2115,7 @@ impl CommandEngine {
                 }
             }
             Cmd::DUMP => self.dump(args),
-            Cmd::RESTORE => self.restore(args),
+            Cmd::RESTORE | Cmd::RESTORE_ASKING => self.restore(args),
             Cmd::COPY => self.copy(args),
             Cmd::SORT => self.sort(false, args),
             Cmd::SORT_RO => self.sort(true, args),
@@ -1991,7 +2128,11 @@ impl CommandEngine {
             Cmd::GEORADIUS_RO => self.georadius(false, true, args),
             Cmd::GEORADIUSBYMEMBER => self.georadius(true, false, args),
             Cmd::GEORADIUSBYMEMBER_RO => self.georadius(true, true, args),
-            Cmd::WAIT => CommandResponse::integer(0),
+            // Inside MULTI or a script it cannot block: the count now.
+            Cmd::WAIT => {
+                let feed = self.repl();
+                CommandResponse::integer(feed.acked_at_least(feed.offset()) as i64)
+            }
 
             // ---- List commands ----
             Cmd::LPUSH => {
@@ -3582,6 +3723,11 @@ impl CommandEngine {
                 }
                 let channel = args[0].clone();
                 let message = args[1].clone();
+                // Replicas' subscribers hear it too, as in Redis.
+                self.repl().command(b"PUBLISH", &[&args[0], &args[1]]);
+                if let Some(hook) = self.publish_hook.get() {
+                    hook(&args[0], &args[1], false);
+                }
                 let count = self.pubsub.publish(channel, message);
                 CommandResponse::integer(count as i64)
             }
@@ -3787,7 +3933,22 @@ impl CommandEngine {
                 }
                 self.run_function(&name, keys, argv, ro || meta.flags.no_writes)
             }
-            Cmd::FUNCTION => self.function_command(args),
+            Cmd::FUNCTION => {
+                let resp = self.function_command(args);
+                // Libraries are not in the data the stream carries: their
+                // changes go to replicas as the commands themselves.
+                if !resp.is_error()
+                    && args.first().is_some_and(|s| {
+                        [&b"LOAD"[..], b"DELETE", b"FLUSH", b"RESTORE"]
+                            .iter()
+                            .any(|w| s.eq_ignore_ascii_case(w))
+                    })
+                {
+                    let refs: Vec<&[u8]> = args.iter().map(|a| a.as_ref()).collect();
+                    self.repl().command(b"FUNCTION", &refs);
+                }
+                resp
+            }
             Cmd::SCRIPT => {
                 let sub = Upper::new(&args[0]);
                 match sub.as_str() {

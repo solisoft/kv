@@ -496,9 +496,12 @@ async fn server_introspection_tells_the_truth() {
     );
     let cfg: Vec<String> = q(&mut c, &["CONFIG", "GET", "data*"]).await.unwrap();
     assert_eq!(cfg, vec!["databases", "16"]);
+    // This in-process server has no replication link installed (the binary
+    // does: see replication_6.rs), so REPLICAOF says so instead of
+    // pretending.
     assert!(
         err_text(q::<()>(&mut c, &["REPLICAOF", "10.0.0.1", "6379"]).await)
-            .contains("not supported")
+            .contains("not available")
     );
     let _: () = q(&mut c, &["REPLICAOF", "NO", "ONE"]).await.unwrap();
     let subs: Vec<Value> = q(&mut c, &["PUBSUB", "NUMSUB", "nobody"]).await.unwrap();

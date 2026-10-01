@@ -278,6 +278,11 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     info.set_push(push_tx);
 
     let mut decoder = CommandDecoder::new();
+    // What a replica announces (`REPLCONF`) before it asks to sync.
+    let mut repl_hs = crate::replication::Handshake::default();
+    // Cluster mode: `ASKING` (for the next command only) and `READONLY`.
+    let mut asking = false;
+    let mut readonly_conn = false;
     loop {
         // ── Phase 1: Decode every complete command in the buffer ──
         // Tighter limits apply until the connection has AUTHed: a
@@ -380,6 +385,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             info.touch(&last.name, commands.len());
         }
         let fast_path = conn.authenticated
+            && !asking
             && !session.in_multi()
             && commands
                 .iter()
@@ -389,10 +395,20 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             // Pre-reserve write buffer for batch responses
             write_buf.reserve(commands.len() * 16);
             for cmd in commands {
-                // Check for MOVED redirect in cluster mode
-                if let Some(moved_frame) = check_cluster_moved(&cluster, &cmd.name, &cmd.args) {
-                    encode_frame(&moved_frame, &mut write_buf);
+                // Cluster mode: MOVED, ASK, CROSSSLOT, CLUSTERDOWN.
+                if let Some(redirect) = cluster_redirect(
+                    &cluster,
+                    &engine,
+                    &cmd.name,
+                    &cmd.args,
+                    false,
+                    readonly_conn,
+                ) {
+                    encode_frame(&redirect, &mut write_buf);
                     continue;
+                }
+                if engine.writes_paused() {
+                    wait_while_paused(&engine, &cmd.name).await;
                 }
                 if engine.script_running() {
                     if !write_buf.is_empty() {
@@ -522,6 +538,99 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     continue;
                 }
 
+                // Replication: the handshake a replica runs, then the link.
+                if !session.in_multi()
+                    && matches!(cmd.name.as_str(), "REPLCONF" | "PSYNC" | "SYNC" | "WAIT")
+                {
+                    if let Some(denied) = engine.acl_gate(&mut session, &cmd.name, &cmd.args) {
+                        encode_response(&denied, &mut write_buf);
+                        continue;
+                    }
+                    match cmd.name.as_str() {
+                        "REPLCONF" => {
+                            if let Some(reply) = replconf(&cmd.args, &mut repl_hs) {
+                                encode_frame(&reply, &mut write_buf);
+                            }
+                        }
+                        "WAIT" => {
+                            let parsed = (cmd.args.len() == 2)
+                                .then(|| {
+                                    let n = std::str::from_utf8(&cmd.args[0])
+                                        .ok()?
+                                        .parse::<i64>()
+                                        .ok()?;
+                                    let t = std::str::from_utf8(&cmd.args[1])
+                                        .ok()?
+                                        .parse::<i64>()
+                                        .ok()?;
+                                    Some((n, t))
+                                })
+                                .flatten();
+                            let frame = match parsed {
+                                None if cmd.args.len() != 2 => RespFrame::error(
+                                    "ERR wrong number of arguments for 'wait' command",
+                                ),
+                                Some((n, t)) if n >= 0 && t >= 0 => {
+                                    if !write_buf.is_empty() {
+                                        socket.write_all(&write_buf).await?;
+                                        write_buf.clear();
+                                    }
+                                    let got =
+                                        crate::replication::wait(&engine, n as usize, t as u64)
+                                            .await;
+                                    RespFrame::Integer(got as i64)
+                                }
+                                Some((_, t)) if t < 0 => {
+                                    RespFrame::error("ERR timeout is negative")
+                                }
+                                _ => {
+                                    RespFrame::error("ERR value is out of range, must be positive")
+                                }
+                            };
+                            encode_frame(&frame, &mut write_buf);
+                        }
+                        _ => {
+                            // PSYNC replid offset | SYNC: this connection
+                            // becomes the replica's link.
+                            let psync = if cmd.name == "PSYNC" {
+                                if cmd.args.len() != 2 {
+                                    encode_frame(
+                                        &RespFrame::error(
+                                            "ERR wrong number of arguments for 'psync' command",
+                                        ),
+                                        &mut write_buf,
+                                    );
+                                    continue;
+                                }
+                                let id = String::from_utf8_lossy(&cmd.args[0]).to_string();
+                                let off = std::str::from_utf8(&cmd.args[1])
+                                    .ok()
+                                    .and_then(|s| s.parse::<i64>().ok())
+                                    .unwrap_or(-1);
+                                Some((id, off))
+                            } else {
+                                None
+                            };
+                            if !write_buf.is_empty() {
+                                socket.write_all(&write_buf).await?;
+                                write_buf.clear();
+                            }
+                            let pending = read_buf.split();
+                            crate::replication::serve_replica(
+                                &mut socket,
+                                pending,
+                                engine.clone(),
+                                peer_addr,
+                                repl_hs.clone(),
+                                psync,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
+
                 if !session.in_multi()
                     && matches!(
                         cmd.name.as_str(),
@@ -535,6 +644,18 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 match cmd.name.as_str() {
                     "SSUBSCRIBE" if !session.in_multi() => {
+                        // Shard channels live in the slot of their name.
+                        if let Some(redirect) = cluster_redirect(
+                            &cluster,
+                            &engine,
+                            &cmd.name,
+                            &cmd.args,
+                            false,
+                            readonly_conn,
+                        ) {
+                            encode_frame(&redirect, &mut write_buf);
+                            continue;
+                        }
                         for channel in &cmd.args {
                             let key = solikv_pubsub::broker::shard_channel(channel);
                             if !conn.ssubscriptions.contains(&key) {
@@ -701,192 +822,40 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         return Ok(());
                     }
                     "CLUSTER" => {
-                        if let Some(ref cluster_mgr) = cluster {
-                            if cmd.args.is_empty() {
-                                encode_frame(
-                                    &RespFrame::error(
-                                        "ERR wrong number of arguments for 'cluster' command",
-                                    ),
-                                    &mut write_buf,
-                                );
-                                continue;
-                            }
-                            let sub_cmd = std::str::from_utf8(&cmd.args[0])
-                                .unwrap_or("")
-                                .to_uppercase();
-                            match sub_cmd.as_str() {
-                                "INFO" => {
-                                    let info = cluster_mgr.cluster_info();
-                                    encode_frame(
-                                        &RespFrame::BulkString(Bytes::from(info)),
-                                        &mut write_buf,
-                                    );
-                                }
-                                "NODES" => {
-                                    let nodes = cluster_mgr.cluster_nodes();
-                                    encode_frame(
-                                        &RespFrame::BulkString(Bytes::from(nodes)),
-                                        &mut write_buf,
-                                    );
-                                }
-                                "SLOTS" => {
-                                    let slots = cluster_mgr.cluster_slots();
-                                    let mut result = Vec::new();
-                                    for slot_info in slots {
-                                        let mut slot_array = Vec::new();
-                                        for part in slot_info {
-                                            slot_array
-                                                .push(RespFrame::BulkString(Bytes::from(part)));
-                                        }
-                                        result.push(RespFrame::Array(slot_array));
-                                    }
-                                    encode_frame(&RespFrame::Array(result), &mut write_buf);
-                                }
-                                "MEET" => {
-                                    if cmd.args.len() != 3 {
-                                        encode_frame(
-                                            &RespFrame::error("ERR CLUSTER MEET ip port"),
-                                            &mut write_buf,
-                                        );
-                                        continue;
-                                    }
-                                    let ip =
-                                        std::str::from_utf8(&cmd.args[1]).unwrap_or("127.0.0.1");
-                                    let port = std::str::from_utf8(&cmd.args[2])
-                                        .unwrap_or("7000")
-                                        .parse::<u16>()
-                                        .unwrap_or(7000);
-                                    cluster_mgr.meet(ip.to_string(), port);
-                                    encode_frame(
-                                        &RespFrame::SimpleString(Bytes::from("OK")),
-                                        &mut write_buf,
-                                    );
-                                }
-                                "ADDSLOTS" => {
-                                    if cmd.args.len() < 2 {
-                                        encode_frame(
-                                            &RespFrame::error(
-                                                "ERR CLUSTER ADDSLOTS slot [slot ...]",
-                                            ),
-                                            &mut write_buf,
-                                        );
-                                        continue;
-                                    }
-                                    // Parsed, not `unwrap_or(0)`. That default
-                                    // made `CLUSTER ADDSLOTS abc` claim slot 0 —
-                                    // a silent wrong assignment, and slot 0 is
-                                    // where every empty-string key lands.
-                                    let mut failed = false;
-                                    for slot_arg in &cmd.args[1..] {
-                                        let slot_str = std::str::from_utf8(slot_arg).unwrap_or("");
-                                        let parsed = match slot_str.split_once('-') {
-                                            Some((start, end)) => {
-                                                match (start.parse::<u16>(), end.parse::<u16>()) {
-                                                    (Ok(s), Ok(e)) => Ok((s, e)),
-                                                    _ => Err(()),
-                                                }
-                                            }
-                                            None => match slot_str.parse::<u16>() {
-                                                Ok(slot) => Ok((slot, slot)),
-                                                Err(_) => Err(()),
-                                            },
-                                        };
-                                        let Ok((start, end)) = parsed else {
-                                            encode_frame(
-                                                &RespFrame::error(format!(
-                                                    "ERR {:?} is not a slot or a slot range",
-                                                    slot_str
-                                                )),
-                                                &mut write_buf,
-                                            );
-                                            failed = true;
-                                            break;
-                                        };
-                                        if let Err(e) = cluster_mgr.add_slots(start, end) {
-                                            encode_frame(&RespFrame::error(e), &mut write_buf);
-                                            failed = true;
-                                            break;
-                                        }
-                                    }
-                                    if failed {
-                                        continue;
-                                    }
-                                    if write_buf.is_empty()
-                                        || !matches!(write_buf.last(), Some(b'*'))
-                                    {
-                                        encode_frame(
-                                            &RespFrame::SimpleString(Bytes::from("OK")),
-                                            &mut write_buf,
-                                        );
-                                    }
-                                }
-                                "DELSLOTS" => {
-                                    if cmd.args.len() < 2 {
-                                        encode_frame(
-                                            &RespFrame::error(
-                                                "ERR CLUSTER DELSLOTS slot [slot ...]",
-                                            ),
-                                            &mut write_buf,
-                                        );
-                                        continue;
-                                    }
-                                    // Parsed like ADDSLOTS. `unwrap_or(0)` made
-                                    // `DELSLOTS abc` release slot 0, and an
-                                    // out-of-range slot indexed past the table.
-                                    let mut failed = false;
-                                    for slot_arg in &cmd.args[1..] {
-                                        let slot_str = std::str::from_utf8(slot_arg).unwrap_or("");
-                                        let Some((start, end)) = parse_slot_range(slot_str) else {
-                                            encode_frame(
-                                                &RespFrame::error(format!(
-                                                    "ERR {:?} is not a slot or a slot range",
-                                                    slot_str
-                                                )),
-                                                &mut write_buf,
-                                            );
-                                            failed = true;
-                                            break;
-                                        };
-                                        if let Err(e) = cluster_mgr.del_slots(start, end) {
-                                            encode_frame(&RespFrame::error(e), &mut write_buf);
-                                            failed = true;
-                                            break;
-                                        }
-                                    }
-                                    if !failed {
-                                        encode_frame(
-                                            &RespFrame::SimpleString(Bytes::from("OK")),
-                                            &mut write_buf,
-                                        );
-                                    }
-                                }
-                                "KEYSLOT" => {
-                                    if cmd.args.len() != 2 {
-                                        encode_frame(
-                                            &RespFrame::error("ERR CLUSTER KEYSLOT key"),
-                                            &mut write_buf,
-                                        );
-                                        continue;
-                                    }
-                                    let slot = cluster_mgr.key_slot(&cmd.args[1]);
-                                    encode_frame(&RespFrame::Integer(slot as i64), &mut write_buf);
-                                }
-                                _ => {
-                                    encode_frame(
-                                        &RespFrame::error(format!(
-                                            "ERR Unknown cluster subcommand '{}'",
-                                            sub_cmd
-                                        )),
-                                        &mut write_buf,
-                                    );
+                        if let Some(denied) = engine.acl_gate(&mut session, &cmd.name, &cmd.args) {
+                            encode_response(&denied, &mut write_buf);
+                            continue;
+                        }
+                        match &cluster {
+                            Some(c) => {
+                                let reply = c.command(&cmd.args);
+                                if session.resp >= 3 {
+                                    encode_response3(&reply, &mut write_buf);
+                                } else {
+                                    encode_response(&reply, &mut write_buf);
                                 }
                             }
-                        } else {
+                            None => encode_frame(
+                                &RespFrame::error("ERR This instance has cluster support disabled"),
+                                &mut write_buf,
+                            ),
+                        }
+                        continue;
+                    }
+                    "ASKING" | "READONLY" | "READWRITE" => {
+                        if cluster.is_none() {
                             encode_frame(
                                 &RespFrame::error("ERR This instance has cluster support disabled"),
                                 &mut write_buf,
                             );
+                            continue;
                         }
+                        match cmd.name.as_str() {
+                            "ASKING" => asking = true,
+                            "READONLY" => readonly_conn = true,
+                            _ => readonly_conn = false,
+                        }
+                        encode_frame(&RespFrame::ok(), &mut write_buf);
                         continue;
                     }
                     _ => {}
@@ -904,12 +873,50 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     continue;
                 }
                 // Queued inside MULTI (the engine queues), or run now.
+                let asked = std::mem::take(&mut asking) || cmd.name == "RESTORE-ASKING";
                 if !session.in_multi() {
-                    if let Some(moved_frame) = check_cluster_moved(&cluster, &cmd.name, &cmd.args) {
-                        encode_frame(&moved_frame, &mut write_buf);
+                    if let Some(redirect) = cluster_redirect(
+                        &cluster,
+                        &engine,
+                        &cmd.name,
+                        &cmd.args,
+                        asked,
+                        readonly_conn,
+                    ) {
+                        encode_frame(&redirect, &mut write_buf);
                         continue;
                     }
+                    if engine.writes_paused() {
+                        if !write_buf.is_empty() {
+                            socket.write_all(&write_buf).await?;
+                            write_buf.clear();
+                        }
+                        wait_while_paused(&engine, &cmd.name).await;
+                    }
                 }
+                // `MIGRATE` talks to another server: run it here, without
+                // holding anything while it waits.
+                if cmd.name == "MIGRATE" && !session.in_multi() {
+                    if let Some(denied) = engine.acl_gate(&mut session, &cmd.name, &cmd.args) {
+                        encode_response(&denied, &mut write_buf);
+                        continue;
+                    }
+                    if !write_buf.is_empty() {
+                        socket.write_all(&write_buf).await?;
+                        write_buf.clear();
+                    }
+                    let reply = migrate(&engine, session.db, &cmd.args).await;
+                    encode_frame(&reply, &mut write_buf);
+                    continue;
+                }
+                let cmd = if cmd.name == "RESTORE-ASKING" {
+                    ParsedCommand {
+                        name: solikv_resp::parser::Name::from_static("RESTORE"),
+                        ..cmd
+                    }
+                } else {
+                    cmd
+                };
                 if engine.script_running() {
                     if !write_buf.is_empty() {
                         socket.write_all(&write_buf).await?;
@@ -1139,6 +1146,15 @@ fn needs_connection_state(name: &str) -> bool {
             | "MONITOR"
             | "SSUBSCRIBE"
             | "SUNSUBSCRIBE"
+            | "REPLCONF"
+            | "PSYNC"
+            | "SYNC"
+            | "WAIT"
+            | "ASKING"
+            | "READONLY"
+            | "READWRITE"
+            | "MIGRATE"
+            | "RESTORE-ASKING"
     )
 }
 
@@ -1902,86 +1918,325 @@ fn encode_pubsub_message(msg: &PubSubMessage, proto: u8, dst: &mut BytesMut) {
     bulk(dst, &msg.message);
 }
 
-/// The key a command is routed by in cluster mode: its first key, from the
-/// command table (every keyed command, not a hand-kept list).
-fn get_command_key<'a>(name: &str, args: &'a [bytes::Bytes]) -> Option<&'a [u8]> {
-    let spec = solikv_engine::commands::lookup(name)?;
-    match spec.keys {
-        solikv_engine::commands::Keys::None => None,
-        solikv_engine::commands::Keys::Range { first, .. } => args
-            .get((first as usize).checked_sub(1)?)
-            .map(|k| k.as_ref()),
-        solikv_engine::commands::Keys::Movable(_) => spec
-            .key_positions(args)
-            .first()
-            .and_then(|&i| args.get(i))
-            .map(|k| k.as_ref()),
-    }
-}
-
-/// What to say when a slot has an owner whose address cannot be read.
+/// Cluster mode: where a command's keys are served, as a redirection to
+/// answer instead of running it — or `None` to run it here.
 ///
-/// A different fault from an unassigned slot, and it gets a different sentence:
-/// somebody claimed this slot under an identifier that carries no address, so the
-/// cluster knows who owns it and cannot say where. Redirecting to a guessed
-/// address would send the client somewhere nobody chose.
-fn unroutable_owner(slot: u16, owner: &str) -> String {
-    format!(
-        "CLUSTERDOWN Hash slot {} is claimed by {:?}, which is not an address this cluster can \
-         redirect to",
-        slot, owner
-    )
-}
-
-fn check_cluster_moved(
+/// Redis Cluster's rules: every key of a command must hash to one slot
+/// (`-CROSSSLOT`); a slot served elsewhere is `-MOVED` (a `READONLY` client
+/// of a replica may read its master's slots); a slot migrating away is
+/// `-ASK` for keys no longer here, `-TRYAGAIN` when a multi-key command
+/// finds some and not others; an importing slot is served after `ASKING`.
+fn cluster_redirect(
     cluster: &Option<Arc<ClusterManager>>,
-    cmd_name: &str,
+    engine: &CommandEngine,
+    name: &str,
     args: &[bytes::Bytes],
+    asking: bool,
+    readonly: bool,
 ) -> Option<RespFrame> {
     let cluster = cluster.as_ref()?;
-    if !cluster.is_enabled() {
-        return None;
-    }
-
-    let key = get_command_key(cmd_name, args)?;
-    if let solikv_cluster::Route::Remote(slot) = cluster.route(key) {
-        // The owner's *address*, resolved through gossip. Ownership is recorded
-        // by node id — the stable identity — so the address is looked up at
-        // redirect time rather than stored beside the claim, where it would go
-        // stale the moment a node moved.
-        if let Some((ip, port)) = cluster.get_slot_owner_address(slot) {
-            return Some(RespFrame::Error(format!("MOVED {} {}:{}", slot, ip, port)));
+    let spec = solikv_engine::commands::lookup(name)?;
+    let keys: smallkeys::Keys<'_> = match spec.keys {
+        solikv_engine::commands::Keys::None => return None,
+        solikv_engine::commands::Keys::Range {
+            first,
+            last,
+            step: _,
+        } if first == last && first > 0 => {
+            smallkeys::Keys::One(args.get(first as usize - 1)?.as_ref())
         }
-
-        // Two different failures, two different sentences. Both used to be
-        // `MOVED <slot> 127.0.0.1:7000` — a port nothing in this cluster is
-        // required to be on. A client follows a MOVED, so it would connect
-        // there, fail, and report a connection error against an address the
-        // operator never configured.
-        return Some(RespFrame::Error(
-            match cluster.get_slot_owner_for_key(key) {
-                Some(owner) => unroutable_owner(slot, &owner),
-                None => format!(
-                    "CLUSTERDOWN Hash slot {} is not served: no node claims it",
-                    slot
-                ),
-            },
-        ));
+        _ => smallkeys::Keys::Many(
+            spec.key_positions(args)
+                .into_iter()
+                .filter_map(|i| args.get(i).map(|k| k.as_ref()))
+                .collect(),
+        ),
+    };
+    let first = keys.first()?;
+    let slot = cluster.key_slot(first);
+    if let smallkeys::Keys::Many(v) = &keys {
+        if v.iter().any(|k| cluster.key_slot(k) != slot) {
+            return Some(RespFrame::Error(
+                "CROSSSLOT Keys in request don't hash to the same slot".into(),
+            ));
+        }
     }
-
-    None
-}
-
-/// `N` or `N-M`, each below 16384.
-fn parse_slot_range(text: &str) -> Option<(u16, u16)> {
-    let (start, end) = match text.split_once('-') {
-        Some((start, end)) => (start.parse::<u16>().ok()?, end.parse::<u16>().ok()?),
-        None => {
-            let slot = text.parse::<u16>().ok()?;
-            (slot, slot)
+    let moved = |cluster: &ClusterManager| -> RespFrame {
+        match cluster.slot_owner_addr(slot) {
+            Some((ip, port)) => RespFrame::Error(format!("MOVED {} {}:{}", slot, ip, port)),
+            None => RespFrame::Error(format!("CLUSTERDOWN Hash slot {} is not served", slot)),
         }
     };
-    (start <= end && end < 16384).then_some((start, end))
+    let present =
+        |keys: &smallkeys::Keys<'_>| keys.iter().filter(|k| engine.key_exists(0, k)).count();
+    match cluster.slot_route(slot) {
+        solikv_cluster::SlotRoute::Local => None,
+        solikv_cluster::SlotRoute::Down => {
+            Some(RespFrame::Error("CLUSTERDOWN The cluster is down".into()))
+        }
+        solikv_cluster::SlotRoute::Moved => {
+            if readonly && !spec.is_write() && cluster.master_serves(slot) {
+                return None;
+            }
+            Some(moved(cluster))
+        }
+        solikv_cluster::SlotRoute::Special => {
+            if cluster.slot_owner(slot).as_deref() == Some(cluster.node_id().as_str()) {
+                // Migrating away: what is still here is served here.
+                let (ip, port) = cluster.migrating_to(slot)?;
+                let here = present(&keys);
+                if here == keys.len() {
+                    None
+                } else if here == 0 {
+                    Some(RespFrame::Error(format!("ASK {} {}:{}", slot, ip, port)))
+                } else {
+                    Some(RespFrame::Error(
+                        "TRYAGAIN Multiple keys request during rehashing of slot".into(),
+                    ))
+                }
+            } else if asking && cluster.is_importing(slot) {
+                if keys.len() > 1 && present(&keys) != keys.len() {
+                    return Some(RespFrame::Error(
+                        "TRYAGAIN Multiple keys request during rehashing of slot".into(),
+                    ));
+                }
+                None
+            } else if readonly && !spec.is_write() && cluster.master_serves(slot) {
+                None
+            } else {
+                Some(moved(cluster))
+            }
+        }
+    }
+}
+
+/// The keys of one command, without a heap allocation for the common case.
+mod smallkeys {
+    pub enum Keys<'a> {
+        One(&'a [u8]),
+        Many(Vec<&'a [u8]>),
+    }
+
+    impl<'a> Keys<'a> {
+        pub fn first(&self) -> Option<&'a [u8]> {
+            match self {
+                Keys::One(k) => Some(k),
+                Keys::Many(v) => v.first().copied(),
+            }
+        }
+
+        pub fn len(&self) -> usize {
+            match self {
+                Keys::One(_) => 1,
+                Keys::Many(v) => v.len(),
+            }
+        }
+
+        pub fn iter(&self) -> impl Iterator<Item = &'a [u8]> + '_ {
+            let (one, many): (Option<&'a [u8]>, &[&'a [u8]]) = match self {
+                Keys::One(k) => (Some(k), &[]),
+                Keys::Many(v) => (None, v.as_slice()),
+            };
+            one.into_iter().chain(many.iter().copied())
+        }
+    }
+}
+
+/// A write arriving while a manual failover pauses clients waits for the
+/// pause to end (reads go on).
+async fn wait_while_paused(engine: &CommandEngine, name: &str) {
+    let write = solikv_engine::commands::lookup(name).is_some_and(|s| s.is_write());
+    if !write {
+        return;
+    }
+    while engine.writes_paused() {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// `MIGRATE host port key|"" destination-db timeout [COPY] [REPLACE]
+/// [AUTH password | AUTH2 username password] [KEYS key [key ...]]`: move keys
+/// to another server with `DUMP` payloads and `RESTORE-ASKING` (which a
+/// Redis or SoliKV target accepts while it imports the slot), then delete
+/// them here unless `COPY`.
+async fn migrate(engine: &Arc<CommandEngine>, db: u32, args: &[Bytes]) -> RespFrame {
+    if args.len() < 5 {
+        return RespFrame::error("ERR wrong number of arguments for 'migrate' command");
+    }
+    let host = String::from_utf8_lossy(&args[0]).to_string();
+    let Some(port) = std::str::from_utf8(&args[1])
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+    else {
+        return RespFrame::error("ERR value is not an integer or out of range");
+    };
+    let Some(dest_db) = std::str::from_utf8(&args[3])
+        .ok()
+        .and_then(|p| p.parse::<u32>().ok())
+    else {
+        return RespFrame::error("ERR value is not an integer or out of range");
+    };
+    let Some(timeout) = std::str::from_utf8(&args[4])
+        .ok()
+        .and_then(|p| p.parse::<i64>().ok())
+    else {
+        return RespFrame::error("ERR value is not an integer or out of range");
+    };
+    let timeout =
+        std::time::Duration::from_millis(if timeout <= 0 { 1000 } else { timeout as u64 });
+    let (mut copy, mut replace) = (false, false);
+    let mut auth: Option<(Option<Bytes>, Bytes)> = None;
+    let mut keys: Vec<Bytes> = Vec::new();
+    let mut i = 5;
+    while i < args.len() {
+        let a = &args[i];
+        if a.eq_ignore_ascii_case(b"COPY") {
+            copy = true;
+        } else if a.eq_ignore_ascii_case(b"REPLACE") {
+            replace = true;
+        } else if a.eq_ignore_ascii_case(b"AUTH") && i + 1 < args.len() {
+            auth = Some((None, args[i + 1].clone()));
+            i += 1;
+        } else if a.eq_ignore_ascii_case(b"AUTH2") && i + 2 < args.len() {
+            auth = Some((Some(args[i + 1].clone()), args[i + 2].clone()));
+            i += 2;
+        } else if a.eq_ignore_ascii_case(b"KEYS") {
+            if !args[2].is_empty() {
+                return RespFrame::error(
+                    "ERR When using MIGRATE KEYS option, the key argument must be set to the empty string",
+                );
+            }
+            keys.extend(args[i + 1..].iter().cloned());
+            break;
+        } else {
+            return RespFrame::error("ERR syntax error");
+        }
+        i += 1;
+    }
+    if !args[2].is_empty() {
+        keys.push(args[2].clone());
+    }
+    // What to send: the keys that exist, with their TTLs.
+    let mut items: Vec<(Bytes, i64, Bytes)> = Vec::new();
+    for k in &keys {
+        let dump = engine.execute_in_db(db, "DUMP", std::slice::from_ref(k));
+        let CommandResponse::BulkString(payload) = dump else {
+            continue;
+        };
+        let ttl = match engine.execute_in_db(db, "PTTL", std::slice::from_ref(k)) {
+            CommandResponse::Integer(t) if t > 0 => t,
+            _ => 0,
+        };
+        items.push((k.clone(), ttl, payload));
+    }
+    if items.is_empty() {
+        return RespFrame::SimpleString(Bytes::from_static(b"NOKEY"));
+    }
+    let io = async {
+        let mut sock = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+        let _ = sock.set_nodelay(true);
+        let mut out: Vec<u8> = Vec::new();
+        let mut expected = 0usize;
+        if let Some((user, pass)) = &auth {
+            match user {
+                Some(u) => out.extend(solikv_persist::aof::encode_command(b"AUTH", &[u, pass])),
+                None => out.extend(solikv_persist::aof::encode_command(b"AUTH", &[pass])),
+            }
+            expected += 1;
+        }
+        let dbs = dest_db.to_string();
+        out.extend(solikv_persist::aof::encode_command(
+            b"SELECT",
+            &[dbs.as_bytes()],
+        ));
+        expected += 1;
+        for (k, ttl, payload) in &items {
+            let t = ttl.to_string();
+            let mut a: Vec<&[u8]> = vec![k, t.as_bytes(), payload];
+            if replace {
+                a.push(b"REPLACE");
+            }
+            out.extend(solikv_persist::aof::encode_command(b"RESTORE-ASKING", &a));
+            expected += 1;
+        }
+        sock.write_all(&out).await?;
+        // Replies: simple lines (+OK / -ERR ...), one per command.
+        let mut replies = Vec::with_capacity(expected);
+        let mut buf = BytesMut::with_capacity(4096);
+        while replies.len() < expected {
+            if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                let line = buf.split_to(nl + 1);
+                replies.push(String::from_utf8_lossy(&line).trim_end().to_string());
+                continue;
+            }
+            if sock.read_buf(&mut buf).await? == 0 {
+                return Err(std::io::Error::other("target closed the connection"));
+            }
+        }
+        Ok::<Vec<String>, std::io::Error>(replies)
+    };
+    let replies = match tokio::time::timeout(timeout, io).await {
+        Err(_) => return RespFrame::error("IOERR error or timeout reading to target instance"),
+        Ok(Err(e)) => {
+            return RespFrame::error(format!(
+                "IOERR error or timeout connecting to the client: {e}"
+            ))
+        }
+        Ok(Ok(r)) => r,
+    };
+    // AUTH and SELECT first; then one reply per key.
+    let skip = replies.len() - items.len();
+    for r in &replies[..skip] {
+        if let Some(e) = r.strip_prefix('-') {
+            return RespFrame::error(format!("ERR Target instance replied with error: {e}"));
+        }
+    }
+    let mut first_err = None;
+    for ((k, _, _), r) in items.iter().zip(&replies[skip..]) {
+        if let Some(e) = r.strip_prefix('-') {
+            first_err.get_or_insert_with(|| e.to_string());
+            continue;
+        }
+        if !copy {
+            engine.execute_in_db(db, "DEL", std::slice::from_ref(k));
+        }
+    }
+    match first_err {
+        Some(e) => RespFrame::error(format!("ERR Target instance replied with error: {e}")),
+        None => RespFrame::ok(),
+    }
+}
+
+/// `REPLCONF <option> <value> ...` from a would-be replica. `None`: no reply
+/// (`ACK`, which a replica sends on its link, not as a command).
+fn replconf(args: &[Bytes], hs: &mut crate::replication::Handshake) -> Option<RespFrame> {
+    if !args.len().is_multiple_of(2) || args.is_empty() {
+        return Some(RespFrame::error("ERR syntax error"));
+    }
+    for pair in args.chunks(2) {
+        let opt = String::from_utf8_lossy(&pair[0]).to_ascii_lowercase();
+        let val = String::from_utf8_lossy(&pair[1]).to_string();
+        match opt.as_str() {
+            "listening-port" => match val.parse::<u16>() {
+                Ok(p) => hs.listening_port = p,
+                Err(_) => {
+                    return Some(RespFrame::error(
+                        "ERR value is not an integer or out of range",
+                    ))
+                }
+            },
+            "ip-address" => hs.ip_address = Some(val),
+            "capa" | "rdb-only" | "rdb-filter-only" => {}
+            "ack" | "getack" | "fack" => return None,
+            _ => {
+                return Some(RespFrame::error(format!(
+                    "ERR Unrecognized REPLCONF option: {}",
+                    opt
+                )))
+            }
+        }
+    }
+    Some(RespFrame::ok())
 }
 
 /// Convert our CommandResponse to a RESP frame for the wire.
@@ -2089,17 +2344,6 @@ fn hello(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn slot_ranges_are_parsed_and_bounded() {
-        assert_eq!(parse_slot_range("5"), Some((5, 5)));
-        assert_eq!(parse_slot_range("0-16383"), Some((0, 16383)));
-        assert_eq!(parse_slot_range("16384"), None);
-        assert_eq!(parse_slot_range("20000"), None);
-        assert_eq!(parse_slot_range("10-5"), None);
-        assert_eq!(parse_slot_range("abc"), None);
-        assert_eq!(parse_slot_range("1-x"), None);
-    }
 
     #[test]
     fn the_auth_failure_map_is_pruned() {

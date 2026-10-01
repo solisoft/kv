@@ -68,9 +68,12 @@ pub const NONCE_HEX_LEN: usize = 32;
 
 /// Longest frame accepted, before parsing.
 ///
-/// A gossip frame is a short line. The bound exists so a peer cannot make this
-/// node buffer without limit before it has authenticated anything.
-pub const MAX_FRAME_BYTES: usize = 8 * 1024;
+/// A frame carries a node's header (its slots, as ranges) and its view of the
+/// other nodes, or a `PUBLISH` relayed cluster-wide; 1 MiB holds the worst
+/// fragmented slot map with room to spare. The bound exists so a peer cannot
+/// make this node buffer without limit before it has authenticated anything
+/// (the bus also caps its connections, so the total is bounded too).
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// How many nonces may be remembered at once.
 ///

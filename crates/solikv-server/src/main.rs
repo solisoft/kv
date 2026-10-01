@@ -17,7 +17,7 @@ use nix::unistd::Pid;
 
 use solikv_persist::FsyncPolicy;
 
-use solikv_cluster::{generate_stable_node_id, ClusterManager, GossipState};
+use solikv_cluster::ClusterManager;
 use solikv_server::cluster_dump;
 use solikv_server::resp_server;
 use solikv_server::rest_server;
@@ -242,6 +242,33 @@ struct Args {
     #[arg(long, default_value = "")]
     notify_keyspace_events: String,
 
+    /// Follow a master at startup: "host port" or "host:port" (Redis
+    /// `replicaof`). `REPLICAOF` changes it at runtime.
+    #[arg(long, value_name = "HOST PORT")]
+    replicaof: Option<String>,
+
+    /// Password to authenticate to the master with (`masterauth`).
+    #[arg(long)]
+    masterauth: Option<String>,
+
+    /// ACL user to authenticate to the master as (`masteruser`).
+    #[arg(long)]
+    masteruser: Option<String>,
+
+    /// Replication backlog: how much of the stream a reconnecting replica
+    /// can resume from without a full resynchronization.
+    #[arg(long, default_value = "1mb", value_name = "SIZE", value_parser = parse_size)]
+    repl_backlog_size: u64,
+
+    /// Refuse writes from clients while this node is a replica.
+    #[arg(long, default_value = "yes", value_parser = parse_yes_no)]
+    replica_read_only: bool,
+
+    /// Address a replica announces to its master (`replica-announce-ip`),
+    /// when the one the master sees is not the one to reach it on.
+    #[arg(long)]
+    replica_announce_ip: Option<String>,
+
     /// Run as daemon in background (kills old instance if running)
     #[arg(short, long)]
     daemon: bool,
@@ -249,6 +276,25 @@ struct Args {
     /// Enable cluster mode (Redis Cluster compatible)
     #[arg(long)]
     cluster_enabled: bool,
+
+    /// Address this node announces to the cluster (and to clients, in
+    /// MOVED and CLUSTER SLOTS), when the bind address is not it.
+    #[arg(long)]
+    cluster_announce_ip: Option<String>,
+
+    /// Cluster bus port (0: the data port + 10000).
+    #[arg(long, default_value_t = 0)]
+    cluster_port: u16,
+
+    /// Milliseconds a node may be unreachable before it is suspected
+    /// (`cluster-node-timeout`).
+    #[arg(long, default_value_t = 15000)]
+    cluster_node_timeout: u64,
+
+    /// Refuse every key while some slot is unassigned or its owner failed
+    /// (`cluster-require-full-coverage`).
+    #[arg(long, default_value = "yes", value_parser = parse_yes_no)]
+    cluster_require_full_coverage: bool,
 
     /// Cluster dump: export all cluster data to file
     #[arg(long)]
@@ -661,51 +707,18 @@ async fn async_main(args: Args) {
 
     let pubsub = Arc::new(solikv_pubsub::PubSubBroker::new());
 
-    // Initialize cluster if enabled
-    let cluster_manager: Option<Arc<ClusterManager>> = if args.cluster_enabled {
-        let bind_ip = if args.bind == "0.0.0.0" || args.bind == "127.0.0.1" {
-            "127.0.0.1".to_string()
-        } else {
-            args.bind.clone()
-        };
-
-        // Try to load existing node_id from cluster.json for stability
-        let node_id = {
-            let cluster_path = args.dir.join("cluster.json");
-            if cluster_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&cluster_path) {
-                    if let Ok(state) =
-                        serde_json::from_str::<solikv_cluster::ClusterStateSnapshot>(&content)
-                    {
-                        if state.ip == bind_ip && state.port == args.port {
-                            tracing::info!("Using persisted node_id: {}", state.node_id);
-                            state.node_id
-                        } else {
-                            generate_stable_node_id(&bind_ip, args.port)
-                        }
-                    } else {
-                        generate_stable_node_id(&bind_ip, args.port)
-                    }
-                } else {
-                    generate_stable_node_id(&bind_ip, args.port)
-                }
+    // --- Cluster mode: the node and its bus (started once the engine exists) ---
+    let cluster_setup = if args.cluster_enabled {
+        let announce_ip = args.cluster_announce_ip.clone().unwrap_or_else(|| {
+            if args.bind == "0.0.0.0" || args.bind == "127.0.0.1" {
+                "127.0.0.1".to_string()
             } else {
-                generate_stable_node_id(&bind_ip, args.port)
+                args.bind.clone()
             }
-        };
-
-        // The bus secret. Required, and checked before anything is bound.
-        //
-        // This used to be the whole of cluster mode: build a `GossipState`, call
-        // `enable()`, log success, and never start the server. Every node then
-        // listened for no peer and reached none — three nodes were three
-        // independent nodes, each reporting healthy. The server is started
-        // below, and it authenticates every frame.
-        //
-        // Refusing without a secret rather than starting open is the same rule
-        // `db/` now follows: gossip decides who is in the cluster and which node
-        // owns which slots, so an unauthenticated bus is a stranger deciding the
-        // topology.
+        });
+        // The bus secret. Required, and checked before anything is bound:
+        // the bus decides membership, slot ownership and failovers, so an
+        // unauthenticated one lets a stranger decide all three.
         let bus_secret = match cluster_password.as_deref() {
             Some(pw) => match solikv_cluster::auth::ClusterSecret::new(pw) {
                 Ok(secret) => secret,
@@ -725,123 +738,49 @@ async fn async_main(args: Args) {
                 std::process::exit(1);
             }
         };
-
-        let gossip = GossipState::new(node_id.clone(), bind_ip.clone(), args.port);
-        let (gossip_tx, mut gossip_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        // The bus listens on the data port plus the standard offset, on the same
-        // address the node advertises — not on loopback, which the previous
-        // version hardcoded and which cannot reach a peer on another machine.
-        let bus_port = args.port + solikv_cluster::CLUSTER_BUS_PORT_OFFSET;
-        let bus_bind: std::net::SocketAddr = format!("{}:{}", bind_ip, bus_port)
+        let cport = match args.cluster_port {
+            0 => match args
+                .port
+                .checked_add(solikv_cluster::CLUSTER_BUS_PORT_OFFSET)
+            {
+                Some(p) => p,
+                None => {
+                    eprintln!("ERROR: port + 10000 is not a valid bus port; set --cluster-port");
+                    std::process::exit(1);
+                }
+            },
+            p => p,
+        };
+        let bus_bind_ip = if args.bind == "0.0.0.0" {
+            "0.0.0.0".to_string()
+        } else {
+            announce_ip.clone()
+        };
+        let bus_bind: std::net::SocketAddr = format!("{}:{}", bus_bind_ip, cport)
             .parse()
             .unwrap_or_else(|e| {
                 eprintln!(
-                    "ERROR: cannot form a cluster bus address from {bind_ip}:{bus_port}: {e}"
+                    "ERROR: cannot form a cluster bus address from {bus_bind_ip}:{cport}: {e}"
                 );
                 std::process::exit(1);
             });
-
-        let bus_secret_for_tasks = bus_secret.clone();
-        let gossip_for_tasks = gossip.clone();
-
-        if let Err(e) = solikv_cluster::gossip::start_gossip_server(
-            bus_bind,
-            bus_secret,
-            gossip.clone(),
-            gossip_tx,
-        )
-        .await
-        {
-            eprintln!("ERROR: cluster bus failed to bind {bus_bind}: {e}");
-            std::process::exit(1);
-        }
-
         let cluster = Arc::new(ClusterManager::new(
-            node_id,
-            bind_ip.clone(),
+            announce_ip,
             args.port,
-            gossip,
+            cport,
+            solikv_cluster::ClusterConfig {
+                node_timeout_ms: args.cluster_node_timeout.max(100),
+                require_full_coverage: args.cluster_require_full_coverage,
+                config_path: Some(args.dir.join("cluster.json")),
+            },
         ));
-        cluster.enable();
-
-        // Drain the authenticated frames into the manager, and answer the ones
-        // that need answering. Without this the channel fills and the server
-        // blocks — the quiet version of the bug this whole change is about.
-        let cluster_for_gossip = cluster.clone();
-        let reply_secret = bus_secret_for_tasks.clone();
-        tokio::spawn(async move {
-            while let Some(message) = gossip_rx.recv().await {
-                let sender = match &message {
-                    solikv_cluster::GossipMessage::Ping {
-                        node_id, ip, port, ..
-                    } => format!("{}:{}", ip, port + solikv_cluster::CLUSTER_BUS_PORT_OFFSET)
-                        .parse::<std::net::SocketAddr>()
-                        .ok()
-                        .map(|addr| (addr, node_id.clone())),
-                    _ => None,
-                };
-                if let Some(reply) = cluster_for_gossip.handle_gossip(message) {
-                    // A pong goes back over a fresh connection to the address the
-                    // ping advertised, not back down the inbound socket: the
-                    // inbound one may be a client that only writes, and the
-                    // advertised address is the one the rest of the cluster uses.
-                    if let Some((peer, peer_id)) = sender {
-                        let secret = reply_secret.clone();
-                        tokio::spawn(async move {
-                            // Addressed to the pinger by id: a pong vouches for
-                            // liveness, and an unaddressed one could be replayed
-                            // at every node to keep a dead peer looking alive.
-                            if let Err(e) = solikv_cluster::gossip::send_frame(
-                                peer,
-                                &reply,
-                                &secret,
-                                std::time::Duration::from_secs(3),
-                                &peer_id,
-                            )
-                            .await
-                            {
-                                tracing::debug!(%peer, error = %e, "gossip pong failed");
-                            }
-                        });
-                    }
-                }
-            }
-        });
-
-        // The outbound half. Nothing dialled a peer before this: there was a
-        // listener and no caller, so even a correctly configured cluster sat
-        // silent. One round every second, failures logged and skipped — a single
-        // unreachable node is what the failure detector is for, not a reason to
-        // stop pinging everyone after it.
-        let gossip_for_round = gossip_for_tasks.clone();
-        let round_secret = bus_secret_for_tasks.clone();
-        let cluster_for_round = cluster.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                // Read fresh each round: an operator can assign or drop slots at
-                // any moment, and a claim captured once would keep announcing
-                // ranges this node has given up.
-                let my_slots = cluster_for_round.my_slot_ranges();
-                solikv_cluster::gossip::gossip_round_with_slots(
-                    &gossip_for_round,
-                    &round_secret,
-                    solikv_cluster::CLUSTER_BUS_PORT_OFFSET,
-                    std::time::Duration::from_secs(3),
-                    &my_slots,
-                )
-                .await;
-            }
-        });
-
-        tracing::info!(%bus_bind, "cluster mode enabled, gossip bus authenticated");
-        Some(cluster)
+        tracing::info!(node_id = %cluster.node_id(), %bus_bind, "cluster mode enabled");
+        Some((cluster, bus_secret, bus_bind))
     } else {
         None
     };
+    let cluster_manager: Option<Arc<ClusterManager>> =
+        cluster_setup.as_ref().map(|(c, _, _)| c.clone());
 
     // Parse keyspace notification flags
     let notify_flags = Arc::new(std::sync::atomic::AtomicU16::new(
@@ -1027,25 +966,83 @@ async fn async_main(args: Args) {
         }
     }
 
-    // --- Load cluster state from RDB ---
-    if let Some(ref cluster) = cluster_manager {
-        let cluster_path = args.dir.join("cluster.json");
-        if cluster_path.exists() {
-            match std::fs::read_to_string(&cluster_path) {
-                Ok(content) => {
-                    match serde_json::from_str::<solikv_cluster::ClusterStateSnapshot>(&content) {
-                        Ok(state) => {
-                            cluster.import_state(&state);
-                            tracing::info!("Loaded cluster state from {:?}", cluster_path);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to parse cluster state: {}", e);
-                        }
-                    }
+    // --- Replication ---
+    engine
+        .repl()
+        .set_backlog_size(args.repl_backlog_size as usize);
+    engine.set_replica_read_only(args.replica_read_only);
+    let replication = solikv_server::replication::Replication::install(
+        engine.clone(),
+        solikv_server::replication::ReplConfig {
+            masterauth: args.masterauth.clone(),
+            masteruser: args.masteruser.clone(),
+            listening_port: args.port,
+            announce_ip: args.replica_announce_ip.clone(),
+            dir: args.dir.clone(),
+        },
+    );
+    solikv_server::replication::spawn_master_pinger(engine.clone());
+
+    // --- Cluster: attach the node to this server, start its bus and cron ---
+    if let Some((cluster, bus_secret, bus_bind)) = cluster_setup {
+        engine.enable_slot_index();
+        let bus = solikv_cluster::Bus::new(bus_secret.clone());
+        cluster.attach(
+            bus.clone(),
+            Arc::new(solikv_server::cluster_host::ServerClusterHost::new(
+                engine.clone(),
+                replication.clone(),
+            )),
+        );
+        {
+            let c = cluster.clone();
+            engine.set_publish_hook(Box::new(move |ch, msg, shard| c.publish(ch, msg, shard)));
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        if let Err(e) = solikv_cluster::gossip::start_bus_server(
+            bus_bind,
+            bus_secret,
+            cluster.my_id_handle(),
+            tx,
+            bus,
+        )
+        .await
+        {
+            eprintln!("ERROR: cluster bus failed to bind {bus_bind}: {e}");
+            std::process::exit(1);
+        }
+        let c = cluster.clone();
+        tokio::spawn(async move {
+            while let Some(m) = rx.recv().await {
+                c.handle(m);
+            }
+        });
+        let c = cluster.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                c.cron();
+            }
+        });
+        // A node that was a replica when it stopped follows its master again.
+        if let Some((ip, port)) = cluster.my_master_addr() {
+            use solikv_engine::replication::ReplController;
+            let _ = replication.replicaof(ip, port);
+        }
+    } else if let Some(spec) = &args.replicaof {
+        match parse_host_port(spec) {
+            Some((host, port)) => {
+                use solikv_engine::replication::ReplController;
+                if let Err(e) = replication.replicaof(host, port) {
+                    eprintln!("ERROR: replicaof: {e}");
+                    std::process::exit(1);
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to read cluster state file: {}", e);
-                }
+            }
+            None => {
+                eprintln!("ERROR: --replicaof expects \"host port\" or host:port, got {spec:?}");
+                std::process::exit(1);
             }
         }
     }
@@ -1189,22 +1186,9 @@ async fn async_main(args: Args) {
         }
     }
 
-    // Save cluster state
+    // Cluster configuration: saved on every change; once more on the way out.
     if let Some(ref cluster) = cluster_manager {
-        let cluster_state = cluster.export_state();
-        let cluster_path = args.dir.join("cluster.json");
-        match serde_json::to_string_pretty(&cluster_state) {
-            Ok(json) => {
-                if let Err(e) = solikv_persist::fsutil::write_atomic(&cluster_path, json) {
-                    tracing::error!("Failed to save cluster state: {}", e);
-                } else {
-                    tracing::info!("Cluster state saved to {:?}", cluster_path);
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to serialize cluster state: {}", e);
-            }
-        }
+        cluster.save_now();
     }
 
     // The pidfile names this process only in daemon mode; leave anyone
@@ -1220,6 +1204,24 @@ async fn async_main(args: Args) {
 fn parse_policy(s: &str) -> Result<solikv_core::store::EvictionPolicy, String> {
     solikv_core::store::EvictionPolicy::parse(s)
         .ok_or_else(|| format!("unknown maxmemory policy '{s}'"))
+}
+
+fn parse_yes_no(s: &str) -> Result<bool, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "yes" | "true" | "1" => Ok(true),
+        "no" | "false" | "0" => Ok(false),
+        other => Err(format!("expected yes or no, got '{other}'")),
+    }
+}
+
+/// `host port` or `host:port`.
+fn parse_host_port(s: &str) -> Option<(String, u16)> {
+    let s = s.trim();
+    let (h, p) = match s.split_once(char::is_whitespace) {
+        Some((h, p)) => (h.trim(), p.trim()),
+        None => s.rsplit_once(':')?,
+    };
+    Some((h.to_string(), p.parse().ok()?))
 }
 
 fn parse_size(s: &str) -> Result<u64, String> {

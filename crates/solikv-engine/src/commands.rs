@@ -258,6 +258,20 @@ fn memory_keys(args: &[Bytes]) -> Vec<usize> {
 }
 
 /// `OBJECT sub key` / `MEMORY USAGE key`: the key is the second argument.
+/// `MIGRATE host port key|"" db timeout [COPY] [REPLACE] [AUTH pw | AUTH2 user pw] [KEYS key…]`
+fn migrate_keys(args: &[Bytes]) -> Vec<usize> {
+    if args.len() < 5 {
+        return Vec::new();
+    }
+    if !args[2].is_empty() {
+        return vec![2];
+    }
+    match args.iter().position(|a| a.eq_ignore_ascii_case(b"KEYS")) {
+        Some(i) if i >= 5 => (i + 1..args.len()).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn second_arg_key(args: &[Bytes]) -> Vec<usize> {
     if args.len() >= 2 {
         vec![1]
@@ -320,7 +334,15 @@ commands! {
     LASTSAVE = "LASTSAVE", 1, &["loading", "stale", "fast"], NONE;
     SHUTDOWN = "SHUTDOWN", -1, &["admin", "noscript", "loading", "stale"], NONE;
     WAIT = "WAIT", 3, &["noscript"], NONE;
+    REPLCONF = "REPLCONF", -1, &["admin", "noscript", "loading", "stale"], NONE;
+    PSYNC = "PSYNC", -3, &["admin", "noscript"], NONE;
+    SYNC = "SYNC", 1, &["admin", "noscript"], NONE;
     CLUSTER = "CLUSTER", -2, &["loading", "stale"], NONE;
+    ASKING = "ASKING", 1, FAST, NONE;
+    READONLY = "READONLY", 1, &["loading", "stale", "fast"], NONE;
+    READWRITE = "READWRITE", 1, &["loading", "stale", "fast"], NONE;
+    MIGRATE = "MIGRATE", -6, &["write", "movablekeys"], Keys::Movable(migrate_keys);
+    RESTORE_ASKING = "RESTORE-ASKING", -4, WD, K1;
     ACL = "ACL", -2, &["admin", "noscript", "loading", "stale"], NONE;
     SLOWLOG = "SLOWLOG", -2, &["admin", "loading", "stale"], NONE;
     LATENCY = "LATENCY", -2, &["admin", "noscript", "loading", "stale"], NONE;

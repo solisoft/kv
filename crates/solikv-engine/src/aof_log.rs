@@ -79,6 +79,7 @@ const EXPLICIT: &[&str] = &[
     "XAUTOCLAIM",
     "COPY",
     "RESTORE",
+    "RESTORE-ASKING",
     "SORT",
 ];
 
@@ -264,10 +265,21 @@ impl Effects {
     }
 }
 
+/// The replication stream as one shard command sees it.
+#[derive(Clone, Copy)]
+pub(crate) struct ReplSink<'a> {
+    pub feed: &'a crate::replication::ReplFeed,
+    /// The shard is in this thread's multi-shard hold.
+    pub held: bool,
+}
+
 /// Called by `ShardHandle` with the shard lock held, after a command ran in
-/// database `db`. Expired keys carry the database each was in.
+/// database `db`, when the log is on or replicas are fed. Expired keys carry
+/// the database each was in.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn log_under_lock(
-    w: &AofWriter,
+    w: Option<&AofWriter>,
+    repl: Option<ReplSink<'_>>,
     shard: u32,
     db: u32,
     resp: &CommandResponse,
@@ -275,13 +287,14 @@ pub(crate) fn log_under_lock(
     explicit: Option<&mut Effects>,
     active_expired: &[(u32, Bytes)],
 ) {
+    let out = Out { w, repl, shard };
     for (d, k) in lazy_expired {
-        emit(w, shard, *d, |buf| encode_into(buf, b"DEL", &[k]));
+        out.emit(*d, |buf| encode_into(buf, b"DEL", &[k]));
     }
     match explicit {
         Some(fx) => {
             for rec in fx.records.drain(..) {
-                emit(w, shard, db, |buf| buf.extend_from_slice(&rec));
+                out.emit(db, |buf| buf.extend_from_slice(&rec));
             }
         }
         None => {
@@ -291,20 +304,53 @@ pub(crate) fn log_under_lock(
                 if !cmd.logged.get() && !resp.is_error() {
                     cmd.logged.set(true);
                     if let Some(pre) = &cmd.pre {
-                        emit(w, shard, db, |buf| buf.extend_from_slice(pre));
+                        out.emit(db, |buf| buf.extend_from_slice(pre));
                     } else if let Some(rec) = aof_form(cmd.name, cmd.args, resp) {
-                        emit(w, shard, db, |buf| rec.write(buf));
+                        out.emit(db, |buf| rec.write(buf));
                     }
                 }
             }
         }
     }
     for (d, k) in active_expired {
-        emit(w, shard, *d, |buf| encode_into(buf, b"DEL", &[k]));
+        out.emit(*d, |buf| encode_into(buf, b"DEL", &[k]));
     }
 }
 
-fn emit(w: &AofWriter, shard: u32, db: u32, write: impl FnOnce(&mut Vec<u8>)) {
+/// Where one shard's records go: its log, the replication stream, or both.
+struct Out<'a> {
+    w: Option<&'a AofWriter>,
+    repl: Option<ReplSink<'a>>,
+    shard: u32,
+}
+
+thread_local! {
+    /// A record encoded once for both destinations.
+    static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+impl Out<'_> {
+    fn emit(&self, db: u32, write: impl FnOnce(&mut Vec<u8>)) {
+        match (self.w, self.repl) {
+            (Some(w), None) => emit_aof(w, self.shard, db, write),
+            (w, Some(r)) => SCRATCH.with(|s| {
+                let mut buf = s.borrow_mut();
+                buf.clear();
+                write(&mut buf);
+                if let Some(w) = w {
+                    emit_aof(w, self.shard, db, |b| b.extend_from_slice(&buf));
+                }
+                r.feed.record(self.shard, db, &buf, r.held);
+                if buf.capacity() > 64 * 1024 {
+                    *buf = Vec::new();
+                }
+            }),
+            (None, None) => {}
+        }
+    }
+}
+
+fn emit_aof(w: &AofWriter, shard: u32, db: u32, write: impl FnOnce(&mut Vec<u8>)) {
     TX.with(|tx| {
         if let Some(opened) = tx.borrow_mut().as_mut() {
             if !opened.contains(&shard) {

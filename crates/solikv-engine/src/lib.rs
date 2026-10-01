@@ -6,6 +6,7 @@ pub mod dispatch;
 pub mod lua;
 pub mod lua_libs;
 pub mod persistence;
+pub mod replication;
 pub mod resp3;
 pub mod response;
 pub mod session;

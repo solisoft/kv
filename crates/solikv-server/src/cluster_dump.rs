@@ -44,57 +44,53 @@ pub struct DumpKey {
     pub value: serde_json::Value,
 }
 
+/// The masters in a `CLUSTER NODES` reply (Redis' format:
+/// `id ip:port@cport[,hostname] flags master ping pong epoch link slot…`).
+/// Replicas are left out: their data is their master's.
 pub fn parse_cluster_nodes(output: &str) -> Vec<ClusterNode> {
     let mut nodes = Vec::new();
-
     for line in output.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 {
+        if parts.len() < 8 {
             continue;
         }
-
-        let node_id = parts[0].to_string();
-        let addr = parts[1];
-
-        // Parse ip:port from format ip@port
-        let (ip, port) = if let Some((ip, port_str)) = addr.split_once('@') {
-            if let Some((_, port)) = port_str.rsplit_once(':') {
-                (ip.to_string(), port.parse().unwrap_or(6379))
-            } else {
-                (ip.to_string(), port_str.parse().unwrap_or(6379))
-            }
-        } else if let Some((ip, port)) = addr.rsplit_once(':') {
-            (ip.to_string(), port.parse().unwrap_or(6379))
-        } else {
-            ("127.0.0.1".to_string(), 6379)
+        let flags = parts[2];
+        if !flags.split(',').any(|f| f == "master") || flags.contains("handshake") {
+            continue;
+        }
+        let hostport = parts[1].split(['@', ',']).next().unwrap_or("");
+        let Some((ip, port)) = hostport.rsplit_once(':') else {
+            continue;
         };
-
-        // Parse slots
+        let Ok(port) = port.parse::<u16>() else {
+            continue;
+        };
         let mut slots = Vec::new();
-        if let Some(slot_part) = parts.get(3) {
-            for range in slot_part.split(',') {
-                if range == "-" {
-                    slots.push((0, 16383));
-                    continue;
-                }
-                if let Some((start, end)) = range.split_once('-') {
-                    if let (Ok(s), Ok(e)) = (start.parse::<u16>(), end.parse::<u16>()) {
-                        slots.push((s, e));
+        for range in &parts[8.min(parts.len())..] {
+            // `[slot->-node]` / `[slot-<-node]`: migration markers, not ranges.
+            if range.starts_with('[') {
+                continue;
+            }
+            match range.split_once('-') {
+                Some((a, b)) => {
+                    if let (Ok(a), Ok(b)) = (a.parse::<u16>(), b.parse::<u16>()) {
+                        slots.push((a, b));
                     }
-                } else if let Ok(s) = range.parse::<u16>() {
-                    slots.push((s, s));
+                }
+                None => {
+                    if let Ok(a) = range.parse::<u16>() {
+                        slots.push((a, a));
+                    }
                 }
             }
         }
-
         nodes.push(ClusterNode {
-            node_id,
-            ip,
+            node_id: parts[0].to_string(),
+            ip: ip.to_string(),
             port,
             slots,
         });
     }
-
     nodes
 }
 
@@ -777,60 +773,30 @@ pub fn restore_cluster(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_cluster_nodes_single_master() {
-        let output = "abc123 127.0.0.1:6379@16379 myself,master - 0 0 0-16383";
-        let nodes = parse_cluster_nodes(output);
-
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].node_id, "abc123");
-        assert!(nodes[0].ip.contains("127.0.0.1"));
-        assert!(nodes[0].port > 0);
-    }
+    const A: &str = "07c37dfeb235213a872192d90877d0cd55635b91";
 
     #[test]
-    fn test_parse_cluster_nodes_with_at_sign() {
-        let output =
-            "f85ba0f344c07497-0000000000003ffb 127.0.0.1@16379 myself,master - 9999 9999 0-16383";
-        let nodes = parse_cluster_nodes(output);
-
-        assert_eq!(nodes.len(), 1);
+    fn cluster_nodes_lines_are_read_in_redis_format() {
+        let output = format!(
+            "{A} 127.0.0.1:30004@31004,host-a myself,master - 0 1426238317239 4 connected 0-5460 7000 [93->-{A}]\n\
+             e7d1eecce10fd6bb5eb35b9f99a514335d9ba9ca 127.0.0.1:30001@31001 slave {A} 0 1426238316232 4 connected\n\
+             292f8b365bb7edb5e285caf0b7e6ddc7265d2f4f 127.0.0.1:30003@31003 master,fail - 0 1426238318243 3 disconnected 10923-16383\n"
+        );
+        let nodes = parse_cluster_nodes(&output);
+        assert_eq!(nodes.len(), 2, "the replica is left out");
+        assert_eq!(nodes[0].node_id, A);
         assert_eq!(nodes[0].ip, "127.0.0.1");
-        assert_eq!(nodes[0].port, 16379);
+        assert_eq!(nodes[0].port, 30004, "the data port, not the bus port");
+        assert_eq!(nodes[0].slots, vec![(0, 5460), (7000, 7000)]);
+        assert_eq!(nodes[1].slots, vec![(10923, 16383)]);
     }
 
     #[test]
-    fn test_parse_cluster_nodes_multiple_slots() {
-        let output = "abc123 127.0.0.1:6379@16379 myself,master - 0 0 0-5460,5461-10922";
-        let nodes = parse_cluster_nodes(output);
-
+    fn cluster_nodes_ignores_short_and_empty_lines() {
+        let output = format!("\n\nfoo bar\n{A} 10.0.0.1:7000@17000 master - 0 0 1 connected\n");
+        let nodes = parse_cluster_nodes(&output);
         assert_eq!(nodes.len(), 1);
-        assert!(!nodes[0].slots.is_empty());
-    }
-
-    #[test]
-    fn test_parse_cluster_nodes_single_slot() {
-        let output = "abc123 127.0.0.1:6379@16379 master - 0 0 500";
-        let nodes = parse_cluster_nodes(output);
-
-        assert_eq!(nodes.len(), 1);
-        assert!(!nodes[0].slots.is_empty());
-    }
-
-    #[test]
-    fn test_parse_cluster_nodes_multiple_nodes() {
-        let output = "node1 127.0.0.1:6379@16379 master - 0 0 0-5460\nnode2 127.0.0.1:6380@16380 master - 0 0 5461-10922\nnode3 127.0.0.1:6381@16381 master - 0 0 10923-16383";
-        let nodes = parse_cluster_nodes(output);
-
-        assert_eq!(nodes.len(), 3);
-    }
-
-    #[test]
-    fn test_parse_cluster_nodes_ignores_empty_lines() {
-        let output = "abc123 127.0.0.1:6379@16379 myself,master - 0 0 0-16383\n\nnode2 127.0.0.1:6380@16380 master - 0 0 5461-16383";
-        let nodes = parse_cluster_nodes(output);
-
-        assert_eq!(nodes.len(), 2);
+        assert!(nodes[0].slots.is_empty());
     }
 
     #[test]

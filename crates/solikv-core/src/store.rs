@@ -111,6 +111,47 @@ struct Keyspace {
     /// Keys that have a TTL — Redis' `expires` dict. Sampled by active
     /// expiry and by the `volatile-*` eviction policies.
     volatile: IndexSet<Bytes, FastHasher>,
+    /// Keys by cluster hash slot, kept only in cluster mode (database 0):
+    /// `CLUSTER COUNTKEYSINSLOT` and `GETKEYSINSLOT`, which resharding calls
+    /// once per batch of keys, would otherwise scan the whole keyspace.
+    slots: Option<Box<SlotIndex>>,
+}
+
+/// See `Keyspace::slots`.
+#[derive(Debug)]
+struct SlotIndex {
+    sets: Vec<Option<Box<IndexSet<Bytes, FastHasher>>>>,
+}
+
+impl SlotIndex {
+    fn new() -> Self {
+        Self {
+            sets: (0..16384).map(|_| None).collect(),
+        }
+    }
+
+    fn add(&mut self, key: &Bytes) {
+        let s = crate::keyspace::hash_slot(key) as usize;
+        self.sets[s]
+            .get_or_insert_with(Default::default)
+            .insert(key.clone());
+    }
+
+    fn remove(&mut self, key: &[u8]) {
+        let s = crate::keyspace::hash_slot(key) as usize;
+        if let Some(set) = &mut self.sets[s] {
+            set.swap_remove(key);
+            if set.is_empty() {
+                self.sets[s] = None;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        for s in self.sets.iter_mut() {
+            *s = None;
+        }
+    }
 }
 
 impl Keyspace {
@@ -119,6 +160,13 @@ impl Keyspace {
     fn insert(&mut self, key: Bytes, entry: KeyEntry) -> Option<KeyEntry> {
         let has_ttl = entry.expires_at.is_some();
         let (idx, old) = self.data.insert_full(key, entry);
+        if old.is_none() {
+            if let Some(ix) = &mut self.slots {
+                if let Some((k, _)) = self.data.get_index(idx) {
+                    ix.add(k);
+                }
+            }
+        }
         let had_ttl = old.as_ref().is_some_and(|o| o.expires_at.is_some());
         if has_ttl && !had_ttl {
             let k = self.data.get_index(idx).map(|(k, _)| k.clone());
@@ -136,6 +184,9 @@ impl Keyspace {
 
     fn remove_index(&mut self, idx: usize) -> Option<(Bytes, KeyEntry)> {
         let (k, e) = self.data.swap_remove_index(idx)?;
+        if let Some(ix) = &mut self.slots {
+            ix.remove(&k);
+        }
         if e.expires_at.is_some() {
             self.volatile.swap_remove(&k);
         }
@@ -164,6 +215,9 @@ impl Keyspace {
     fn clear(&mut self) {
         self.data = KeyMap::default();
         self.volatile = IndexSet::default();
+        if let Some(ix) = &mut self.slots {
+            ix.clear();
+        }
     }
 }
 
@@ -208,6 +262,10 @@ pub struct ShardStore {
     /// Epoch of the latest snapshot begun (entries' `snap` compare to it).
     snap_epoch: u32,
     rng: u64,
+    /// Replica: an expired key reads as missing but stays until the
+    /// master's `DEL` arrives, and the active cycle does not run — keys
+    /// expire on the master's clock, not on this one (Redis ≥ 3.2).
+    replica_expiry: bool,
 }
 
 impl ShardStore {
@@ -220,6 +278,66 @@ impl ShardStore {
             snapshot: None,
             snap_epoch: 0,
             rng: seed(),
+            replica_expiry: false,
+        }
+    }
+
+    /// See the `replica_expiry` field.
+    pub fn set_replica_expiry(&mut self, on: bool) {
+        self.replica_expiry = on;
+    }
+
+    // ---- Cluster slots ----
+
+    /// Keep database 0's keys indexed by hash slot (cluster mode).
+    pub fn enable_slot_index(&mut self) {
+        self.ensure_parked(0);
+        let Some(ks) = self.keyspace_mut(0) else {
+            return;
+        };
+        if ks.slots.is_some() {
+            return;
+        }
+        let mut ix = SlotIndex::new();
+        for k in ks.data.keys() {
+            ix.add(k);
+        }
+        ks.slots = Some(Box::new(ix));
+    }
+
+    /// Keys of database 0 in `slot` (expired ones not yet reclaimed
+    /// included, as Redis counts them).
+    pub fn count_in_slot(&self, slot: u16) -> usize {
+        let Some(ks) = self.keyspace(0) else { return 0 };
+        match &ks.slots {
+            Some(ix) => ix.sets[slot as usize % 16384]
+                .as_ref()
+                .map_or(0, |s| s.len()),
+            None => ks
+                .data
+                .keys()
+                .filter(|k| crate::keyspace::hash_slot(k) == slot)
+                .count(),
+        }
+    }
+
+    /// Up to `count` keys of database 0 in `slot`.
+    pub fn keys_in_slot(&self, slot: u16, count: usize) -> Vec<Bytes> {
+        let Some(ks) = self.keyspace(0) else {
+            return Vec::new();
+        };
+        match &ks.slots {
+            Some(ix) => ix.sets[slot as usize % 16384]
+                .as_ref()
+                .map(|s| s.iter().take(count).cloned().collect())
+                .unwrap_or_default(),
+            None => ks
+                .data
+                .keys()
+                .filter(|k| crate::keyspace::hash_slot(k) == slot)
+                .take(count)
+                .cloned()
+                .collect(),
         }
     }
 
@@ -553,6 +671,9 @@ impl ShardStore {
     }
 
     fn expire_index(&mut self, idx: usize) {
+        if self.replica_expiry {
+            return;
+        }
         self.capture(idx);
         if let Some((k, _)) = self.ks.remove_index(idx) {
             self.note_expired(k);
@@ -778,7 +899,9 @@ impl ShardStore {
             examined += 1;
             let (k, entry) = self.ks.data.get_index(c).expect("c < len");
             if entry.is_expired() {
-                deferred_expire.push(k.clone());
+                if !self.replica_expiry {
+                    deferred_expire.push(k.clone());
+                }
                 continue;
             }
             if !type_filter.is_none_or(|t| t.eq_ignore_ascii_case(entry.type_name())) {
@@ -834,8 +957,8 @@ impl ShardStore {
     /// removed, with the database each was in.
     pub fn active_expire_cycle(&mut self, budget: Duration) -> Vec<(u32, Bytes)> {
         let mut removed = Vec::new();
-        // Loading: nothing expires (see `LoadingGuard`).
-        if is_loading() {
+        // Loading: nothing expires (see `LoadingGuard`); nor on a replica.
+        if is_loading() || self.replica_expiry {
             return removed;
         }
         let start = Instant::now();
@@ -1012,6 +1135,11 @@ impl ShardStore {
 
     /// The live entry for `key`, without the lazy-expiry side effect (for
     /// read-only callers such as persistence, which hold `&self`).
+    /// [`peek`](Self::peek) in database `db`, without selecting it.
+    pub fn peek_in(&self, db: u32, key: &[u8]) -> Option<&KeyEntry> {
+        self.keyspace(db)?.data.get(key).filter(|e| !e.is_expired())
+    }
+
     pub fn peek(&self, key: &[u8]) -> Option<&KeyEntry> {
         self.ks.data.get(key).filter(|e| !e.is_expired())
     }

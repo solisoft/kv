@@ -48,6 +48,108 @@ fn entry_bytes(key_len: usize, e: &KeyEntry, samples: usize) -> usize {
 }
 
 impl CommandEngine {
+    /// `ROLE`.
+    pub(crate) fn role_reply(&self) -> CommandResponse {
+        let feed = self.repl();
+        if let Some(st) = self.repl_ctl.get().and_then(|c| c.status()) {
+            let offset = if st.state == "connected" {
+                feed.offset() as i64
+            } else {
+                -1
+            };
+            return CommandResponse::array(vec![
+                CommandResponse::bulk_string("slave"),
+                CommandResponse::bulk(Bytes::from(st.master_host)),
+                CommandResponse::integer(st.master_port as i64),
+                CommandResponse::bulk_string(st.state),
+                CommandResponse::integer(offset),
+            ]);
+        }
+        let replicas = feed
+            .sinks()
+            .into_iter()
+            .filter(|s| s.online.load(Ordering::Relaxed))
+            .map(|s| {
+                CommandResponse::array(vec![
+                    CommandResponse::bulk(Bytes::from(s.addr.clone())),
+                    CommandResponse::bulk(Bytes::from(s.listening_port.to_string())),
+                    CommandResponse::bulk(Bytes::from(s.ack.load(Ordering::Relaxed).to_string())),
+                ])
+            })
+            .collect();
+        CommandResponse::array(vec![
+            CommandResponse::bulk_string("master"),
+            CommandResponse::integer(feed.offset() as i64),
+            CommandResponse::array(replicas),
+        ])
+    }
+
+    /// `INFO replication`.
+    pub(crate) fn info_replication(&self) -> String {
+        let feed = self.repl();
+        let (replid, replid2, offset, second) = feed.ids();
+        let (active, first, histlen) = feed.backlog_info();
+        let mut out = String::from("# Replication\r\n");
+        match self.repl_ctl.get().and_then(|c| c.status()) {
+            Some(st) => {
+                out.push_str(&format!(
+                    "role:slave\r\nmaster_host:{}\r\nmaster_port:{}\r\nmaster_link_status:{}\r\n\
+                     master_last_io_seconds_ago:{}\r\nmaster_sync_in_progress:{}\r\n\
+                     slave_read_repl_offset:{}\r\nslave_repl_offset:{}\r\nslave_priority:100\r\n\
+                     slave_read_only:{}\r\nreplica_announced:1\r\n",
+                    st.master_host,
+                    st.master_port,
+                    if st.state == "connected" {
+                        "up"
+                    } else {
+                        "down"
+                    },
+                    st.last_io_secs,
+                    st.sync_in_progress as u8,
+                    offset,
+                    offset,
+                    self.replica_read_only() as u8,
+                ));
+            }
+            None => out.push_str("role:master\r\n"),
+        }
+        let sinks = feed.sinks();
+        out.push_str(&format!("connected_slaves:{}\r\n", sinks.len()));
+        for (i, s) in sinks.iter().enumerate() {
+            let online = s.online.load(Ordering::Relaxed);
+            let ack = s.ack.load(Ordering::Relaxed);
+            out.push_str(&format!(
+                "slave{}:ip={},port={},state={},offset={},lag={}\r\n",
+                i,
+                s.addr,
+                s.listening_port,
+                if online { "online" } else { "wait_bgsave" },
+                ack,
+                0
+            ));
+        }
+        out.push_str(&format!(
+            "sync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\n",
+            feed.sync_full.load(Ordering::Relaxed),
+            feed.sync_partial_ok.load(Ordering::Relaxed),
+            feed.sync_partial_err.load(Ordering::Relaxed),
+        ));
+        out.push_str(&format!(
+            "master_failover_state:no-failover\r\nmaster_replid:{}\r\nmaster_replid2:{}\r\n\
+             master_repl_offset:{}\r\nsecond_repl_offset:{}\r\nrepl_backlog_active:{}\r\n\
+             repl_backlog_size:{}\r\nrepl_backlog_first_byte_offset:{}\r\nrepl_backlog_histlen:{}\r\n",
+            replid,
+            replid2,
+            offset,
+            second,
+            active as u8,
+            feed.backlog_size(),
+            if active { first } else { 0 },
+            histlen,
+        ));
+        out
+    }
+
     pub(crate) fn memory_command(&self, args: &[Bytes]) -> CommandResponse {
         let sub = Upper::new(&args[0]);
         match sub.as_str() {
@@ -856,7 +958,12 @@ impl CommandEngine {
                  executable:{}\r\n\
                  config_file:{}\r\n",
                 env!("CARGO_PKG_VERSION"),
-                if self.static_config.read().iter().any(|(k, v)| k == "cluster-enabled" && v == "yes") {
+                if self
+                    .static_config
+                    .read()
+                    .iter()
+                    .any(|(k, v)| k == "cluster-enabled" && v == "yes")
+                {
                     "cluster"
                 } else {
                     "standalone"
@@ -937,7 +1044,11 @@ impl CommandEngine {
                     max,
                     solikv_core::memory::human(max),
                     self.maxmemory_policy().name(),
-                    if used > 0 { rss as f64 / used as f64 } else { 1.0 },
+                    if used > 0 {
+                        rss as f64 / used as f64
+                    } else {
+                        1.0
+                    },
                 )
             }
             "persistence" => self.persistence.stats.info_section(self.dirty()),
@@ -947,7 +1058,9 @@ impl CommandEngine {
                     .pubsub
                     .numsub()
                     .into_iter()
-                    .filter(|(ch, n)| *n > 0 && !ch.starts_with(solikv_pubsub::broker::SHARD_PREFIX))
+                    .filter(|(ch, n)| {
+                        *n > 0 && !ch.starts_with(solikv_pubsub::broker::SHARD_PREFIX)
+                    })
                     .count();
                 let shard_channels = self
                     .pubsub
@@ -993,13 +1106,7 @@ impl CommandEngine {
                     self.blocking.blocking_keys(),
                 )
             }
-            "replication" => format!(
-                "# Replication\r\nrole:master\r\nconnected_slaves:0\r\nmaster_failover_state:no-failover\r\n\
-                 master_replid:{}\r\nmaster_replid2:0000000000000000000000000000000000000000\r\n\
-                 master_repl_offset:{}\r\nsecond_repl_offset:-1\r\nrepl_backlog_active:0\r\n",
-                run_id(),
-                self.replication_offset.load(Ordering::Relaxed)
-            ),
+            "replication" => self.info_replication(),
             "cpu" => {
                 let (sys, user) = cpu_times();
                 format!(

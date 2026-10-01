@@ -7,7 +7,6 @@ members = [
     "crates/solikv-server",
     "crates/solikv-persist",
     "crates/solikv-cluster",
-    "crates/solikv-replication",
     "crates/solikv-pubsub",
     "crates/solikv-ffi",
 ]
@@ -41,7 +40,6 @@ solikv-engine = { path = "crates/solikv-engine" }
 solikv-server = { path = "crates/solikv-server" }
 solikv-persist = { path = "crates/solikv-persist" }
 solikv-cluster = { path = "crates/solikv-cluster" }
-solikv-replication = { path = "crates/solikv-replication" }
 solikv-pubsub = { path = "crates/solikv-pubsub" }
 
 [profile.release]

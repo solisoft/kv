@@ -1533,12 +1533,14 @@ dependencies = [
  "async-trait",
  "bytes",
  "combine",
+ "crc16",
  "futures-util",
  "itertools",
  "itoa",
  "num-bigint",
  "percent-encoding",
  "pin-project-lite",
+ "rand 0.8.7",
  "ryu",
  "sha1_smol",
  "socket2 0.5.10",
@@ -1900,6 +1902,7 @@ dependencies = [
  "parking_lot",
  "rand 0.8.7",
  "serde",
+ "serde_json",
  "sha2",
  "solikv-core",
  "thiserror",
@@ -1982,18 +1985,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "solikv-replication"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "serde",
- "solikv-core",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "solikv-resp"
 version = "0.1.0"
 dependencies = [
@@ -2017,6 +2008,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "nix",
+ "parking_lot",
  "pem",
  "redis",
  "reqwest",
