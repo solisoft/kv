@@ -422,6 +422,9 @@ impl CommandEngine {
         };
         self.pause_all.store(all, Ordering::Release);
         self.writes_paused_until.store(until, Ordering::Release);
+        // Both kinds of pause hold expiry, as Redis' do: keys past their
+        // TTL read as missing but stay, and the active cycle waits.
+        self.shards.hold_expiry_until(until);
     }
 
     /// Enough good replicas for `min-replicas-to-write` (or not a master,
@@ -1920,11 +1923,20 @@ impl CommandEngine {
                 if args.is_empty() {
                     return CommandResponse::wrong_arity(&name.to_lowercase());
                 }
+                let touch = id == Cmd::TOUCH;
                 let mut total = 0i64;
                 for (idx, keys) in group_by_shard(&self.shards, args) {
                     let resp = self.shards.shard(idx).execute(|store| {
                         CommandResponse::integer(
-                            keys.iter().filter(|k| store.exists(k)).count() as i64
+                            keys.iter()
+                                .filter(|k| {
+                                    if touch {
+                                        store.touch_key(k)
+                                    } else {
+                                        store.exists(k)
+                                    }
+                                })
+                                .count() as i64,
                         )
                     });
                     if let CommandResponse::Integer(n) = resp {
@@ -4589,6 +4601,10 @@ impl CommandEngine {
             session.info.id,
             (!session.user.unrestricted()).then(|| session.user.clone()),
         );
+        // `CLIENT NO-TOUCH`: this command (and any script it runs) leaves
+        // the keys' LRU/LFU as they were — except `TOUCH`, whose point that is.
+        let _no_touch = (session.info.no_touch() && id != Cmd::TOUCH)
+            .then(|| solikv_core::access::no_touch(true));
         let t0 = crate::stats::stamp();
         let resp = self.execute_session_inner(session, name, args);
         if matches!(resp, CommandResponse::Queued) {
@@ -5089,8 +5105,8 @@ impl CommandEngine {
                 }
             }
             // Recorded and shown in `CLIENT LIST` (flags `e`, `T`). There is
-            // no client eviction to exempt from; NO-TOUCH does not yet keep
-            // a client's reads from refreshing LRU/LFU.
+            // no client eviction to exempt from; NO-TOUCH is honoured by
+            // `execute_session`.
             "NO-EVICT" | "NO-TOUCH" => match rest {
                 [v] if v.eq_ignore_ascii_case(b"ON") || v.eq_ignore_ascii_case(b"OFF") => {
                     let on = v.eq_ignore_ascii_case(b"ON");

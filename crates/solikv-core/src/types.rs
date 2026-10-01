@@ -803,6 +803,38 @@ pub mod access {
         }
     }
 
+    thread_local! {
+        /// Set while a `CLIENT NO-TOUCH` client's command runs.
+        static NO_TOUCH: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Run the rest of this thread's command with key accesses leaving
+    /// LRU/LFU alone (`CLIENT NO-TOUCH`); the previous setting comes back
+    /// when the guard drops.
+    pub fn no_touch(on: bool) -> NoTouchGuard {
+        NoTouchGuard {
+            prev: NO_TOUCH.with(|n| n.replace(on)),
+        }
+    }
+
+    /// Whether accesses refresh LRU/LFU right now.
+    #[inline]
+    pub fn touching() -> bool {
+        !NO_TOUCH.with(|n| n.get())
+    }
+
+    /// See [`no_touch`].
+    pub struct NoTouchGuard {
+        prev: bool,
+    }
+
+    impl Drop for NoTouchGuard {
+        fn drop(&mut self) {
+            let prev = self.prev;
+            NO_TOUCH.with(|n| n.set(prev));
+        }
+    }
+
     /// `access` after the key was read or written.
     #[inline]
     pub fn touched(prev: u32) -> u32 {

@@ -20,6 +20,9 @@ pub const SHUTTING_DOWN: &str = "ERR server is shutting down";
 /// State every shard handle shares.
 #[derive(Default)]
 struct Shared {
+    /// Until when (unix ms) a `CLIENT PAUSE` holds expiry; every store of
+    /// this manager reads it (see `ShardStore::set_expiry_hold`).
+    expiry_hold: Arc<std::sync::atomic::AtomicU64>,
     /// The append-only log, once startup has loaded the dataset. Set once;
     /// commands replayed before it is set are, correctly, not logged again.
     aof: OnceLock<AofWriter>,
@@ -235,9 +238,9 @@ unsafe impl Send for SoloStore {}
 unsafe impl Sync for SoloStore {}
 
 impl SoloStore {
-    fn new() -> Self {
+    fn new(store: ShardStore) -> Self {
         Self {
-            inner: UnsafeCell::new(ShardStore::new()),
+            inner: UnsafeCell::new(store),
             #[cfg(debug_assertions)]
             busy: std::sync::atomic::AtomicBool::new(false),
         }
@@ -667,13 +670,15 @@ impl ShardManager {
         let mut shards = Vec::with_capacity(num_shards);
 
         for i in 0..num_shards {
+            let mut store = ShardStore::new();
+            store.set_expiry_hold(shared.expiry_hold.clone());
             let backend = if solo {
                 StoreBackend::Solo {
-                    store: Arc::new(SoloStore::new()),
+                    store: Arc::new(SoloStore::new(store)),
                 }
             } else {
                 StoreBackend::Locked {
-                    store: Arc::new(Mutex::new(ShardStore::new())),
+                    store: Arc::new(Mutex::new(store)),
                     spinning: AtomicBool::new(false),
                 }
             };
@@ -790,6 +795,11 @@ impl ShardManager {
 
     pub fn active_expire_enabled(&self) -> bool {
         !self.shared.active_expire_off.load(Ordering::Relaxed)
+    }
+
+    /// Hold expiry until `until` (unix ms; 0 releases): `CLIENT PAUSE`.
+    pub fn hold_expiry_until(&self, until: u64) {
+        self.shared.expiry_hold.store(until, Ordering::Release);
     }
 
     pub fn expired_keys(&self) -> u64 {

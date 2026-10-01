@@ -118,6 +118,12 @@ impl ClientInfo {
         self.no_touch.store(on, Ordering::Relaxed);
     }
 
+    /// `CLIENT NO-TOUCH ON`: this client's commands leave LRU/LFU alone.
+    #[inline]
+    pub fn no_touch(&self) -> bool {
+        self.no_touch.load(Ordering::Relaxed)
+    }
+
     /// End the connection (`CLIENT KILL`), wherever it is waiting.
     pub fn kill_now(&self) {
         self.kill();

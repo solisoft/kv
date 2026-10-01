@@ -288,6 +288,11 @@ pub struct ShardStore {
     /// master's `DEL` arrives, and the active cycle does not run — keys
     /// expire on the master's clock, not on this one (Redis ≥ 3.2).
     replica_expiry: bool,
+    /// Until when (unix ms, 0 = not) a `CLIENT PAUSE` holds expiry, shared
+    /// by the stores of one server: meanwhile keys expire as on a replica
+    /// (read as missing, removed later), as Redis pauses expiry with writes
+    /// so that a failover's replica catches up with an unchanging dataset.
+    expiry_hold: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl ShardStore {
@@ -303,12 +308,29 @@ impl ShardStore {
             snap_epoch: 0,
             rng: seed(),
             replica_expiry: false,
+            expiry_hold: None,
         }
     }
 
     /// See the `replica_expiry` field.
     pub fn set_replica_expiry(&mut self, on: bool) {
         self.replica_expiry = on;
+    }
+
+    /// See the `expiry_hold` field.
+    pub fn set_expiry_hold(&mut self, hold: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        self.expiry_hold = Some(hold);
+    }
+
+    /// Whether an expired key is kept for now (read as missing, not
+    /// removed): on a replica, or while a pause holds expiry.
+    #[inline]
+    fn keeps_expired(&self) -> bool {
+        self.replica_expiry
+            || self.expiry_hold.as_ref().is_some_and(|h| {
+                let until = h.load(std::sync::atomic::Ordering::Relaxed);
+                until != 0 && now_millis() < until
+            })
     }
 
     // ---- Cluster slots ----
@@ -676,7 +698,9 @@ impl ShardStore {
             return None;
         }
         let e = &mut self.ks.data[idx];
-        e.access = access::touched(e.access);
+        if access::touching() {
+            e.access = access::touched(e.access);
+        }
         Some(e)
     }
 
@@ -690,12 +714,14 @@ impl ShardStore {
         }
         self.capture(idx);
         let e = &mut self.ks.data[idx];
-        e.access = access::touched(e.access);
+        if access::touching() {
+            e.access = access::touched(e.access);
+        }
         Some(e)
     }
 
     fn expire_index(&mut self, idx: usize) {
-        if self.replica_expiry {
+        if self.keeps_expired() {
             return;
         }
         self.capture(idx);
@@ -923,7 +949,7 @@ impl ShardStore {
             examined += 1;
             let (k, entry) = self.ks.data.get_index(c).expect("c < len");
             if entry.is_expired() {
-                if !self.replica_expiry {
+                if !self.keeps_expired() {
                     deferred_expire.push(k.clone());
                 }
                 continue;
@@ -982,7 +1008,7 @@ impl ShardStore {
     pub fn active_expire_cycle(&mut self, budget: Duration) -> Vec<(u32, Bytes)> {
         let mut removed = Vec::new();
         // Loading: nothing expires (see `LoadingGuard`); nor on a replica.
-        if is_loading() || self.replica_expiry {
+        if is_loading() || self.keeps_expired() {
             return removed;
         }
         let start = Instant::now();
@@ -1074,7 +1100,7 @@ impl ShardStore {
     /// is removed, as `HDEL` of its last field would. Nothing expires while
     /// loading or on a replica (the master's `HDEL`s do it).
     pub(crate) fn purge_hash_fields_in(&mut self, db: u32, key: &Bytes) {
-        if is_loading() || self.replica_expiry {
+        if is_loading() || self.keeps_expired() {
             return;
         }
         let now = now_millis();
@@ -1238,6 +1264,17 @@ impl ShardStore {
         self.capture_parked(db, idx);
         self.keyspace_mut(db)?.remove_index(idx);
         Some((db, key))
+    }
+
+    /// `TOUCH`: refresh a live key's LRU/LFU (whatever `CLIENT NO-TOUCH`
+    /// says — `TOUCH` is the exception Redis makes). False when missing.
+    pub fn touch_key(&mut self, key: &Bytes) -> bool {
+        let Some(idx) = self.index_of_live(key) else {
+            return false;
+        };
+        let e = &mut self.ks.data[idx];
+        e.access = access::touched(e.access);
+        true
     }
 
     /// `OBJECT IDLETIME` / `OBJECT FREQ` source: the key's access field.
