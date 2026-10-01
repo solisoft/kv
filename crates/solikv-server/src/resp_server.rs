@@ -539,7 +539,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     continue;
                 }
                 if engine.writes_paused() {
-                    wait_while_paused(&engine, &cmd.name).await;
+                    wait_while_paused(&engine, &cmd.name, &cmd.args).await;
                 }
                 if engine.script_running() {
                     if !write_buf.is_empty() {
@@ -747,6 +747,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                                 write_buf.clear();
                             }
                             let pending = read_buf.split();
+                            info.set_kind(solikv_engine::session::KIND_REPLICA);
                             crate::replication::serve_replica(
                                 &mut socket,
                                 pending,
@@ -754,6 +755,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                                 peer_addr,
                                 repl_hs.clone(),
                                 psync,
+                                &info,
                             )
                             .await?;
                             return Ok(());
@@ -1022,7 +1024,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                             socket.write_all(&write_buf).await?;
                             write_buf.clear();
                         }
-                        wait_while_paused(&engine, &cmd.name).await;
+                        wait_while_paused(&engine, &cmd.name, &cmd.args).await;
                     }
                 }
                 // `MIGRATE` talks to another server: run it here, without
@@ -2180,14 +2182,11 @@ mod smallkeys {
     }
 }
 
-/// A write arriving while a manual failover pauses clients waits for the
-/// pause to end (reads go on).
-async fn wait_while_paused(engine: &CommandEngine, name: &str) {
-    let write = solikv_engine::commands::lookup(name).is_some_and(|s| s.is_write());
-    if !write {
-        return;
-    }
-    while engine.writes_paused() {
+/// A command held by `CLIENT PAUSE` (or a manual failover's pause) waits
+/// for it to end: writes and what may replicate under `WRITE`, everything
+/// but `CLIENT UNPAUSE` under `ALL`.
+async fn wait_while_paused(engine: &CommandEngine, name: &str, args: &[Bytes]) {
+    while engine.pause_holds(name, args) {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }

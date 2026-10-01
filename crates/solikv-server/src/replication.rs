@@ -73,6 +73,7 @@ pub async fn serve_replica<S: AsyncRead + AsyncWrite + Unpin>(
     peer: std::net::SocketAddr,
     hs: Handshake,
     psync: Option<(String, i64)>,
+    info: &solikv_engine::session::ClientInfo,
 ) -> std::io::Result<()> {
     let feed = engine.repl().clone();
     let sink = Arc::new(Sink {
@@ -85,6 +86,7 @@ pub async fn serve_replica<S: AsyncRead + AsyncWrite + Unpin>(
             .unwrap_or_else(|| peer.ip().to_string()),
         listening_port: hs.listening_port,
         online: Arc::new(AtomicBool::new(false)),
+        last_ack_ms: Arc::new(AtomicU64::new(solikv_core::now_millis())),
     });
 
     let continued = match &psync {
@@ -147,6 +149,8 @@ pub async fn serve_replica<S: AsyncRead + AsyncWrite + Unpin>(
         }
         tokio::select! {
             _ = sink.notify.notified() => {}
+            // `CLIENT KILL TYPE replica`: the replica reconnects and resumes.
+            _ = info.killed() => return Ok(()),
             r = socket.read_buf(&mut pending) => {
                 if r? == 0 {
                     return Ok(());
@@ -167,6 +171,8 @@ pub async fn serve_replica<S: AsyncRead + AsyncWrite + Unpin>(
                             .and_then(|s| s.parse::<u64>().ok())
                         {
                             sink.ack.fetch_max(off, Ordering::Relaxed);
+                            sink.last_ack_ms
+                                .store(solikv_core::now_millis(), Ordering::Relaxed);
                             feed.acked.notify_waiters();
                         }
                     }
@@ -416,6 +422,13 @@ impl Replication {
         .map_err(|_| "connect timed out".to_string())?
         .map_err(|e| format!("connect: {e}"))?;
         let mut link = Link::new(stream);
+        // The link shows in `CLIENT LIST` (flag M), and `CLIENT KILL TYPE
+        // master` drops it (the link reconnects, as in Redis).
+        let info = self
+            .engine
+            .clients()
+            .register(format!("{host}:{port}"), String::new());
+        info.set_kind(solikv_engine::session::KIND_MASTER);
 
         // PING (an `-NOAUTH` answer is fine: AUTH comes next).
         link.send(&[b"PING"]).await?;
@@ -527,6 +540,7 @@ impl Replication {
                 return Ok(());
             }
             tokio::select! {
+                _ = info.killed() => return Err("link closed by CLIENT KILL".into()),
                 r = link.stream.read(&mut buf) => {
                     let n = r.map_err(|e| format!("read: {e}"))?;
                     if n == 0 {

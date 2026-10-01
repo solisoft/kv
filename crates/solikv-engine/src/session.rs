@@ -49,7 +49,19 @@ pub struct ClientInfo {
     push: Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::tracking::Push>>>,
     /// `CLIENT TRACKING … REDIRECT` target, for `CLIENT LIST` (-1: none).
     redir: AtomicI64,
+    /// [`KIND_NORMAL`], [`KIND_REPLICA`] or [`KIND_MASTER`].
+    kind: std::sync::atomic::AtomicU8,
+    /// `CLIENT NO-EVICT`, `CLIENT NO-TOUCH` (shown in `CLIENT LIST`).
+    no_evict: AtomicBool,
+    no_touch: AtomicBool,
 }
+
+/// A client connection.
+pub const KIND_NORMAL: u8 = 0;
+/// A replica's link to this node (it sent `PSYNC`).
+pub const KIND_REPLICA: u8 = 1;
+/// This node's link to its master.
+pub const KIND_MASTER: u8 = 2;
 
 impl ClientInfo {
     pub fn name(&self) -> Option<Bytes> {
@@ -74,6 +86,41 @@ impl ClientInfo {
 
     pub fn user_name(&self) -> String {
         self.user.lock().clone()
+    }
+
+    pub fn set_kind(&self, kind: u8) {
+        self.kind.store(kind, Ordering::Relaxed);
+    }
+
+    /// `CLIENT LIST TYPE` / `CLIENT KILL TYPE`: normal, replica, master or
+    /// pubsub.
+    pub fn client_type(&self) -> &'static str {
+        match self.kind.load(Ordering::Relaxed) {
+            KIND_REPLICA => "replica",
+            KIND_MASTER => "master",
+            _ if self.subs.load(Ordering::Relaxed) + self.psubs.load(Ordering::Relaxed) > 0 => {
+                "pubsub"
+            }
+            _ => "normal",
+        }
+    }
+
+    /// Seconds since the connection was accepted.
+    pub fn age_secs(&self) -> u64 {
+        self.created.elapsed().as_secs()
+    }
+
+    pub fn set_no_evict(&self, on: bool) {
+        self.no_evict.store(on, Ordering::Relaxed);
+    }
+
+    pub fn set_no_touch(&self, on: bool) {
+        self.no_touch.store(on, Ordering::Relaxed);
+    }
+
+    /// End the connection (`CLIENT KILL`), wherever it is waiting.
+    pub fn kill_now(&self) {
+        self.kill();
     }
 
     pub fn is_killed(&self) -> bool {
@@ -120,11 +167,22 @@ impl ClientInfo {
         let psubs = self.psubs.load(Ordering::Relaxed);
         let multi = self.multi.load(Ordering::Relaxed);
         let mut flags = String::new();
+        match self.kind.load(Ordering::Relaxed) {
+            KIND_REPLICA => flags.push('S'),
+            KIND_MASTER => flags.push('M'),
+            _ => {}
+        }
         if multi >= 0 {
             flags.push('x');
         }
         if subs + psubs > 0 {
             flags.push('P');
+        }
+        if self.no_evict.load(Ordering::Relaxed) {
+            flags.push('e');
+        }
+        if self.no_touch.load(Ordering::Relaxed) {
+            flags.push('T');
         }
         if flags.is_empty() {
             flags.push('N');
@@ -188,6 +246,9 @@ impl ClientRegistry {
             user: Mutex::new("default".to_string()),
             push: Mutex::new(None),
             redir: AtomicI64::new(-1),
+            kind: std::sync::atomic::AtomicU8::new(KIND_NORMAL),
+            no_evict: AtomicBool::new(false),
+            no_touch: AtomicBool::new(false),
         });
         self.clients.lock().insert(id, Arc::downgrade(&info));
         info

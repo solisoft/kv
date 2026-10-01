@@ -322,6 +322,11 @@ pub struct CommandEngine {
     publish_hook: OnceLock<PublishHook>,
     /// Clients' writes wait until this wall-clock ms (manual failover).
     writes_paused_until: AtomicU64,
+    /// The pause in effect holds every command, not only writes.
+    pause_all: std::sync::atomic::AtomicBool,
+    /// `min-replicas-to-write` (0: off) and `min-replicas-max-lag` (s).
+    pub(crate) min_replicas_to_write: AtomicU64,
+    pub(crate) min_replicas_max_lag: AtomicU64,
 }
 
 /// See `CommandEngine::set_publish_hook`: `(channel, message, shard)`.
@@ -381,24 +386,78 @@ impl CommandEngine {
             replica_read_only: std::sync::atomic::AtomicBool::new(true),
             publish_hook: OnceLock::new(),
             writes_paused_until: AtomicU64::new(0),
+            pause_all: std::sync::atomic::AtomicBool::new(false),
+            min_replicas_to_write: AtomicU64::new(0),
+            min_replicas_max_lag: AtomicU64::new(10),
         }
     }
 
-    /// Hold clients' writes for `ms` (0 releases them now).
+    /// `min-replicas-to-write` / `min-replicas-max-lag`.
+    pub fn set_min_replicas(&self, to_write: u64, max_lag_secs: u64) {
+        self.min_replicas_to_write
+            .store(to_write, Ordering::Relaxed);
+        self.min_replicas_max_lag
+            .store(max_lag_secs, Ordering::Relaxed);
+    }
+
+    /// Hold clients' writes for `ms` (0 releases them now). A manual
+    /// failover's pause.
     pub fn pause_writes(&self, ms: u64) {
+        self.pause_clients(ms, false);
+    }
+
+    /// `CLIENT PAUSE ms [WRITE|ALL]`: hold clients' writes (and commands
+    /// that may replicate: scripts, `PUBLISH`) — or every command — for
+    /// `ms`. 0 releases them (`CLIENT UNPAUSE`). Replication links are
+    /// never held: the replica stream must keep flowing for a pause to be
+    /// useful (a failover waits on it).
+    pub fn pause_clients(&self, ms: u64, all: bool) {
         let until = if ms == 0 {
             0
         } else {
             solikv_core::now_millis().saturating_add(ms)
         };
+        self.pause_all.store(all, Ordering::Release);
         self.writes_paused_until.store(until, Ordering::Release);
     }
 
-    /// Whether clients' writes must wait now (one relaxed load when not).
+    /// Enough good replicas for `min-replicas-to-write` (or not a master,
+    /// or loading / applying a master's stream, which are not clients).
+    fn min_replicas_ok(&self) -> bool {
+        let needed = self.min_replicas_to_write.load(Ordering::Relaxed);
+        let feed = self.shards.repl();
+        needed == 0
+            || feed.is_replica()
+            || crate::replication::applying_master_stream()
+            || solikv_core::is_loading()
+            || feed.good_replicas(self.min_replicas_max_lag.load(Ordering::Relaxed))
+                >= needed as usize
+    }
+
+    /// Whether some pause is in effect (one relaxed load when not).
     #[inline]
     pub fn writes_paused(&self) -> bool {
         let until = self.writes_paused_until.load(Ordering::Relaxed);
         until != 0 && solikv_core::now_millis() < until
+    }
+
+    /// Whether command `name` must wait for the current pause to end.
+    pub fn pause_holds(&self, name: &str, args: &[Bytes]) -> bool {
+        if !self.writes_paused() {
+            return false;
+        }
+        if self.pause_all.load(Ordering::Acquire) {
+            // The way out of an ALL pause short of its timeout.
+            return !(name == "CLIENT"
+                && args
+                    .first()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(b"UNPAUSE")));
+        }
+        crate::commands::lookup(name).is_some_and(|s| s.is_write())
+            || matches!(
+                name,
+                "EVAL" | "EVALSHA" | "FCALL" | "PUBLISH" | "SPUBLISH" | "PFCOUNT"
+            )
     }
 
     /// Whether `key` exists (live) in database `db`.
@@ -829,6 +888,16 @@ impl CommandEngine {
             && !solikv_core::is_loading()
         {
             return CommandResponse::error("READONLY You can't write against a read only replica.");
+        }
+
+        // `min-replicas-to-write`: a master refuses writes it cannot get to
+        // enough replicas. A script's own writes come back through here.
+        if write
+            && !matches!(id, Cmd::EVAL | Cmd::EVALSHA | Cmd::FCALL)
+            && self.min_replicas_to_write.load(Ordering::Relaxed) != 0
+            && !self.min_replicas_ok()
+        {
+            return CommandResponse::error("NOREPLICAS Not enough good replicas to write.");
         }
 
         if self.maxmemory.load(Ordering::Relaxed) != 0
@@ -4916,11 +4985,23 @@ impl CommandEngine {
             }
             "LIST" => {
                 let mut ids: Option<Vec<u64>> = None;
+                let mut kind: Option<&'static str> = None;
                 let mut i = 0;
                 while i < rest.len() {
                     let opt = Upper::new(&rest[i]);
                     match opt.as_str() {
-                        "TYPE" if i + 1 < rest.len() => i += 2,
+                        "TYPE" if i + 1 < rest.len() => {
+                            match client_type_arg(&rest[i + 1]) {
+                                Some(t) => kind = Some(t),
+                                None => {
+                                    return CommandResponse::error(format!(
+                                        "ERR Unknown client type '{}'",
+                                        String::from_utf8_lossy(&rest[i + 1])
+                                    ))
+                                }
+                            }
+                            i += 2
+                        }
                         "ID" => {
                             let mut v = Vec::new();
                             for a in &rest[i + 1..] {
@@ -4938,6 +5019,9 @@ impl CommandEngine {
                 let mut out = String::new();
                 for c in session.registry().list() {
                     if ids.as_ref().is_some_and(|ids| !ids.contains(&c.id)) {
+                        continue;
+                    }
+                    if kind.is_some_and(|k| c.client_type() != k) {
                         continue;
                     }
                     out.push_str(&c.describe());
@@ -4968,9 +5052,17 @@ impl CommandEngine {
                     _ => CommandResponse::syntax_error(),
                 }
             }
-            // Accepted, meaningless here (no eviction, no LRU clock yet).
+            // Recorded and shown in `CLIENT LIST` (flags `e`, `T`). There is
+            // no client eviction to exempt from; NO-TOUCH does not yet keep
+            // a client's reads from refreshing LRU/LFU.
             "NO-EVICT" | "NO-TOUCH" => match rest {
                 [v] if v.eq_ignore_ascii_case(b"ON") || v.eq_ignore_ascii_case(b"OFF") => {
+                    let on = v.eq_ignore_ascii_case(b"ON");
+                    if sub.as_str() == "NO-EVICT" {
+                        session.info.set_no_evict(on);
+                    } else {
+                        session.info.set_no_touch(on);
+                    }
                     CommandResponse::ok()
                 }
                 _ => CommandResponse::syntax_error(),
@@ -4979,16 +5071,42 @@ impl CommandEngine {
             "CACHING" => self.client_caching(session, rest),
             "GETREDIR" => self.client_getredir(session),
             "TRACKINGINFO" => self.client_trackinginfo(session),
-            "PAUSE" | "UNPAUSE" => CommandResponse::error(format!(
-                "ERR CLIENT {} is not supported by this server",
-                sub
-            )),
+            "PAUSE" => {
+                let (ms, mode) = match rest {
+                    [ms] => (ms, None),
+                    [ms, mode] => (ms, Some(mode)),
+                    _ => return CommandResponse::wrong_arity("client|pause"),
+                };
+                let Some(ms) = std::str::from_utf8(ms)
+                    .ok()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .filter(|v| *v >= 0)
+                else {
+                    return CommandResponse::error("ERR timeout is not an integer or out of range");
+                };
+                let all = match mode {
+                    None => true,
+                    Some(m) if m.eq_ignore_ascii_case(b"ALL") => true,
+                    Some(m) if m.eq_ignore_ascii_case(b"WRITE") => false,
+                    Some(_) => return CommandResponse::syntax_error(),
+                };
+                self.pause_clients(ms as u64, all);
+                CommandResponse::ok()
+            }
+            "UNPAUSE" => {
+                if !rest.is_empty() {
+                    return CommandResponse::wrong_arity("client|unpause");
+                }
+                self.pause_clients(0, false);
+                CommandResponse::ok()
+            }
             "HELP" => CommandResponse::array(
                 [
                     "CLIENT <subcommand> [<arg> ...]. Subcommands are:",
                     "ID, GETNAME, SETNAME <name>, SETINFO <attr> <value>, INFO,",
                     "LIST [TYPE type] [ID id ...], KILL <filter> <value> ...,",
-                    "REPLY ON|OFF|SKIP, NO-EVICT ON|OFF, NO-TOUCH ON|OFF",
+                    "REPLY ON|OFF|SKIP, NO-EVICT ON|OFF, NO-TOUCH ON|OFF,",
+                    "PAUSE <timeout> [WRITE|ALL], UNPAUSE",
                 ]
                 .iter()
                 .map(|l| CommandResponse::simple(l))
@@ -5018,6 +5136,9 @@ impl CommandEngine {
         let mut id: Option<u64> = None;
         let mut addr: Option<String> = None;
         let mut laddr: Option<String> = None;
+        let mut kind: Option<&'static str> = None;
+        let mut user: Option<String> = None;
+        let mut maxage: Option<u64> = None;
         let mut skip_me = true;
         for pair in rest.chunks(2) {
             let opt = Upper::new(&pair[0]);
@@ -5036,8 +5157,21 @@ impl CommandEngine {
                     "no" => skip_me = false,
                     _ => return CommandResponse::syntax_error(),
                 },
-                // Every client is a normal client of the default user here.
-                "TYPE" | "USER" | "MAXAGE" => {}
+                "TYPE" => match client_type_arg(&pair[1]) {
+                    Some(t) => kind = Some(t),
+                    None => {
+                        return CommandResponse::error(format!("ERR Unknown client type '{}'", val))
+                    }
+                },
+                "USER" => user = Some(val),
+                "MAXAGE" => match val.parse() {
+                    Ok(v) => maxage = Some(v),
+                    Err(_) => {
+                        return CommandResponse::error(
+                            "ERR value is not an integer or out of range",
+                        )
+                    }
+                },
                 _ => return CommandResponse::syntax_error(),
             }
         }
@@ -5046,10 +5180,24 @@ impl CommandEngine {
                 id.is_none_or(|id| c.id == id)
                     && addr.as_ref().is_none_or(|a| &c.addr == a)
                     && laddr.as_ref().is_none_or(|a| &c.laddr == a)
+                    && kind.is_none_or(|k| c.client_type() == k)
+                    && user.as_ref().is_none_or(|u| &c.user_name() == u)
+                    && maxage.is_none_or(|m| c.age_secs() >= m)
             },
             skip_me,
         );
         CommandResponse::integer(n)
+    }
+}
+
+/// `TYPE normal|master|replica|slave|pubsub` of `CLIENT LIST` / `KILL`.
+fn client_type_arg(v: &[u8]) -> Option<&'static str> {
+    match v.to_ascii_lowercase().as_slice() {
+        b"normal" => Some("normal"),
+        b"master" => Some("master"),
+        b"replica" | b"slave" => Some("replica"),
+        b"pubsub" => Some("pubsub"),
+        _ => None,
     }
 }
 

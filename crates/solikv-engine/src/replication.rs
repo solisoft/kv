@@ -139,6 +139,16 @@ pub struct Sink {
     /// Set once the initial synchronization has been sent; before that the
     /// replica is `wait_bgsave` and not counted by `WAIT`.
     pub online: Arc<AtomicBool>,
+    /// Unix ms of the replica's last `REPLCONF ACK` (its lag, for `INFO`
+    /// and `min-replicas-max-lag`).
+    pub last_ack_ms: Arc<AtomicU64>,
+}
+
+impl Sink {
+    /// Seconds since the replica last acknowledged.
+    pub fn lag_secs(&self) -> u64 {
+        solikv_core::now_millis().saturating_sub(self.last_ack_ms.load(Ordering::Relaxed)) / 1000
+    }
 }
 
 struct SinkSlot {
@@ -469,6 +479,17 @@ impl ReplFeed {
         self.connected.load(Ordering::Relaxed)
     }
 
+    /// Online replicas that acknowledged within `max_lag_secs`
+    /// (`min-replicas-to-write`'s "good" replicas).
+    pub fn good_replicas(&self, max_lag_secs: u64) -> usize {
+        self.inner
+            .lock()
+            .sinks
+            .iter()
+            .filter(|s| s.sink.online.load(Ordering::Relaxed) && s.sink.lag_secs() <= max_lag_secs)
+            .count()
+    }
+
     /// The registered replicas.
     pub fn sinks(&self) -> Vec<Arc<Sink>> {
         self.inner
@@ -792,6 +813,7 @@ mod tests {
             addr: "127.0.0.1".into(),
             listening_port: 0,
             online: Arc::new(AtomicBool::new(false)),
+            last_ack_ms: Arc::new(AtomicU64::new(solikv_core::now_millis())),
         })
     }
 

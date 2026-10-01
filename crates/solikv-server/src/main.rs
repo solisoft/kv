@@ -295,6 +295,16 @@ struct Args {
     #[arg(long, default_value = "yes", value_parser = parse_yes_no)]
     replica_read_only: bool,
 
+    /// A master refuses writes (NOREPLICAS) unless at least this many
+    /// replicas acknowledged within --min-replicas-max-lag (0 = off)
+    #[arg(long, default_value = "0", alias = "min-slaves-to-write")]
+    min_replicas_to_write: u64,
+
+    /// Seconds since its last acknowledgement within which a replica counts
+    /// for --min-replicas-to-write
+    #[arg(long, default_value = "10", alias = "min-slaves-max-lag")]
+    min_replicas_max_lag: u64,
+
     /// Address a replica announces to its master (`replica-announce-ip`),
     /// when the one the master sees is not the one to reach it on.
     #[arg(long)]
@@ -1091,6 +1101,7 @@ async fn async_main(args: Args) {
         .repl()
         .set_backlog_size(args.repl_backlog_size as usize);
     engine.set_replica_read_only(args.replica_read_only);
+    engine.set_min_replicas(args.min_replicas_to_write, args.min_replicas_max_lag);
     let replication = solikv_server::replication::Replication::install(
         engine.clone(),
         solikv_server::replication::ReplConfig {

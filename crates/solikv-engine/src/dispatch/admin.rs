@@ -125,7 +125,14 @@ impl CommandEngine {
                 s.listening_port,
                 if online { "online" } else { "wait_bgsave" },
                 ack,
-                0
+                s.lag_secs()
+            ));
+        }
+        let min_replicas = self.min_replicas_to_write.load(Ordering::Relaxed);
+        if min_replicas > 0 {
+            out.push_str(&format!(
+                "min_slaves_good_slaves:{}\r\n",
+                feed.good_replicas(self.min_replicas_max_lag.load(Ordering::Relaxed))
             ));
         }
         out.push_str(&format!(
@@ -646,6 +653,18 @@ impl CommandEngine {
                 ["no", "local", "yes"][self.debug_mode.load(Ordering::Relaxed) as usize % 3].into(),
             ),
             ("lua-memory-limit".into(), self.lua_memory_limit.to_string()),
+            (
+                "min-replicas-to-write".into(),
+                self.min_replicas_to_write
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            ),
+            (
+                "min-replicas-max-lag".into(),
+                self.min_replicas_max_lag
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            ),
         ];
         for (k, val) in self.static_config.read().iter() {
             if !v.iter().any(|(n, _)| n == k) {
@@ -675,6 +694,8 @@ impl CommandEngine {
         "appendfsync",
         "auto-aof-rewrite-percentage",
         "auto-aof-rewrite-min-size",
+        "min-replicas-to-write",
+        "min-replicas-max-lag",
     ];
 
     fn config_validate(&self, param: &str, value: &str) -> Result<(), String> {
@@ -728,6 +749,7 @@ impl CommandEngine {
                     .to_string()
             }),
             "auto-aof-rewrite-percentage" => int(0, i64::MAX),
+            "min-replicas-to-write" | "min-replicas-max-lag" => int(0, i32::MAX as i64),
             "auto-aof-rewrite-min-size" => solikv_core::memory::parse_size(value)
                 .map(|_| ())
                 .ok_or_else(|| {
@@ -789,6 +811,12 @@ impl CommandEngine {
             "auto-aof-rewrite-percentage" => {
                 self.persistence.set_auto_rewrite(value.parse().ok(), None)
             }
+            "min-replicas-to-write" => self
+                .min_replicas_to_write
+                .store(value.parse().unwrap_or(0), Ordering::Relaxed),
+            "min-replicas-max-lag" => self
+                .min_replicas_max_lag
+                .store(value.parse().unwrap_or(10), Ordering::Relaxed),
             "auto-aof-rewrite-min-size" => self
                 .persistence
                 .set_auto_rewrite(None, solikv_core::memory::parse_size(value)),
@@ -929,6 +957,8 @@ impl CommandEngine {
             ("busy-reply-threshold", "5000"),
             ("tracking-table-max-keys", "1000000"),
             ("hz", "10"),
+            ("min-replicas-to-write", "0"),
+            ("min-replicas-max-lag", "10"),
         ];
         let mut header = false;
         for (name, default) in defaults {
