@@ -1,11 +1,11 @@
 # Changelog
 
-## 0.5.0 — unreleased
+## 0.5.0 — 2026-11-07
 
 The follow-up to the September 2026 audit (security, performance, missing
-features). Proposed version: 0.5.0 — the on-disk layout, the cluster bus and
+features). A minor version because the on-disk layout, the cluster bus and
 several defaults changed; see *Breaking changes* and the README's *Upgrading
-from 0.4.x*. The workspace `Cargo.toml` versions are not bumped yet.
+from 0.4.x*.
 
 ### Security
 
