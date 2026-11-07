@@ -342,7 +342,15 @@ fn a_manual_failover_swaps_master_and_replica() {
         }
         false
     });
-    assert!(done, "manual failover did not complete in three attempts");
+    assert!(
+        done,
+        "manual failover did not complete in three attempts\n\
+         replica:\n{}{}\nmaster:\n{}{}",
+        replica.c().info("replication"),
+        replica.c().bulk(&["CLUSTER", "NODES"]),
+        nodes[1].c().info("replication"),
+        nodes[1].c().bulk(&["CLUSTER", "NODES"]),
+    );
     wait_until(Duration::from_secs(20), || cluster_ok_any(&replica));
     let mut cr = replica.c();
     assert_eq!(cr.get(&key).as_deref(), Some("before"));

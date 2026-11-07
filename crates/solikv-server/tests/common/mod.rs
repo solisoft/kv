@@ -58,6 +58,9 @@ impl Drop for TmpDir {
 pub struct Server {
     pub child: Child,
     pub port: u16,
+    /// The server's stderr, shown when a test fails (its directory goes
+    /// with the test).
+    pub log: Option<PathBuf>,
 }
 
 impl Server {
@@ -66,14 +69,17 @@ impl Server {
     }
 
     pub fn start_on(port: u16, dir: &Path, extra: &[&str]) -> Self {
-        let log = std::fs::File::create(dir.join(format!("stderr-{port}.log"))).unwrap();
+        // The server logs to stdout (tracing's default writer): both
+        // streams go to one file, or the log would always be empty.
+        let log_path = dir.join(format!("stderr-{port}.log"));
+        let log = std::fs::File::create(&log_path).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_solikv"))
             .args(["--port", &port.to_string(), "--rest-port", "0"])
             .args(["--bind", "127.0.0.1", "--log-level", "info"])
             .arg("--dir")
             .arg(dir)
             .args(extra)
-            .stdout(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
             .spawn()
             .expect("spawn solikv");
@@ -82,7 +88,11 @@ impl Server {
             assert!(Instant::now() < deadline, "server did not start");
             std::thread::sleep(Duration::from_millis(20));
         }
-        Self { child, port }
+        Self {
+            child,
+            port,
+            log: Some(log_path),
+        }
     }
 
     fn answers(port: u16) -> bool {
@@ -124,6 +134,21 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // A failing test: what the server logged is often the only account
+        // of why (a CI runner's temp directory is gone afterwards).
+        if std::thread::panicking() {
+            if let Some(text) = self
+                .log
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+            {
+                let lines: Vec<&str> = text.lines().collect();
+                eprintln!("--- server :{} log, last 60 lines ---", self.port);
+                for l in &lines[lines.len().saturating_sub(60)..] {
+                    eprintln!("{l}");
+                }
+            }
+        }
     }
 }
 

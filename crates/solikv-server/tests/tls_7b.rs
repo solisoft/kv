@@ -195,7 +195,11 @@ fn start_tls(dir: &Path, port: u16, args: &[String], client: Arc<rustls::ClientC
         .stderr(Stdio::from(log))
         .spawn()
         .expect("spawn solikv");
-    let srv = Server { child, port };
+    let srv = Server {
+        child,
+        port,
+        log: None,
+    };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
