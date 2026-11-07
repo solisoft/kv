@@ -22,8 +22,11 @@ impl Node {
                 "--cluster-enabled",
                 "--cluster-password",
                 SECRET,
+                // Long enough that a node starved of CPU on a two-core CI
+                // runner is not declared failed mid-test (CLUSTERDOWN); the
+                // one test that kills a node waits 40 s for the takeover.
                 "--cluster-node-timeout",
-                "1500",
+                "5000",
                 "--shards",
                 "2",
             ],
@@ -365,7 +368,7 @@ fn cluster_state_survives_a_restart() {
         "--cluster-password",
         SECRET,
         "--cluster-node-timeout",
-        "1500",
+        "5000",
     ];
     let port = common::next_port();
     let srv = Server::start_on(port, &dir.0, &args);
