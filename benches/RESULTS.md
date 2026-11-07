@@ -1,5 +1,108 @@
 # SoliKV benchmark results
 
+## SoliKV against KiviDB 1.2 and Redis 8.10 (2026-11-07)
+
+**Servers:** SoliKV at ce5bd25 (default 16 shards, fat LTO, one codegen unit), KiviDB 1.2.0 (the release's `kividb-linux-x86_64` binary, default build), Redis 8.10.3 built from source (jemalloc).
+**Settings, every server:** AOF on, `appendfsync everysec`, no RDB save points, automatic AOF rewrite at the defaults, everything else at its defaults (Redis `io-threads 1`, KiviDB's own thread count). KiviDB has no flag for the fsync policy or save points; the harness checks with `CONFIG GET` that its defaults match and refuses to run otherwise. Data directories on tmpfs.
+**Machine:** AMD Ryzen 9 9950X (16 cores, 32 threads, two CCDs), 125 GiB RAM, Rocky Linux 10, kernel 6.12. Servers pinned to one CCD (`0-7,16-23`), `redis-benchmark` and the load generator to the other (`8-15,24-31`), over loopback.
+**Method:** three rounds alternating the three servers, a fresh server for every suite, median shown; the best value of each row in bold. `redis-benchmark` 8.10.3 and `benches/loadgen`. Reproduce with `benches/versus.py` and `BENCH_SERVER_CPUS`/`BENCH_CLIENT_CPUS` (see [README.md](README.md)).
+
+### Versions
+
+| Server | Version | Flags |
+|---|---|---|
+| SoliKV | solikv 0.4.3 | `--save ''` |
+| KiviDB 1.2 | kividb 1.2.0 | — |
+| Redis 8.10 | Redis 8.10.3 | — |
+
+### Standard commands — 50 clients, 200k ops (req/s)
+
+| Command | SoliKV | KiviDB 1.2 | Redis 8.10 |
+|---|---|---|---|
+| PING INLINE | **180.2K/s** | 179.5K/s | 180.0K/s |
+| PING MBULK | **181.3K/s** | 179.2K/s | 179.9K/s |
+| SET | 178.7K/s | 177.1K/s | **185.5K/s** |
+| GET | 179.7K/s | 178.9K/s | **180.7K/s** |
+| INCR | 178.9K/s | 177.1K/s | **183.2K/s** |
+| LPUSH | 177.8K/s | 176.1K/s | **187.1K/s** |
+| RPUSH | 177.8K/s | 175.3K/s | **185.7K/s** |
+| LPOP | 178.6K/s | 176.2K/s | **185.4K/s** |
+| RPOP | 178.9K/s | 176.2K/s | **185.5K/s** |
+| SADD | 178.9K/s | 177.0K/s | **180.5K/s** |
+| HSET | 177.6K/s | 176.1K/s | **185.7K/s** |
+| ZADD | 178.1K/s | 175.1K/s | **180.5K/s** |
+| MSET | 173.8K/s | 173.2K/s | **174.5K/s** |
+
+### Pipelined — P=16, 50 clients, 2M ops (req/s)
+
+| Command | SoliKV | KiviDB 1.2 | Redis 8.10 |
+|---|---|---|---|
+| SET | **2.57M/s** | 1.31M/s | 1.62M/s |
+| GET | **2.60M/s** | 2.56M/s | 2.53M/s |
+| INCR | **2.56M/s** | 1.22M/s | 1.81M/s |
+| LPUSH | **2.52M/s** | 1.20M/s | 1.61M/s |
+| SADD | **2.58M/s** | 1.29M/s | 2.47M/s |
+| HSET | **2.55M/s** | 1.04M/s | 1.47M/s |
+| ZADD | **2.55M/s** | 1.04M/s | 2.22M/s |
+
+### One hot key — `redis-benchmark --threads 6 -c 96 -P 32 -n 20000000` (req/s)
+
+| Command | SoliKV | KiviDB 1.2 | Redis 8.10 |
+|---|---|---|---|
+| SET | **6.15M/s** | 1.31M/s | 1.86M/s |
+| GET | 10.00M/s | **13.32M/s** | 3.81M/s |
+| INCR | **5.33M/s** | 1.23M/s | 2.16M/s |
+| LPUSH | **5.33M/s** | 1.23M/s | 1.86M/s |
+| HSET | **5.00M/s** | 1.05M/s | 1.74M/s |
+| ZADD | **5.00M/s** | 1.07M/s | 2.75M/s |
+
+### Targeted workloads
+
+| Workload | SoliKV | KiviDB 1.2 | Redis 8.10 |
+|---|---|---|---|
+| SETBIT growing a 10 MB bitmap (100k calls) | **75.6 ms** | 26.99 s | 87.4 ms |
+| APPEND building a 10 MB string (20k calls) | **16.7 ms** | 1.60 s | 24.9 ms |
+| ZRANK, 200k-member sorted set | 994.5K/s | 8.2K/s | **1.24M/s** |
+| ZRANGE 10 members deep in a 200k sorted set | 623.7K/s | 12.9K/s | **709.4K/s** |
+| Full ZSCAN, 50k members | **14.1 ms** | 264.4 ms | 19.7 ms |
+| Full HSCAN, 50k fields | **12.8 ms** | 116.6 ms | 13.1 ms |
+| SINTER 100k-member set with 100-member set | **103.0K/s** | 775/s | 96.4K/s |
+| SPOP until a 100k set is empty | **67.4 ms** | 85.8 ms | 99.4 ms |
+| One MSET of 10k pairs | **2.32 ms** | 2.41 ms | 2.54 ms |
+| One RPUSH of 100k elements | 9.30 ms | 11.0 ms | **9.15 ms** |
+| One DEL of 1000 keys | 154 µs | 144 µs | **131 µs** |
+
+### Latency seen by other clients
+
+| Measurement | SoliKV | KiviDB 1.2 | Redis 8.10 |
+|---|---|---|---|
+| GET p99.9 during BGSAVE (1M keys, 16 clients) | 344 µs | **85 µs** | 168 µs |
+| GET worst during BGSAVE | 2.04 ms | **1.21 ms** | 1.60 ms |
+| GET p99.9 while SAVE runs | 289 µs | **90 µs** | 143 µs |
+| GET worst while SAVE runs | 62.4 ms | **1.97 ms** | 327.1 ms |
+| SET p99.9 refilling after FLUSHALL of 1M keys | 1.81 ms | 2.37 ms | **1.29 ms** |
+| SET worst refilling after FLUSHALL | 84.7 ms | 9.62 ms | **5.40 ms** |
+| Other keys, worst, BGSAVE with a 2M-element list | 1.49 ms | 10.7 ms | **710 µs** |
+| Other keys, worst, BGREWRITEAOF with a 2M-element list | 2.04 ms | 9.07 ms | **606 µs** |
+
+### Housekeeping
+
+| Measurement | SoliKV | KiviDB 1.2 | Redis 8.10 |
+|---|---|---|---|
+| Expired keys still counted 3 s after 200k keys expired, idle server | **0** | **0** | **0** |
+
+### Reading these numbers
+
+- **Writes:** SoliKV leads every pipelined write by about 2× (SET 2.57M/s against 1.31M/s, HSET and ZADD 2.5× ahead) and every hot-key write by 4–5× (SET 6.15M/s against 1.31M/s). KiviDB's writes are also below Redis 8.10 here. Pipelined, SoliKV is at the single `redis-benchmark` process's ceiling (GET is level at about 2.6M/s for all three), so its margin may be larger.
+- **Reads:** level pipelined; on one hot key KiviDB leads (13.3M/s against 10.0M/s for SoliKV, 3.8M/s for Redis).
+- **Large values are KiviDB's weak spot:** growing a 10 MB bitmap with SETBIT takes 27 s against 76 ms, APPEND to 10 MB 1.6 s against 17 ms, SINTER and ZRANK on large sets are 100× slower — each command appears to do work proportional to the value's size.
+- **Snapshots are KiviDB's strength:** GET p99.9 during BGSAVE 85 µs against 344 µs for SoliKV, and its worst GET while SAVE runs is 2 ms against 62 ms for SoliKV and 327 ms for Redis.
+- **Refill after a FLUSHALL of 1M keys is still SoliKV's weak spot:** worst SET 85 ms against 9.6 ms for KiviDB and 5.4 ms for Redis.
+- **Hot-key figures are coarse:** `-n 20000000` finishes in 1.5–4 s on this machine, and `redis-benchmark` reports a duration rounded to a quarter second, hence the round numbers (10.00M, 6.15M, 5.33M) and roughly ±10% resolution.
+- **Not KiviDB's own setup:** its published figures (21M GET/s at pipeline 16) are with persistence off, on a 32-core Graviton server with the load generator on a second machine. This run keeps AOF on, as in the Redis comparison below, and shares one machine.
+
+---
+
 ## SoliKV against Redis 7.4 and Redis 8.10 (2026-10-01)
 
 **Servers:** SoliKV at 49ff314 (`claude/audit-fixes`, default 16 shards, and `--solo`), Redis 7.4.11 and Redis 8.10.2, all built from source on this machine (Redis with its default jemalloc).

@@ -3,7 +3,7 @@
 
 usage: versus.py OUT_DIR TARGET... [--rounds 3] [--bigkey-n 2000000]
 
-A TARGET is NAME=KIND:PATH[:EXTRA FLAGS], KIND being solikv or redis:
+A TARGET is NAME=KIND:PATH[:EXTRA FLAGS], KIND being solikv, redis or kividb:
 
   versus.py results/ \\
     "SoliKV=solikv:/tmp/solikv:--save ''" \\
@@ -27,8 +27,8 @@ def parse_target(spec):
     name, _, rest = spec.partition("=")
     kind, _, rest = rest.partition(":")
     path, _, extra = rest.partition(":")
-    if not name or kind not in ("solikv", "redis") or not path:
-        sys.exit(f"bad target {spec!r}: want NAME=solikv|redis:PATH[:FLAGS]")
+    if not name or kind not in ("solikv", "redis", "kividb") or not path:
+        sys.exit(f"bad target {spec!r}: want NAME=solikv|redis|kividb:PATH[:FLAGS]")
     return name, harness.target(path, kind, shlex.split(extra))
 
 

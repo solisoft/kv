@@ -9,7 +9,7 @@ alternating them round by round, each suite on a fresh server with its own data 
 | `harness.py` | Starts and stops a server, runs `redis-benchmark` or the load generator against it. |
 | `compare.py` | The full before/after run: suites, one hot key, `--solo` BGSAVE, a huge key. About 40 minutes with 3 rounds. |
 | `report.py` | Prints the Markdown tables of `RESULTS.md` from a `compare.py` results directory. |
-| `versus.py` | Several servers side by side (SoliKV, SoliKV `--solo`, Redis 7, Redis 8…), alternating round by round: suites, one hot key, a huge key. |
+| `versus.py` | Several servers side by side (SoliKV, SoliKV `--solo`, Redis 7, Redis 8, KiviDB…), alternating round by round: suites, one hot key, a huge key. |
 | `report_versus.py` | One column per server, best value of each row in bold. |
 
 ## Requirements
@@ -46,6 +46,21 @@ python3 report_versus.py results-vs/
 
 Redis runs with `--appendonly yes --appendfsync everysec --save ""` and its other defaults
 (`io-threads 1`); `--save ''` gives SoliKV the same no-snapshot setting.
+
+KiviDB is a third kind, `kividb`, started with `--aof`. It has no command-line flag for the
+fsync policy or save points, so the harness checks with `CONFIG GET` that they are `everysec`
+and none, and refuses to run if a KiviDB version changes those defaults:
+
+```bash
+python3 versus.py results-kividb/ \
+  "SoliKV=solikv:/tmp/solikv-after:--save ''" \
+  "KiviDB 1.2=kividb:/opt/kividb/kividb" \
+  "Redis 8.10=redis:/opt/redis-8.10.3/src/redis-server"
+```
+
+On a Linux machine with enough cores, keep servers and clients apart with `taskset` CPU lists:
+`BENCH_SERVER_CPUS=0-7,16-23 BENCH_CLIENT_CPUS=8-15,24-31` put them on the two CCDs of a
+Ryzen 9 9950X. Without these variables nothing is pinned.
 
 The server under test listens on `127.0.0.1:6390` (REST on 6391); change it with `BENCH_PORT`.
 Data directories go to the system temp directory unless `BENCH_TMP` is set. With AOF on, the
