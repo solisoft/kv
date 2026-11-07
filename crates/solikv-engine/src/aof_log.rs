@@ -525,6 +525,25 @@ fn parse_i64(b: &[u8]) -> Option<i64> {
     std::str::from_utf8(b).ok()?.parse().ok()
 }
 
+thread_local! {
+    /// The deadline (ms) the running command computed from a relative TTL.
+    /// Its record logs that instant instead of re-reading the clock, which
+    /// may have ticked since: the restarted server would see the field
+    /// expire a millisecond later than the one that set it.
+    static DEADLINE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Hand the absolute deadline a command just computed to its log record.
+pub(crate) fn note_deadline(at: u64) {
+    DEADLINE.with(|d| d.set(Some(at)));
+}
+
+fn take_deadline() -> Option<Vec<u8>> {
+    DEADLINE
+        .with(|d| d.take())
+        .map(|at| at.to_string().into_bytes())
+}
+
 /// Absolute expiry in ms for a relative amount, as the command computed it.
 fn abs_ms(amount: &[u8], seconds: bool) -> Option<Vec<u8>> {
     let n = parse_i64(amount)?;
@@ -702,6 +721,8 @@ pub(crate) fn aof_form<'a>(
             Some(enc("XADD", &out))
         }
         "HEXPIRE" | "HPEXPIRE" | "HEXPIREAT" | "HPEXPIREAT" => {
+            // Taken first, so it never outlives the command that noted it.
+            let noted = take_deadline();
             // Per-field codes: 1 set, 2 deleted (deadline already past); the
             // others changed nothing. All fields share one deadline, so a
             // command sets or deletes, never both.
@@ -728,7 +749,10 @@ pub(crate) fn aof_form<'a>(
                 return None;
             }
             let at = match name {
-                "HEXPIRE" | "HPEXPIRE" => abs_ms(&args[1], name == "HEXPIRE")?,
+                "HEXPIRE" | "HPEXPIRE" => match noted {
+                    Some(at) => at,
+                    None => abs_ms(&args[1], name == "HEXPIRE")?,
+                },
                 "HEXPIREAT" => parse_i64(&args[1])?
                     .checked_mul(1000)?
                     .max(0)
@@ -816,6 +840,24 @@ mod tests {
 
     fn b(s: &str) -> Bytes {
         Bytes::from(s.to_string())
+    }
+
+    /// `HEXPIRE` logs the deadline the command stored, not the clock read
+    /// again when the record is encoded: one tick apart, the field came back
+    /// after a restart expiring a millisecond later (seen on CI).
+    #[test]
+    fn hexpire_logs_the_deadline_it_stored() {
+        let args = [b("h"), b("3600"), b("FIELDS"), b("1"), b("f")];
+        let set = CommandResponse::Array(vec![CommandResponse::Integer(1)]);
+        note_deadline(4_102_444_800_123);
+        let rec = String::from_utf8(form("HEXPIRE", &args, &set).unwrap()).unwrap();
+        assert!(
+            rec.contains("HPEXPIREAT") && rec.contains("4102444800123"),
+            "{rec}"
+        );
+        // Consumed: the next record computes its own.
+        let rec = String::from_utf8(form("HEXPIRE", &args, &set).unwrap()).unwrap();
+        assert!(!rec.contains("4102444800123"), "{rec}");
     }
 
     fn decoded(rec: &[u8]) -> Vec<String> {

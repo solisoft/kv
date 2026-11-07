@@ -944,6 +944,9 @@ impl CommandEngine {
             ));
         }
         let deadline = deadline as u64;
+        if matches!(id, Cmd::HEXPIRE | Cmd::HPEXPIRE) {
+            crate::aof_log::note_deadline(deadline);
+        }
         self.shards
             .shard_for_key(&key)
             .execute(move |s| s.hash_field_expire(&key, deadline, cond, &fields))
