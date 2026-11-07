@@ -4,7 +4,7 @@
 mod common;
 
 use common::{wait_until, Client, Server, TmpDir};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SECRET: &str = "a-cluster-password-of-at-least-32-bytes!!";
 
@@ -319,11 +319,30 @@ fn a_manual_failover_swaps_master_and_replica() {
         .unwrap();
     c1.ok(&["SET", &key, "before"]);
 
-    replica.c().ok(&["CLUSTER", "FAILOVER"]);
-    wait_until(Duration::from_secs(30), || {
+    // A manual failover gives up after 5 s (CLUSTER_MF_TIMEOUT, as in
+    // Redis), which a CPU-starved CI runner can exceed; an operator would
+    // ask again, so the test does too.
+    let swapped = || {
         replica.c().info("replication").contains("role:master")
             && nodes[1].c().info("replication").contains("role:slave")
+    };
+    let done = (0..3).any(|_| {
+        // Already through (the last attempt finished just late): asking a
+        // master to fail over is an error.
+        if swapped() {
+            return true;
+        }
+        replica.c().ok(&["CLUSTER", "FAILOVER"]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if swapped() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
     });
+    assert!(done, "manual failover did not complete in three attempts");
     wait_until(Duration::from_secs(20), || cluster_ok_any(&replica));
     let mut cr = replica.c();
     assert_eq!(cr.get(&key).as_deref(), Some("before"));
