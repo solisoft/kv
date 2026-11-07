@@ -36,6 +36,14 @@ from 0.4.x*. The workspace `Cargo.toml` versions are not bumped yet.
   over TLS. Peers are checked against the CA. `--tls-auth-clients-user CN`
   (Redis 8's `tls-auth-clients-user`) logs a RESP client in as the enabled
   ACL user its verified certificate's subject CN names.
+- **ACL inside commands**: what runs inside a command is checked against
+  the user who sent it. A script started over REST used to run its
+  `redis.call`s with no user, so a `+@read` user read any key through
+  `EVAL_RO`; REST requests now run under their user, and `/cmd` no longer
+  takes `EVAL_RO`, `EVALSHA_RO`, `FCALL`, `FCALL_RO`, `FUNCTION` or `ACL`.
+  `SORT`'s `BY` patterns and `GET` read keys no ACL check saw; as in Redis 7
+  they now need access to every key. `SORT … STORE a STORE b` checked `a`
+  and wrote `b`; the destination checked is now the one written.
 - **ACL**: users with SHA-256 passwords, command/category/subcommand rules,
   key (`~`, `%R~`, `%W~`) and channel (`&`) patterns, selectors, `ACL LOG`,
   `--aclfile`. Scripts, `SUBSCRIBE`, blocking commands and every REST route

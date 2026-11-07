@@ -232,6 +232,12 @@ pub(crate) fn current_client() -> u64 {
     CURRENT_CLIENT.with(|c| c.borrow().0)
 }
 
+/// The restricted user running the current command (`None`: an unrestricted
+/// user, or no client at all — replay, replication, the server itself).
+pub(crate) fn current_user() -> Option<Arc<crate::acl::AclUser>> {
+    CURRENT_CLIENT.with(|c| c.borrow().1.clone())
+}
+
 struct CurrentClient {
     prev: (u64, Option<Arc<crate::acl::AclUser>>),
 }
@@ -4645,6 +4651,20 @@ impl CommandEngine {
         }
     }
 
+    /// Run a command for `user` outside a connection (the REST API). The
+    /// caller has checked the command itself against the user's ACL; what
+    /// runs inside it — a script's `redis.call`s, `SORT`'s patterns — is
+    /// checked here against the same user, as over RESP.
+    pub fn execute_as(
+        &self,
+        user: &Arc<crate::acl::AclUser>,
+        name: &str,
+        args: &[Bytes],
+    ) -> CommandResponse {
+        let _client = CurrentClient::enter(0, (!user.unrestricted()).then(|| user.clone()));
+        self.execute(name, args)
+    }
+
     pub fn execute_session(
         &self,
         session: &mut Session,
@@ -5784,8 +5804,7 @@ impl CommandEngine {
         spec: &crate::commands::CommandSpec,
         args: &[Bytes],
     ) -> Result<(), String> {
-        let user = CURRENT_CLIENT.with(|c| c.borrow().1.clone());
-        let Some(user) = user else {
+        let Some(user) = current_user() else {
             return Ok(());
         };
         self.acl.check(&user, spec, args).map_err(|d| {
@@ -6536,6 +6555,74 @@ mod sec_tests {
             CommandResponse::Error(s) => s.clone(),
             other => panic!("expected error, got {:?}", other),
         }
+    }
+
+    fn argv(args: &[&str]) -> Vec<Bytes> {
+        args.iter().map(|a| Bytes::from(a.to_string())).collect()
+    }
+
+    /// A restricted user's command run outside a connection (`execute_as`,
+    /// the REST API's path): what runs inside it is checked against that
+    /// user. It used to run with no client set, and `script_acl_check` let
+    /// every `redis.call` through — `EVAL_RO`, in `@read`, read any key.
+    #[test]
+    fn execute_as_checks_what_runs_inside_the_command() {
+        let engine = engine();
+        engine.execute(
+            "ACL",
+            &argv(&["SETUSER", "reader", "on", ">pw", "~app:*", "+@read"]),
+        );
+        engine.execute("SET", &argv(&["secret:token", "s3cr3t"]));
+        engine.execute("RPUSH", &argv(&["app:l", "token"]));
+        let reader = engine.acl().user("reader").unwrap();
+
+        let script = "return redis.call('GET','secret:token')";
+        let resp = engine.execute_as(&reader, "EVAL_RO", &argv(&[script, "0"]));
+        assert!(err_string(&resp).contains("NOPERM"), "{resp:?}");
+        let resp = engine.execute_as(
+            &reader,
+            "EVAL_RO",
+            &argv(&["return redis.call('LLEN','app:l')", "0"]),
+        );
+        assert!(matches!(resp, CommandResponse::Integer(1)), "{resp:?}");
+
+        let resp = engine.execute_as(
+            &reader,
+            "SORT_RO",
+            &argv(&["app:l", "BY", "nosort", "GET", "secret:*"]),
+        );
+        assert!(
+            err_string(&resp).contains("GET option of SORT denied"),
+            "{resp:?}"
+        );
+        let resp = engine.execute_as(&reader, "SORT_RO", &argv(&["app:l", "BY", "secret:*"]));
+        assert!(
+            err_string(&resp).contains("BY option of SORT denied"),
+            "{resp:?}"
+        );
+        let resp = engine.execute_as(
+            &reader,
+            "SORT_RO",
+            &argv(&["app:l", "BY", "nosort", "ALPHA"]),
+        );
+        assert!(
+            !resp.is_error(),
+            "a pattern-free BY needs no extra access: {resp:?}"
+        );
+
+        // The server itself (no client) and unrestricted users keep patterns.
+        let resp = engine.execute(
+            "SORT_RO",
+            &argv(&["app:l", "BY", "nosort", "GET", "secret:*"]),
+        );
+        assert!(!resp.is_error(), "{resp:?}");
+        let root = engine.acl().user("default").unwrap();
+        let resp = engine.execute_as(
+            &root,
+            "SORT_RO",
+            &argv(&["app:l", "BY", "nosort", "GET", "secret:*"]),
+        );
+        assert!(!resp.is_error(), "{resp:?}");
     }
 
     /// `SAVE` used to hardcode `data`/`dump`, ignoring `--dir` and

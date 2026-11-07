@@ -420,6 +420,12 @@ impl AclUser {
         self.enabled
     }
 
+    /// May read every key (`~*` or `%R~*`): what `SORT`'s `BY` and `GET`
+    /// patterns need, since the keys they read are known only at run time.
+    pub fn reads_all_keys(&self) -> bool {
+        self.keys.iter().any(|k| k.pattern == "*" && k.read)
+    }
+
     fn refresh(&mut self) {
         let all_cmds =
             (0..commands::all().len()).all(|i| self.allowed[i / 64] & (1 << (i % 64)) != 0);

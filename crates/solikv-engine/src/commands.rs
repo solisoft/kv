@@ -224,15 +224,28 @@ fn streams_keys(args: &[Bytes]) -> Vec<usize> {
     (pos + 1..pos + 1 + rest / 2).collect()
 }
 
-/// `SORT key … [STORE dest]`
+/// `SORT key … [STORE dest]`. The options are walked as `sort()` parses
+/// them, so the destination reported is the one written: the last `STORE`,
+/// never a `BY`/`GET` pattern or `LIMIT` number that happens to read "store".
 fn sort_keys(args: &[Bytes]) -> Vec<usize> {
-    let mut v = vec![0];
-    if let Some(p) = args.iter().position(|a| a.eq_ignore_ascii_case(b"STORE")) {
-        if p + 1 < args.len() {
-            v.push(p + 1);
+    let mut store = None;
+    let mut i = 1;
+    while i < args.len() {
+        let a = &args[i];
+        if a.eq_ignore_ascii_case(b"LIMIT") {
+            i += 3;
+        } else if a.eq_ignore_ascii_case(b"BY") || a.eq_ignore_ascii_case(b"GET") {
+            i += 2;
+        } else if a.eq_ignore_ascii_case(b"STORE") {
+            if i + 1 < args.len() {
+                store = Some(i + 1);
+            }
+            i += 2;
+        } else {
+            i += 1;
         }
     }
-    v
+    std::iter::once(0).chain(store).collect()
 }
 
 /// `GEORADIUS key … [STORE dest] [STOREDIST dest]`.
@@ -672,6 +685,31 @@ mod tests {
 
     fn b(s: &str) -> Bytes {
         Bytes::from(s.to_string())
+    }
+
+    /// The ACL checks the keys `sort_keys` reports: they must be the ones
+    /// `SORT` writes. With two `STORE`s the last is written; reporting the
+    /// first let `~app:*` overwrite any key.
+    #[test]
+    fn sort_reports_the_destination_it_writes() {
+        let sort = lookup("SORT").unwrap();
+        let args = |a: &[&str]| a.iter().map(|s| b(s)).collect::<Vec<_>>();
+        assert_eq!(
+            sort.keys_of(&args(&[
+                "l", "ALPHA", "STORE", "app:ok", "STORE", "admin:x"
+            ])),
+            vec![b("l"), b("admin:x")]
+        );
+        // A pattern or a LIMIT number that reads "store" is not a destination.
+        assert_eq!(
+            sort.keys_of(&args(&["l", "GET", "store", "BY", "STORE"])),
+            vec![b("l")]
+        );
+        assert_eq!(
+            sort.keys_of(&args(&["l", "BY", "nosort", "STORE", "d"])),
+            vec![b("l"), b("d")]
+        );
+        assert_eq!(sort.keys_of(&args(&["l", "STORE"])), vec![b("l")]);
     }
 
     #[test]

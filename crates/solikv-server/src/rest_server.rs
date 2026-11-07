@@ -99,11 +99,11 @@ tokio::task_local! {
 /// route is checked exactly as the command it maps to would be over RESP.
 fn exec(state: &AppState, cmd: &str, args: &[Bytes]) -> CommandResponse {
     let user = REST_USER.try_with(|u| u.clone()).ok();
-    if let Some(user) = user.filter(|u| !u.unrestricted()) {
+    if let Some(user) = user.as_ref().filter(|u| !u.unrestricted()) {
         let acl = state.engine.acl();
         match solikv_engine::commands::lookup_ci(cmd.as_bytes()) {
             Some(spec) => {
-                if let Err(denied) = acl.check(&user, spec, args) {
+                if let Err(denied) = acl.check(user, spec, args) {
                     acl.log_denial(
                         &user.name,
                         &denied,
@@ -121,7 +121,12 @@ fn exec(state: &AppState, cmd: &str, args: &[Bytes]) -> CommandResponse {
             }
         }
     }
-    state.engine.execute(cmd, args)
+    // Under the request's user, so what the command runs inside it — a
+    // script's `redis.call`s, `SORT`'s patterns — is checked as over RESP.
+    match &user {
+        Some(user) => state.engine.execute_as(user, cmd, args),
+        None => state.engine.execute(cmd, args),
+    }
 }
 
 /// How the REST listener is exposed.
@@ -1079,7 +1084,13 @@ const REST_BLOCKED_COMMANDS: &[&str] = &[
     "DEBUG",
     "EVAL",
     "EVALSHA",
+    "EVAL_RO",
+    "EVALSHA_RO",
+    "FCALL",
+    "FCALL_RO",
+    "FUNCTION",
     "SCRIPT",
+    "ACL",
     "MODULE",
     "BGSAVE",
     "BGREWRITEAOF",

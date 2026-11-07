@@ -2403,6 +2403,10 @@ impl CommandEngine {
         let (mut desc, mut alpha) = (false, false);
         let mut limit: Option<(i64, i64)> = None;
         let mut store: Option<Bytes> = None;
+        // `BY` with a pattern and `GET` read keys built from the elements,
+        // which no ACL key check has seen: as in Redis 7, only a user who may
+        // read every key can use them.
+        let partial_keys = super::current_user().is_some_and(|u| !u.reads_all_keys());
         let mut i = 1;
         while i < args.len() {
             let opt = Upper::new(&args[i]);
@@ -2412,10 +2416,20 @@ impl CommandEngine {
                 ("DESC", _) => desc = true,
                 ("ALPHA", _) => alpha = true,
                 ("BY", Some(p)) => {
+                    if partial_keys && p.contains(&b'*') {
+                        return CommandResponse::error(
+                            "ERR BY option of SORT denied due to insufficient ACL permissions.",
+                        );
+                    }
                     by = Some(p.clone());
                     i += 1;
                 }
                 ("GET", Some(p)) => {
+                    if partial_keys {
+                        return CommandResponse::error(
+                            "ERR GET option of SORT denied due to insufficient ACL permissions.",
+                        );
+                    }
                     gets.push(p.clone());
                     i += 1;
                 }

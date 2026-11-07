@@ -147,6 +147,75 @@ fn rest_routes_run_under_the_acl_user_of_the_request() {
     assert!(log.contains("reader"), "{log}");
 }
 
+/// What runs inside a command is checked against the user who sent it, over
+/// RESP and over REST alike: scripts' calls, `SORT`'s `BY`/`GET` patterns,
+/// and the `STORE` destination `SORT` actually writes.
+#[test]
+fn acl_holds_inside_scripts_and_sort_patterns() {
+    watchdog(120);
+    let dir = TmpDir::new("acl-inside");
+    let rest = next_port();
+    let srv = Server::start(
+        &dir.0,
+        &["--requirepass", "rootpw", "--rest-port", &rest.to_string()],
+    );
+    let mut c = authed(&srv, "rootpw");
+    c.ok(&[
+        "ACL",
+        "SETUSER",
+        "reader",
+        "on",
+        ">readerpw",
+        "~app:*",
+        "+@read",
+        "+sort",
+    ]);
+    c.ok(&["SET", "secret:x", "hidden"]);
+    c.ok(&["SET", "admin:config", "orig"]);
+    c.int(&["RPUSH", "app:l", "x"]);
+    let mut u = srv.client();
+    u.ok(&["AUTH", "reader", "readerpw"]);
+
+    // RESP: patterns need access to every key; the last STORE is checked.
+    let r = u.cmd(&["SORT_RO", "app:l", "BY", "nosort", "GET", "secret:*"]);
+    assert!(r.contains("GET option of SORT denied"), "{r}");
+    let r = u.cmd(&["SORT_RO", "app:l", "BY", "secret:*"]);
+    assert!(r.contains("BY option of SORT denied"), "{r}");
+    let r = u.cmd(&[
+        "SORT",
+        "app:l",
+        "ALPHA",
+        "STORE",
+        "app:ok",
+        "STORE",
+        "admin:config",
+    ]);
+    assert!(r.contains("NOPERM"), "{r}");
+    assert_eq!(c.get("admin:config").as_deref(), Some("orig"));
+    assert_eq!(u.int(&["SORT", "app:l", "ALPHA", "STORE", "app:ok"]), 1);
+
+    // REST: scripts are not on `/cmd`, and SORT's patterns are refused there too.
+    wait_until(Duration::from_secs(10), || {
+        http(rest, "GET", "/health", None, "").0 == 200
+    });
+    let reader = basic("reader", "readerpw");
+    for cmd in ["EVAL_RO", "EVALSHA_RO", "FCALL", "FCALL_RO", "FUNCTION"] {
+        let body = format!(r#"{{"command":"{cmd}","args":["return 1","0"]}}"#);
+        let (st, resp) = http(rest, "POST", "/cmd", Some(&reader), &body);
+        assert_eq!(st, 403, "{cmd}: {resp}");
+        assert!(!resp.contains("hidden"), "{cmd}: {resp}");
+    }
+    let (st, resp) = http(
+        rest,
+        "POST",
+        "/cmd",
+        Some(&reader),
+        r#"{"command":"SORT_RO","args":["app:l","BY","nosort","GET","secret:*"]}"#,
+    );
+    assert!(!resp.contains("hidden"), "{st} {resp}");
+    assert!(resp.contains("GET option of SORT denied"), "{st} {resp}");
+}
+
 #[test]
 fn rest_connections_past_the_cap_get_503() {
     watchdog(120);
