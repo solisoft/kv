@@ -881,6 +881,14 @@ impl ClusterManager {
                 if newer {
                     if let Some(n) = st.nodes.get_mut(node) {
                         n.config_epoch = *config_epoch;
+                        // Only masters own slots: one we still took for a
+                        // replica (a promotion we have not heard of from
+                        // it yet) is a master now, as in Redis' UPDATE.
+                        // Otherwise its old master gives the slots up
+                        // without following it, and stays empty for good.
+                        if n.master.take().is_some() {
+                            st.dirty = true;
+                        }
                     }
                     let node = node.clone();
                     self.claim_slots(st, fx, &node, *config_epoch, slots);
@@ -2661,6 +2669,43 @@ mod tests {
             st.nodes[&st.myself].master.as_deref(),
             Some(b.node_id().as_str())
         );
+    }
+
+    /// After a failover, a master can hear of its promoted replica's claim
+    /// through a third node's UPDATE before the replica's own header. It
+    /// still thought of the claimant as its replica, so it lost its slots
+    /// without following anyone, and stayed an empty master for good: the
+    /// claimant's later pings found no slot left to take (seen on CI as a
+    /// manual failover whose old master never became a replica).
+    #[test]
+    fn an_update_from_a_third_node_makes_the_old_master_follow() {
+        let a = mgr();
+        let b = ClusterManager::new("127.0.0.1".into(), 7001, 17001, ClusterConfig::default());
+        let c = ClusterManager::new("127.0.0.1".into(), 7002, 17002, ClusterConfig::default());
+        a.add_slots(&[5, 6]).unwrap();
+        {
+            let mut st = a.state.lock();
+            let me = st.myself.clone();
+            let mut nb = Node::new(b.node_id(), "127.0.0.1".into(), 7001, 17001);
+            nb.master = Some(me);
+            st.nodes.insert(b.node_id(), nb);
+            let nc = Node::new(c.node_id(), "127.0.0.1".into(), 7002, 17002);
+            st.nodes.insert(c.node_id(), nc);
+        }
+        a.handle(Message::Update {
+            h: header_of(&c),
+            node: b.node_id(),
+            config_epoch: 7,
+            slots: vec![(5, 6)],
+        });
+        assert_eq!(a.slot_owner(5), Some(b.node_id()));
+        assert!(a.is_replica(), "a must follow the node that took its slots");
+        let st = a.state.lock();
+        assert_eq!(
+            st.nodes[&st.myself].master.as_deref(),
+            Some(b.node_id().as_str())
+        );
+        assert!(st.nodes[&b.node_id()].master.is_none(), "b is a master now");
     }
 
     #[test]
