@@ -5,7 +5,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1021,18 +1021,36 @@ impl Drop for LoadingGuard {
 /// goes backwards: a TTL set now and checked just after is measured against
 /// the same clock. (A cache refreshed from the command path instead, every
 /// 16th call, went arbitrarily stale on a quiet server.)
+///
+/// When nobody has asked for the time for [`CLOCK_IDLE_TICKS`] milliseconds,
+/// the refresher stops: a thousand wake-ups a second on an idle server for a
+/// time nobody reads. The cache then reads 0, and the next call reads the
+/// real clock and wakes the refresher.
 #[inline]
 pub fn now_millis() -> u64 {
+    // Only the first read after the refresher looked writes: a line every
+    // core keeps shared under load.
+    if !CLOCK_READ.load(Ordering::Relaxed) {
+        CLOCK_READ.store(true, Ordering::Relaxed);
+    }
     let t = CLOCK.load(Ordering::Relaxed);
     if t != 0 {
         t
     } else {
-        start_clock()
+        clock_asleep()
     }
 }
 
+/// The cached time; 0 while there is no refresher running (not started
+/// yet, asleep, or it could not start).
 static CLOCK: AtomicU64 = AtomicU64::new(0);
-static CLOCK_THREAD: OnceLock<()> = OnceLock::new();
+/// The latest time handed out: the floor of every later one.
+static CLOCK_LAST: AtomicU64 = AtomicU64::new(0);
+/// Someone read the time since the refresher last looked.
+static CLOCK_READ: AtomicBool = AtomicBool::new(false);
+static CLOCK_THREAD: OnceLock<Option<std::thread::Thread>> = OnceLock::new();
+/// Refreshes without a reader before the refresher sleeps.
+const CLOCK_IDLE_TICKS: u32 = 100;
 
 fn wall_millis() -> u64 {
     SystemTime::now()
@@ -1041,30 +1059,45 @@ fn wall_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// The real clock, never below a time already handed out: a wall clock
+/// stepped back must not make a TTL already judged expired come back to
+/// life.
+fn monotonic_millis() -> u64 {
+    let now = wall_millis();
+    CLOCK_LAST.fetch_max(now, Ordering::Relaxed).max(now)
+}
+
 #[cold]
-fn start_clock() -> u64 {
-    CLOCK_THREAD.get_or_init(|| {
+fn clock_asleep() -> u64 {
+    let refresher = CLOCK_THREAD.get_or_init(|| {
         let spawned = std::thread::Builder::new()
             .name("solikv-clock".into())
             .spawn(|| loop {
-                std::thread::sleep(Duration::from_millis(1));
-                // fetch_max: a wall clock stepped back must not make a TTL
-                // already judged expired come back to life.
-                CLOCK.fetch_max(wall_millis(), Ordering::Relaxed);
+                CLOCK.store(monotonic_millis(), Ordering::Relaxed);
+                for _ in 0..CLOCK_IDLE_TICKS {
+                    std::thread::sleep(Duration::from_millis(1));
+                    CLOCK.store(monotonic_millis(), Ordering::Relaxed);
+                }
+                if CLOCK_READ.swap(false, Ordering::Relaxed) {
+                    continue;
+                }
+                // Nobody asked: calls read the real clock until one wakes
+                // this thread (an unpark before the park is not lost).
+                CLOCK.store(0, Ordering::Relaxed);
+                std::thread::park();
             });
         match spawned {
-            // Only a running refresher may publish a cached time; without
-            // one, 0 keeps every call on the real clock.
-            Ok(_) => {
-                CLOCK.fetch_max(wall_millis(), Ordering::Relaxed);
+            Ok(handle) => Some(handle.thread().clone()),
+            Err(e) => {
+                tracing::error!("clock thread: {e}; reading the time per call");
+                None
             }
-            Err(e) => tracing::error!("clock thread: {e}; reading the time per call"),
         }
     });
-    match CLOCK.load(Ordering::Relaxed) {
-        0 => wall_millis(),
-        t => t,
+    if let Some(t) = refresher {
+        t.unpark();
     }
+    monotonic_millis()
 }
 
 /// Current time in seconds since UNIX epoch.
@@ -1183,6 +1216,24 @@ impl CommandResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refresher that went to sleep (the cache reads 0) still answers
+    /// with the real time, never below what it handed out, and the call
+    /// wakes it: the cache is filled again.
+    #[test]
+    fn an_idle_clock_answers_and_wakes_its_refresher() {
+        let before = now_millis();
+        CLOCK.store(0, Ordering::Relaxed);
+        let now = now_millis();
+        assert!(now >= before);
+        assert!(now.abs_diff(wall_millis()) < 1_000);
+        let start = std::time::Instant::now();
+        while CLOCK.load(Ordering::Relaxed) == 0 {
+            assert!(start.elapsed() < Duration::from_secs(5), "never woke up");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(now_millis() >= now);
+    }
 
     #[test]
     fn test_key_entry_no_expiry() {

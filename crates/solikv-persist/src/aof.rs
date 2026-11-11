@@ -315,6 +315,13 @@ fn push_bulk(buf: &mut Vec<u8>, data: &[u8]) {
 /// for it (backpressure: a stalled disk must not turn into unbounded memory).
 const MAX_PENDING: usize = 64 * 1024 * 1024;
 
+/// Passes with nothing to write (one a millisecond) before the writer
+/// stops polling and sleeps until an append wakes it.
+const IDLE_AFTER_PASSES: u32 = 100;
+/// The writer's sleep once idle: an append wakes it sooner, and nothing
+/// waits on it otherwise (the once-a-second fsync has nothing to sync).
+const IDLE_PARK: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// What a sequenced entry in a thread's buffer is.
 const KIND_RECORD: u8 = 0;
 const KIND_ROTATE: u8 = 1;
@@ -361,6 +368,11 @@ struct Inner {
     /// fsynced: everything appended before a pass starts is written by it.
     durable: tokio::sync::watch::Sender<u64>,
     thread: std::sync::OnceLock<std::thread::Thread>,
+    /// The writer sleeps instead of polling: the next append wakes it.
+    /// Read by an append under its thread's buffer lock, which the writer
+    /// takes after setting it to check the buffers are empty: either the
+    /// writer sees the record or the append sees the flag.
+    idle: std::sync::atomic::AtomicBool,
     /// Set when the last handle is dropped.
     closed: std::sync::atomic::AtomicBool,
 }
@@ -520,7 +532,7 @@ impl AofWriter {
             tracing::error!("AOF record for unknown shard {}", shard);
             return;
         }
-        self.with_local_buf(|tb| {
+        let idle = self.with_local_buf(|tb| {
             let mut data = tb.data.lock();
             if data.len() >= MAX_PENDING {
                 drop(data);
@@ -539,7 +551,14 @@ impl AofWriter {
             write(&mut data);
             let len = (data.len() - at - ENTRY_HEADER) as u32;
             data[at + ENTRY_HEADER - 4..at + ENTRY_HEADER].copy_from_slice(&len.to_le_bytes());
+            // Under the buffer lock (see `Inner::idle`).
+            self.inner.idle.load(Ordering::Relaxed)
         });
+        if idle && self.inner.idle.swap(false, Ordering::Relaxed) {
+            if let Some(t) = self.inner.thread.get() {
+                t.unpark();
+            }
+        }
         if self.inner.policy() == FsyncPolicy::Always {
             // Counted once the record is in the buffer (its lock released),
             // so a pass that reads this count drains the record too.
@@ -696,6 +715,7 @@ pub fn spawn_aof_writer(
         appended: AtomicU64::new(0),
         durable: tokio::sync::watch::Sender::new(0),
         thread: std::sync::OnceLock::new(),
+        idle: std::sync::atomic::AtomicBool::new(false),
         closed: std::sync::atomic::AtomicBool::new(false),
     });
 
@@ -777,6 +797,8 @@ fn writer_loop(inner: Arc<Inner>, mut logs: Vec<ShardLog>, dir: PathBuf, stats: 
     let mut drained: Vec<usize> = Vec::new();
     let mut per_shard: Vec<Vec<Entry>> = (0..inner.shards).map(|_| Vec::new()).collect();
     let mut select = Vec::new();
+    // Passes in a row that found nothing to write.
+    let mut quiet: u32 = 0;
 
     loop {
         let closing = inner.closed.load(Ordering::Acquire);
@@ -817,6 +839,11 @@ fn writer_loop(inner: Arc<Inner>, mut logs: Vec<ShardLog>, dir: PathBuf, stats: 
             }
             t += 1;
         }
+        quiet = if drained.is_empty() {
+            quiet.saturating_add(1)
+        } else {
+            0
+        };
         for &t in &drained {
             let buf = &threads[t].1;
             let mut at = 0;
@@ -1020,8 +1047,23 @@ fn writer_loop(inner: Arc<Inner>, mut logs: Vec<ShardLog>, dir: PathBuf, stats: 
         match inner.policy() {
             // Woken by each append; the timeout keeps the once-a-second flush.
             FsyncPolicy::Always => std::thread::park_timeout(Duration::from_millis(100)),
-            // Poll: an append never has to wake this thread (see `AofWriter`).
-            _ => std::thread::park_timeout(Duration::from_millis(1)),
+            // Poll while appends come: an append then never has to wake
+            // this thread (see `AofWriter`).
+            _ if quiet < IDLE_AFTER_PASSES || order.iter().any(|o| !o.held.is_empty()) => {
+                std::thread::park_timeout(Duration::from_millis(1))
+            }
+            // Idle: sleep until an append wakes it, instead of a thousand
+            // wake-ups a second for nothing. The flag goes up before the
+            // buffers are checked under their locks (see `Inner::idle`).
+            _ => {
+                inner.idle.store(true, Ordering::Relaxed);
+                let joined = !inner.threads.lock().is_empty();
+                let empty = !joined && threads.iter().all(|(tb, _)| tb.data.lock().is_empty());
+                if empty {
+                    std::thread::park_timeout(IDLE_PARK);
+                }
+                inner.idle.store(false, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -1563,6 +1605,40 @@ mod tests {
         w.set_policy(FsyncPolicy::Everysec);
         w.log(0, &mut s0, "SET", &[b("a"), b("x")]);
         assert_eq!(w.durable_target(), None, "only `always` holds replies");
+    }
+
+    /// With nothing to write the writer stops polling and sleeps; the next
+    /// append wakes it, and its record reaches the file without waiting
+    /// out the sleep.
+    #[test]
+    fn an_idle_writer_sleeps_until_an_append_wakes_it() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let aof = dir.path().join(AOF_DIRNAME);
+        create_incr_files(&aof, 1, 1).unwrap();
+        let stats = Arc::new(PersistStats::new());
+        let w = spawn_aof_writer(&aof, 1, 1, FsyncPolicy::Everysec, stats).unwrap();
+        let mut seq = 0;
+        w.log(0, &mut seq, "SET", &[b("a"), b("1")]);
+        w.sync().unwrap();
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let start = Instant::now();
+            while !done() {
+                assert!(start.elapsed() < Duration::from_secs(5), "{what}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        until("the writer never went idle", &|| {
+            w.inner.idle.load(Ordering::Relaxed)
+        });
+        w.log(0, &mut seq, "SET", &[b("a"), b("2")]);
+        // The append took the flag down to wake the writer.
+        assert!(!w.inner.idle.load(Ordering::Relaxed));
+        until("the record never reached the file", &|| {
+            let mut n = 0;
+            replay_log(&incr_path(&aof, 1, 0), |_| n += 1).unwrap();
+            n == 2
+        });
     }
 
     /// A record for another database is preceded by `SELECT`, once.
