@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.0 — 2026-11-11
+
+### Performance
+
+- **An idle server sleeps.** The AOF writer (under `appendfsync everysec`)
+  and the cached clock's refresher polled every millisecond for good: an
+  idle server woke ~1000 times a second, ~1940 after its first command.
+  Both keep their 1 ms pace under load and sleep after 100 ms with nothing
+  to do; the next append or time read wakes them. Idle: ~1940 → ~53
+  wake-ups a second. Throughput unchanged (pipelined `SET`: 5.68M → 5.79M/s
+  on 1M keys, 4.95M → 4.93M/s on one hot key, within noise).
+
+### Correctness
+
+- **Cluster failover**: an old master that learns from a third node's
+  `UPDATE` that its replica took its slots now follows it as a replica.
+  It stayed a master with no slots and no replica for good.
+- **`HEXPIRE`/`HPEXPIRE` in the AOF** log the deadline they stored, not
+  the clock read again a tick later: after a restart a field could expire
+  1 ms later than `HPEXPIRETIME` had said.
+
 ## 0.5.0 — 2026-11-07
 
 The follow-up to the September 2026 audit (security, performance, missing
